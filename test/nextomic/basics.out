@@ -18,7 +18,7 @@ ok entid of an unknown ident is nil
 {:db/id 34, :db/ident :person/photo, :db/valueType :db.type/bytes, :db/cardinality :db.cardinality/one, :db/index false, :db/isComponent false, :db/fulltext false, :db/doc a portrait}
 ok schema and the attribute entity agree on the doc
 ok the doc is absent from the view before it
-{:error :nextomic/value-type, :message nextomic value type}
+{:error :nextomic/value-type, :message :person/uuid takes a :db.type/uuid, not "0123ABCD-4567-89EF-0123-456789ABCDEF", :attr :person/uuid, :value 0123ABCD-4567-89EF-0123-456789ABCDEF}
 ok an upper-case uuid matches nothing
 #nextomic/entity {:db/id 4294967296}
 {:person/born 1000000, :person/photo raw bytes, :person/name Ann, :person/home 4294967297, :person/tags #{:staff :admin}, :person/email ann@example.com, :person/age 41, :person/active true, :person/uuid 0123abcd-4567-89ef-0123-456789abcdef, :person/height 1.7, :db/id 4294967296}
@@ -51,37 +51,37 @@ ok nested calls see the same db-before, so equal claims are one datom
 ok a nil result is no tx-data
 ok a call inside with is speculative
 [[4294967298 :person/age 37 16 false] [4294967298 :person/age 40 16 true]]
-{:error :nextomic/cas, :attr :person/age, :expected 37, :actual 40}
-{:error :nextomic/conflict, :e 4294967298, :a :person/height}
+{:error :nextomic/cas, :expected 37, :actual 40, :message :person/age holds 40, not the 37 the cas expected, :attr :person/age}
+{:error :nextomic/conflict, :message two claims of one transaction disagree about :person/height of entity 4294967298, :e 4294967298, :a :person/height}
 ok cas against an absent attribute
-{:error :nextomic/cas, :attr :person/height, :expected nil, :actual 1.8}
+{:error :nextomic/cas, :expected nil, :actual 1.8, :message :person/height holds 1.8, not the nil the cas expected, :attr :person/height}
 []
 [nil 23 :person/full-name]
 Bob
 ok the old name is gone from every view
 ok tx-range decodes the entries written under the old name
-{:error :nextomic/unknown-attribute, :attr :person/name}
+{:error :nextomic/unknown-attribute, :message :person/name names no attribute, :attr :person/name}
 {:error :nextomic/tx-data, :message a retired ident name is never reused}
-{:error :nextomic/conflict, :e 23, :a :db/ident}
+{:error :nextomic/conflict, :message two claims of one transaction disagree about :db/ident of entity 23, :e 23, :a :db/ident}
 #{Bob Robert}
 Bob
 {:error :nextomic/schema, :message an entity holds two values; cardinality stays many, :e 4294967298, :attr :person/full-name}
 :db.cardinality/one
 Robert
 {:error :nextomic/schema, :message a unique attribute is cardinality one, :attr :person/email}
-{:error :nextomic/conflict, :e 25, :a :db/valueType}
+{:error :nextomic/conflict, :message two claims of one transaction disagree about :db/valueType of entity 25, :e 25, :a :db/valueType}
 9
 10
-{:error :nextomic/conflict, :e 4294967298, :a :person/age}
-{:error :nextomic/conflict, :e 4294967298, :a :person/age}
-{:error :nextomic/conflict, :e 4294967298, :a :person/age}
-{:error :nextomic/conflict, :e 4294967298, :a :person/age}
+{:error :nextomic/conflict, :message two claims of one transaction disagree about :person/age of entity 4294967298, :e 4294967298, :a :person/age}
+{:error :nextomic/conflict, :message two claims of one transaction disagree about :person/age of entity 4294967298, :e 4294967298, :a :person/age}
+{:error :nextomic/conflict, :message two claims of one transaction disagree about :person/age of entity 4294967298, :e 4294967298, :a :person/age}
+{:error :nextomic/conflict, :message two claims of one transaction disagree about :person/age of entity 4294967298, :e 4294967298, :a :person/age}
 {:db/id 4294967298, :person/age 11}
 {:db/id 4294967298, :person/age 12}
 ok a unique value moves before its old holder lets go
 ok a lookup ref names an identity asserted after it
 :no-error
-{:error :nextomic/unique, :attr :person/email, :value x2@example.com}
+{:error :nextomic/unique, :message :person/email "x2@example.com" belongs to another entity, :attr :person/email, :value x2@example.com}
 :sorted-entity 42
 {:db/id 4294967304, :person/full-name El, :person/email l@example.com, :person/age 1, :person/tags #{:listed}}
 {:db/id 4294967304, :person/email l@example.com, :person/age 2}

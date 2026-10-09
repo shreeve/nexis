@@ -16,25 +16,25 @@ Ann
 ([Ann] [Bob])
 ([Ann 1] [Bob 2])
 #{}
-{:error :nextomic/value-type, :message nextomic value type}
+{:error :nextomic/value-type, :message :user/email takes a :db.type/string, not 5, :attr :user/email, :value 5}
 {:error :nextomic/tx-data, :message a lookup ref needs a unique attribute, :attr :user/name}
 ([Bob])
-{:error :nextomic/value-type, :message nextomic value type}
-{:error :nextomic/value-type, :message nextomic value type}
-{:error :nextomic/unknown-attribute, :attr :user/nope}
+{:error :nextomic/value-type, :message < compares values of one kind, not a long and a string}
+{:error :nextomic/value-type, :message < compares values of one kind, not a string and a keyword}
+{:error :nextomic/unknown-attribute, :message :user/nope names no attribute, :attr :user/nope}
 {:error :nextomic/query-syntax, :message ?a is never bound; a predicate, function or rule argument needs a pattern, an input or an earlier clause to bind it, :clause 1}
 {:error :nextomic/query-syntax, :message missing? is (missing? $ ?e :attr), :clause 1}
 {:error :nextomic/query-syntax, :message unknown rule, :clause 0}
-{:error :nextomic/unique, :attr :user/email, :value ann@x}
-{:error :nextomic/unknown-attribute, :attr :user/nope}
+{:error :nextomic/unique, :message :user/email "ann@x" belongs to another entity, :attr :user/email, :value ann@x}
+{:error :nextomic/unknown-attribute, :message :user/nope names no attribute, :attr :user/nope}
 {:error :nextomic/tx-data, :message a nested map under a non-component ref needs :db/id or a unique attribute}
-{:error :nextomic/unknown-attribute, :attr :user/nope}
+{:error :nextomic/unknown-attribute, :message :user/nope names no attribute, :attr :user/nope}
 {:error :kind-mismatch, :message kind mismatch}
 {:error :nextomic/tx-data, :message a lookup ref is [attr value]}
 {:error :nextomic/tx-data, :message a lookup ref needs a unique attribute, :attr :user/name}
-{:error :nextomic/value-type, :message nextomic value type}
-{:error :nextomic/no-entity, :message nextomic no entity}
-{:error :nextomic/no-entity, :message nextomic no entity}
+{:error :nextomic/value-type, :message :user/email takes a :db.type/string, not 5, :attr :user/email, :value 5}
+{:error :nextomic/no-entity, :message [:user/email "zed@x"] names no entity, :value [:user/email zed@x]}
+{:error :nextomic/no-entity, :message 0 names no entity, :value 0}
 {:error :nextomic/tx-data, :message a unique attribute is cardinality one}
 {:error :nextomic/tx-data, :message a unique attribute is cardinality one}
 ok failed transactions leave the basis alone
@@ -51,8 +51,8 @@ ok entities of one view are equal
 ok an entity of a view that differs is not
 ok entity-db is the view
 ok the entity reads its own view; a later transaction shows through a newer db
-{:error :nextomic/history-view, :message nextomic history view}
-{:error :nextomic/history-view, :message nextomic history view}
+{:error :nextomic/history-view, :message entity and pull read a current, as-of or since db-value, not a history one}
+{:error :nextomic/history-view, :message entity and pull read a current, as-of or since db-value, not a history one}
 ([30 true])
 ok the transaction entity is not the t
 26

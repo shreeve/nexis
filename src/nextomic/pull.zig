@@ -419,7 +419,10 @@ const Puller = struct {
     fn resolveEntity(self: *Puller, e: Value) Failure!u64 {
         var fault: db_mod.Fault = .{};
         const eid = marshal.entity(self.read, self.arena, e, &fault) catch |err| {
-            self.diag.* = .{ .message = fault.message orelse "unknown attribute", .attr = fault.attr };
+            self.diag.* = switch (err) {
+                error.ValueType => .{ .attr = fault.attr, .given = fault.given, .value_type = fault.value_type },
+                else => .{ .message = fault.message orelse "unknown attribute", .attr = fault.attr },
+            };
             return err;
         };
         return eid orelse error.NoEntity;

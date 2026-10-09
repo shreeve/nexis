@@ -69,6 +69,12 @@ pub const Fault = struct {
     attr: ?Value = null,
     e: ?u64 = null,
     value: ?Val = null,
+    /// The value at fault as the program wrote it, when it is no datom
+    /// value: one of the wrong type, an entity reference that names
+    /// nothing. From the operation's own arguments, so rooted.
+    given: ?Value = null,
+    /// The type a value of the wrong type was refused for.
+    value_type: ?key.ValueType = null,
     message: ?[]const u8 = null,
     /// A failed `:db.fn/cas`: what it expected and what it found, either
     /// absent when the attribute had no value, and the expected keyword

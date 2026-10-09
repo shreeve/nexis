@@ -16,6 +16,10 @@
 (println (t/caught (d/transact! c [[:db/add a :user/nope 1]])))
 (println (t/caught (d/datoms db :eavt a :user/nope)))
 (println (t/caught (d/transact! c [[:db/add a :user/age "old"]])))
+; A caught error names the call that failed: its function, line and
+; column (the file is this run's path to the script).
+(defn file-age [v] (d/transact! c [[:db/add a :user/age v]]))
+(println (try (file-age "old") (catch :nextomic/value-type e [(:fn e) (:line e) (:column e) (string? (:file e))])))
 (println (t/caught (d/datoms db :eavt a :user/age "old")))
 (println (t/caught (d/transact! c [[:db/add a :user/email "b@x"]])))
 (println (t/caught (d/transact! c [[:db/add a :user/age 2] [:db/add a :user/age 3]])))

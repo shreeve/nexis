@@ -112,7 +112,10 @@ pub fn entity(rd: *Read, arena: Allocator, v: Value, fault: *Fault) Error!?u64 {
         .fixnum => {
             const n = v.asFixnum();
             // A fixnum is at most `id_max` (§2.1).
-            if (n <= 0) return error.NoEntity;
+            if (n <= 0) {
+                fault.* = .{ .given = v };
+                return error.NoEntity;
+            }
             return @intCast(n);
         },
         .keyword => return rd.entid(arena, .{ .ident = v.asKeywordId() }),
@@ -126,7 +129,10 @@ pub fn entity(rd: *Read, arena: Allocator, v: Value, fault: *Fault) Error!?u64 {
                 fault.* = .{ .message = "a lookup ref needs a unique attribute", .attr = vector_mod.nth(v, 0) };
                 return error.TxData;
             }
-            const lv = (try valOf(rd, arena, attr.value_type, vector_mod.nth(v, 1), fault)) orelse return null;
+            const lv = (valOf(rd, arena, attr.value_type, vector_mod.nth(v, 1), fault) catch |err| {
+                if (err == error.ValueType) fault.attr = vector_mod.nth(v, 0);
+                return err;
+            }) orelse return null;
             return rd.entid(arena, .{ .lookup = .{ .a = attr.id, .v = lv } });
         },
         else => return error.KindMismatch,
@@ -138,8 +144,16 @@ pub fn entity(rd: *Read, arena: Allocator, v: Value, fault: *Fault) Error!?u64 {
 // =============================================================================
 
 /// The datom value of a VM value under type `vt` (see the module
-/// contract).
+/// contract). A value of the wrong type is named in `fault` with the
+/// type, for the caller to add the attribute it knows.
 pub fn valOf(rd: *Read, arena: Allocator, vt: key.ValueType, v: Value, fault: *Fault) Error!?Val {
+    return convertVal(rd, arena, vt, v, fault) catch |err| {
+        if (err == error.ValueType and fault.given == null) fault.* = .{ .given = v, .value_type = vt };
+        return err;
+    };
+}
+
+fn convertVal(rd: *Read, arena: Allocator, vt: key.ValueType, v: Value, fault: *Fault) Error!?Val {
     switch (vt) {
         .boolean => {
             if (!v.isBool()) return error.ValueType;

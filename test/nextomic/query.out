@@ -42,7 +42,7 @@ Cy
 {:error :nextomic/query-syntax, :message a lookup ref needs a db source; this source is a collection, :clause 0}
 {:error :nextomic/query-syntax, :message this clause reads a db value, and its source is a collection, :clause 1}
 {:error :nextomic/query-syntax, :message this clause reads a db value, and its source is a collection}
-{:error :nextomic/value-type, :message nextomic value type}
+{:error :nextomic/value-type, :message a collection source holds tuples: vectors or lists of values}
 ([Ann] [Di] [Flo])
 ([Bob] [Edward])
 ([Di] [Flo])
@@ -69,8 +69,8 @@ ok a predicate through a variable is tested the same way
 {:error :nextomic/query-syntax, :message get-else takes a cardinality-one attribute, :clause 1}
 {:error :nextomic/query-syntax, :message get-else takes a default that is not nil, :clause 1}
 {:error :nextomic/query-syntax, :message get-else takes a default that is not nil}
-{:error :nextomic/unknown-attribute, :attr :person/nope}
-{:error :nextomic/unknown-attribute, :attr :person/nope}
+{:error :nextomic/unknown-attribute, :message :person/nope names no attribute, :attr :person/nope}
+{:error :nextomic/unknown-attribute, :message :person/nope names no attribute, :attr :person/nope}
 ([Bob Bob B 3] [Cy Cy C 2] [Di Di D 2] [Edward Edward E 6] [Flo Flo F 3])
 ([Cy :green] [Cy :red] [Edward :green])
 ([[Ann 30]] [[Bob 26]] [[Cy 41]] [[Di 30]] [[Edward 55]] [[Flo 33]])
@@ -86,7 +86,7 @@ ok a sum past the fixnum range is a bignum, as + gives
 30
 ([Ann 4] [Bob 2] [Cy 4])
 (3 8 5)
-{:error :nextomic/value-type, :message nextomic value type}
+{:error :nextomic/value-type, :message variance takes numbers, not a string}
 (:blue :green :red)
 ok keywords compare and aggregate by name, as compare orders them
 ok an unqualified keyword orders before a qualified one, as compare orders them
@@ -102,14 +102,14 @@ nil
 (Ann Di)
 (Ann Bob Cy Di Edward Flo)
 {:error :nextomic/query-syntax, :message :keys, :strs and :syms take one name per :find element}
-{:error :nextomic/unknown-attribute, :attr :nope/attr}
-{:error :nextomic/unknown-attribute, :attr :nope/attr} 0
-{:error :nextomic/history-view, :message nextomic history view}
+{:error :nextomic/unknown-attribute, :message :nope/attr names no attribute, :attr :nope/attr}
+{:error :nextomic/unknown-attribute, :message :nope/attr names no attribute, :attr :nope/attr} 0
+{:error :nextomic/history-view, :message entity and pull read a current, as-of or since db-value, not a history one}
 {:db/id 4294967298, :person/name Cy, :person/age 41}
 {:db/id 4294967298, :person/name Cy}
 {:db/id 23, :db/ident :person/name}
 nil
-{:error :nextomic/value-type, :message nextomic value type}
+{:error :nextomic/value-type, :message pull takes an entity id, a lookup ref or an ident, not a string}
 [{:db/id 4294967300, :person/name Ed} {:db/id 4294967300, :person/name Edward}]
 {:error :nextomic/query-syntax, :message a pull pattern variable is bound by a scalar :in input}
 {:error :nextomic/query-syntax, :message unknown data source; declare it in :in}
@@ -143,7 +143,7 @@ ok a repeated query and rule set are served from the caches
 ok explain returns the plan as text
 ok a rule call is costed by its bodies: the smaller scan runs first, then the call
 {:error :nextomic/query-syntax, :message unknown symbol in data pattern, :clause 0}
-{:error :nextomic/query-syntax, :message :find variable is not bound by :in or :where}
+{:error :nextomic/query-syntax, :message :find variable ?x is not bound by :in or :where}
 {:error :nextomic/query-syntax, :message wrong number of inputs}
 {:error :nextomic/query-syntax, :message unknown function: nope}
 {:error :not-callable, :message an integer is not callable}
@@ -151,10 +151,10 @@ ok a rule call is costed by its bodies: the smaller scan runs first, then the ca
 {:error :nextomic/query-syntax, :message not shares no variable with the clauses around it: ?x is bound nowhere outside; not joins on a variable bound outside it, :clause 1}
 {:error :nextomic/query-syntax, :message or branch 2 does not mention ?e, which branch 1 does; every or branch uses the same variables (or-join names the join variables), :clause 1}
 {:error :nextomic/query-syntax, :message or-join branch 2 leaves ?w unbound; every branch binds every join variable, :clause 1}
-{:error :nextomic/unbound-pattern, :message nextomic unbound pattern}
-{:error :nextomic/unknown-attribute, :attr :nope/attr}
-{:error :nextomic/unknown-attribute, :attr :nope/attr}
-{:error :nextomic/value-type, :message nextomic value type}
+{:error :nextomic/unbound-pattern, :message a pattern with nothing bound: no constant, and no variable an earlier clause or :in binds}
+{:error :nextomic/unknown-attribute, :message :nope/attr names no attribute, :attr :nope/attr}
+{:error :nextomic/unknown-attribute, :message :nope/attr names no attribute, :attr :nope/attr}
+{:error :nextomic/value-type, :message sum takes numbers, not a string}
 {:error :nextomic/query-syntax, :message empty :find element}
 {:error :nextomic/query-syntax, :message rule half body 1 leaves ?y unbound; every body binds every head variable, :clause 1}
 {:error :nextomic/query-syntax, :message ?zz is never bound; not-join joins on variables the clauses around it bind, :clause 1}
@@ -182,12 +182,12 @@ ok results are ordinary sets
 #{}
 {:error :nextomic/tx-data, :message attribute is not :db/fulltext, :attr :order/items}
 {:error :nextomic/tx-data, :message attribute is not :db/fulltext, :attr :person/name}
-{:error :nextomic/unknown-attribute, :attr :person/nope}
-{:error :nextomic/value-type, :message nextomic value type}
+{:error :nextomic/unknown-attribute, :message :person/nope names no attribute, :attr :person/nope}
+{:error :nextomic/value-type, :message fulltext searches for a string, not a long}
 {:error :nextomic/query-syntax, :message fulltext is (fulltext $ :attr "needle"), :clause 0}
 {:error :nextomic/schema, :message :db/fulltext takes a string attribute, :attr :person/age}
 {:error :nextomic/schema, :message :db/fulltext takes a string attribute, :attr :person/nick}
-{:error :nextomic/conflict, :e 44, :a :db/fulltext}
+{:error :nextomic/conflict, :message two claims of one transaction disagree about :db/fulltext of entity 44, :e 44, :a :db/fulltext}
 ok :db/fulltext is a bootstrap attribute
-{:error :nextomic/closed, :message nextomic closed}
+{:error :nextomic/closed, :message the connection is released, or the with scope of this db-value has ended}
 :query-done

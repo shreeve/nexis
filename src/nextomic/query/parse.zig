@@ -39,6 +39,7 @@ const dispatch = @import("../../dispatch.zig");
 const stack = @import("../../stack.zig");
 const gc = @import("../../gc.zig");
 const marshal = @import("../marshal.zig");
+const key = @import("../key.zig");
 const ir = @import("ir.zig");
 
 const Allocator = std.mem.Allocator;
@@ -64,6 +65,10 @@ pub const Diag = struct {
     message: []const u8 = "",
     /// The attribute an `UnknownAttribute` names, as the query wrote it.
     attr: ?Value = null,
+    /// A value of the wrong type, as the query or its input wrote it,
+    /// and the type it was refused for.
+    given: ?Value = null,
+    value_type: ?key.ValueType = null,
     /// Backing store of a formatted message, so one that names a
     /// variable outlives the arena of the parse or plan that failed.
     /// The longest template is under 160 bytes, so a message keeps
@@ -75,6 +80,8 @@ pub const Diag = struct {
     pub fn set(self: *Diag, clause: ?usize, comptime fmt: []const u8, args: anytype) void {
         self.clause = clause;
         self.attr = null;
+        self.given = null;
+        self.value_type = null;
         self.message = std.mem.print(&self.buf, fmt, args) catch &self.buf;
     }
 };
@@ -452,7 +459,7 @@ const Parser = struct {
         self.clause_index = null;
         for (self.pull_srcs.items) |ps| self.find_elems[ps.find].pull.src = try self.srcOf(ps.sym);
         for (out.find) |f| {
-            if (!ir.containsVar(bound.items, f.variable_of())) return self.fail(":find variable is not bound by :in or :where");
+            if (!ir.containsVar(bound.items, f.variable_of())) return self.failFmt(":find variable {s} is not bound by :in or :where", .{self.varName(f.variable_of())});
             if (f != .pull) continue;
             if (self.sources.items.len == 0) return self.fail("pull reads a data source, and :in names none");
             switch (f.pull.pattern) {
@@ -461,7 +468,7 @@ const Parser = struct {
             }
         }
         for (out.with) |w| {
-            if (!ir.containsVar(bound.items, w)) return self.fail(":with variable is not bound by :in or :where");
+            if (!ir.containsVar(bound.items, w)) return self.failFmt(":with variable {s} is not bound by :in or :where", .{self.varName(w)});
         }
     }
 

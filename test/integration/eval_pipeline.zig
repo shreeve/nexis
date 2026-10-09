@@ -4488,7 +4488,7 @@ test "db/* and Nextomic on one file: a write inside the other's transaction is r
         \\ (count (:tx-data (nextomic/transact! a [[:db.fn/call (fn [db] (when (db/get-key r) [{:n 9}]))]])))
         \\ (do (nextomic/transact! a [{:n 3}]) (db/put-key! r 4) (db/get-key r))
         \\ (nextomic/q '[:find ?v :where [_ :n ?v]] (nextomic/db a))]
-    , "[{:error :db/busy, :message db busy, :fn fn} {:error :nextomic/nested, :message nextomic nested, :fn test-form} {:error :nextomic/nested, :message nextomic nested, :fn test-form} nil 1 4 #{[3]}]");
+    , "[{:error :db/busy, :message db busy, :fn fn} {:error :nextomic/nested, :message the store's write transaction is held: a with scope, a transaction function or another connection is writing, :fn test-form} {:error :nextomic/nested, :message the store's write transaction is held: a with scope, a transaction function or another connection is writing, :fn test-form} nil 1 4 #{[3]}]");
 }
 
 test "db: Nextomic's nx/ trees are not reachable through db/*" {

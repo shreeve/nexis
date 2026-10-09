@@ -18,8 +18,8 @@ ok added false is empty on a current view
 [500]
 ok an empty range
 {:error :nextomic/tx-data, :message index-range reads an indexed or unique attribute, :attr :item/name}
-{:error :nextomic/value-type, :message nextomic value type}
-{:error :nextomic/unknown-attribute, :attr :item/nope}
+{:error :nextomic/value-type, :message :item/qty takes a :db.type/long, not "a", :attr :item/qty, :value a}
+{:error :nextomic/unknown-attribute, :message :item/nope names no attribute, :attr :item/nope}
 [60 95]
 [95 97 65]
 [3 3 3 60]

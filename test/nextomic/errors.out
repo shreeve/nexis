@@ -1,19 +1,20 @@
-{:error :nextomic/unknown-attribute, :attr :user/nope}
-{:error :nextomic/unknown-attribute, :attr :user/nope}
-{:error :nextomic/value-type, :message nextomic value type}
-{:error :nextomic/value-type, :message nextomic value type}
-{:error :nextomic/unique, :attr :user/email, :value b@x}
-{:error :nextomic/conflict, :e 4294967296, :a :user/age}
-{:error :nextomic/no-entity, :message nextomic no entity}
-{:error :nextomic/no-entity, :message nextomic no entity}
+{:error :nextomic/unknown-attribute, :message :user/nope names no attribute, :attr :user/nope}
+{:error :nextomic/unknown-attribute, :message :user/nope names no attribute, :attr :user/nope}
+{:error :nextomic/value-type, :message :user/age takes a :db.type/long, not "old", :attr :user/age, :value old}
+[file-age 21 20 true]
+{:error :nextomic/value-type, :message :user/age takes a :db.type/long, not "old", :attr :user/age, :value old}
+{:error :nextomic/unique, :message :user/email "b@x" belongs to another entity, :attr :user/email, :value b@x}
+{:error :nextomic/conflict, :message two claims of one transaction disagree about :user/age of entity 4294967296, :e 4294967296, :a :user/age}
+{:error :nextomic/no-entity, :message the lookup ref [:user/email "nobody@x"] names no entity, :attr :user/email, :value nobody@x}
+{:error :nextomic/no-entity, :message 0 names no entity, :value 0}
 {:error :nextomic/tx-data, :message :db/add is [:db/add e a v]}
 {:error :nextomic/tx-data, :message unknown op; one of :db/add, :db/retract, :db/retractEntity, :db.fn/call, :db.fn/cas}
 {:error :nextomic/tx-data, :message tx-data is a vector or a list of forms}
 {:error :nextomic/tx-data, :message a lookup ref needs a unique attribute, :attr :user/age}
-{:error :nextomic/cas, :attr :user/age, :expected 2, :actual 1}
+{:error :nextomic/cas, :expected 2, :actual 1, :message :user/age holds 1, not the 2 the cas expected, :attr :user/age}
 {:error :nextomic/tx-data, :message :db.fn/cas is [:db.fn/cas e a old new]}
 :inside
-{:error :nextomic/nested, :message nextomic nested}
+{:error :nextomic/nested, :message the store's write transaction is held: a with scope, a transaction function or another connection is writing}
 {:error :nextomic/tx-data, :message tx-data is a vector or a list of forms}
 {:error :nextomic/tx-data, :message :db.fn/call takes a function or a symbol naming one}
 {:error :nextomic/tx-fn, :message unknown function: no-such-fn}
@@ -28,15 +29,15 @@ nil
 {:error :nextomic/tx-data, :message a transaction's :db/txInstant is never earlier than the one before}
 ok a failed transaction leaves the basis alone
 ok the store still works after every failure
-{:error :nextomic/conflict, :e 27, :a :db/ident}
-{:error :nextomic/conflict, :e 26, :a :db/ident}
+{:error :nextomic/conflict, :message two claims of one transaction disagree about :db/ident of entity 27, :e 27, :a :db/ident}
+{:error :nextomic/conflict, :message two claims of one transaction disagree about :db/ident of entity 26, :e 26, :a :db/ident}
 ok a conflicting rename leaves the attribute its name
 ok an aborted rename is not cached
 ok the attribute keeps its old name
-{:error :nextomic/value-type, :message nextomic value type}
+{:error :nextomic/value-type, :message :x/new takes a :db.type/string, not 5, :attr :x/new, :value 5}
 #{[{:db/id 4294967298, :x/old 1}]}
 ok a rename inside a query leaves the old name unknown
-{:error :nextomic/unknown-attribute, :attr :x/old}
+{:error :nextomic/unknown-attribute, :message :x/old names no attribute, :attr :x/old}
 {:error :nextomic/schema, :message an ident is never retracted; assert a new :db/ident to rename it, :attr :x/a}
 {:error :nextomic/schema, :message an ident is never retracted; assert a new :db/ident to rename it, :attr :x/a}
 {:error :nextomic/schema, :message an ident is never retracted; assert a new :db/ident to rename it, :attr :x/a}
@@ -49,21 +50,21 @@ ok a refused ident retraction leaves every name resolving
 {:error :nextomic/tx-data, :message a new attribute needs :db/valueType and :db/cardinality}
 {:error :nextomic/tx-data, :message a tempid no assertion stands on names no entity}
 {:error :nextomic/tx-data, :message a lookup ref needs a unique attribute}
-{:error :nextomic/value-type, :message nextomic value type}
-{:error :nextomic/no-entity, :message nextomic no entity}
+{:error :nextomic/value-type, :message :user/boss takes a :db.type/ref, not nil, :attr :user/boss, :value nil}
+{:error :nextomic/no-entity, :message 70368744177664 names no entity, :value 70368744177664}
 {:error :nextomic/tx-data, :message :db.fn/cas never renames; assert the new :db/ident}
 {:error :nextomic/schema, :message an attribute name never starts with _, which marks a reverse ref, :attr :x/_secret}
 {:error :nextomic/schema, :message an attribute name never starts with _, which marks a reverse ref, :attr :x/a}
 ok an enum ident may start with _
-{:error :nextomic/cas, :attr :x/role, :expected :role/never, :actual :role/admin}
+{:error :nextomic/cas, :expected :role/never, :actual :role/admin, :message :x/role holds :role/admin, not the :role/never the cas expected, :attr :x/role}
 ok a cas mints no ident for its old value
-{:error :nextomic/closed, :message nextomic closed}
-{:error :nextomic/closed, :message nextomic closed}
-{:error :nextomic/closed, :message nextomic closed}
-{:error :nextomic/closed, :message nextomic closed}
-{:error :nextomic/closed, :message nextomic closed}
-{:error :nextomic/closed, :message nextomic closed}
-{:error :nextomic/closed, :message nextomic closed}
+{:error :nextomic/closed, :message the connection is released, or the with scope of this db-value has ended}
+{:error :nextomic/closed, :message the connection is released, or the with scope of this db-value has ended}
+{:error :nextomic/closed, :message the connection is released, or the with scope of this db-value has ended}
+{:error :nextomic/closed, :message the connection is released, or the with scope of this db-value has ended}
+{:error :nextomic/closed, :message the connection is released, or the with scope of this db-value has ended}
+{:error :nextomic/closed, :message the connection is released, or the with scope of this db-value has ended}
+{:error :nextomic/closed, :message the connection is released, or the with scope of this db-value has ended}
 ok release is idempotent
 ok reopened store is at the last committed basis
 :errors-done

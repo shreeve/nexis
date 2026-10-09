@@ -1139,38 +1139,40 @@ as `:clause`.
 
 ## 7. Errors
 
-Every error is catchable, and a handler takes it as a map, `{:error
-keyword :message m ...}`, whose other keys name what went wrong and,
-as every runtime error's do, the place the failing call was made
-(`:fn`, `:file`, `:line`, `:column`; `docs/VM.md` §13); `(:error m)`
-is the keyword and `(catch :nextomic/unique e ...)` takes it. A key is
-present only when its value is known. With no handler in force an
-error is thrown as it is built, without the place, and the report
-gives the trace; one that names nothing beyond its tag is then the
-bare keyword.
+Every error is catchable and is a map, `{:error keyword :message m
+...}`, whose other keys name what went wrong; `(:error m)` is the
+keyword and `(catch :nextomic/unique e ...)` takes it. `:message` is a
+sentence naming the attribute, value, entity or variable at fault
+(`":user/age takes a :db.type/long, not \"old\""`); the raise site's
+own when it gives one, else made from the keys (`natives.messageOf`).
+A key is present only when its value is known. When a handler is in
+force the map also carries, as every runtime error's does, the place
+of the failing call (`:fn`, `:file`, `:line`, `:column`;
+`docs/VM.md` §13); with none it is thrown as built and the report
+gives the place and the trace.
 
-| error | when | payload |
+| error | when | payload besides `:message` |
 |---|---|---|
 | `:nextomic/unknown-attribute` | an attribute keyword or id names no attribute | `:attr`, as the program wrote it |
-| `:nextomic/value-type` | a value that does not fit its attribute's type, or a comparison or aggregate over a type it does not take | bare |
+| `:nextomic/value-type` | a value that does not fit its attribute's type (in tx-data, a lookup ref, a `datoms` or `index-range` component, a query input), or a comparison, aggregate, `fulltext` search or `pull` over a value it does not take | `:attr` and `:value`, as the program wrote them, when an attribute refused it; the message names the type (`:db.type/long`), or the operation and the kinds it met (`< compares values of one kind, not a long and a string`) |
 | `:nextomic/unique` | two entities would hold one unique `(a v)` | `:attr` and `:value` |
 | `:nextomic/conflict` | two claims in one transaction disagree, or a schema change §3 step 5 refuses as a conflict | `:e` and `:a` |
-| `:nextomic/no-entity` | an entity reference names nothing, or an id no allocator handed out | bare |
-| `:nextomic/unbound-pattern` | a pattern with nothing bound | bare |
-| `:nextomic/basis-in-future` | a db-value newer than its file (§4) | bare |
-| `:nextomic/closed` | an operation through a released connection or an ended `with` scope | bare |
-| `:nextomic/busy` | `release` while an operation is in flight | bare |
-| `:nextomic/tx-data` | malformed tx-data, a lookup ref on a non-unique attribute (as an entity or a ref value), a nested map nothing could reach, a tempid no assertion stands on, a unique card-many attribute, `fulltext` or `index-range` on an attribute without the flag | `:message`; `:attr` when an attribute is at fault |
-| `:nextomic/schema` | a schema change the attribute's data or type refuses, or the retraction of an ident | `:message` and `:attr`; `:e`, the entity holding two values, when many → one is refused |
-| `:nextomic/history-view` | `entity` or `pull` on a history db | bare |
-| `:nextomic/nested` | `transact!`, `with` or `excise!` while the file's write transaction is held (a `with` scope, a transaction function, another connection to the same file) | bare |
-| `:nextomic/tx-fn` | a transaction function that cannot run | `:message`: the unbound symbol, or the depth limit and its value |
+| `:nextomic/no-entity` | an entity reference names nothing, or an id no allocator handed out | `:value`, the reference as written; a lookup ref in tx-data that finds nothing, `:attr` and `:value` |
+| `:nextomic/unbound-pattern` | a pattern with nothing bound | none |
+| `:nextomic/basis-in-future` | a db-value newer than its file (§4) | none |
+| `:nextomic/closed` | an operation through a released connection or an ended `with` scope | none |
+| `:nextomic/busy` | `release` while an operation is in flight | none |
+| `:nextomic/tx-data` | malformed tx-data, a lookup ref on a non-unique attribute (as an entity or a ref value), a nested map nothing could reach, a tempid no assertion stands on, a unique card-many attribute, `fulltext` or `index-range` on an attribute without the flag | `:attr` when an attribute is at fault |
+| `:nextomic/schema` | a schema change the attribute's data or type refuses, or the retraction of an ident | `:attr`; `:e`, the entity holding two values, when many → one is refused |
+| `:nextomic/history-view` | `entity` or `pull` on a history db | none |
+| `:nextomic/nested` | `transact!`, `with` or `excise!` while the file's write transaction is held (a `with` scope, a transaction function, another connection to the same file) | none |
+| `:nextomic/tx-fn` | a transaction function that cannot run | the message names the unbound symbol, or the depth limit and its value |
 | `:nextomic/cas` | a `:db.fn/cas` whose expectation failed | `:attr`, `:expected` and `:actual`, the last two nil for an absent value |
-| `:nextomic/query-syntax` | a query the parser or planner refuses, or an unbound function name at run time | `:message`; `:clause`, the index into `:where`, when inside a clause. A scoping refusal names the variable at fault: the one an `or` branch mentions and another does not, the join variable an `or-join` branch or a rule body leaves unbound, the one a `not` body has that nothing outside binds, the argument, function-position, `not-join` or required `or-join` variable no clause ever binds |
-| `:nextomic/pull-syntax` | a bad pull pattern (from `pull`, `pull-many` or a find element) | `:message`; `:clause`, the index of the spec |
-| `:kind-mismatch`, `:invalid-argument`, `:arity-mismatch` | the VM's own keywords for an argument of the wrong kind (a db-value where a connection belongs), an unknown index, `:sync` or `:durability` option or a negative `t`, or a wrong argument count | bare |
-| `:stack-overflow` | tx-data, a query or a pull pattern nested past the native stack guard | bare |
-| `:db/*` | an engine failure, through `db.failureName` (`:db/key-too-large`, `:db/map-full`, `:db/read-only`, `:db/open-failed`, ...); a store whose bytes do not decode, or name an ident it lacks, or a page that fails the engine's check, is `:db/corrupted` | bare |
+| `:nextomic/query-syntax` | a query the parser or planner refuses, or an unbound function name at run time | `:clause`, the index into `:where`, when inside a clause. A scoping refusal names the variable at fault in the message: a `:find` or `:with` variable nothing binds, the one an `or` branch mentions and another does not, the join variable an `or-join` branch or a rule body leaves unbound, the one a `not` body has that nothing outside binds, the argument, function-position, `not-join` or required `or-join` variable no clause ever binds |
+| `:nextomic/pull-syntax` | a bad pull pattern (from `pull`, `pull-many` or a find element) | `:clause`, the index of the spec |
+| `:kind-mismatch`, `:invalid-argument`, `:arity-mismatch` | the VM's own errors for an argument of the wrong kind (a db-value where a connection belongs), an unknown index, `:sync` or `:durability` option or a negative `t`, or a wrong argument count | as every runtime error's (`docs/VM.md` §13) |
+| `:stack-overflow` | tx-data, a query or a pull pattern nested past the native stack guard | as every runtime error's |
+| `:db/*` | an engine failure, through `db.failureName` (`:db/key-too-large`, `:db/map-full`, `:db/read-only`, `:db/open-failed`, ...); a store whose bytes do not decode, or name an ident it lacks, or a page that fails the engine's check, is `:db/corrupted` | none; a store of another format names both formats in the message and its own as `:format` |
 
 ---
 
