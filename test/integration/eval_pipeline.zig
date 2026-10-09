@@ -8720,3 +8720,7 @@ test "macroexpand-1 says why a macro failed" {
     try expectOutputProgram("(defmacro m [] (throw (ex-info \"bad input\" {}))) (try (macroexpand-1 '(m)) (catch :macro-expansion-failure e (:message e)))", "macro m threw bad input");
     try expectOutput("(try (macroexpand-1 '(when)) (catch any e [(:error e) (:message e)]))", "[:macro-expansion-failure when: expected a test]");
 }
+
+test "defmacro: a macro returning a native fn names its kind as every message does" {
+    try expectMacroFailure("(defmacro m [] +)", "(m)", "a macro returned a function, which is not a form", "(m)");
+}

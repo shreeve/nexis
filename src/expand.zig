@@ -1537,7 +1537,7 @@ pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, call_origin: SrcSpan
             }
             break :blk .{ .list = items.items };
         },
-        else => return ctx.fail(origin, "a macro returned {s}, which is not a form", .{try kindPhrase(ctx, v.kind())}),
+        else => return ctx.fail(origin, "a macro returned {s}, which is not a form", .{vm_mod.kindPhrase(v.kind())}),
     };
     const form = try makeForm(ctx, datum, origin);
     const carries_meta = switch (v.kind()) {
@@ -1549,15 +1549,6 @@ pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, call_origin: SrcSpan
         if (!meta_v.isNil()) return makeForm(ctx, .{ .with_meta = .{ .target = form, .meta = try valueToForm(ctx, meta_v, origin) } }, origin);
     }
     return form;
-}
-
-/// `kind` with its article, for a message: "an atom", "a typed vector".
-fn kindPhrase(ctx: *ExpandContext, kind: value_mod.Kind) ExpandError![]const u8 {
-    const name = std.mem.trimEnd(u8, @tagName(kind), "_");
-    const article = if (std.mem.findScalar(u8, "aeiou", name[0]) != null) "an" else "a";
-    const phrase = try ctx.allocator.print("{s} {s}", .{ article, name });
-    std.mem.replaceScalar(u8, phrase, '_', ' ');
-    return phrase;
 }
 
 /// An interned `ns/name` text as a qualified name.
