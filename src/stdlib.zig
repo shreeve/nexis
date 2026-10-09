@@ -423,7 +423,7 @@ const core_rows = .{
     .{ "read-string", 1, 2, &fnReadString, "[s] [opts s]", "Returns the first form of the string s as data; the text after it is\n  ignored. When s holds no form, returns the :eof value of the map\n  opts, else :reader-error, as is text that does not read." },
     .{ "eval", 1, 1, &fnEval, "[form]", "Compiles form in the current namespace, runs it and returns its\n  value. A form that does not compile throws\n  {:error :compile-error :message m :form form :kind name}, m the\n  compiler's sentence." },
     // Metadata (SEMANTICS.md §7).
-    .{ "meta", 1, 1, &fnMeta, "[obj]", "Returns the metadata map of obj, a list, vector, map, set, record,\n  atom or Var; nil when it has none or cannot have any." },
+    .{ "meta", 1, 1, &fnMeta, "[obj]", "Returns the metadata map of obj, a list, vector, map, set, record,\n  fn, atom or Var; nil when it has none or cannot have any." },
     .{ "with-meta", 2, 2, &fnWithMeta, "[obj m]", "Returns a value equal to obj with the map m (or nil) as its metadata.\n  A scalar is :no-metadata-on-immediate; a Var or atom takes metadata\n  in place, through reset-meta! or alter-meta!." },
     .{ "reset-meta!", 2, 2, &fnResetMeta, "[iref metadata-map]", "Sets the metadata of the Var or atom iref to metadata-map in place\n  and returns it." },
     .{ "alter-meta!", 2, null, &fnAlterMeta, "[iref f & args]", "Sets the metadata of the Var or atom iref to\n  (apply f (meta iref) args) in place and returns it." },
@@ -3396,12 +3396,12 @@ fn fnEval(vm: *VM, args: []const Value) VmError!Value {
 
 fn carriesHeaderMeta(k: Kind) bool {
     return switch (k) {
-        .list, .lazy_seq, .persistent_vector, .persistent_map, .persistent_set, .record, .typed_vector, .sorted_map, .sorted_set => true,
+        .list, .lazy_seq, .persistent_vector, .persistent_map, .persistent_set, .record, .typed_vector, .sorted_map, .sorted_set, .function => true,
         else => false,
     };
 }
 
-/// `(meta x)` → the metadata map of a list, vector, map, set, record,
+/// `(meta x)` → the metadata map of a list, vector, map, set, record, fn,
 /// atom or Var; nil for anything else or when none is attached. The
 /// Var a native was installed in takes the native's documentation as
 /// its metadata the first time it is asked for (`nativeVarMeta`).
@@ -3445,6 +3445,15 @@ fn fnWithMeta(vm: *VM, args: []const Value) VmError!Value {
     // A realized block over the seq, as `LazySeq.withMeta` is
     // `new LazySeq(meta, seq())`: no rest carries the metadata.
     if (x.kind() == .lazy_seq) return lazy_mod.realizedWithMeta(vm.ensureHeap(), try seq_mod.seqOf(vm, x), meta_h) catch VmError.OutOfMemory;
+    // A closure's block holds its cell pointers in its own tail: a new
+    // closure over the same routine shares the cells.
+    if (x.kind() == .function) {
+        const c = VM.asClosure(x);
+        const f = vm.allocClosure(c.routine, c.upvalues.len) catch return VmError.OutOfMemory;
+        @memcpy(@constCast(VM.asClosure(f).upvalues), c.upvalues);
+        heap_mod.Heap.asHeapHeader(f).setMeta(meta_h);
+        return f;
+    }
     const h = heap_mod.Heap.asHeapHeader(x);
     const body = heap_mod.Heap.bodyBytes(h);
     const copy = vm.ensureHeap().alloc(x.kind(), body.len) catch return VmError.OutOfMemory;

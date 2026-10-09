@@ -2247,9 +2247,9 @@ test "multimethods: methods, get-method, prefers, remove-all-methods and what ea
         \\[(= rv (defmethod rv :a [_] :a)) (= rv (prefer-method rv :a :b)) (prefers rv) (= rv (remove-method rv :a))
         \\ (do (defmethod rv :c [_] :c) (= rv (remove-all-methods rv))) (methods rv) (prefers rv)
         \\ (multifn? rv) (multifn? inc) (fn? rv) (ifn? rv) (= rv rv) (get {rv 1} rv) (meta rv)
-        \\ (try (with-meta rv {:a 1}) (catch any e e)) (try (methods {}) (catch ClassCastException e e))
+        \\ (meta (with-meta rv {:a 1})) (try (methods {}) (catch ClassCastException e e))
         \\ (try (defmethod {} :a [] 1) (catch any e e))]
-    , "[true true {:a #{:b}} true true {} {} true false true true true 1 nil {:error :kind-mismatch, :message kind mismatch, :fn test-form} {:error :kind-mismatch, :message expected a multimethod, got a map, :fn test-form} {:error :kind-mismatch, :message expected a multimethod, got a map, :fn test-form}]");
+    , "[true true {:a #{:b}} true true {} {} true false true true true 1 nil {:a 1} {:error :kind-mismatch, :message expected a multimethod, got a map, :fn test-form} {:error :kind-mismatch, :message expected a multimethod, got a map, :fn test-form}]");
     // get-method: an ambiguity throws as a call does; no match and no default is nil.
     try expectOutputProgram(
         \\(derive :user/a :user/c) (derive :user/b :user/c) (derive :user/ab :user/a) (derive :user/ab :user/b)
@@ -8765,4 +8765,19 @@ test "shell: sh names a missing :dir, an :env name of another kind and an unknow
     try expectOutputWithIo("(try (nexis.shell/sh \"ls\" :dir \"/nexis-no-such-dir\") (catch any e [(:error e) (:message e)]))", "[:file-not-found sh: cannot run ls in /nexis-no-such-dir]");
     try expectOutputWithIo("(try (nexis.shell/sh \"env\" :env {1 \"x\"}) (catch any e [(:error e) (:message e)]))", "[:kind-mismatch sh: an :env name is a string, keyword or symbol, got an integer]");
     try expectOutputWithIo("(try (nexis.shell/sh \"true\" :out-enc \"UTF-8\") (catch any e [(:error e) (:message e)]))", "[:invalid-argument sh: an option other than :in, :dir, :env]");
+}
+
+// =============================================================================
+// A fn carries metadata (SEMANTICS.md §7)
+// =============================================================================
+
+test "with-meta of a fn is a fn carrying the map, calling as the original" {
+    try expectOutput("(meta (with-meta (fn [] 1) {:a 1}))", "{:a 1}");
+    try expectOutput("[(meta (fn [] 1)) ((with-meta (fn [] 1) {:a 1})) (let [x 5 f (with-meta (fn [y] (+ x y)) {:a 1})] (f 2))]", "[nil 1 7]");
+    try expectOutput("(let [f (fn [] 1) g (with-meta f {:a 1})] [(meta f) (= f g) (fn? g) (meta (vary-meta g assoc :b 2)) (meta (with-meta g nil))])", "[nil false true {:a 1, :b 2} nil]");
+    try expectOutput("(defn f \"d\" [] 1) (meta (with-meta f {:x true}))", "{:x true}");
+}
+
+test "gc: a fn's metadata and captures survive the cycles after with-meta" {
+    try expectOutputUnderGc(churn ++ "(let [x (str \"cap\" 1) f (with-meta (fn [] x) {:k (str \"m\" 2)})] (dotimes [i 20] (churn i)) [(f) (:k (meta f))])", "[cap1 m2]");
 }

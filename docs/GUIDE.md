@@ -271,8 +271,8 @@ in `str/replace`. `docs/REGEX.md` §6 lists the differences.
   its head (`docs/LAZY.md` §9).
 - **A record type is a symbol** (`user.Point`); `(instance? Point p)`
   reads as in Clojure.
-- **Functions carry no metadata**, and neither do symbols; collections,
-  records and Vars do.
+- **Symbols carry no metadata**, and neither do native functions;
+  collections, records, `fn`s and Vars do.
 
 ---
 
