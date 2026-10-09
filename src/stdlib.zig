@@ -420,7 +420,7 @@ const core_rows = .{
     .{ "sequential?", 1, 1, kindPredicate(isSequential), .leaf, "[x]", "Returns true if x is a list, a lazy seq or a vector; false of a\n  typed vector." },
     .{ "associative?", 1, 1, kindPredicate(isAssociative), .leaf, "[x]", "Returns true if x is a vector, a hash or sorted map, or a record." },
     .{ "fn?", 1, 1, kindPredicate(isFn), .leaf, "[x]", "Returns true if x is a function: a fn, a native function or a\n  protocol method. A callable keyword or collection is not (ifn?)." },
-    .{ "ifn?", 1, 1, kindPredicate(isIfn), .leaf, "[x]", "Returns true if x can be called as a function: a function, a\n  keyword, a symbol, a vector, a map or set (hash or sorted), or a\n  transient." },
+    .{ "ifn?", 1, 1, kindPredicate(isIfn), .leaf, "[x]", "Returns true if x can be called as a function: a function, a Var,\n  a keyword, a symbol, a vector, a map or set (hash or sorted), or a\n  transient." },
     .{ "counted?", 1, 1, kindPredicate(isCounted), .leaf, "[x]", "Returns true if x is a list, vector, map, set, record, typed vector\n  or transient; false of nil, a string and a lazy seq." },
     .{ "delay?", 1, 1, &fnDelayQ, "[x]", "Returns true if x is a delay." },
     // Lazy seqs (docs/LAZY.md).
@@ -3996,8 +3996,10 @@ fn isFn(k: Kind) bool {
         else => false,
     };
 }
+/// What `callDirect` calls: a function, a Var (its value in force,
+/// as Clojure's `Var` is an `IFn`) or a lookup target.
 fn isIfn(k: Kind) bool {
-    return isFn(k) or vm_mod.isLookupCallable(k);
+    return isFn(k) or k == .var_ or vm_mod.isLookupCallable(k);
 }
 
 // =============================================================================

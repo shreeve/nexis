@@ -6858,6 +6858,7 @@ test "core: predicates, names and conversions" {
         .{ .src = "[(coll? []) (coll? {}) (coll? \"s\") (coll? nil)]", .expected = "[true true false false]" },
         .{ .src = "[(sequential? []) (sequential? '()) (sequential? #{}) (associative? {}) (associative? []) (associative? #{})]", .expected = "[true true false true true false]" },
         .{ .src = "[(fn? inc) (fn? (fn [] 1)) (fn? :a) (ifn? :a) (ifn? {}) (ifn? 1)]", .expected = "[true true false true true false]" },
+        .{ .src = "(do (defrecord R [a]) [(ifn? #'inc) (ifn? (var +)) (fn? #'inc) (ifn? (->R 1)) (ifn? (transient []))])", .expected = "[true true false false true]" },
         .{ .src = "(do (defrecord R [a]) [(map? (->R 1)) (coll? (->R 1))])", .expected = "[true true]" },
         .{ .src = "[(true? true) (true? 1) (false? false) (false? nil)]", .expected = "[true false true false]" },
         .{ .src = "(name :abc)", .expected = "abc" },
