@@ -274,20 +274,14 @@ Local all sync a commit before it returns unless asked not to. `:commit` can
 lose more than its own commits, the whole store where the storage
 reorders writes (the table above), which no program should get
 without asking. A durable commit costs the device's flush, twice, and
-the writing of its pages: on the Linux host of `docs/PERF.md` §3.15
-(ext4 on NVMe) 2.2 ms for a small Nextomic transaction against 13 μs
-with `:commit`, and 6–7 ms on an Apple M5 (APFS, `F_FULLFSYNC`). A
-program of a few transactions pays a few milliseconds: a schema and
-one transaction in a fresh store take 17–23 ms durable against
-10–12 ms with `:commit` on the Linux host, whose `:commit` run syncs
-once at its end. A program of many small transactions pays the flush
-for each: a thousand take 2.1 s durable against 17–22 ms there, and
-6–7 s against 17–23 ms on the M5. Such a program asks for speed: it
-batches its writes into fewer transactions (a transaction of a
+the writing of its pages, milliseconds where `:commit` costs
+microseconds (`docs/PERF.md` §3 "Durable commits" has the figures): a
+program of a few transactions pays a few milliseconds, one of many
+small transactions the flush for each. Such a program asks for speed:
+it batches its writes into fewer transactions (a transaction of a
 thousand entities commits with one pair of flushes), opens its
 connection `{:durability :commit}`, or commits with `{:sync :none}`
-and calls `sync` where it must not lose what it wrote (`docs/PERF.md`
-§3 "Durable commits").
+and calls `sync` where it must not lose what it wrote.
 
 Creating a file syncs its first state before `db/open` returns (emdb
 writes and syncs a new file's meta pages), so a new store is on the
@@ -570,21 +564,10 @@ outside its transaction), and it reads back as a list
 
 ### 10. Tests
 
-`test/prop/db.zig` is the emdb round-trip property test: D1 writes 10 000 random
-values across 5 named trees and reads each back equal with an equal
-hash; D2 closes, reopens the file with a fresh heap and interner, and
-reads 2 000 values back; D3 checks that the identity triple alone
-decides ref equality and hash; D4 writes the same key to every tree
-with different values and reads each tree's own back. The inline tests
-in `src/db.zig` pin the canonical store id, the pinned geometry, the
-refusal of a hard-linked file, close refused while a transaction is
-open, the tree-handle cache, `ConnectionUnavailable`, `StoreMismatch`
-and the invalid names. The language surface runs in
-`test/integration/eval_pipeline.zig` (among them: close aborting open
-transactions, ten thousand dropped reads and dropped writes under the
-default and the stress collection policies, and a `db/reduce-tree`
-whose callback writes, deletes and walks the tree under it),
-`test/integration/runtime_polish.zig` and `examples/durable-refs.nx`.
+`test/prop/db.zig` (round trips of random values through stores) and
+the inline tests of `src/db.zig` cover the Zig layer;
+`test/integration/eval_pipeline.zig`, `test/integration/runtime_polish.zig`
+and `examples/durable-refs.nx` the language surface.
 
 ---
 
@@ -595,9 +578,11 @@ whose callback writes, deletes and walks the tree under it),
 `.durable_ref` arm, and `gc.zig` its `markHandle`
 and `sweepHandles` (§3.2); `format.zig` reads a ref's
 tree name and key bytes to print it; `stdlib.zig` holds the natives;
-Nextomic imports it only for `failureName`, the geometry constants
-`page_size` and `max_named_trees`, and `StoreFile`, through which it
-shares the file's environment (§3.1); it keeps raw byte keys and never
+Nextomic imports it only for `failureName`, `Durability`, the
+geometry constants `page_size`, `initial_map_size` and
+`map_grow_step`, `StoreFile`, through which it shares the file's
+environment (§3.1), and, in its tests, `engineSyncs`; it keeps raw
+byte keys and never
 goes through `db.zig`'s connections, trees, codec calls or refs.
 
 ---

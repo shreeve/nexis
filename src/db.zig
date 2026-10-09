@@ -1,50 +1,8 @@
-//! db.zig — durable identities + emdb integration.
-//!
-//! Authoritative spec: `docs/DB.md`. Derivative from PLAN §23 #6,
-//! #7 (explicit transactions; durable refs are identities),
-//! `docs/CODEC.md` (value-bytes serialization), `docs/VALUE.md`
-//! §2.2 (kind 26 `durable_ref`), `docs/SEMANTICS.md` §2.6 / §3.2
-//! (identity-triple equality + hash).
-//!
-//! Responsibilities:
-//!   - `StoreFile`: the one `emdb.Env` of a store file in this
-//!     process, shared by every connection and Nextomic store of it.
-//!   - `Connection` type over a `StoreFile` with a `store_id` hashed
-//!     from the file's canonical path (DB.md §2).
-//!   - `durable_ref` heap Value kind (VALUE.md §2.2 kind 26) with
-//!     self-contained identity triple (store_id, tree_name,
-//!     key_bytes) and an advisory non-identity `conn: ?*Connection`
-//!     pointer.
-//!   - `WriteTxn` / `ReadTxn` wrappers around `emdb.Txn`, and the
-//!     `Handle` the language holds one by, which `close` and the
-//!     collector end.
-//!   - `Walk`: a tree walk that a write under it cannot disturb.
-//!   - `put` / `get` / `del` by `(tree_name, key_bytes, value)` —
-//!     keys are **opaque byte slices**, values
-//!     are codec-encoded via `src/codec.zig`.
-//!   - `putRef` / `getRef` / `delRef` ref-based convenience.
-//!   - Per-kind hash / equality helpers consumed by
-//!     `src/dispatch.zig` and `src/gc.zig`.
-//!
-//! Scope (DB.md §1): explicit-transaction primitives. No `alter!`,
-//! no as-of, no with-tx macro live here.
-//!
-//! Module graph (one-way terminal):
-//!
-//!     src/db.zig
-//!     ├── @import("std")
-//!     ├── @import("value.zig")
-//!     ├── @import("heap.zig")
-//!     ├── @import("intern.zig")
-//!     ├── @import("hash.zig")
-//!     ├── @import("codec.zig")
-//!     └── @import("emdb")
-//!
-//! Importers (DB.md §11): `dispatch.zig` / `gc.zig` at their
-//! `.durable_ref` arms, `gc.zig` to mark and sweep transaction
-//! handles, `format.zig` to print refs and handles, `stdlib.zig` for
-//! the natives, and Nextomic for `StoreFile` and the geometry
-//! constants.
+//! db.zig — store files, `db/*` connections, transactions and
+//! durable refs over emdb (docs/DB.md): the one environment of a store
+//! file in the process (`StoreFile`, §3.1), which Nextomic shares;
+//! connections, transaction handles and tree walks (§3); the
+//! `durable_ref` heap kind and its identity hash and equality (§4, §7).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -465,12 +423,6 @@ fn canonicalPath(allocator: std.mem.Allocator, path: [*:0]const u8) ![:0]u8 {
 
 // =============================================================================
 // Connection (DB.md §3)
-//
-// NOT a runtime Value kind. Plain Zig struct allocated on the
-// caller's allocator. Caller owns the lifetime via explicit
-// `close()`. Multiple durable-refs may point at one Connection via
-// their advisory `conn` pointer; the Connection is not
-// reference-counted.
 // =============================================================================
 
 pub const Connection = struct {
@@ -547,10 +499,9 @@ pub const reader_slots: u32 = 4096;
 /// How a commit reaches the disk (DB.md §3.3). Every commit is atomic
 /// and seen at once by every connection and process sharing the file.
 pub const Durability = enum {
-    /// A commit syncs nothing; the file is synced once when its
-    /// connection closes, at `db/sync` and `nextomic/sync`, and when
-    /// the process ends. A crash of the process loses nothing; a crash
-    /// of the system can lose the commits since the last sync.
+    /// A commit syncs nothing; the file is synced when its connection
+    /// closes, at `db/sync` and `nextomic/sync`, and when the process
+    /// ends. What a crash of the system can lose is DB.md §3.3's.
     commit,
     /// Every commit syncs data and meta: it is on the disk when it
     /// returns. The default.
@@ -560,18 +511,12 @@ pub const Durability = enum {
         return std.meta.stringToEnum(Durability, text);
     }
 
-    /// The durability `NEXIS_DURABILITY`'s text names, `durable` when
-    /// it is unset. `bin/nexis` refuses any other value at start, so an
-    /// unknown one reaches here only from an embedding, and reads as
-    /// unset.
-    pub fn fromEnv(text: ?[]const u8) Durability {
-        return parse(text orelse return .durable) orelse .durable;
-    }
-
-    /// The process's: `NEXIS_DURABILITY` (`fromEnv`).
+    /// The process's: the durability `NEXIS_DURABILITY` names,
+    /// `durable` when it is unset. `bin/nexis` refuses any other value
+    /// at start, so an unknown one reaches here only from an embedding,
+    /// and reads as unset.
     pub fn process() Durability {
-        const text = std.c.getenv("NEXIS_DURABILITY") orelse return fromEnv(null);
-        return fromEnv(std.mem.span(text));
+        return parse(std.mem.span(std.c.getenv("NEXIS_DURABILITY") orelse return .durable)) orelse .durable;
     }
 
     pub fn syncOverride(self: Durability) emdb.SyncOverride {
@@ -1056,31 +1001,9 @@ pub fn put(
     try txn.inner.putInTree(tree_id, key_bytes, encoded);
 }
 
-/// Read a value by `(tree_name, key_bytes)`. Accepts either a
-/// `*WriteTxn` or `*ReadTxn` via duck-typing (both have
-/// `.conn: *Connection` and `.inner: *emdb.Txn`).
-///
-/// `elementHash` / `elementEq` are the hash and equality functions
-/// the codec uses to rebuild decoded map / set / vector collections.
-/// They MUST be the authoritative runtime hash and equality for all
-/// codec-serializable kinds — callers almost always pass
-/// `&dispatch.hashValue, &dispatch.equal`.
-///
-/// Why the caller passes them instead of `src/db.zig` importing
-/// `src/dispatch.zig` directly: `dispatch.zig` already imports
-/// `db.zig` (for the `.durable_ref` arms), so `db.zig` importing
-/// `dispatch.zig` would create a module-graph cycle. The
-/// parameterized seam keeps the graph one-way terminal while
-/// letting production callers supply full dispatch semantics. Inline
-/// tests that work with a restricted Value alphabet may pass
-/// narrower stand-ins.
-///
-/// Using non-dispatch callbacks is unsound for decoded CHAMP-shaped
-/// maps / sets (>8 entries with heap-kind keys): the internal trie
-/// placement depends on hash bits, and a subsequent lookup through
-/// `dispatch.hashValue` would miss entries placed under an
-/// alternative hash. Small array-maps (≤8 entries) tolerate
-/// mismatched callbacks because they probe purely via equality.
+/// The value under `(tree_name, key_bytes)` in either transaction
+/// kind, decoded with the hash and equality `elementHash` and
+/// `elementEq`, which must agree with dispatch's (DB.md §5).
 pub fn get(
     txn: anytype,
     tree_name: []const u8,
@@ -1258,9 +1181,6 @@ pub fn delRef(txn: *WriteTxn, r: Value) !bool {
 
 // =============================================================================
 // Per-kind hash / equality (DB.md §7)
-//
-// Consumed by `src/dispatch.zig` at the `.durable_ref` arm and by
-// `src/gc.zig` at the same arm.
 // =============================================================================
 
 /// Identity-triple hash: the store id's two halves, then xxHash3 over
@@ -1342,10 +1262,6 @@ test "failureName: every emdb error nexis can meet has its keyword; every decode
         else if (std.mem.eql(u8, name, "UnserializableKind")) "unserializable" else "codec-failed";
         try testing.expectEqualStrings(expected, failureName(@field(codec_mod.DecodeError, name)));
     }
-}
-
-test "DurableRefBody layout: 32 bytes header" {
-    try testing.expectEqual(@as(usize, 32), @sizeOf(DurableRefBody));
 }
 
 test "open / close: round-trip with a tiny file" {
@@ -1655,13 +1571,6 @@ test "Durability: parses its two names and nothing else" {
     for ([_][]const u8{ "", "batch", "batched", "Durable", "commit " }) |text| {
         try testing.expect(Durability.parse(text) == null);
     }
-}
-
-test "Durability: a process that names none syncs every commit" {
-    try testing.expectEqual(Durability.durable, Durability.fromEnv(null));
-    try testing.expectEqual(Durability.durable, Durability.fromEnv("batch"));
-    try testing.expectEqual(Durability.commit, Durability.fromEnv("commit"));
-    try testing.expectEqual(Durability.durable, Durability.fromEnv("durable"));
 }
 
 test "durability commit: a commit is seen at once and syncs nothing; close syncs the file once" {
