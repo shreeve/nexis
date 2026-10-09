@@ -482,8 +482,8 @@ after numbers in the commit message.
    callbacks of `docs/PERF.md` §3.33 (0.94, from 1.30), and is level on
    string splitting.
    Warm JVM Clojure is faster on seven of ten: `fib` 5.6×
-   (`docs/PERF.md` §3.38; 6.0× in §3.15), the destructuring loop 5.3×
-   (5.5×), string splitting 2.4×, the map build 2.1×,
+   (`docs/PERF.md` §3.38; 6.0× in §3.15), the destructuring loop 5.0×
+   (`docs/PERF.md` §3.40; 5.5×), string splitting 2.4×, the map build 2.1×,
    the pipeline and vectors 2.1× (§3.33), the transient map 1.2×; nexis
    leads on the counting loop (0.71), on `frequencies`/`group-by`
    (0.92) and on `sort` (54–56 ms against 147 ms, `docs/PERF.md`
@@ -505,10 +505,13 @@ after numbers in the commit message.
      takes the `preserve_none` convention and saves no register
      (`docs/PERF.md` §3.38), so a `fib` call is 203.5 instructions and
      42.6 cycles on the Linux host (from 211.5 and 45.6), `fib` 26 ms
-     (5.6× warm JVM Clojure) and the destructuring loop 205 ms (5.3×).
-     What remains on x86-64 is a leaf call's load of the native's
-     result, which the CPU cannot forward (`docs/PERF.md` §6 "A
-     width-consistent native boundary on x86-64"), and on both hosts
+     (5.6× warm JVM Clojure); values cross the native boundary at
+     widths the CPU forwards (`docs/PERF.md` §3.40), so a leaf call
+     runs 10–18% fewer cycles and the destructuring loop 190–192 ms
+     (5.0×), its blocked loads 17.4 → 5.4 M. What remains on x86-64 is
+     the result a native assembles in a temporary and copies out
+     wider, inside `count`, `nth` and `nthnext` (`docs/PERF.md` §6 "A
+     native's result assembled in a temporary"), and on both hosts
      the dependent chain of each fetch (frame → routine → code →
      instruction → table). em's runtime is the reference: its handlers
      take six argument registers (the instruction, the pc and three
