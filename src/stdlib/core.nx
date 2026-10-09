@@ -124,11 +124,11 @@
 
 (defmacro defonce
   "Defines name as the value of expr unless the Var is already bound,
-  in which case expr is not evaluated. Returns the Var."
+  in which case expr is not evaluated. Returns the Var when it defines
+  name, else nil."
   [name expr]
   `(let [v# (def ~name)]
-     (when-not (bound? v#) (def ~name ~expr))
-     v#))
+     (when-not (bound? v#) (def ~name ~expr))))
 
 ; The printed form is built when the macro expands, so the check costs
 ; its test and the failure one call of two constants, a conj that makes
@@ -342,12 +342,12 @@
 ; ---- collection extras ----
 
 (defn merge
-  "Returns a map of the maps conj'd left to right, a later key's value
-  winning. nil when no map is non-nil; the first non-nil map decides
-  the result's kind, so a record stays one."
+  "Returns a map of the maps conj'd onto the first left to right, a
+  later key's value winning; {} stands for a leading nil or false.
+  nil when every map is nil or false."
   [& maps]
-  (when (some some? maps)
-    (reduce conj (remove nil? maps))))
+  (when (some identity maps)
+    (reduce (fn* [acc m] (conj (or acc {}) m)) maps)))
 
 ; The short arities call f directly, with no argument list to build.
 (defn update

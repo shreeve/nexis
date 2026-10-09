@@ -8735,3 +8735,11 @@ test "doseq and for share one modifier expander and check their bindings as Cloj
         \\[([1 1 1] [3 9 1]) (0 2 4 6 8) (1 3) 2 3 :a4 5 :a 1 (macro doseq threw doseq requires an even number of forms in binding vector macro doseq threw doseq requires a vector for its binding macro doseq threw doseq: unknown modifier :foo macro doseq threw doseq: a modifier needs a binding before it macro for threw for requires a binding macro for threw for: unknown modifier :bar)]
     );
 }
+
+test "defonce returns nil when the Var is bound; merge is Clojure's" {
+    try expectOutputProgram(
+        \\(defrecord R [a])
+        \\[(defonce a 1) (defonce a 2) a (merge nil (->R 1)) (record? (merge (->R 1) {:b 2})) (merge false {:a 1})
+        \\ (merge) (merge nil false) (merge {:a 1} nil {:a 2 :b 3})]
+    , "[#'user/a nil 1 {:a 1} true {:a 1} nil nil {:a 2, :b 3}]");
+}
