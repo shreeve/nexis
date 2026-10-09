@@ -3941,15 +3941,39 @@ pub const VM = struct {
 
     /// `dst.* = v` a word at a time (`loadWords`).
     inline fn storeWords(dst: *Value, v: Value) void {
+        if (wide_stores) {
+            const pair: @Vector(2, u64) = .{ v.tag, v.payload };
+            @as(*align(8) volatile @Vector(2, u64), @ptrCast(dst)).* = pair;
+            return;
+        }
         @as(*volatile u64, &dst.tag).* = v.tag;
         @as(*volatile u64, &dst.payload).* = v.payload;
     }
 
+    const wide_stores = builtin.cpu.arch == .x86_64;
+
     /// `dst.* = src.*` a word at a time (`loadWords`).
     inline fn copyWords(dst: *Value, src: *const Value) void {
-        const v = loadWords(src);
-        @as(*volatile u64, &dst.tag).* = v.tag;
-        @as(*volatile u64, &dst.payload).* = v.payload;
+        storeWords(dst, loadWords(src));
+    }
+
+    /// `@memcpy(dst, src)` a word at a time (`loadWords`).
+    fn copyRun(dst: []Value, src: []const Value) void {
+        for (dst, src) |*d, *s| copyWords(d, s);
+    }
+
+    /// `copyRun` of key, value pairs, each stored as one 32-byte entry
+    /// on x86-64, the width a map's constructor reads it.
+    fn copyEntries(dst: []Value, src: []const Value) void {
+        if (!wide_stores) return copyRun(dst, src);
+        var i: usize = 0;
+        while (i + 2 <= dst.len) : (i += 2) {
+            const k = loadWords(&src[i]);
+            const v = loadWords(&src[i + 1]);
+            const entry: @Vector(4, u64) = .{ k.tag, k.payload, v.tag, v.payload };
+            @as(*align(8) volatile @Vector(4, u64), @ptrCast(&dst[i])).* = entry;
+        }
+        if (i < dst.len) copyWords(&dst[i], &src[i]);
     }
 
     /// Slot `op` of `frame`, an operand verification proved a slot
@@ -4977,8 +5001,7 @@ pub const VM = struct {
         const src = self.verifiedSlot(frame, inst.b);
         const v = loadWords(src);
         src.* = comptime value_mod.nilValue();
-        @as(*volatile u64, &dst.tag).* = v.tag;
-        @as(*volatile u64, &dst.payload).* = v.payload;
+        storeWords(dst, v);
         return self.nextAt(frame, pc);
     }
 
@@ -5080,7 +5103,7 @@ pub const VM = struct {
             else => return .of(err),
         };
         countNative(native);
-        self.verifiedSlot(frame, inst.c).* = result;
+        copyWords(self.verifiedSlot(frame, inst.c), &result);
         return self.nextSafeAt(frame, pc);
     }
 
@@ -5095,13 +5118,8 @@ pub const VM = struct {
         if (argc < native.min_arity or argc > max or argc > max_native_args) return self.general(frame, inst, pc);
         const base: usize = @as(usize, frame.base_slot) + inst.a.index + 1;
         frame.pc = @intCast(pc);
-        // A whole buffer copies inline where the stack's capacity
-        // covers it; the other copy is a call of its own, which the
-        // optimizer cannot fold the inline one into.
         var buf: [max_native_args]Value = undefined;
-        if (base + max_native_args <= self.stack.capacity) {
-            buf = self.stack.items.ptr[base..][0..max_native_args].*;
-        } else copySlots(buf[0..argc], self.stack.items[base..][0..argc]);
+        copyRun(buf[0..argc], self.stack.items[base..][0..argc]);
         if (native.consumes and argc > 0) self.stack.items[base + argc - 1] = value_mod.nilValue();
         countNative(native);
         const overflows = dispatch_mod.spoilCount();
@@ -5116,12 +5134,8 @@ pub const VM = struct {
         // The arguments are dead once the call returns (§6); the callee
         // is a native, which holds no heap value.
         for (self.stack.items.ptr[base..][0..argc]) |*slot| slot.* = value_mod.nilValue();
-        self.slotAt(caller, inst.c.index).* = result;
+        copyWords(self.slotAt(caller, inst.c.index), &result);
         return self.nextSafe(caller);
-    }
-
-    noinline fn copySlots(dst: []Value, src: []const Value) void {
-        @memcpy(dst, src);
     }
 
     /// `fastCall` of a keyword or symbol, `(:k m)`, `(:k m d)`, `('s m)`,
@@ -5135,7 +5149,7 @@ pub const VM = struct {
         const base: usize = @as(usize, frame.base_slot) + inst.a.index + 1;
         const default = if (argc == 2) self.stack.items[base + 1] else value_mod.nilValue();
         const result = lookupInPlace(callee, self.stack.items[base], default) orelse return self.general(frame, inst, pc);
-        self.slotAt(frame, inst.c.index).* = result;
+        copyWords(self.slotAt(frame, inst.c.index), &result);
         return self.nextAt(frame, pc);
     }
 
@@ -5156,7 +5170,7 @@ pub const VM = struct {
         const target = loadWords(self.fastOperand(frame, inst.b).ptr);
         const default = if (inst.variant == @backingInt(Call.lookup_or)) self.slotAt(frame, @as(usize, inst.b.index) + 1).* else value_mod.nilValue();
         const result = lookupInPlace(key, target, default) orelse return self.general(frame, inst, pc);
-        self.verifiedSlot(frame, inst.a).* = result;
+        copyWords(self.verifiedSlot(frame, inst.a), &result);
         return self.nextAt(frame, pc);
     }
 
@@ -5281,14 +5295,14 @@ pub const VM = struct {
         else
             self.allocator.alloc(Value, argc) catch return VmError.OutOfMemory;
         defer if (argc > buf.len) self.allocator.free(args);
-        @memcpy(args, self.stack.items[args_base..][0..argc]);
+        copyRun(args, self.stack.items[args_base..][0..argc]);
         if (callee.kind() == .native_fn and asNativeFn(callee).consumes and argc > 0) self.stack.items[args_base + argc - 1] = value_mod.nilValue();
         const result = try self.callDirect(callee, args);
         // The block is dead once the call returns (§6): the compiler
         // never reads a block after its call (`COMPILER.md` §4.4), so
         // it keeps nothing it held alive until a later call reuses it.
         nilSlots(self.stack.items[args_base - 1 ..][0 .. argc + 1]);
-        (try self.slotPtr(result_dst)).* = result;
+        copyWords(try self.slotPtr(result_dst), &result);
     }
 
     /// Push `frame`. The caller has already grown the stack into
@@ -5701,22 +5715,24 @@ pub const VM = struct {
         else
             self.allocator.alloc(Value, argc) catch return VmError.OutOfMemory;
         defer if (argc > buf.len) self.allocator.free(args);
-        @memcpy(args, self.stack.items[start..][0..argc]);
+        // A map's constructor reads each key and value as one entry.
+        if (variant == .map) copyEntries(args, self.stack.items[start..][0..argc]) else copyRun(args, self.stack.items[start..][0..argc]);
         const heap = self.ensureHeap();
         const hash = &dispatch_mod.hashValue;
         const eql = &dispatch_mod.equal;
         const overflows = dispatch_mod.spoilCount();
         errdefer self.dropSpoils(overflows);
+        // Each result is read a word at a time where it is returned.
         const result: Value = switch (variant) {
-            .list => list_mod.fromSlice(heap, args) catch return VmError.OutOfMemory,
-            .vector => vector_mod.fromSlice(heap, args) catch return VmError.OutOfMemory,
+            .list => loadWords(&(list_mod.fromSlice(heap, args) catch return VmError.OutOfMemory)),
+            .vector => loadWords(&(vector_mod.fromSlice(heap, args) catch return VmError.OutOfMemory)),
             .map => blk: {
                 if (argc % 2 != 0) return VmError.BytecodeCorruption;
                 // Flat key, value pairs are `Entry`s laid end to end.
                 const entries: [*]const champ_mod.Entry = @ptrCast(args.ptr);
-                break :blk champ_mod.mapFromEntries(heap, entries[0 .. argc / 2], hash, eql) catch return VmError.OutOfMemory;
+                break :blk loadWords(&(champ_mod.mapFromEntries(heap, entries[0 .. argc / 2], hash, eql) catch return VmError.OutOfMemory));
             },
-            .set => champ_mod.setFromElements(heap, args, hash, eql) catch return VmError.OutOfMemory,
+            .set => loadWords(&(champ_mod.setFromElements(heap, args, hash, eql) catch return VmError.OutOfMemory)),
             .concat => blk: {
                 // A lazy part's spine is realized before anything is
                 // gathered: realizing runs code that may collect, and
@@ -5731,12 +5747,12 @@ pub const VM = struct {
                     error.KindMismatch => VmError.KindMismatch,
                     else => VmError.OutOfMemory,
                 };
-                break :blk list_mod.fromSlice(heap, elements.items) catch return VmError.OutOfMemory;
+                break :blk loadWords(&(list_mod.fromSlice(heap, elements.items) catch return VmError.OutOfMemory));
             },
             _ => return VmError.BytecodeCorruption,
         };
         try self.checkDeepData(overflows);
-        (try self.slotPtrIn(self.currentFrame(), inst.c.index)).* = result;
+        storeWords(try self.slotPtrIn(self.currentFrame(), inst.c.index), result);
     }
 
     /// Append the elements of the seqable `v` to `out`; a map
@@ -6591,16 +6607,22 @@ pub fn numDouble(a: value_mod.Value) VmError!value_mod.Value {
 /// `max`/`min` over two operands: the winning operand itself, of
 /// its own kind (`(max 2 1.0)` is 2); on a tie the second, as
 /// Clojure's `(if (> x y) x y)`; NaN wins.
+/// The winner is read a word at a time into the result: a choice
+/// between two values returned whole is assembled in a temporary and
+/// copied out with loads wider than its stores (`VM.loadWords`).
 pub fn numExtremum(want_max: bool, a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
+    return VM.loadWords(if (try extremumIsFirst(want_max, a, b)) &a else &b);
+}
+
+fn extremumIsFirst(want_max: bool, a: value_mod.Value, b: value_mod.Value) VmError!bool {
     if (a.isFloat() or b.isFloat()) {
         const x = try toFloat(a);
         const y = try toFloat(b);
-        if (std.math.isNan(x)) return a;
-        if (std.math.isNan(y)) return b;
-        return if (if (want_max) x > y else x < y) a else b;
+        if (std.math.isNan(x)) return true;
+        if (std.math.isNan(y)) return false;
+        return if (want_max) x > y else x < y;
     }
-    const ord = try integerOrder(a, b);
-    return if (ord == (if (want_max) std.math.Order.gt else std.math.Order.lt)) a else b;
+    return try integerOrder(a, b) == (if (want_max) std.math.Order.gt else std.math.Order.lt);
 }
 // =============================================================================
 // Convenience helpers for hand-assembling bytecode in tests.
@@ -9387,6 +9409,22 @@ test "VM dispatch: a trap after fast instructions names its instruction in every
         for (case[3], vm.error_trace.items) |want, got| {
             try testing.expectEqualStrings(want[0], got.name);
             try testing.expectEqual(want[1], got.pc);
+        }
+    }
+}
+
+test "VM.copyRun and VM.copyEntries: every value, at any count" {
+    // The copies the native boundary makes a word, or an entry, at a
+    // time (§8): each element lands whole, an odd count's last value
+    // as one, and nothing past the count is written.
+    var src: [7]Value = undefined;
+    for (&src, 0..) |*v, i| v.* = if (i % 2 == 0) fx(@intCast(i)) else value_mod.fromFloat(@floatFromInt(i));
+    for (0..src.len + 1) |n| {
+        for ([_]*const fn ([]Value, []const Value) void{ &VM.copyRun, &VM.copyEntries }) |copy| {
+            var dst: [8]Value = @splat(true_v);
+            copy(dst[0..n], src[0..n]);
+            for (dst[0..n], src[0..n]) |d, e| try testing.expectEqual(e, d);
+            for (dst[n..]) |d| try testing.expectEqual(true_v, d);
         }
     }
 }
