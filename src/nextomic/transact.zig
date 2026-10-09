@@ -530,6 +530,31 @@ const Ctx = struct {
         return error.UnknownAttribute;
     }
 
+    /// `ValueType`: `v`, as the program wrote it, does not fit
+    /// `attr`. A value inside it at fault already (a lookup ref's) is
+    /// the one named.
+    fn wrongType(self: *Ctx, attr: *const Attr, v: Value) error{ValueType} {
+        if (self.fault) |f| if (f.given == null) {
+            f.* = .{ .attr = self.attrValue(attr.id), .given = v, .value_type = attr.value_type };
+        };
+        return error.ValueType;
+    }
+
+    /// `NoEntity`: `v`, as the program wrote it, names no entity.
+    fn noEntity(self: *Ctx, v: Value) error{NoEntity} {
+        if (self.fault) |f| if (f.given == null) {
+            f.* = .{ .given = v };
+        };
+        return error.NoEntity;
+    }
+
+    /// `NoEntity`: lookup ref `l` finds nothing, in the store or among
+    /// this transaction's claims.
+    fn noLookup(self: *Ctx, l: *const Lookup) error{NoEntity} {
+        if (self.fault) |f| f.* = .{ .attr = self.attrValue(l.attr.id), .value = l.v };
+        return error.NoEntity;
+    }
+
     /// `TxData` with the reason.
     fn malformed(self: *Ctx, message: []const u8) error{TxData} {
         if (self.fault) |f| f.* = .{ .message = message };
@@ -999,6 +1024,13 @@ const Ctx = struct {
     }
 
     fn entityFromVm(self: *Ctx, v: Value) Failure!Ent {
+        return self.convertEntity(v) catch |err| switch (err) {
+            error.NoEntity => self.noEntity(v),
+            else => err,
+        };
+    }
+
+    fn convertEntity(self: *Ctx, v: Value) Failure!Ent {
         switch (v.kind()) {
             .fixnum => {
                 const n = v.asFixnum();
@@ -1025,6 +1057,13 @@ const Ctx = struct {
 
     /// Convert a VM value by the attribute's type.
     fn valueFromVm(self: *Ctx, attr: *const Attr, v: Value, use: Use) Failure!PVal {
+        return self.convertValue(attr, v, use) catch |err| switch (err) {
+            error.ValueType => self.wrongType(attr, v),
+            else => err,
+        };
+    }
+
+    fn convertValue(self: *Ctx, attr: *const Attr, v: Value, use: Use) Failure!PVal {
         switch (attr.value_type) {
             .boolean => {
                 if (!v.isBool()) return error.ValueType;
@@ -1197,7 +1236,7 @@ const Ctx = struct {
                 .tempid => null,
                 .lookup => |l| blk: {
                     const vb = try key.valBytes(self.arena, l.v);
-                    break :blk (try self.probeAvet(l.attr.id, vb)) orelse return error.NoEntity;
+                    break :blk (try self.probeAvet(l.attr.id, vb)) orelse return self.noLookup(l);
                 },
             };
             const id: u32 = blk: {
@@ -1368,7 +1407,7 @@ const Ctx = struct {
         return switch (e) {
             .eid => |id| id,
             .tempid => |i| self.eidOfTempid(i),
-            .lookup => |l| (try self.lookupEid(l)) orelse error.NoEntity,
+            .lookup => |l| (try self.lookupEid(l)) orelse self.noLookup(l),
         };
     }
 
@@ -1376,7 +1415,7 @@ const Ctx = struct {
         return switch (v) {
             .val => |x| x,
             .tempid => |i| .{ .ref = self.eidOfTempid(i) },
-            .lookup => |l| .{ .ref = (try self.lookupEid(l)) orelse return error.NoEntity },
+            .lookup => |l| .{ .ref = (try self.lookupEid(l)) orelse return self.noLookup(l) },
             .ident => unreachable,
         };
     }

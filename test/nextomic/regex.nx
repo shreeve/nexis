@@ -24,7 +24,7 @@
          (let [q '[:find (count ?e) . :where [?e :p/name ?n] [(re-find #"(?i)^[ab]" ?n)]]]
            (= 3 (d/q q db) (d/q q db))))
 (t/check "a pattern as a datom value is :nextomic/value-type"
-         (= :nextomic/value-type (t/caught (d/transact! c [{:p/name #"x"}]))))
+         (= :nextomic/value-type (t/caught-tag (d/transact! c [{:p/name #"x"}]))))
 (t/check "a pattern where a keyword value belongs is :nextomic/value-type too"
-         (= :nextomic/value-type (t/caught (d/transact! c [[:db/add [:p/name "Bob"] :p/tag #"k"]]))))
+         (= :nextomic/value-type (t/caught-tag (d/transact! c [[:db/add [:p/name "Bob"] :p/tag #"k"]]))))
 (println :done)

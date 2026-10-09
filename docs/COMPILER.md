@@ -942,18 +942,21 @@ symbol's own for `UnresolvedSymbol` (`LowerDiag`). An expansion error
 carries the span of the innermost form the expander failed at
 (`ExpandContext.failure`), and its reason goes to
 `CompileOptions.out_detail`; so does what `LowerDiag.detail` says of
-an unresolved symbol (`unable to resolve symbol: foo`) or a limit
-(`fn many: more than 4096 local slots`). Forms a macro produced carry
-the call's span, so an error inside an expansion is reported at the
-call. There
+an unresolved symbol (`unable to resolve symbol: foo`, with what to
+write instead of a Clojure name nexis lacks, `TOOLING.md` §1) or a
+limit (`fn many: more than 4096 local slots`). Forms a macro produced
+carry the call's span, so an error inside an expansion is reported at
+the call, except the forms a user macro was given, which keep their
+own (`MACROEXPAND.md` §4b). There
 is no secondary span and no expansion-provenance chain. The CLI's
 rendering of a compile error, and its exit status, are `TOOLING.md`
 §1.
 
 **Inside `eval`**, a compile error is not reported by the CLI: the
-hook throws `{:error :compile-error :message "<variant name>" :form
-<the form>}`, plus `:detail` with the expander's reason for a macro
-failure, on the calling VM, a catchable value like any other throw
+hook throws `{:error :compile-error :message <the sentence> :form
+<the form> :kind "<variant name>"}`, the sentence being what the CLI
+would report after `compile error: ` (the variant in words when there
+is none), on the calling VM, a catchable value like any other throw
 (MACROEXPAND.md §1.2 item 9). Uncaught, it reaches the CLI as
 `UncaughtThrow` with the map as its value.
 

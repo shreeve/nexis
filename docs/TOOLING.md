@@ -103,9 +103,10 @@ whatever its size, realizing a lazy seq in it first (`docs/LAZY.md`
 the evaluation would be, and so it is for `nexis -e`. `*1`, `*2` and
 `*3` hold the last three values. A runtime error is reported on stderr, the frames, handlers and
 bindings the aborted run left are discarded (`VM.resetAfterError`),
-and `*e` is the thrown value, or for a VM error the keyword `catch`
-sees (`vm.vmErrorToKeywordName`: `DivideByZero` is `:divide-by-zero`;
-out of memory, which no `catch` sees, `:out-of-memory`); a parse, reader or compile
+and `*e` is the thrown value, or for a VM error the error map `catch`
+would have taken (`VM.errorValue`, `docs/VM.md` §13: `DivideByZero`
+is `{:error :divide-by-zero :message "divide by zero" ...}`; out of
+memory, which no `catch` sees, the keyword `:out-of-memory`); a parse, reader or compile
 error is reported and leaves `*e` as it was. `:quit` or `:q` alone
 on a line at the start of a form, or end of input, exits. Every
 input's text is kept for the session, so a function defined in one
@@ -161,6 +162,25 @@ form: `require: no file my/app.nx on the load path`, `require: cyclic
 require of my.app`, `require: PATH does not begin with (ns my.app)`
 (metadata on the name, `(ns ^:no-doc my.app)`, is allowed).
 
+A Clojure idiom nexis lacks adds, after `; `, one clause on what to
+write instead, so a program written from Clojure finds the nexis
+spelling at the error: an unresolved Java constructor, method or
+class member (`Exception.`: ``throw (ex-info "message" {:key
+value})``; `.toUpperCase`: `nexis.string/upper-case`; `Math/sqrt`:
+`nexis.math/sqrt`; `System/getenv`: `nexis.sys/getenv`), a name of
+Clojure's threads, agents or STM (`future`, `pmap`, `agent`,
+`thread`, `dosync`), a ratio or BigDecimal literal (`1/3`, `1.5M`), a
+tagged literal (`#inst`, `#uuid`) and a library with no counterpart
+(`clojure.java.io`). The tables are `expand.idiomHint` and
+`namespaceHint` and `reader.numberLiteralHint` and
+`taggedLiteralHint`; a name the program defines itself is its own, so
+`(defn thread ...)` resolves as any other.
+
+```
+nexis: <-e>:1:2: compile error: unable to resolve symbol: Exception.; nexis has no Java classes: throw (ex-info "message" {:key value}), or any value
+nexis: <-e>:1:1: reader error: :bad-number-literal 1/3; nexis has no ratios: (/ 1 3) divides, to a double when inexact
+```
+
 **A runtime error** that no `try` catches ends the program with exit
 5 and this report on stderr:
 
@@ -180,7 +200,10 @@ nexis: test/golden/cli/divide-by-zero.nx:5:3: runtime error: DivideByZero
   argument, got 0`). An uncaught throw is `UncaughtThrow` followed by
   the thrown value as `pr-str` prints it (`runtime error:
   UncaughtThrow {:error :negative, :value -3}`, `uncaught-throw.err`,
-  whose `throw` spans two lines and is underlined on its first). An
+  whose `throw` spans two lines and is underlined on its first); an
+  error map a handler rethrew is printed without the place keys it
+  carries (`:fn`, `:file`, `:line`, `:column`; VM.md §13), which the
+  header and the trace show (`VM.withoutPlace`). An
   error or a thrown value that leaves through a `finally`, a `catch`
   no clause of which matches, or a `catch` that throws it again is
   reported where it was raised, with its detail and the frames it left,
@@ -366,14 +389,17 @@ the private helpers.
   `nexis.test/out`, `println` unless replaced (a harness without
   stdout collects the lines instead). One line per failure names the
   test, the descriptions in force, the form, the expected and actual
-  values (`pr-str`) and the message when given. `examples/tests-demo.nx`
-  shows every outcome:
+  values (`pr-str`) and the message when given. A test's error names
+  an error map by its tag, its message and the file name, line and
+  column it was raised at (`ERROR in user/t: :divide-by-zero divide
+  by zero at app.nx:12:5`), any other thrown value as `pr-str` prints
+  it. `examples/tests-demo.nx` shows every outcome:
 
   ```
   FAIL in user/failing-test (a wrong expectation): (= 5 (area 2 2)) expected: 5 actual: 4 ; areas multiply
-  ERROR in user/erroring-test: :divide-by-zero
+  ERROR in user/erroring-test: {:message "not a number", :data {:error :bad-age, :input "one"}}
   FAIL in user/bare-test: (empty? [1]) expected: true actual: false ; a bare assertion that fails
-  Ran 5 tests containing 9 assertions.
+  Ran 5 tests containing 10 assertions.
   2 failures, 1 errors.
   ```
 

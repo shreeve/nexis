@@ -13,11 +13,11 @@ ok instant order agrees with sort
 [140737488355328 9007199254740992 9007199254740993 9223372036854775807]
 [-9223372036854775808 -9007199254740993 -9007199254740992]
 [-1 0 140737488355327]
-:nextomic/value-type
-:nextomic/value-type
-:nextomic/value-type
-:nextomic/value-type
-:nextomic/value-type
+{:error :nextomic/value-type, :message :n/v takes a :db.type/long, not 9223372036854775808, :attr :n/v, :value 9223372036854775808}
+{:error :nextomic/value-type, :message :n/v takes a :db.type/long, not -9223372036854775809, :attr :n/v, :value -9223372036854775809}
+{:error :nextomic/value-type, :message :n/at takes a :db.type/instant, not 9223372036854775808, :attr :n/at, :value 9223372036854775808}
+{:error :nextomic/value-type, :message :n/v takes a :db.type/long, not 9223372036854775808, :attr :n/v, :value 9223372036854775808}
+{:error :nextomic/value-type, :message :n/v takes a :db.type/long, not -9223372036854775809, :attr :n/v, :value -9223372036854775809}
 ok a bignum constant in a pattern
 {:error :nextomic/query-syntax, :message an attribute is a keyword or an id, :clause 0}
 ok the tx position holds a transaction entity
@@ -36,7 +36,7 @@ ok sum is exact
 27670116110564327421
 36893488147419103228
 ok a card-many set of edges
-{:error :nextomic/cas, :attr :n/v, :expected -9223372036854775808, :actual 9223372036854775807}
+{:error :nextomic/cas, :expected -9223372036854775808, :actual 9223372036854775807, :message :n/v holds 9223372036854775807, not the -9223372036854775808 the cas expected, :attr :n/v}
 ok cas asserted the bignum
 ok as-of reads the value before
 ([-9223372036854775808 false] [-9223372036854775808 true] [9223372036854775807 true])

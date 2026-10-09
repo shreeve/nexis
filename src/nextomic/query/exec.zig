@@ -63,6 +63,7 @@ const marshal = @import("../marshal.zig");
 const pull_mod = @import("../pull.zig");
 const fulltext = @import("../fulltext.zig");
 const stack = @import("../../stack.zig");
+const vm_mod = @import("../../vm.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -489,7 +490,7 @@ pub const Exec = struct {
         switch (b) {
             .lt, .le, .gt, .ge => {
                 for (args[0 .. args.len - 1], args[1..]) |x, y| {
-                    const o = x.compare(y, self.interner) orelse return error.ValueType;
+                    const o = x.compare(y, self.interner) orelse return self.wrongType("{s} compares values of one kind, not {s} and {s}", .{ predName(b), cellPhrase(x), cellPhrase(y) });
                     const ok = switch (b) {
                         .lt => o == .lt,
                         .le => o != .gt,
@@ -522,7 +523,7 @@ pub const Exec = struct {
     /// must carry `:db/fulltext` at the view's basis.
     fn fulltextHits(self: *Exec, src: ?ir.Src, attr: Cell, needle: Cell) anyerror![]const []const Cell {
         const read = try self.readOf(src);
-        if (needle != .str) return error.ValueType;
+        if (needle != .str) return self.wrongType("fulltext searches for a string, not {s}", .{cellPhrase(needle)});
         const at = try self.attrNamed(read, attr);
         const a = at.id;
         if (!at.fulltext) {
@@ -1003,7 +1004,10 @@ pub const Exec = struct {
         };
         var fault: db_mod.Fault = .{};
         return marshal.entity(read, self.arena, v, &fault) catch |err| {
-            if (self.diag) |d| d.* = .{ .message = fault.message orelse "unknown attribute", .attr = fault.attr };
+            if (self.diag) |d| d.* = switch (err) {
+                error.ValueType => .{ .attr = fault.attr, .given = fault.given, .value_type = fault.value_type },
+                else => .{ .message = fault.message orelse "unknown attribute", .attr = fault.attr },
+            };
             return err;
         };
     }
@@ -1130,18 +1134,18 @@ pub const Exec = struct {
                 std.mem.sort(Cell, cells, CellOrder{ .names = self.interner, .descending = false }, CellOrder.less);
                 if (cells.len == 0) return .nil;
                 if (cells.len % 2 == 1) return cells[cells.len / 2];
-                const lo = try numberOf(cells[cells.len / 2 - 1]);
-                const hi = try numberOf(cells[cells.len / 2]);
+                const lo = try self.numberOf(op, cells[cells.len / 2 - 1]);
+                const hi = try self.numberOf(op, cells[cells.len / 2]);
                 return .{ .double = (lo + hi) / 2 };
             },
             .variance, .stddev => {
                 if (members.len == 0) return .nil;
                 var mean: f64 = 0;
-                for (members) |m| mean += try numberOf(basis.cell(m, col));
+                for (members) |m| mean += try self.numberOf(op, basis.cell(m, col));
                 mean /= @floatFromInt(members.len);
                 var acc: f64 = 0;
                 for (members) |m| {
-                    const d = (try numberOf(basis.cell(m, col))) - mean;
+                    const d = (try self.numberOf(op, basis.cell(m, col))) - mean;
                     acc += d * d;
                 }
                 const variance = acc / @as(f64, @floatFromInt(members.len));
@@ -1167,10 +1171,10 @@ pub const Exec = struct {
                         fsum += d;
                     },
                     .vm => |v| {
-                        if (v.kind() != .bignum) return error.ValueType;
+                        if (v.kind() != .bignum) return self.wrongType("{s} takes numbers, not {s}", .{ op.name(), cellPhrase(.{ .vm = v }) });
                         big = if (big) |acc| try bignum.add(self.heap, acc, v) else v;
                     },
-                    else => return error.ValueType,
+                    else => |c| return self.wrongType("{s} takes numbers, not {s}", .{ op.name(), cellPhrase(c) }),
                 };
                 const total = fsum + @as(f64, @floatFromInt(isum)) + if (big) |v| bignum.toF64(v) else 0;
                 if (op == .avg) return .{ .double = total / @as(f64, @floatFromInt(members.len)) };
@@ -1192,9 +1196,40 @@ pub const Exec = struct {
         }
     };
 
-    /// A numeric cell as a double; anything else is `ValueType`.
-    fn numberOf(c: Cell) error{ValueType}!f64 {
-        return c.asNumber() orelse error.ValueType;
+    /// `ValueType`, with the reason in the diagnostic.
+    fn wrongType(self: *Exec, comptime fmt: []const u8, args: anytype) error{ValueType} {
+        if (self.diag) |d| d.set(null, fmt, args);
+        return error.ValueType;
+    }
+
+    /// A comparison predicate as a query writes it.
+    fn predName(b: ir.Builtin) []const u8 {
+        return switch (b) {
+            .lt => "<",
+            .le => "<=",
+            .gt => ">",
+            .ge => ">=",
+            else => @tagName(b),
+        };
+    }
+
+    /// A cell's kind with its article, for a message: "a string".
+    fn cellPhrase(c: Cell) []const u8 {
+        return switch (c) {
+            .nil => "nil",
+            .int => "a long",
+            .double => "a double",
+            .boolean => "a boolean",
+            .keyword => "a keyword",
+            .str => "a string",
+            .vm => |v| vm_mod.kindPhrase(v.kind()),
+        };
+    }
+
+    /// A numeric cell as a double for aggregate `op`; anything else is
+    /// `ValueType`.
+    fn numberOf(self: *Exec, op: ir.AggOp, c: Cell) error{ValueType}!f64 {
+        return c.asNumber() orelse self.wrongType("{s} takes numbers, not {s}", .{ op.name(), cellPhrase(c) });
     }
 
     fn cellVector(self: *Exec, cells: []const Cell) !Cell {
@@ -1292,7 +1327,7 @@ pub const Exec = struct {
                 const pr = &(p.* orelse continue);
                 const e = c.asEid() orelse switch (c.*) {
                     .keyword, .vm => try self.inputEntity(pr.puller.read, c.*),
-                    else => return error.ValueType,
+                    else => return self.wrongType("pull takes an entity id, a lookup ref or an ident, not {s}", .{cellPhrase(c.*)}),
                 };
                 c.* = .{ .vm = if (e) |id| try pr.eid(id) else value.nilValue() };
             }

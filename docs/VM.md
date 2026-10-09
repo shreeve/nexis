@@ -1043,7 +1043,8 @@ frame). With a `finally_pc` it pushes a
 the finally body; otherwise it jumps to `post_pc`.
 
 **`ctrl:throw A`**, `VM.throwValue(v)` and `VM.throwKeyword(name)`
-walk the handler stack from the top:
+(a native's error, thrown as its error value, §13) walk the handler
+stack from the top:
 - A `try_` handler catches: every frame above the handler's is
   discarded (each restoring the stack length it recorded), the
   handler becomes `cleanup`, the value goes to `binding_slot` and
@@ -1098,9 +1099,11 @@ which the run loop resumes. With no handler the result is
 error.
 
 **Catchable VM errors.** A `VmError` in the keyword-mapped set (§13)
-raised while a handler is active becomes its keyword and is thrown
+raised while a handler is active becomes its error value and is thrown
 through the same path, so `(try (/ 1 0) (catch any e e))` is
-`:divide-by-zero`. Without a handler the Zig error leaves the run.
+`{:error :divide-by-zero :message "divide by zero" ...}` and
+`(catch :divide-by-zero e ...)` takes it. Without a handler the Zig
+error leaves the run.
 
 ---
 
@@ -1109,7 +1112,8 @@ through the same path, so `(try (/ 1 0) (catch any e e))` is
 `VmError` is the VM's Zig error set. User code and reports see the
 keyword form of the catchable subset (`vmErrorToKeywordName`).
 
-**Catchable** (raised as the keyword when a handler is active):
+**Catchable** (raised as an error map when a handler is active; see
+"Error values" below):
 
 | Error | Keyword | When |
 |---|---|---|
@@ -1130,8 +1134,8 @@ keyword form of the catchable subset (`vmErrorToKeywordName`).
 | `NotARecord`, `NoProtocolImpl`, `NoProtocolMethod` | `:not-a-record`, `:no-protocol-impl`, `:no-protocol-method` | Records and protocols (`docs/PROTOCOLS.md`) |
 | `StackOverflow` | `:stack-overflow` | A call would push frame number `VM.max_frames` (default 2^20; an embedder may set it); a native re-entering the VM finds the native stack past the guard, or `VM.max_nested_runs` run loops nested (§13.1); or `=`, `hash` or printing inside a call or opcode met data nested past the guard (SEMANTICS.md §2.7). Runaway recursion ends in well under a second; legitimate recursion a hundred thousand calls deep runs |
 
-Natives also throw keywords of their own through `throwKeyword` or a
-thrown map, documented with the native: `:unserializable`
+Natives also throw errors of their own through `throwKeyword` or
+`throwErrorMap`, documented with the native: `:unserializable`
 (`docs/CODEC.md`), the `:db/*` and `:nextomic/*` errors
 (`docs/DB.md`, `docs/NEXTOMIC.md`),
 `:transient-used-after-persistent` (`docs/TRANSIENT.md`),
@@ -1140,6 +1144,36 @@ thrown map, documented with the native: `:unserializable`
 `docs/REGEX.md` §11),
 `:no-metadata-on-immediate` (`docs/SEMANTICS.md` §7) and
 `:no-compiler` (`docs/MACROEXPAND.md` §1.2).
+
+**Error values.** What a handler takes for a catchable error, or for
+a native's `throwKeyword`, is the map `VM.errorValue` builds:
+
+```
+{:error :kind-mismatch :message "+ expects numbers, got a string"
+ :fn "f" :file "app.nx" :line 12 :column 3}
+```
+
+`:error` is the keyword above; `:message` the error detail (below),
+or with none the keyword's name in words (`"index out of bounds"`,
+`"db key too large"`); `:fn`, `:file`, `:line` and `:column` the
+place it was raised, each present when known: the routine's name and
+its source path, and the line and column of the failing instruction's
+span. The place is the innermost frame running the program's own code
+(`VM.raiseSite`), so an error inside a function of the standard
+library, whose sources are marked `SourceInfo.library`, is placed at
+the program's call of it; with no such frame, the innermost one. A
+native's error map (`throwErrorMap`: Nextomic's, `re-pattern`'s) gets
+the same place keys. `catch` takes the map by its `:error`
+(`docs/MACROEXPAND.md` §10), `ex-message` reads `:message`, and
+`ex-data` returns the map itself (`docs/STDLIB.md` §8). With no
+handler in force the error leaves the run as the `VmError`, and a
+native's keyword as the bare keyword, which the host reports with its
+trace; the REPL's `*e` holds the map a catch would have taken. Building
+the map can fail only for memory; then the value is the bare keyword,
+which every `catch` that takes the map also takes, so a handler still
+runs when the heap is exhausted. The line of a place costs a scan of
+the source before it; the VM keeps the last place it computed, so a
+handler taking an error in a loop scans once.
 
 **Not catchable** (compiler bugs or corrupt bytecode; they leave the
 run):
@@ -1183,8 +1217,8 @@ is named as the language presents it (`kindPhrase`: `nil`, `a
 boolean`, `an integer`, `a map`, ...). A sentence longer than the
 160-byte buffer keeps what fits, cut at a character, and ends in `…`.
 The detail is empty when the raise site has nothing to add; `run` clears it on entry and a
-handler clears it when it takes the error as a keyword, so it never
-describes an earlier error.
+handler clears it when it takes the error as its error value's
+`:message`, so it never describes an earlier error.
 
 **Error trace.** When an error leaves a run the VM records the frame
 chain in `VM.error_trace`, innermost first, one
@@ -1294,8 +1328,8 @@ tests that inspect VM state are individual. `src/compile.zig` pins
 the 10k-iteration `recur` loop (§11).
 `test/integration/eval_pipeline.zig`, `runtime_polish.zig` and
 `numbers.zig` run source through the compiler and VM (captured loop
-bindings, `letfn*`, variadic calls, every catchable keyword, error
-traces); `test/golden/cli/*` pin the reports and `zig build examples`
+bindings, `letfn*`, variadic calls, every catchable error and its
+error value, error traces); `test/golden/cli/*` pin the reports and `zig build examples`
 runs every example.
 
 ---

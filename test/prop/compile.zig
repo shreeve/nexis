@@ -193,7 +193,7 @@ const cases = [_]Case{
     // in order, before the left fold over their values, as the fn's
     // call computes them, promotion and contagion included.
     .{ .src = "(let* [big 140737488355327] [(+ big big big) (* big big big) (- 0 big big 1) (+ 1 2.5 big) (* 2 3 0.5) (- 10 1 2 3)])", .out = "[422212465065981 2787593149816268471570079086250062495350783 -281474976710655 1.407374883553305E14 3.0 4]" },
-    .{ .src = "(let* [log (atom [])] (try (+ (do (swap! log conj 1) \"x\") (do (swap! log conj 2) 2) (do (swap! log conj 3) 3)) (catch any e [e @log])))", .out = "[:kind-mismatch [1 2 3]]" },
+    .{ .src = "(let* [log (atom [])] (try (+ (do (swap! log conj 1) \"x\") (do (swap! log conj 2) 2) (do (swap! log conj 3) 3)) (catch any e [e @log])))", .out = "[{:error :kind-mismatch, :message + expects numbers, got a string, :fn test-form} [1 2 3]]" },
     .{ .src = "(let* [log (atom [])] (try (* 2 (do (swap! log conj 1) nil) (do (swap! log conj 2) (throw :later))) (catch any e [e @log])))", .out = "[:later [1 2]]" },
     .{ .src = "(do (def x 1) [(+ x x (do (def x 10) x)) (+ x 1 2)])", .out = "[12 13]" },
     // Variadic fns and recur into them.
@@ -260,9 +260,9 @@ const cases = [_]Case{
     // read-string reads the first form, whatever follows it.
     .{ .src = "[(read-string \"1 )\") (read-string \"(+ 1 2) (\") (read-string \"1 2\") (read-string \" ; c\\n [1 2] x\")]", .out = "[1 (+ 1 2) 1 [1 2]]" },
     .{ .src = "[(= \"a)\" (read-string \"\\\"a)\\\" (\")) (= \\) (read-string \"\\\\) (\")) (= '{:a [1]} (read-string \"{:a [1]}}\"))]", .out = "[true true true]" },
-    .{ .src = "[(try (read-string \"\") (catch any e e)) (try (read-string \")\") (catch any e e)) (try (read-string \"{:a 1 :a 2} x\") (catch any e e))]", .out = "[:reader-error :reader-error :reader-error]" },
+    .{ .src = "[(try (read-string \"\") (catch any e e)) (try (read-string \")\") (catch any e e)) (try (read-string \"{:a 1 :a 2} x\") (catch any e e))]", .out = "[{:error :reader-error, :message reader error, :fn test-form} {:error :reader-error, :message reader error, :fn test-form} {:error :reader-error, :message reader error, :fn test-form}]" },
     // eval's compile failure carries the expander's message.
-    .{ .src = "(try (eval '(let [x] x)) (catch :compile-error e [(:message e) (string? (:detail e))]))", .out = "[MacroExpansionFailure true]" },
+    .{ .src = "(try (eval '(let [x] x)) (catch :compile-error e [(:kind e) (string? (:message e)) (contains? e :detail)]))", .out = "[MacroExpansionFailure true false]" },
     // Host macros the compiler relies on.
     .{ .src = "[(let [x 1 y 2] (+ x y)) ((fn [x] (+ x 1)) 41) (loop [i 0 acc 0] (if (< i 5) (recur (+ i 1) (+ acc i)) acc))]", .out = "[3 42 10]" },
     .{ .src = "[(when true 42) (when false 42) (when true 1 2 3) (when-not false 99) (when-not true 99)]", .out = "[42 nil 3 99 nil]" },
@@ -295,7 +295,7 @@ const cases = [_]Case{
     // each time a loop reaches them.
     .{ .src = "(do (defn f [& xs] (into [:old] xs)) (def gen (atom 0)) (defn g [] (let [k (swap! gen inc)] (defn f [& xs] (into [k] xs))) 0) [(f (f (f (g)))) (f (g) (f 1))])", .out = "[[:old [:old [:old 0]]] [1 0 [2 1]]]" },
     .{ .src = "(do (defn f [x] [:old x]) (def n (atom 0)) (f (loop* [] (let* [v (f 1)] (if (< (swap! n inc) 3) (do (defn f [x] [:new x]) (recur)) v)))))", .out = "[:old [:new 1]]" },
-    .{ .src = "(do (declare nope) (def log (atom [])) (try (nope (nope (swap! log conj 1))) (catch any e [e @log])))", .out = "[:unbound-var []]" },
+    .{ .src = "(do (declare nope) (def log (atom [])) (try (nope (nope (swap! log conj 1))) (catch any e [e @log])))", .out = "[{:error :unbound-var, :message unbound var, :fn test-form} []]" },
     // A call whose arguments run no code reads its Var at the call, each
     // time it runs: a redefinition between two runs of one call site, a
     // binding in force, a with-redefs.
@@ -314,13 +314,13 @@ const cases = [_]Case{
     .{ .src = "(let* [h (fn* f [n] (if (= n 0) f (f (dec n))))] (= h (h 3)))", .out = "true" },
     .{ .src = "((fn* f [n] (if (= n 0) 0 ((fn* [] (+ 1 (f (dec n))))))) 5)", .out = "5" },
     .{ .src = "(mapv (fn* [g] (g)) ((fn* f [n] (if (= n 0) [] (conj (f (dec n)) (fn* [] n)))) 3))", .out = "[1 2 3]" },
-    .{ .src = "[((fn* f [n] (let* [f inc] (f n))) 4) ((fn* f [n & r] (if (= n 0) r (f (dec n) n))) 3) (try ((fn* f [n] (f n n)) 1) (catch any e e))]", .out = "[5 (1) :arity-mismatch]" },
+    .{ .src = "[((fn* f [n] (let* [f inc] (f n))) 4) ((fn* f [n & r] (if (= n 0) r (f (dec n) n))) 3) (try ((fn* f [n] (f n n)) 1) (catch any e e))]", .out = "[5 (1) {:error :arity-mismatch, :message f takes 1 argument, got 2, :fn f}]" },
     // A keyword or symbol called on any target, with a default or not,
     // is `get` of it (VM.md §6): in place on a map, a record or nil,
     // the general way on everything else.
     .{ .src = "(do (defrecord P [x y]) (let* [m {:a 1 'b 2} p (->P 3 4)] [(:a m) (:c m) (:c m 9) ('b m) ('c m 8) (:x p) (:z p 0) (:a nil) (:a nil 5)]))", .out = "[1 nil 9 2 8 3 0 nil 5]" },
     .{ .src = "(let* [t (transient {:a 2})] [(:a [1 2]) (:a \"s\" 3) (:a 5) (:a #{:a}) (:b #{:a} 0) (:a (sorted-map :a 1)) (:a t) (:b t 6) (:a (seq [1]))])", .out = "[nil 3 nil :a 0 1 2 6 nil]" },
-    .{ .src = "[(try (:a (sorted-map 1 2)) (catch any e e)) (try (:a (let* [t (transient {:a 1})] (persistent! t) t)) (catch any e e))]", .out = "[:kind-mismatch :transient-used-after-persistent]" },
+    .{ .src = "[(try (:a (sorted-map 1 2)) (catch any e e)) (try (:a (let* [t (transient {:a 1})] (persistent! t) t)) (catch any e e))]", .out = "[{:error :kind-mismatch, :message kind mismatch, :fn test-form} {:error :transient-used-after-persistent, :message transient used after persistent!, :fn test-form}]" },
     .{ .src = "(do (def m {:k {:j 7}}) (let* [f (fn* [] (:j (:k m))) g (fn* [x] (:j x :none))] [(f) (g {}) (g {:j nil}) (:k {:k 1} (f))]))", .out = "[7 :none nil 1]" },
     // The general way from a native's callback leaves the native's
     // roots as it found them.

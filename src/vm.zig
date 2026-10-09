@@ -618,6 +618,10 @@ pub const SpanEntry = struct {
 pub const SourceInfo = struct {
     path: []const u8,
     text: []const u8,
+    /// The text is the standard library's (`stdlib.embedded`): an
+    /// error value is placed at the program's call into it instead
+    /// (`VM.raiseSite`).
+    library: bool = false,
 
     pub const LineCol = struct { line: u32, col: u32 };
 
@@ -2660,9 +2664,12 @@ pub const VM = struct {
     /// a string`. Set where the VM raises the error, empty when the
     /// raise site has nothing to add (natives raise without one);
     /// cleared when a run starts and when a handler takes the error
-    /// as a keyword, so it never describes an earlier error.
+    /// as a value (its `:message`), so it never describes an earlier
+    /// error.
     error_detail: []const u8 = "",
     detail_buf: [160]u8 = undefined,
+    /// The last place an error value was located at (`placeOf`).
+    place_cache: struct { text: []const u8 = "", pos: u32 = 0, place: SourceInfo.LineCol = .{ .line = 0, .col = 0 } } = .{},
     /// The origins of the throws handlers are holding, innermost last;
     /// a `.cleanup` handler or a `.throwing` continuation names its
     /// entry by index. Entries no live record names are dropped before
@@ -4331,12 +4338,9 @@ pub const VM = struct {
 
     /// Runtime error translation to a user-throwable Value.
     /// Recoverable errors (VM.md §13's catchable table) become
-    /// keyword payloads routed through `unwindThrow`;
+    /// error maps (`errorValue`) routed through `unwindThrow`;
     /// non-recoverable errors (bytecode corruption, OOM, etc.)
     /// bubble back out unchanged.
-    ///
-    /// Translation: each recoverable VmError maps to a keyword
-    /// like `:kind-mismatch` (a keyword, not a map).
     ///
     /// Note: throw machinery via unwindThrow may itself raise
     /// UncaughtThrow (if no handler catches the translated
@@ -4349,11 +4353,121 @@ pub const VM = struct {
         // propagates, so a program that does not opt into
         // try/catch sees the original error taxonomy.
         if (self.findThrowTarget() == null) return err;
-        const interner = self.ensureInterner();
-        const payload = interner.internKeywordValue(kw_name) catch return err;
+        const tag = self.ensureInterner().internKeywordValue(kw_name) catch return err;
+        const payload = self.errorValue(tag, self.error_detail, self.raiseSite());
         const origin = try self.originFor(payload, err);
         self.error_detail = "";
         try self.unwindThrow(payload, origin);
+    }
+
+    /// The value a handler takes for the runtime error `tag` (VM.md
+    /// §13): the map `{:error tag :message m :fn name :file path
+    /// :line l :column c}`. `m` is `detail`, or the tag's name in
+    /// words when the raise site gave none (`:index-out-of-bounds`
+    /// says "index out of bounds"); the place is `at`, the frame that
+    /// raised it, each key present only when known. Nothing here
+    /// can fail: when memory is exhausted the value is `tag` itself,
+    /// the bare keyword, which `catch` takes as it takes the map.
+    pub fn errorValue(self: *VM, tag: Value, detail: []const u8, at: ?TraceFrame) Value {
+        return self.buildErrorMap(tag, detail, at) catch tag;
+    }
+
+    fn buildErrorMap(self: *VM, tag: Value, detail: []const u8, at: ?TraceFrame) !Value {
+        var m = try self.putKey(try champ_mod.mapEmpty(self.ensureHeap()), "error", tag);
+        var words: [96]u8 = undefined;
+        const message = if (detail.len > 0) detail else blk: {
+            const name = self.ensureInterner().keywordName(tag.asKeywordId());
+            for ([_][2][]const u8{
+                .{ "atom-re-entry", "atom re-entry" },
+                .{ "transient-used-after-persistent", "transient used after persistent!" },
+            }) |pair| if (std.mem.eql(u8, name, pair[0])) break :blk pair[1];
+            // `:db/key-too-large` says "db key too large".
+            const n = @min(name.len, words.len);
+            for (name[0..n], words[0..n]) |c, *w| w.* = if (c == '-' or c == '/') ' ' else c;
+            break :blk words[0..n];
+        };
+        m = try self.putKey(m, "message", try string_mod.fromBytes(self.ensureHeap(), message));
+        return self.addPlace(m, at);
+    }
+
+    /// `m` with the place of `at`: `:fn`, `:file`, `:line` and
+    /// `:column`, each when known.
+    fn addPlace(self: *VM, map: Value, at: ?TraceFrame) !Value {
+        const frame = at orelse return map;
+        const heap = self.ensureHeap();
+        var m = try self.putKey(map, "fn", try string_mod.fromBytes(heap, frame.name));
+        const source = frame.source orelse return m;
+        m = try self.putKey(m, "file", try string_mod.fromBytes(heap, source.path));
+        const span = frame.span orelse return m;
+        const place = self.placeOf(source, span.pos);
+        m = try self.putKey(m, "line", value_mod.fromFixnum(place.line).?);
+        return self.putKey(m, "column", value_mod.fromFixnum(place.col).?);
+    }
+
+    /// `v` without the place keys `addPlace` gives an error map, for
+    /// a report that shows the place itself; `v` as it is when it is
+    /// not such a map (one with `:error`, `:fn` and `:file`) or memory
+    /// is exhausted.
+    pub fn withoutPlace(self: *VM, v: Value) Value {
+        if (v.kind() != .persistent_map) return v;
+        for ([_][]const u8{ "error", "fn", "file" }) |key| {
+            const k = self.ensureInterner().internKeywordValue(key) catch return v;
+            if (champ_mod.mapGet(v, k, &dispatch_mod.hashValue, &dispatch_mod.equal) == .absent) return v;
+        }
+        var m = v;
+        for ([_][]const u8{ "fn", "file", "line", "column" }) |key| {
+            const k = self.ensureInterner().internKeywordValue(key) catch return v;
+            m = champ_mod.mapDissoc(self.ensureHeap(), m, k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch return v;
+        }
+        return m;
+    }
+
+    /// `m` with the keyword named `key` mapped to `v`.
+    fn putKey(self: *VM, m: Value, key: []const u8, v: Value) !Value {
+        const k = try self.ensureInterner().internKeywordValue(key);
+        return champ_mod.mapAssoc(self.ensureHeap(), m, k, v, &dispatch_mod.hashValue, &dispatch_mod.equal);
+    }
+
+    /// `throwValue` of an error map a native built (`{:error tag
+    /// ...}`), placed as `errorValue` places a runtime error when a
+    /// handler is in force to take it; as it is when none is, or when
+    /// memory is exhausted.
+    pub fn throwErrorMap(self: *VM, map: Value) VmError {
+        if (self.findThrowTarget() == null) return self.throwValue(map);
+        return self.throwValue(self.addPlace(map, self.raiseSite()) catch map);
+    }
+
+    /// Where an error value says a runtime error was raised: the
+    /// innermost frame running the program's own code (any routine
+    /// whose source is not the library's, one with no source, as
+    /// `eval` compiles, included), so an error
+    /// inside a library function (`update`, `map`'s step) is placed
+    /// at the program's call of it; the innermost frame when no frame
+    /// is the program's. Null outside any run.
+    pub fn raiseSite(self: *VM) ?TraceFrame {
+        const frames = self.frames.items;
+        const lowest: usize = if (frames[0].routine == &idle_routine) 1 else 0;
+        if (frames.len == lowest) return null;
+        var i = frames.len;
+        const at = while (i > lowest) {
+            i -= 1;
+            const source = frames[i].routine.source orelse break i;
+            if (!source.library) break i;
+        } else frames.len - 1;
+        const f = frames[at];
+        const pc: u32 = if (f.pc > 0) f.pc - 1 else 0;
+        return .{ .name = f.routine.name, .pc = pc, .span = f.routine.spanAt(pc), .source = f.routine.source };
+    }
+
+    /// `source.lineCol(pos)`, remembered for the last place asked: a
+    /// handler taking errors in a loop is at one place, and a line
+    /// costs a scan of the text before it.
+    fn placeOf(self: *VM, source: *const SourceInfo, pos: u32) SourceInfo.LineCol {
+        const c = &self.place_cache;
+        if (c.text.ptr != source.text.ptr or c.text.len != source.text.len or c.pos != pos) {
+            c.* = .{ .text = source.text, .pos = pos, .place = source.lineCol(pos) };
+        }
+        return c.place;
     }
 
     // -------------------------------------------------------------------------
@@ -5972,10 +6086,15 @@ pub const VM = struct {
         return VmError.ControlTransferred;
     }
 
-    /// `throwValue` of the keyword named `name`.
+    /// `throwValue` of the error named `name`, as a runtime error
+    /// travels (VM.md §13): the map `errorValue` builds, located at
+    /// the frame that called the native, when a handler is in force
+    /// to take it; the bare keyword when none is, which the host's
+    /// report names.
     pub fn throwKeyword(self: *VM, name: []const u8) VmError {
         const kw = self.ensureInterner().internKeywordValue(name) catch return VmError.OutOfMemory;
-        return self.throwValue(kw);
+        if (self.findThrowTarget() == null) return self.throwValue(kw);
+        return self.throwValue(self.errorValue(kw, "", self.raiseSite()));
     }
 
     /// Common throw-unwind logic. Used by `execCtrlThrow`,
@@ -7875,6 +7994,41 @@ test "VM error detail: a sentence longer than the buffer is cut with an ellipsis
     try testing.expectEqualStrings("f takes 1 argument, got 0", vm.error_detail);
 }
 
+test "VM error value: a map of tag, message and place; the bare keyword when memory is exhausted" {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var vm = try VM.init(failing.allocator(), &VM.idle_routine);
+    defer vm.deinit();
+    const tag = try vm.ensureInterner().internKeywordValue("index-out-of-bounds");
+    // Nothing more can be allocated, the map's keys not yet interned:
+    // the tag alone, which a catch by `:index-out-of-bounds` takes as
+    // it takes the map.
+    failing.fail_index = failing.alloc_index;
+    try testing.expect(vm.errorValue(tag, "a sentence", null).identicalTo(tag));
+    failing.fail_index = std.math.maxInt(usize);
+    const m = vm.errorValue(tag, "", null);
+    try testing.expectEqualStrings("index-out-of-bounds", try caughtTag(&vm, m));
+    const message = try lookup(m, try vm.ensureInterner().internKeywordValue("message"), value_mod.nilValue());
+    try testing.expectEqualStrings("index out of bounds", string_mod.asBytes(message));
+}
+
+test "VM error value: a report drops the place a rethrown error map carries, and nothing else" {
+    var vm = try VM.init(testing.allocator, &VM.idle_routine);
+    defer vm.deinit();
+    const info = SourceInfo{ .path = "t.nx", .text = "(f)" };
+    const routine = Routine{ .code = &.{}, .consts = &.{}, .slot_count = 1, .name = "f", .source = &info, .spans = &.{.{ .pc = 0, .span = .{ .pos = 0, .len = 3 } }} };
+    const tag = try vm.ensureInterner().internKeywordValue("kind-mismatch");
+    const placed = vm.errorValue(tag, "", .{ .name = "f", .pc = 0, .span = routine.spanAt(0), .source = &info });
+    try testing.expectEqual(@as(usize, 6), champ_mod.mapCount(placed));
+    const bare = vm.withoutPlace(placed);
+    try testing.expectEqual(@as(usize, 2), champ_mod.mapCount(bare));
+    try testing.expectEqualStrings("kind-mismatch", try caughtTag(&vm, bare));
+    // A map of the program's own with a :line of its own keeps it.
+    const line_key = try vm.ensureInterner().internKeywordValue("line");
+    const own = try vm.putKey(try vm.putKey(try champ_mod.mapEmpty(vm.ensureHeap()), "error", tag), "line", fx(3));
+    try testing.expect(vm.withoutPlace(own).identicalTo(own));
+    try testing.expectEqual(@as(i64, 3), (try lookup(own, line_key, value_mod.nilValue())).asFixnum());
+}
+
 test "VM ctrl: a try's finally body runs after its catch; try-enter names a try of the routine" {
     // (try (throw 7) (catch any e e) (finally <s2 := 1>)), returning
     // the list of s0 (the result), s1 (the binding) and s2.
@@ -7903,6 +8057,15 @@ test "VM ctrl: a try's finally body runs after its catch; try-enter names a try 
 }
 
 // ---- numeric tower ----
+
+/// The tag of a value a handler took: a keyword's name, or the name
+/// of an error map's `:error`.
+fn caughtTag(vm: *VM, v: Value) ![]const u8 {
+    const interner = vm.ensureInterner();
+    const tag = if (v.kind() == .persistent_map) try lookup(v, try interner.internKeywordValue("error"), value_mod.nilValue()) else v;
+    if (tag.kind() != .keyword) return error.TestUnexpectedResult;
+    return interner.keywordName(tag.asKeywordId());
+}
 
 fn fx(n: i64) value_mod.Value {
     return value_mod.fromFixnum(n).?;
@@ -9652,7 +9815,7 @@ test "Callback: an error in the callee is caught where a handler stands, else le
     const frames = vm.frames.items.len;
     try testing.expectEqual(@as(i64, 6), (try cb.call(&.{fx(5)})).asFixnum());
     const kw = try cb.call(&.{value_mod.nilValue()});
-    try testing.expectEqualStrings("kind-mismatch", vm.ensureInterner().keywordName(kw.asKeywordId()));
+    try testing.expectEqualStrings("kind-mismatch", try caughtTag(&vm, kw));
     try testing.expectEqual(@as(i64, 8), (try cb.call(&.{fx(7)})).asFixnum());
     try testing.expectEqual(frames, vm.frames.items.len);
     try testing.expectEqual(@as(usize, 0), vm.handlers.items.len);
@@ -9882,7 +10045,7 @@ test "Callback batches: an element's error caught inside the callee, the batch g
         _ = try cb.call1(fx(0));
         try cb.each(&items, .{ .slots = &out });
         for (out, 0..) |v, i| if (i == k) {
-            try testing.expectEqualStrings("kind-mismatch", vm.ensureInterner().keywordName(v.asKeywordId()));
+            try testing.expectEqualStrings("kind-mismatch", try caughtTag(&vm, v));
         } else try testing.expectEqual(@as(i64, @intCast(i + 1)), v.asFixnum());
         try expectBatchClean(&vm, frames, stack);
     }
@@ -9931,7 +10094,7 @@ test "Callback batches: an element's error with no handler leaves its frame, one
     defer vm.deinit();
     callback_test_natives.second_error = null;
     const result = try vm.run();
-    try testing.expectEqualStrings("kind-mismatch", vm.ensureInterner().keywordName(result.asKeywordId()));
+    try testing.expectEqualStrings("kind-mismatch", try caughtTag(&vm, result));
     try testing.expectEqual(VmError.ControlTransferred, callback_test_natives.second_error.?);
     try expectBatchClean(&vm, 1, vm.stack.items.len);
 }
@@ -10109,7 +10272,7 @@ test "Callback: a throw past the native ends its call with ControlTransferred an
     defer vm.deinit();
     callback_test_natives.second_error = null;
     const result = try vm.run();
-    try testing.expectEqualStrings("kind-mismatch", vm.ensureInterner().keywordName(result.asKeywordId()));
+    try testing.expectEqualStrings("kind-mismatch", try caughtTag(&vm, result));
     try testing.expectEqual(VmError.ControlTransferred, callback_test_natives.second_error.?);
     try testing.expectEqual(@as(usize, 1), vm.frames.items.len);
     try testing.expectEqual(@as(usize, 0), vm.handlers.items.len);
@@ -10149,7 +10312,7 @@ test "VM dispatch: a native's throw two loops deep reaches the handler below" {
     defer vm.deinit();
     const result = try vm.run();
     try testing.expectEqual(@as(usize, 2), vector_mod.count(result));
-    try testing.expect(vector_mod.nth(result, 0).isKeyword());
+    try testing.expectEqualStrings("boom", try caughtTag(&vm, vector_mod.nth(result, 0)));
     try testing.expectEqual(@as(i64, 7), vector_mod.nth(result, 1).asFixnum());
     try testing.expectEqual(@as(usize, 0), vm.loop_depth);
     try testing.expectEqual(@as(usize, 1), vm.frames.items.len);

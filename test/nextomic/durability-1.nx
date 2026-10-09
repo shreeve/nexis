@@ -24,11 +24,11 @@
 (t/check "an option map may be a sorted map" (nil? (d/release (d/connect "commit.edb" (sorted-map :sync :full :durability :commit)))))
 
 (t/check "an unknown durability is :invalid-argument"
-         (= :invalid-argument (t/caught (d/connect "other.edb" {:durability :batch}))))
+         (= :invalid-argument (t/caught-tag (d/connect "other.edb" {:durability :batch}))))
 (t/check "a durability that is not a keyword is :invalid-argument"
-         (= :invalid-argument (t/caught (d/connect "other.edb" {:durability "commit"}))))
+         (= :invalid-argument (t/caught-tag (d/connect "other.edb" {:durability "commit"}))))
 (t/check "options that are not a map are :kind-mismatch"
-         (= :kind-mismatch (t/caught (d/connect "other.edb" [:durability :commit]))))
+         (= :kind-mismatch (t/caught-tag (d/connect "other.edb" [:durability :commit]))))
 
 (d/transact! c [{:n/v 2}])
 (d/transact! k [{:n/v 2}])

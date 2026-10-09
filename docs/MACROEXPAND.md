@@ -111,8 +111,8 @@ otherwise it is an ordinary call. User macros shadow host macros.
    in a macro body see and change the program's namespaces, record
    types, protocols and stores. Its
    result, every lazy seq in it realized on the sub-VM and made a list
-   (`seq.asLists`, `docs/LAZY.md` §8), becomes a Form at the call's
-   span (`valueToForm`), or its
+   (`seq.asLists`, `docs/LAZY.md` §8), becomes a Form (`valueToForm`)
+   placed as §4b says, or its
    throw or VM error becomes the failure message (§8). The sub-VM is
    released and the result is expanded again in the call's place.
 4. **A fresh sub-VM per call**: no handler, finally or halted state
@@ -195,11 +195,14 @@ otherwise it is an ordinary call. User macros shadow host macros.
      the routine, its constants and every closure prototype live in
      the VM's runtime arena. A value that is not a form (a list
      holding a function) and a form that does not compile throw
-     `{:error :compile-error :message "<CompileError name>" :form
-     form}`, plus `:detail` with the expander's reason when it gave
-     one, so `(catch :compile-error e ...)` takes it and
-     `ex-message` reads the name (`"UnsupportedForm"` for a
-     non-form). A throw inside the evaluated form propagates as an
+     `{:error :compile-error :message m :form form :kind name}`, `m`
+     the compiler's sentence (`"unable to resolve symbol: nope"`, the
+     expander's reason) or, with none, the `CompileError` name in
+     words (`"unsupported form"` for a non-form), and `name` that
+     name (`"UnsupportedForm"`), with the place of the `eval` call
+     when a handler is in force (`docs/VM.md` §13); so
+     `(catch :compile-error e ...)` takes it and `ex-message` reads
+     the sentence. A throw inside the evaluated form propagates as an
      ordinary throw.
    - Syntax-quote is not data at run time: a quoted form holding one
      is `UnsupportedFeature` at compile and `read-string` rejects
@@ -243,7 +246,7 @@ name in `(def x ...)`) or miss bodies that are.
 | `var` | Opaque. |
 | `if`, `do`, `recur`, `throw`, `#%` constructors, ordinary calls | Every sub-form expands in the current env. |
 | `set!` | `(set! target v)` → `(nexis.core/var-set (var target) v)` with `v` expanded. `target` must be a symbol; a lexical name is refused (a local has no thread binding). The Var's own checks (`:not-dynamic`, `:no-thread-binding`) happen at run time (`VM.md` §6.5). |
-| `try` | `(try body* (catch M b h*)* (finally f*)?)` becomes the primitive `(try body* (catch any g <chain>) (finally f*)?)`. The chain tries the clauses in order, `(if (nexis.internal/#%catch-matches? g M) (let* [b g] h*) ...)`, and ends in `(throw g)`, so a value no clause takes unwinds through the `finally`. A matcher is `any`; a class name that names a nexis error, which takes that error's tags (`ArithmeticException` `:divide-by-zero` and `:arithmetic-overflow`; `IndexOutOfBoundsException`, `ArrayIndexOutOfBoundsException` and `StringIndexOutOfBoundsException` `:index-out-of-bounds`; `ClassCastException` `:kind-mismatch` and `:not-callable`; `IllegalArgumentException` `:invalid-argument`, `:no-matching-clause`, `:arity-mismatch`, `:no-method` and `:ambiguous-method`; `IllegalStateException` `:preference-conflict`; `ArityException` `:arity-mismatch`; `AssertionError` `:assertion-failed`; `StackOverflowError` `:stack-overflow`; bare or under `java.lang.` or `clojure.lang.`); any other symbol (a class name such as `Exception`, taken as `any` since nexis has no classes); `:default` (also `any`); or a keyword `:tag`, which takes a thrown value equal to `:tag`, a map or record whose `:error` is `:tag`, or an `ex-info` map whose data's `:error` is `:tag`. Any other matcher, a catch or finally before the body's end, or a binding that is not an unqualified symbol is `MalformedMacroCall`. No clause: a finally-only `try`; neither clause: `(do body*)`. The body, each handler (its binding in scope) and the finally body expand; matchers and bindings do not. |
+| `try` | `(try body* (catch M b h*)* (finally f*)?)` becomes the primitive `(try body* (catch any g <chain>) (finally f*)?)`. The chain tries the clauses in order, `(if (nexis.internal/#%catch-matches? g M) (let* [b g] h*) ...)`, and ends in `(throw g)`, so a value no clause takes unwinds through the `finally`. A matcher is `any`; a class name that names a nexis error, which takes that error's tags (`ArithmeticException` `:divide-by-zero` and `:arithmetic-overflow`; `IndexOutOfBoundsException`, `ArrayIndexOutOfBoundsException` and `StringIndexOutOfBoundsException` `:index-out-of-bounds`; `ClassCastException` `:kind-mismatch` and `:not-callable`; `IllegalArgumentException` `:invalid-argument`, `:no-matching-clause`, `:arity-mismatch`, `:no-method` and `:ambiguous-method`; `IllegalStateException` `:preference-conflict`; `ArityException` `:arity-mismatch`; `AssertionError` `:assertion-failed`; `StackOverflowError` `:stack-overflow`; bare or under `java.lang.` or `clojure.lang.`); any other symbol (a class name such as `Exception`, taken as `any` since nexis has no classes); `:default` (also `any`); or a keyword `:tag`, which takes a thrown value equal to `:tag`, a map or record whose `:error` is `:tag`, or an `ex-info` map whose data's `:error` is `:tag`; a runtime error arrives as its error map (`VM.md` §13), so `:kind-mismatch`, `ClassCastException` and `any` all take `(+ 1 "a")`'s. Any other matcher, a catch or finally before the body's end, or a binding that is not an unqualified symbol is `MalformedMacroCall`. No clause: a finally-only `try`; neither clause: `(do body*)`. The body, each handler (its binding in scope) and the finally body expand; matchers and bindings do not. |
 | `defmacro` | §1.2; replaced by `(var name)`. |
 | `ns` | `(ns NAME "doc"? {attrs}? clause*)` switches `registry.current` to `NAME` at expansion time, creating it (parent `nexis.core`) when unregistered, then runs each `(:require spec*)` clause as `require` does. `(:refer-clojure :exclude [names])` interns each name `nexis.core` or the host macro table holds as an unbound Var of the namespace, so the name resolves, inlines and expands as the namespace's own from then on (a use before the namespace defines it is `:unbound-var` at run time; `nexis.core/name` still reaches core's), until the namespace defines it or a `:refer` of another namespace's Var of the name replaces it, as Clojure, which maps an excluded name to nothing, lets one; `(:refer-clojure)` alone does nothing, and `:only` or `:rename` is `MalformedMacroCall`. `(:gen-class)` is accepted and does nothing; the docstring and attribute map are accepted and not kept; any other clause (`:import`, `:use`) is `MalformedMacroCall`. Every clause, its options and its specs, is checked before the switch, so a malformed one leaves the namespace as it was; a namespace that does not load fails after it, as Clojure's `ns` fails after its `in-ns`. Replaced by `nil`. |
 | `require` | `(require spec*)`: each spec, quoted or not, is `ns-name` or `[ns-name option*]`, loaded at expansion time through `load_callback` and replaced by `nil`. `:as a` aliases the namespace; `:as-alias a` aliases it without loading; `:refer [x y]` maps `x` and `y` in the current namespace to that namespace's Vars (the same Vars: a later `def` there is seen here); `:refer :all` maps every Var not marked `:private`; `:rename {x z}` names a referred `x` as `z`. A prefix list, a vector whose second element is not a keyword or any list, requires each suffix under its prefix, as Clojure's does: `[app c [d :as dd]]` and `(app c [d :as dd])` are the specs `app.c` and `[app.d :as dd]`; a suffix holding a period, a suffix that is itself a prefix list, and a suffix other than a symbol or vector are `MalformedMacroCall`. A keyword spec (`:reload`) is a flag and changes nothing. Referring a name the current namespace defines itself, and `def` of a name that refers to another namespace's Var, are `MalformedMacroCall` (Clojure's rule); a missing Var or unknown option is reported by name. |
@@ -327,12 +330,18 @@ Host macros that need a fresh name (`and`, `or`, `case`, `condp`,
 - An input sub-form reused in the output keeps its own `origin`.
 - A form a macro synthesizes takes the macro call's `origin`, so the
   `if` that `(when ...)` produces points at the `when`.
-- A user macro's result, converted by `valueToForm`, is entirely at
-  the call's span.
+- A user macro's result, converted by `valueToForm`, keeps the place
+  of each list, vector, map or set it took from the macro's arguments
+  (`ExpandContext.arg_spans`, the arguments' non-empty collections by
+  heap address, which the sub-VM's heap never collects or reuses
+  during the call), so the body a `doseq` or `with-open` was given
+  is reported where it is written; every other form of the result,
+  and a symbol or scalar, which is not known by address, is at the
+  call's span.
 
-There is no separate "generated" origin: an error inside macro
-output is reported at the macro call. The `Builder` (§10b) carries
-the call's span to every form it makes.
+There is no separate "generated" origin: an error inside a form a
+macro made is reported at the macro call. The `Builder` (§10b)
+carries the call's span to every form it makes.
 
 ---
 
@@ -485,7 +494,7 @@ and `eval` puts it under `:detail`.
 
 | Failure | Span | Message |
 |---|---|---|
-| A user macro throws | the call | `macro m threw <message>`: an `ex-info` or error map's `:message`, a string, a keyword |
+| A user macro throws | the call | `macro m threw <what>`: an error map's `:error` and `:message` (`:kind-mismatch: + expects numbers, got nil`), either alone when it has one, an `ex-info` map's `:message`, a string, a keyword |
 | … fails in the VM | the call | `macro m failed: ArityMismatch: ...` (the VM's detail when it has one) |
 | … gets the wrong number of arguments | the call | `macro m takes 1 argument, got 0`, the counts named as a call's arity error names them (`VM.md` §13): `macro m takes at least 2 arguments, got 1`, `macro m takes 1 or at least 3 arguments, got 2` |
 | … returns a non-form | the call | `a macro returned a function, which is not a form` |

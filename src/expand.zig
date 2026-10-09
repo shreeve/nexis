@@ -133,6 +133,12 @@ pub const ExpandContext = struct {
     /// many enclosing binding forms bind it (`Scope`); empty at the
     /// top of a form.
     lexical: std.StringHashMapUnmanaged(u32) = .empty,
+    /// While a user macro's call converts its arguments to data and
+    /// its result back (`callUserMacro`): the span of each argument
+    /// collection by its heap address, so a form of the result that is
+    /// one of them keeps its own place and an error in it is reported
+    /// there, not at the macro call.
+    arg_spans: ?*std.AutoHashMapUnmanaged(u64, SrcSpan) = null,
 
     /// Whether `name` is bound by a binding form around the walk.
     fn isLexical(self: *const ExpandContext, name: []const u8) bool {
@@ -1254,7 +1260,13 @@ fn callUserMacro(
     const routine = vm_mod.VM.asClosure(macro_var.root).routine;
     if (routine.entryFor(args.len) == null) return ctx.fail(span, "macro {s} takes {f}, got {d}", .{ name, routine.arityPhrase(), args.len });
 
-    // Each argument as data, unevaluated.
+    // Each argument as data, unevaluated, its collections' places
+    // kept for the result.
+    var spans: std.AutoHashMapUnmanaged(u64, SrcSpan) = .empty;
+    defer spans.deinit(ctx.allocator);
+    const outer_spans = ctx.arg_spans;
+    ctx.arg_spans = &spans;
+    defer ctx.arg_spans = outer_spans;
     const arg_values = try ctx.allocator.alloc(value_mod.Value, args.len);
     defer ctx.allocator.free(arg_values);
     for (args, 0..) |a, i| arg_values[i] = try formToValue(ctx, a);
@@ -1295,18 +1307,26 @@ fn callUserMacro(
 }
 
 /// A thrown value in a failure message: a string as itself, a
-/// keyword as `:name`, a map by its `:message` string or `:error`
-/// keyword, anything else by its kind.
+/// keyword as `:name`, an error map as its `:error` keyword and its
+/// `:message` string (`:kind-mismatch: + expects numbers, got nil`),
+/// either alone when it has only one, anything else by its kind.
 fn describeThrown(ctx: *ExpandContext, thrown: value_mod.Value) ExpandError![]const u8 {
     switch (thrown.kind()) {
         .string => return string_mod.asBytes(thrown),
         .keyword => return ctx.allocator.print(":{s}", .{ctx.interner.keywordName(thrown.asKeywordId())}),
-        .persistent_map => for ([_][]const u8{ "message", "error" }) |key_name| {
-            const key = ctx.interner.internKeywordValue(key_name) catch return ExpandError.OutOfMemory;
-            switch (champ_mod.mapGet(thrown, key, &dispatch.hashValue, &dispatch.equal)) {
-                .present => |v| if (v.kind() == .string or v.kind() == .keyword) return describeThrown(ctx, v),
-                .absent => {},
+        .persistent_map => {
+            var parts: [2]?[]const u8 = .{ null, null };
+            for ([_][]const u8{ "error", "message" }, &parts) |key_name, *part| {
+                const key = ctx.interner.internKeywordValue(key_name) catch return ExpandError.OutOfMemory;
+                switch (champ_mod.mapGet(thrown, key, &dispatch.hashValue, &dispatch.equal)) {
+                    .present => |v| if (v.kind() == .string or v.kind() == .keyword) {
+                        part.* = try describeThrown(ctx, v);
+                    },
+                    .absent => {},
+                }
             }
+            if (parts[0] != null and parts[1] != null) return ctx.allocator.print("{s}: {s}", .{ parts[0].?, parts[1].? });
+            if (parts[0] orelse parts[1]) |one| return one;
         },
         else => {},
     }
@@ -1323,6 +1343,27 @@ fn describeThrown(ctx: *ExpandContext, thrown: value_mod.Value) ExpandError![]co
 /// marker list a sorted collection travels as (`valueToForm`) the
 /// collection itself. A syntax-quote or an unquote is not data.
 pub fn formToValue(ctx: *ExpandContext, form: *const Form) ExpandError!value_mod.Value {
+    const v = try formValue(ctx, form);
+    if (ctx.arg_spans) |spans| if (spanKey(v)) |k| {
+        spans.put(ctx.allocator, k, form.origin) catch return ExpandError.OutOfMemory;
+    };
+    return v;
+}
+
+/// What `arg_spans` knows a value by: the address of a non-empty
+/// list, vector, map or set, which no other value shares while the
+/// expansion runs (its heap does not collect).
+fn spanKey(v: value_mod.Value) ?u64 {
+    return switch (v.kind()) {
+        .list => if (list_mod.isEmpty(v)) null else v.payload,
+        .persistent_vector => if (vector_mod.count(v) == 0) null else v.payload,
+        .persistent_map => if (champ_mod.mapCount(v) == 0) null else v.payload,
+        .persistent_set => if (champ_mod.setCount(v) == 0) null else v.payload,
+        else => null,
+    };
+}
+
+fn formValue(ctx: *ExpandContext, form: *const Form) ExpandError!value_mod.Value {
     try checkStack();
     const heap = try ctx.heapForArgs();
     const oom = ExpandError.OutOfMemory;
@@ -1431,14 +1472,17 @@ fn mapOf(heap: *heap_mod.Heap, kvs: []const value_mod.Value) !value_mod.Value {
     return m;
 }
 
-/// A macro's result as a form, every form at `origin` (the call's
-/// span) in `ctx.allocator`: the inverse of `formToValue`, a bignum
+/// A macro's result as a form in `ctx.allocator`, each one the macro
+/// was given at its own place (`arg_spans`) and every other at
+/// `call_origin`: the inverse of `formToValue`, a bignum
 /// within i64 an `int` and beyond it a `bigint`. The list
 /// `(nexis.internal/#%meta x m)` becomes `^m x`, and so does a list,
 /// vector, map or set carrying the metadata `m` (§5). A function, a
 /// Var or any other kind is not a form.
-pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: SrcSpan) ExpandError!*Form {
+pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, call_origin: SrcSpan) ExpandError!*Form {
     try checkStack();
+    // A form the macro was given, at its own place, and its parts.
+    const origin = if (ctx.arg_spans) |spans| (if (spanKey(v)) |k| spans.get(k) orelse call_origin else call_origin) else call_origin;
     const datum: Datum = switch (v.kind()) {
         .nil => .nil,
         .true_, .false_ => .{ .bool_ = v.kind() == .true_ },
@@ -2943,6 +2987,129 @@ pub fn defaultMacros(allocator: Allocator) ExpandError!HostMacroTable {
     try table.put(allocator, "extend-protocol", expandExtendProtocol);
     return table;
 }
+
+// =============================================================================
+// Clojure idioms nexis lacks (TOOLING.md §1)
+// =============================================================================
+
+/// What to write instead of a Clojure name nexis lacks, for the report
+/// of a symbol that resolves to nothing: Java interop (`Exception.`,
+/// `.toUpperCase`, `Math/sqrt`, `System/getenv`) and the JVM's
+/// threads (`future`, `pmap`, `agent`); null for any other name. One
+/// clause, in `allocator`.
+pub fn idiomHint(allocator: Allocator, ns: ?[]const u8, name: []const u8) Allocator.Error!?[]const u8 {
+    if (ns) |n| return classMemberHint(allocator, n, name);
+    if (name.len > 1 and name[name.len - 1] == '.' and !std.mem.eql(u8, name, "..")) {
+        const class = name[(if (std.mem.findScalarLast(u8, name[0 .. name.len - 1], '.')) |i| i + 1 else 0) .. name.len - 1];
+        if (std.mem.endsWith(u8, class, "Exception") or std.mem.endsWith(u8, class, "Error") or std.mem.eql(u8, class, "Throwable"))
+            return "nexis has no Java classes: throw (ex-info \"message\" {:key value}), or any value";
+        return "nexis has no Java interop, so no constructors: functions build values";
+    }
+    if (name.len > 1 and name[0] == '.' and name[1] != '.') {
+        const method = name[1..];
+        for (method_hints) |pair| if (std.mem.eql(u8, method, pair[0]))
+            return try allocator.print("nexis has no Java interop, so no .method calls: use {s}", .{pair[1]});
+        return "nexis has no Java interop, so no .method calls: call a function (nexis.string has the string ones)";
+    }
+    if (std.mem.eql(u8, name, "new")) return "nexis has no Java interop, so no constructors: functions build values";
+    for (thread_hints) |pair| for (pair[0]) |n| if (std.mem.eql(u8, name, n)) return pair[1];
+    return null;
+}
+
+/// `ns/name` where `ns` is a Java class (`Math/sqrt`, `System/getenv`,
+/// `java.util.UUID/randomUUID`): the nexis function, or what it is.
+fn classMemberHint(allocator: Allocator, ns: []const u8, name: []const u8) Allocator.Error!?[]const u8 {
+    if (std.mem.eql(u8, ns, "Math") or std.mem.eql(u8, ns, "StrictMath")) {
+        for ([_][2][]const u8{ .{ "abs", "abs" }, .{ "max", "max" }, .{ "min", "min" }, .{ "random", "rand" } }) |pair| {
+            if (std.mem.eql(u8, name, pair[0])) return try allocator.print("nexis has no Java interop: use {s}", .{pair[1]});
+        }
+        // Java's camelCase is clojure.math's kebab-case: `toRadians`
+        // is `to-radians`.
+        const camel = name.len > 0 and std.ascii.isLower(name[0]);
+        var kebab: std.ArrayList(u8) = .empty;
+        for (name) |c| {
+            if (camel and std.ascii.isUpper(c)) {
+                try kebab.appendSlice(allocator, &.{ '-', std.ascii.toLower(c) });
+            } else try kebab.append(allocator, c);
+        }
+        for (math_names) |m| if (std.mem.eql(u8, kebab.items, m))
+            return try allocator.print("nexis has no Java interop: use nexis.math/{s} (clojure.math/{s})", .{ m, m });
+        return "nexis has no Java interop: nexis.math (clojure.math) has the math functions";
+    }
+    for (member_hints) |h| if (std.mem.eql(u8, ns, h[0]) and std.mem.eql(u8, name, h[1]))
+        return try allocator.print("nexis has no Java interop: use {s}", .{h[2]});
+    if (std.mem.eql(u8, ns, "clojure.java.io")) return namespaceHint("clojure.java.io");
+    const java_package = std.mem.startsWith(u8, ns, "java.") or std.mem.startsWith(u8, ns, "javax.");
+    const class_name = std.ascii.isUpper(ns[(if (std.mem.findScalarLast(u8, ns, '.')) |i| i + 1 else 0)..][0]);
+    if (java_package or class_name) return try allocator.print("nexis has no Java interop: {s} is a Java class", .{ns});
+    return null;
+}
+
+/// What to require instead of a library namespace nexis lacks, for
+/// the report of a `require` that finds no file; null for any other.
+pub fn namespaceHint(name: []const u8) ?[]const u8 {
+    for ([_][2][]const u8{
+        .{ "clojure.java.io", "nexis has no clojure.java.io: slurp and spit read and write a file, read-line reads stdin" },
+        .{ "clojure.core.async", "nexis runs one thread and has no core.async: call functions in order" },
+    }) |pair| if (std.mem.eql(u8, name, pair[0])) return pair[1];
+    if (std.mem.startsWith(u8, name, "java.") or std.mem.startsWith(u8, name, "javax.")) return "nexis has no Java interop";
+    return null;
+}
+
+/// A Java method and the nexis function that does its work.
+const method_hints = [_][2][]const u8{
+    .{ "toUpperCase", "nexis.string/upper-case" },
+    .{ "toLowerCase", "nexis.string/lower-case" },
+    .{ "trim", "nexis.string/trim" },
+    .{ "length", "count" },
+    .{ "size", "count" },
+    .{ "substring", "subs" },
+    .{ "startsWith", "nexis.string/starts-with?" },
+    .{ "endsWith", "nexis.string/ends-with?" },
+    .{ "contains", "nexis.string/includes? for a string, contains? for a collection" },
+    .{ "indexOf", "nexis.string/index-of" },
+    .{ "split", "nexis.string/split" },
+    .{ "replace", "nexis.string/replace" },
+    .{ "isEmpty", "empty?" },
+    .{ "charAt", "nth" },
+    .{ "equals", "=" },
+    .{ "toString", "str" },
+    .{ "getMessage", "ex-message" },
+    .{ "getData", "ex-data" },
+    .{ "getCause", "ex-cause" },
+};
+
+/// A static member of a Java class and the nexis function for it.
+const member_hints = [_][3][]const u8{
+    .{ "System", "getenv", "nexis.sys/getenv" },
+    .{ "System", "exit", "exit" },
+    .{ "System", "nanoTime", "nano-time" },
+    .{ "System", "currentTimeMillis", "(nexis.time/inst-ms (nexis.time/now))" },
+    .{ "Integer", "parseInt", "parse-long" },
+    .{ "Long", "parseLong", "parse-long" },
+    .{ "Double", "parseDouble", "parse-double" },
+    .{ "Boolean", "parseBoolean", "parse-boolean" },
+    .{ "String", "valueOf", "str" },
+    .{ "String", "join", "nexis.string/join" },
+    .{ "UUID", "randomUUID", "random-uuid" },
+    .{ "java.util.UUID", "randomUUID", "random-uuid" },
+};
+
+/// `nexis.math`'s names (clojure.math's).
+const math_names = [_][]const u8{ "PI", "E", "sqrt", "cbrt", "pow", "exp", "expm1", "log", "log10", "log1p", "floor", "ceil", "round", "signum", "hypot", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "to-radians", "to-degrees", "floor-div", "floor-mod" };
+
+/// Clojure's concurrency names, which a nexis of one isolate and one
+/// thread has none of.
+const thread_hints = [_]struct { []const []const u8, []const u8 }{
+    .{ &.{ "future", "future-call" }, "nexis runs one thread, so no future: call the function and use its value" },
+    .{ &.{"pmap"}, "nexis runs one thread, so no pmap: use map" },
+    .{ &.{ "pcalls", "pvalues" }, "nexis runs one thread: call the functions in order" },
+    .{ &.{ "agent", "send", "send-off", "await" }, "nexis has no agents: an atom holds state that changes" },
+    .{ &.{ "promise", "deliver" }, "nexis runs one thread, so no promise: use the value, or an atom" },
+    .{ &.{"thread"}, "nexis runs one thread, so no thread: call the function" },
+    .{ &.{"locking"}, "nexis runs one thread, so nothing to lock: run the body" },
+    .{ &.{ "dosync", "ref", "ref-set", "alter", "commute" }, "nexis has no STM: an atom holds shared state, db/ref a durable one" },
+};
 
 // =============================================================================
 // Inline tests

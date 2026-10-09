@@ -36,5 +36,5 @@
 (t/check "with takes lazy tx-data"
          (= 2 (d/with c (lazy-seq [{:p/name "e" :p/age 2}]) (fn [db _] (:p/age (d/entity db [:p/name "e"]))))))
 (t/check "a lazy tx-data whose body throws aborts before the transaction"
-         (= :boom (t/caught (d/transact! c (lazy-seq (throw :boom))))))
+         (= :boom (t/caught-tag (d/transact! c (lazy-seq (throw :boom))))))
 (println :done)

@@ -95,9 +95,20 @@
               (if msg (str " ; " msg) "")))
   false)
 
+; How a thrown value reads in a report: an error map as its tag, its
+; message and the file name, line and column it was raised at; any
+; other value as pr-str prints it.
+(defn- describe-thrown [e]
+  (if (and (map? e) (keyword? (:error e)) (string? (:message e)))
+    (str (pr-str (:error e)) " " (:message e)
+         (if (:line e)
+           (str " at " (last (nexis.string/split (:file e) #"/")) ":" (:line e) ":" (:column e))
+           ""))
+    (pr-str e)))
+
 (defn- error! [e]
   (bump! :error)
-  (emit! (str "ERROR" (where) ": " (pr-str e))))
+  (emit! (str "ERROR" (where) ": " (describe-thrown e))))
 
 ; ---- assertions ----
 
@@ -198,7 +209,8 @@
   later call replaces the kind's fixtures; another kind is
   :invalid-argument."
   [kind & fs]
-  (when-not (contains? #{:once :each} kind) (throw :invalid-argument))
+  (when-not (contains? #{:once :each} kind)
+    (nexis.internal/#%raise :invalid-argument (str "use-fixtures takes :once or :each, not " (pr-str kind))))
   (swap! fixtures assoc-in [(nexis.internal/#%current-ns) kind] (join-fixtures fs))
   nil)
 

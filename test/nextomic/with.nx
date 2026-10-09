@@ -56,11 +56,11 @@
              (= ["Ann" "Bob"] (names (d/as-of db-after (d/basis-t before)))))
       (t/check "the committed view is untouched inside the scope" (= ["Ann" "Bob"] (names (d/db c))))
       (t/check "transact! inside the scope is nested"
-             (= :nextomic/nested (t/caught (d/transact! c [[:db/add ann :person/tags :blue]]))))
+             (= :nextomic/nested (t/caught-tag (d/transact! c [[:db/add ann :person/tags :blue]]))))
       (t/check "with inside the scope is nested"
-             (= :nextomic/nested (t/caught (d/with c [] (fn [inner r] inner)))))
+             (= :nextomic/nested (t/caught-tag (d/with c [] (fn [inner r] inner)))))
       (t/check "a second connection to the file is nested too, not blocked"
-             (= :nextomic/nested (d/with-conn [c2 "with.edb"] (t/caught (d/transact! c2 [[:db/add ann :person/tags :blue]])))))
+             (= :nextomic/nested (d/with-conn [c2 "with.edb"] (t/caught-tag (d/transact! c2 [[:db/add ann :person/tags :blue]])))))
       :speculated)))
 (t/check "with returns f's value" (= :speculated outcome))
 
@@ -89,7 +89,7 @@
 (def first-view (d/with c [] (fn [db-after report] db-after)))
 (d/with c [] (fn [db-after report]
   (t/check "an ended scope's db-value equals no later scope's" (not= first-view db-after))
-  (t/check "and stays closed in it" (= :nextomic/closed (t/caught (d/datoms first-view :eavt ann))))))
+  (t/check "and stays closed in it" (= :nextomic/closed (t/caught-tag (d/datoms first-view :eavt ann))))))
 
 ; A speculative schema attribute exists in the view only.
 (d/with c [{:db/id "nick" :db/ident :person/nick :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]

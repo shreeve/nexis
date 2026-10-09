@@ -211,7 +211,7 @@ test "integration: a protocol fn is a first-class function" {
     try expectOutput(
         \\(defprotocol Shape (area [s]))
         \\(try (mapv area [1]) (catch any e e))
-    , ":no-protocol-impl");
+    , "{:error :no-protocol-impl, :message no impl of area for an integer, :fn test-form}");
 }
 
 test "integration: recur into a variadic fn passes the rest param one seq" {
@@ -354,10 +354,10 @@ test "meta / with-meta / vary-meta on collections never touch equality, hash or 
     try expectOutput("(meta (vary-meta [1] assoc :b 2))", "{:b 2}");
     try expectOutput("(meta (vary-meta (with-meta [1] {:a 1}) assoc :b 2))", "{:a 1, :b 2}");
     try expectOutput("(meta (with-meta (with-meta [1] {:a 1}) nil))", "nil");
-    try expectOutput("(try (with-meta 1 {}) (catch any e e))", ":no-metadata-on-immediate");
-    try expectOutput("(try (with-meta \"s\" {}) (catch any e e))", ":no-metadata-on-immediate");
-    try expectOutput("(try (with-meta (var meta) {}) (catch any e e))", ":kind-mismatch");
-    try expectOutput("(try (with-meta [1] 5) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (with-meta 1 {}) (catch any e e))", "{:error :no-metadata-on-immediate, :message no metadata on immediate, :fn test-form}");
+    try expectOutput("(try (with-meta \"s\" {}) (catch any e e))", "{:error :no-metadata-on-immediate, :message no metadata on immediate, :fn test-form}");
+    try expectOutput("(try (with-meta (var meta) {}) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
+    try expectOutput("(try (with-meta [1] 5) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
     try expectOutput("[(meta \"s\") (meta 1) (meta nil) (meta :k)]", "[nil nil nil nil]");
 }
 
@@ -388,7 +388,7 @@ test "metadata: a seq view of a vector takes it without copying, and its rest do
 
 test "metadata: a record carries it through assoc and dissoc; kinds that cannot carry it are :kind-mismatch" {
     try expectOutput("(defrecord P [x y]) (let [p (with-meta (->P 1 2) {:m 1})] [(meta p) p (= p (->P 1 2)) (meta (assoc p :x 3)) (meta (dissoc p :z)) (meta (assoc p :z 3)) (meta (->P 1 2)) (meta (with-meta p nil))])", "[{:m 1} #user.P{:x 1, :y 2} true {:m 1} {:m 1} {:m 1} nil nil]");
-    try expectOutput("[(try (with-meta (atom 1) {}) (catch any e e)) (try (with-meta inc {}) (catch any e e)) (try (with-meta (transient []) {}) (catch any e e)) (meta (atom 1))]", "[:kind-mismatch :kind-mismatch :kind-mismatch nil]");
+    try expectOutput("[(try (with-meta (atom 1) {}) (catch any e e)) (try (with-meta inc {}) (catch any e e)) (try (with-meta (transient []) {}) (catch any e e)) (meta (atom 1))]", "[{:error :kind-mismatch, :message kind mismatch, :fn test-form} {:error :kind-mismatch, :message kind mismatch, :fn test-form} {:error :kind-mismatch, :message kind mismatch, :fn test-form} nil]");
     // A typed vector carries it, as Clojure's vector-of does.
     try expectOutput("(let [v (i64-vector [1 2]) m (with-meta v {:k 1})] [(meta m) (meta v) (= m v) (= (hash m) (hash v)) m (meta (with-meta m nil)) (meta (vary-meta (f64-vector [0.5]) assoc :f 2))])", "[{:k 1} nil true true #i64[1 2] nil {:f 2}]");
 }
@@ -701,7 +701,7 @@ test "integration: every exit path leaves the VM's stacks as it found them" {
         \\ (try (binding [*d* 5] (try (mapv (fn [x] (throw x)) [:in]) (finally (swap! log conj *d*)))) (catch any e e))
         \\ (binding [*d* 7] (mapv (fn [x] (try (inc x) (finally (swap! log conj *d*)))) [1 2]))
         \\ *d* @log]
-    ), "[[:t 1] :divide-by-zero :in [2 3] 0 [5 7 7]]");
+    ), "[[:t 1] {:error :divide-by-zero, :message divide by zero, :fn fn} :in [2 3] 0 [5 7 7]]");
     try testing.expectEqual(@as(usize, 0), program.v.handlers.items.len);
     try testing.expectEqual(@as(usize, 0), program.v.finally_stack.items.len);
     try testing.expectEqual(@as(usize, 0), program.v.dyn_frames.items.len);
@@ -765,7 +765,7 @@ test "try: a class that names a nexis error catches that error alone, as in Cloj
     try expectOutput("(try ((fn [x] x)) (catch IllegalArgumentException e :iae))", ":iae");
     try expectOutput("(try (case 3 1 :one) (catch IllegalArgumentException e :iae))", ":iae");
     try expectOutput("(try (throw :other) (catch ArithmeticException e :ae) (catch Throwable e [:t e]))", "[:t :other]");
-    try expectOutput("(try (try (/ 1 0) (catch ClassCastException e :cce)) (catch any e e))", ":divide-by-zero");
+    try expectOutput("(try (try (/ 1 0) (catch ClassCastException e :cce)) (catch any e e))", "{:error :divide-by-zero, :message divide by zero, :fn test-form}");
     // Calling a value that is no function is a ClassCastException in
     // Clojure; an overflow an ArithmeticException.
     try expectOutput("[(try (1 2) (catch ClassCastException e :cce)) (try (bit-and 1 10000000000000000000) (catch ArithmeticException e :ae))]", "[:cce :ae]");
@@ -905,7 +905,7 @@ test "integration: native nth — list + vector" {
 }
 
 test "integration: native nth — out of bounds catchable" {
-    try expectOutput("(try (nth [1 2] 5) (catch any e e))", ":index-out-of-bounds");
+    try expectOutput("(try (nth [1 2] 5) (catch any e e))", "{:error :index-out-of-bounds, :message index out of bounds, :fn test-form}");
 }
 
 test "integration: native empty?" {
@@ -960,8 +960,8 @@ test "integration: a macro body reads names of its keyword and symbol arguments"
 }
 
 test "integration: native fn — arity mismatch is catchable" {
-    try expectOutput("(try (first) (catch any e e))", ":arity-mismatch");
-    try expectOutput("(try (cons 1) (catch any e e))", ":arity-mismatch");
+    try expectOutput("(try (first) (catch any e e))", "{:error :arity-mismatch, :message first takes 1 argument, got 0, :fn test-form}");
+    try expectOutput("(try (cons 1) (catch any e e))", "{:error :arity-mismatch, :message cons takes 2 arguments, got 1, :fn test-form}");
 }
 
 test "integration: recursion through a native re-entry ends in a catchable :stack-overflow" {
@@ -969,8 +969,8 @@ test "integration: recursion through a native re-entry ends in a catchable :stac
     // loop on the native stack; the guard stops it before the stack
     // does (VM.md §13.1).
     try expectOutput("(defn g [n] (if (= n 0) 0 (+ 1 (apply g [(- n 1)])))) (g 300)", "300");
-    try expectOutput("(defn g [n] (if (= n 0) 0 (+ 1 (apply g [(- n 1)])))) (try (g 100000000) (catch any e e))", ":stack-overflow");
-    try expectOutput("(defn h [n] (if (= n 0) 0 (+ 1 (first (mapv h [(- n 1)]))))) (try (h 100000000) (catch any e e))", ":stack-overflow");
+    try expectOutput("(defn g [n] (if (= n 0) 0 (+ 1 (apply g [(- n 1)])))) (try (g 100000000) (catch any e e))", "{:error :stack-overflow, :message stack overflow, :fn g}");
+    try expectOutput("(defn h [n] (if (= n 0) 0 (+ 1 (first (mapv h [(- n 1)]))))) (try (h 100000000) (catch any e e))", "{:error :stack-overflow, :message stack overflow, :fn h}");
     // The VM is whole afterwards: the next call runs normally.
     try expectOutput("(defn g [n] (if (= n 0) 0 (+ 1 (apply g [(- n 1)])))) (try (g 100000000) (catch any e e)) (g 10)", "10");
 }
@@ -983,7 +983,7 @@ test "integration: a closure made just past the stack guard's last check is stil
         \\(defn f4 [n] (if (zero? n) 0 (+ 1 (first (mapv (fn [x] (let [g (fn [] x)] (f4 (g)))) [(dec n)])))))
         \\(defn pad [k] (if (zero? k) (try (f4 100000000) (catch :stack-overflow e e)) (apply pad [(dec k)])))
         \\(set (mapv pad (range 12)))
-    , "#{:stack-overflow}");
+    , "#{{:error :stack-overflow, :message stack overflow, :fn f4}}");
 }
 
 test "integration: run loops nest at most max_nested_runs deep" {
@@ -993,7 +993,7 @@ test "integration: run loops nest at most max_nested_runs deep" {
     program.v.max_nested_runs = 50;
     const g = "(defn g [n] (if (= n 0) 0 (+ 1 (apply g [(- n 1)])))) ";
     try harness.expectResult(&program, "", try program.run(g ++ "(g 40)"), "40");
-    try harness.expectResult(&program, "", try program.run("[(try (g 60) (catch any e e)) (try (first (mapv g [60])) (catch any e e)) (g 40)]"), "[:stack-overflow :stack-overflow 40]");
+    try harness.expectResult(&program, "", try program.run("[(try (g 60) (catch any e e)) (try (first (mapv g [60])) (catch any e e)) (g 40)]"), "[{:error :stack-overflow, :message stack overflow, :fn g} {:error :stack-overflow, :message stack overflow, :fn g} 40]");
     try testing.expectEqual(@as(usize, 0), program.v.nested_runs);
 }
 
@@ -1006,7 +1006,7 @@ test "integration: runaway recursion is a catchable :stack-overflow; deep legiti
     try program.init();
     defer program.deinit();
     program.v.max_frames = 20_000;
-    try harness.expectResult(&program, "", try program.run("(defn f [n] (inc (f n))) (try (f 1) (catch any e [:caught e]))"), "[:caught :stack-overflow]");
+    try harness.expectResult(&program, "", try program.run("(defn f [n] (inc (f n))) (try (f 1) (catch any e [:caught e]))"), "[:caught {:error :stack-overflow, :message stack overflow, :fn f}]");
     try testing.expectEqual(@as(usize, 1), program.v.frames.items.len);
     try testing.expectError(vm.VmError.StackOverflow, program.run("(f 1)"));
     // The trace keeps the innermost 32 frames and the outermost 8
@@ -1144,7 +1144,7 @@ test "integration: multi-arity arity-mismatch is catchable" {
     try expectOutput(
         \\(do (defn f ([x] :one) ([x y] :two))
         \\    (try (f 1 2 3) (catch any e e)))
-    , ":arity-mismatch");
+    , "{:error :arity-mismatch, :message f takes 1 or 2 arguments, got 3, :fn test-form}");
 }
 
 test "integration: multi-arity with variadic overload" {
@@ -1181,7 +1181,7 @@ test "multi-arity fn: anonymous, named and letfn clauses dispatch by argc" {
     try expectOutput("(letfn [(f ([x] x) ([x y] y))] [(f 1) (f 1 2)])", "[1 2]");
     try expectOutput("(letfn [(f [[a b]] (+ a b))] (f [1 2]))", "3");
     try expectOutput("(let [f (fn ([[a b]] (+ a b)) ([m k] (get m k)))] [(f [1 2]) (f {:k 3} :k)])", "[3 3]");
-    try expectOutput("(try ((fn ([x] x)) 1 2) (catch any e e))", ":arity-mismatch");
+    try expectOutput("(try ((fn ([x] x)) 1 2) (catch any e e))", "{:error :arity-mismatch, :message fn takes 1 argument, got 2, :fn test-form}");
     try expectProgramError("(fn ([x] 1) ([x] 2))", compile.CompileError.MacroExpansionFailure);
     try expectProgramError("(fn ([x y] 1) ([x & r] 2))", compile.CompileError.MacroExpansionFailure);
 }
@@ -1196,7 +1196,7 @@ test "multi-arity fn: each clause is called at its count through every path" {
         \\   (try (f 1 2 3) (catch any e e)) (try (apply f [1 2 3]) (catch any e e))
         \\   (mapv f [1 2]) (mapv f [1] [2]) (filterv f [1]) (reduce f [1 2 3])
         \\   (let [a (atom 0)] (swap! a f 1 2 3 4) @a)])
-    , "[:0 :1 :2 [:v nil] [:v (5 6 7)] :0 :2 [:v (5)] [1 2] :arity-mismatch :arity-mismatch [:1 :1] [:2] [1] :2 [:v (4)]]");
+    , "[:0 :1 :2 [:v nil] [:v (5 6 7)] :0 :2 [:v (5)] [1 2] {:error :arity-mismatch, :message fn takes 0 to 2 or at least 4 arguments, got 3, :fn test-form} {:error :arity-mismatch, :message fn takes 0 to 2 or at least 4 arguments, got 3, :fn test-form} [:1 :1] [:2] [1] :2 [:v (4)]]");
     try expectOutput(
         \\(do (defprotocol Sz (sz [x] [x n]))
         \\    (defrecord Box [v] Sz (sz [_] v) (sz [_ n] (* v n)))
@@ -1349,7 +1349,7 @@ test "destructuring: a map pattern after & takes keyword arguments" {
     try expectOutput("(do (defn ma ([x] x) ([x & {:keys [a]}] [x a])) [(ma 1) (ma 1 :a 2)])", "[1 [1 2]]");
     // As Clojure 1.11's: one trailing argument is the map itself,
     // whatever it is, and no arguments leave nil to destructure.
-    try expectOutput("[((fn [& {:keys [a]}] a) :a) ((fn [& {:as m}] m)) (try ((fn [& {:keys [a]}] a) :a 1 :b) (catch any e e))]", "[nil nil :invalid-argument]");
+    try expectOutput("[((fn [& {:keys [a]}] a) :a) ((fn [& {:as m}] m)) (try ((fn [& {:keys [a]}] a) :a 1 :b) (catch any e e))]", "[nil nil {:error :invalid-argument, :message invalid argument, :fn fn}]");
     // #%kwargs itself: a non-seq is itself, a seq of one its element,
     // the empty seq {}, a longer seq the map of its pairs.
     try expectOutput("[(nexis.internal/#%kwargs '(:a)) (nexis.internal/#%kwargs [1 2]) (nexis.internal/#%kwargs nil) (nexis.internal/#%kwargs ()) (nexis.internal/#%kwargs {:a 1}) (nexis.internal/#%kwargs '(:a 1 :b 2))]", "[:a [1 2] nil {} {:a 1} {:a 1, :b 2}]");
@@ -1364,7 +1364,7 @@ test "destructuring: every map pattern takes a seq as keyword arguments, as Cloj
     // Any seq, a lazy one included, as Clojure 1.12's destructure takes it.
     try expectOutput("(let [{:keys [a] :as m} (map identity [:a 1])] [a m])", "[1 {:a 1}]");
     try expectOutput("[(let [{:keys [a b]} (filter some? [:a nil 1 :b 2])] [a b]) (let [{:keys [a b]} (concat [:a 1] [:b 2])] [a b]) (let [{:keys [a]} (map identity [{:a 3}])] a) (let [{:as m} (filter some? [nil])] m)]", "[[1 2] [1 2] 3 {}]");
-    try expectOutput("(try (let [{:keys [a]} (map identity [:a 1 :b])] a) (catch any e e))", ":invalid-argument");
+    try expectOutput("(try (let [{:keys [a]} (map identity [:a 1 :b])] a) (catch any e e))", "{:error :invalid-argument, :message invalid argument, :fn test-form}");
     // A vector is not a seq: its map pattern looks it up by index.
     try expectOutput("(let [{a 1} [:x :y]] a)", ":y");
 }
@@ -1492,6 +1492,34 @@ test "loader: a defmacro whose function does not compile is reported where and w
     try expectLoaded("(defmacro m [] (helper)) (defn helper [] 5) (m)", "5");
 }
 
+test "loader: a Clojure idiom nexis lacks is reported with what to use instead" {
+    // Java interop: constructors, methods, static members.
+    try expectLoadFailure("(throw (Exception. \"boom\"))", "compile error: unable to resolve symbol: Exception.; nexis has no Java classes: throw (ex-info \"message\" {:key value}), or any value", "Exception.");
+    try expectLoadFailure("(RuntimeException. \"boom\")", "compile error: unable to resolve symbol: RuntimeException.; nexis has no Java classes: throw (ex-info \"message\" {:key value}), or any value", "RuntimeException.");
+    try expectLoadFailure("(java.util.Date.)", "compile error: unable to resolve symbol: java.util.Date.; nexis has no Java interop, so no constructors: functions build values", "java.util.Date.");
+    try expectLoadFailure("(.toUpperCase \"x\")", "compile error: unable to resolve symbol: .toUpperCase; nexis has no Java interop, so no .method calls: use nexis.string/upper-case", ".toUpperCase");
+    try expectLoadFailure("(.frob \"x\")", "compile error: unable to resolve symbol: .frob; nexis has no Java interop, so no .method calls: call a function (nexis.string has the string ones)", ".frob");
+    try expectLoadFailure("(Math/sqrt 2)", "compile error: unable to resolve symbol: Math/sqrt; nexis has no Java interop: use nexis.math/sqrt (clojure.math/sqrt)", "Math/sqrt");
+    try expectLoadFailure("(Math/floorDiv 7 2)", "compile error: unable to resolve symbol: Math/floorDiv; nexis has no Java interop: use nexis.math/floor-div (clojure.math/floor-div)", "Math/floorDiv");
+    try expectLoadFailure("(Math/abs -1)", "compile error: unable to resolve symbol: Math/abs; nexis has no Java interop: use abs", "Math/abs");
+    try expectLoadFailure("(System/getenv \"HOME\")", "compile error: unable to resolve symbol: System/getenv; nexis has no Java interop: use nexis.sys/getenv", "System/getenv");
+    try expectLoadFailure("(Thread/sleep 10)", "compile error: unable to resolve symbol: Thread/sleep; nexis has no Java interop: Thread is a Java class", "Thread/sleep");
+    // One thread: no future, pmap, agent or thread.
+    try expectLoadFailure("(future (+ 1 2))", "compile error: unable to resolve symbol: future; nexis runs one thread, so no future: call the function and use its value", "future");
+    try expectLoadFailure("(pmap inc [1 2])", "compile error: unable to resolve symbol: pmap; nexis runs one thread, so no pmap: use map", "pmap");
+    try expectLoadFailure("(agent 0)", "compile error: unable to resolve symbol: agent; nexis has no agents: an atom holds state that changes", "agent");
+    try expectLoadFailure("(thread (println 1))", "compile error: unable to resolve symbol: thread; nexis runs one thread, so no thread: call the function", "thread");
+    // A name the program defines is its own, a Clojure name or not.
+    try expectLoaded("(defn thread [f] (f)) (thread (fn [] 7))", "7");
+    // Libraries: clojure.java.io.
+    try expectLoadFailure("(clojure.java.io/file \"x\")", "compile error: unable to resolve symbol: clojure.java.io/file; nexis has no clojure.java.io: slurp and spit read and write a file, read-line reads stdin", "clojure.java.io/file");
+    // Literals: a ratio, a BigDecimal, #inst and #uuid.
+    try expectLoadFailure("(+ 1/3 1)", "reader error: :bad-number-literal 1/3; nexis has no ratios: (/ 1 3) divides, to a double when inexact", "1/3");
+    try expectLoadFailure("1.5M", "reader error: :bad-number-literal 1.5M; nexis has no BigDecimal: 1.5 is a double", "1.5M");
+    try expectLoadFailure("#inst \"2026-10-09\"", "parse error: unexpected `#inst`; nexis has no #inst literal: (nexis.time/parse \"2026-10-09T12:00:00Z\") is an instant", "#inst");
+    try expectLoadFailure("#uuid \"x\"", "parse error: unexpected `#uuid`; nexis has no #uuid literal: a UUID is its canonical string", "#uuid");
+}
+
 test "loader: a parse error names the delimiter left open" {
     try expectLoadFailure("(println [1 2 3)", "parse error: unexpected `)`; the `[` at 1:10 is open", ")");
     try expectLoadFailure("(def x 1)\n(defn f [x]\n  (+ x", "parse error: unclosed `(`", "(");
@@ -1607,7 +1635,7 @@ test "integration: core.nx second / last" {
     try expectOutput("(last (list :a :b :c))", ":c");
     try expectOutput("(last (list))", "nil");
     try expectOutput("[(last []) (last nil) (last \"hé\") (last {:a 1}) (last (range 100000)) (last (rest [1])) (last (map inc (range 9))) (last (cons 0 (rest [1 2 3 4 5])))]", "[nil nil é [:a 1] 99999 nil 9 5]");
-    try expectOutput("(try (last 5) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (last 5) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
 }
 
 test "integration: core.nx reverse" {
@@ -1686,7 +1714,7 @@ test "integration: core.nx comment, doto, defonce, assert and time" {
     try expectOutput("[(assert (= 1 1)) (try (assert (= 1 2)) (catch :assertion-failed e (ex-message e)))]", "[nil Assert failed: (= 1 2)]");
     try expectOutput("(try (assert false \"nope\") (catch any e (ex-message e)))", "Assert failed: nope\nfalse");
     // The shape :pre and :post throw: {:error :assertion-failed :message ...}.
-    try expectOutput("(try (assert (= 1 \"a\") (str \"n\" 1)) (catch any e [(ex-message e) (:error e) (ex-data e)]))", "[Assert failed: n1\n(= 1 \"a\") :assertion-failed nil]");
+    try expectOutput("(try (assert (= 1 \"a\") (str \"n\" 1)) (catch any e [(ex-message e) (:error e) (ex-data e)]))", "[Assert failed: n1\n(= 1 \"a\") :assertion-failed {:error :assertion-failed, :message Assert failed: n1\n(= 1 \"a\")}]");
     try expectOutput("(= (try (assert (pos? -1)) (catch any e e)) (try ((fn [x] {:pre [(pos? x)]} x) -1) (catch any e (assoc e :message \"Assert failed: (pos? -1)\"))))", "true");
     try expectOutput("(let [f (fn [] (try (assert false) (catch any e e)))] (identical? (f) (f)))", "false");
     try expectOutput("(let [r (atom nil) s (with-out-str (reset! r (time (+ 1 2))))] [@r (subs s 0 15) (subs s (- (count s) 8))])", "[3 \"Elapsed time:   msecs\"\n]");
@@ -1706,7 +1734,7 @@ test "integration: core.nx higher-order functions: some-fn, every-pred, memoize,
     // as Clojure's arities do.
     try expectOutput("[((some-fn :a :b) {:b 5}) ((some-fn :a) {} {}) ((some-fn even? neg? zero?) 1) ((some-fn even? neg? zero? #{9}) 1) ((some-fn even?) 1 3 5 7) ((some-fn even?))]", "[5 nil false nil nil nil]");
     try expectOutput("[((some-fn :a :b) {} {} {} {:b 4} {:a 5}) ((some-fn #{4} #{5} #{6} #{7}) 1 2 3 7 6)]", "[4 6]");
-    try expectOutput("(try (some-fn) (catch any e e))", ":arity-mismatch");
+    try expectOutput("(try (some-fn) (catch any e e))", "{:error :arity-mismatch, :message some-fn takes at least 1 argument, got 0, :fn test-form}");
     try expectOutputProgram("(def calls (atom 0)) (def f (memoize (fn [x] (swap! calls inc) (* x x)))) [(f 3) (f 3) (f 4) @calls]", "[9 9 16 2]");
     try expectOutputProgram("(defn down [n] (if (zero? n) :done #(down (dec n)))) (trampoline down 100000)", ":done");
     try expectOutput("(sort (comparator >) [1 3 2])", "(3 2 1)");
@@ -1721,7 +1749,7 @@ test "integration: core.nx sequence functions: partition-by, dedupe, take-nth, s
     try expectOutput("[(partition-by odd? []) (partition-by odd? nil) (dedupe []) (dedupe nil) (take-last 0 [1 2]) (take-last 2 nil) (take-last 2 []) (take-last 5 [1 2])]", "[() () () () nil nil nil (1 2)]");
     try expectOutput("[(nthrest [1 2] 0) (nthrest [1 2] -1) (nthrest nil 1) (nthrest [] 1) (nthrest [1] 2) (nthrest (list 1 2) 1) (drop 0 [1 2]) (drop 0 nil) (drop 5 [1]) (drop -1 [1]) (nthnext [1 2] 0)]", "[[1 2] [1 2] nil () () (2) (1 2) () () (1) (1 2)]");
     // As Clojure's: distinct? takes one argument or more.
-    try expectOutput("(try (distinct?) (catch any e e))", ":arity-mismatch");
+    try expectOutput("(try (distinct?) (catch any e e))", "{:error :arity-mismatch, :message distinct? takes at least 1 argument, got 0, :fn test-form}");
     try expectOutput("[(distinct? 1 2 3) (distinct? 1 2 1) (doall (map inc [1])) (dorun [1]) (rseq [1 2 3]) (rseq []) (nthnext [1 2 3] 2) (nthnext [1] 1)]", "[true false (2) nil (3 2 1) nil (3) nil]");
     try expectOutput("[(ffirst [[1 2]]) (fnext [1 2 3]) (nnext [1 2 3]) (second #{9}) (second (list 1 2 3))]", "[1 2 (3) nil 2]");
 }
@@ -1750,7 +1778,7 @@ test "core: nfirst, tree-seq, replace, bounded-count, random-sample" {
     try expectOutput("[(nfirst [[1 2 3] 4]) (nfirst nil) (nfirst [[1]])]", "[(2 3) nil nil]");
     try expectOutput("(tree-seq seq? identity '((1 2 (3)) (4)))", "(((1 2 (3)) (4)) (1 2 (3)) 1 2 (3) 3 (4) 4)");
     try expectOutput("[(tree-seq map? vals {:a {:b 1} :c 2}) (tree-seq vector? seq []) (tree-seq vector? seq 1)]", "[({:a {:b 1}, :c 2} {:b 1} 1 2) ([]) (1)]");
-    try expectOutput("(try (doall (tree-seq nil nil 1)) (catch any e e))", ":not-callable");
+    try expectOutput("(try (doall (tree-seq nil nil 1)) (catch any e e))", "{:error :not-callable, :message nil is not callable, :fn test-form}");
     // Deep trees walk without the native stack.
     try expectOutput("(count (tree-seq vector? seq (reduce (fn [t _] [t]) 0 (range 100000))))", "100001");
     try expectOutput("[(replace {1 :a 2 :b} [1 2 3]) (replace {1 :a} '(1 2 1)) (replace [:a :b] [0 1 0 5]) (replace {} nil) (replace {1 2} #{1 3}) (meta (replace {} ^:m [1]))]", "[[:a :b 3] (:a 2 :a) [:a :b :a 5] () (2 3) {:m true}]");
@@ -1771,7 +1799,7 @@ test "core: var-get, find-var, load-string" {
         \\(def x 4)
         \\[(var-get #'x) (find-var 'user/x) (find-var 'nexis.core/inc) (find-var 'user/nope) (try (find-var 'nope/x) (catch any e e))
         \\ (try (var-get 1) (catch any e e)) (load-string "(def zz 2) (+ zz x) ; c") zz (load-string "")]
-    , "[4 #'user/x #'nexis.core/inc nil :no-such-namespace :kind-mismatch 6 2 nil]");
+    , "[4 #'user/x #'nexis.core/inc nil {:error :no-such-namespace, :message no namespace named nope, :fn test-form} {:error :kind-mismatch, :message var-get takes a Var, got an integer, :fn test-form} 6 2 nil]");
 }
 
 test "core: load-string reads and evaluates a form at a time, and leaves the namespace as it found it" {
@@ -1812,7 +1840,7 @@ test "integration: char and int conversion, parse-long, parse-double, parse-bool
     try expectOutput("[(int \\A) (char 97) (int 3.9) (long \\a) (char \\b)]", "[65 a 3 97 b]");
     // int checks Java's 32-bit int range, as Clojure's cast does.
     try expectOutput("[(int 2147483647) (int -2147483648) (int -3.9) (int -2147483647.9)]", "[2147483647 -2147483648 -3 -2147483647]");
-    try expectOutput("(map #(try (int %) (catch any e e)) [2147483648 2147483648.5 -2147483649.0 1e300 99999999999999999999 ##Inf])", "(:invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument)");
+    try expectOutput("(map #(try (int %) (catch any e e)) [2147483648 2147483648.5 -2147483649.0 1e300 99999999999999999999 ##Inf])", "({:error :invalid-argument, :message invalid argument, :fn fn} {:error :invalid-argument, :message invalid argument, :fn fn} {:error :invalid-argument, :message invalid argument, :fn fn} {:error :invalid-argument, :message invalid argument, :fn fn} {:error :invalid-argument, :message invalid argument, :fn fn} {:error :invalid-argument, :message invalid argument, :fn fn})");
     // A float is truncated, then range-checked: Clojure's boxed cast
     // (longCast, then the narrowing check), the rule nexis follows.
     try expectOutput("[(int 2147483647.5) (byte 127.5) (byte -128.5) (short -32768.5)]", "[2147483647 127 -128 -32768]");
@@ -1820,11 +1848,11 @@ test "integration: char and int conversion, parse-long, parse-double, parse-bool
     try expectOutput("[(int ##NaN) (short ##NaN) (byte ##NaN)]", "[0 0 0]");
     // short and byte check their Java ranges the same way.
     try expectOutput("[(byte 127) (byte -128) (byte 1.9) (byte \\a) (short 32767) (short -32768) (short -1.5) (short \\a)]", "[127 -128 1 97 32767 -32768 -1 97]");
-    try expectOutput("(map #(try (byte %) (catch any e e)) [128 -129 128.5 -129.5 \\é 99999999999999999999 ##-Inf nil \"1\"])", "(:invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :kind-mismatch :kind-mismatch)");
-    try expectOutput("(map #(try (short %) (catch any e e)) [32768 -32769 32768.5])", "(:invalid-argument :invalid-argument :invalid-argument)");
+    try expectOutput("(map #(try (byte %) (catch any e e)) [128 -129 128.5 -129.5 \\é 99999999999999999999 ##-Inf nil \"1\"])", "({:error :invalid-argument, :message invalid argument, :fn fn} {:error :invalid-argument, :message invalid argument, :fn fn} {:error :invalid-argument, :message invalid argument, :fn fn} {:error :invalid-argument, :message invalid argument, :fn fn} {:error :invalid-argument, :message invalid argument, :fn fn} {:error :invalid-argument, :message invalid argument, :fn fn} {:error :invalid-argument, :message invalid argument, :fn fn} {:error :kind-mismatch, :message kind mismatch, :fn fn} {:error :kind-mismatch, :message kind mismatch, :fn fn})");
+    try expectOutput("(map #(try (short %) (catch any e e)) [32768 -32769 32768.5])", "({:error :invalid-argument, :message invalid argument, :fn fn} {:error :invalid-argument, :message invalid argument, :fn fn} {:error :invalid-argument, :message invalid argument, :fn fn})");
     try expectOutput("[(parse-long \"42\") (parse-long \"-7\") (parse-long \"4x\") (parse-long \" 1\") (parse-double \"1.5\") (parse-double \"x\") (parse-boolean \"true\") (parse-boolean \"no\")]", "[42 -7 nil nil 1.5 nil true nil]");
-    try expectOutput("(try (char -1) (catch any e e))", ":invalid-argument");
-    try expectOutput("(try (parse-long 1) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (char -1) (catch any e e))", "{:error :invalid-argument, :message invalid argument, :fn test-form}");
+    try expectOutput("(try (parse-long 1) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
     // Java's Long/valueOf and Double/valueOf grammars, as Clojure's
     // parse-long and parse-double use them: no Zig-only spellings.
     try expectOutput("[(parse-long \"+5\") (parse-long \"-0\") (parse-long \"1_000\") (parse-long \"+-5\") (parse-long \"0x10\") (parse-long \"+\") (parse-long \"\") (parse-long \"99999999999999999999\") (parse-long \"-9223372036854775808\")]", "[5 0 nil nil nil nil nil nil -9223372036854775808]");
@@ -1847,8 +1875,8 @@ test "integration: format with %s %d %f %x %% and widths" {
     try expectOutput("(format \"%s-%d-%5.2f-%x-%%-%3d|%-3d|%05d\" \"a\" 42 3.14159 255 7 7 42)", "a-42- 3.14-ff-%-  7|7  |00042");
     try expectOutput("(format \"%s %s\" [1 \"b\"] nil)", "[1 \"b\"] nil");
     try expectOutput("(format \"%.1f %.3f %f\" 2 -0.0005 1.5)", "2.0 -0.001 1.500000");
-    try expectOutput("(try (format \"%d\" \"x\") (catch any e e))", ":kind-mismatch");
-    try expectOutput("(try (format \"%d\") (catch any e e))", ":invalid-argument");
+    try expectOutput("(try (format \"%d\" \"x\") (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
+    try expectOutput("(try (format \"%d\") (catch any e e))", "{:error :invalid-argument, :message invalid argument, :fn test-form}");
     try expectOutput("(with-out-str (printf \"%d+%d\" 1 2))", "1+2");
 }
 
@@ -1857,8 +1885,8 @@ test "integration: format widths count characters, %.Ns truncates, fields are bo
     try expectOutput("(format \"%.2s|%.0s|%.9s|%5.1s|%.1s\" \"héllo\" \"x\" \"ab\" \"éa\" nil)", "hé||ab|    é|n");
     try expectOutput("(let [s (format \"%.400f\" 1e300)] [(count s) (subs s 0 3) (subs s 299 304)])", "[702 100 00.00]");
     try expectOutput("(format \"%f %.2f %f %5.1f\" ##NaN ##Inf ##-Inf 1e-300)", "NaN Infinity -Infinity   0.0");
-    try expectOutput("[(try (format \"%99999999999999999999d\" 1) (catch any e e)) (try (format \"%.99999999999999999999f\" 1.0) (catch any e e)) (try (format \"%2000000s\" \"\") (catch any e e))]", "[:invalid-argument :invalid-argument :invalid-argument]");
-    try expectOutput("[(try (format \"%.2d\" 1) (catch any e e)) (try (format \"%.1x\" 1) (catch any e e)) (try (format \"%.1c\" \\a) (catch any e e))]", "[:invalid-argument :invalid-argument :invalid-argument]");
+    try expectOutput("[(try (format \"%99999999999999999999d\" 1) (catch any e e)) (try (format \"%.99999999999999999999f\" 1.0) (catch any e e)) (try (format \"%2000000s\" \"\") (catch any e e))]", "[{:error :invalid-argument, :message invalid argument, :fn test-form} {:error :invalid-argument, :message invalid argument, :fn test-form} {:error :invalid-argument, :message invalid argument, :fn test-form}]");
+    try expectOutput("[(try (format \"%.2d\" 1) (catch any e e)) (try (format \"%.1x\" 1) (catch any e e)) (try (format \"%.1c\" \\a) (catch any e e))]", "[{:error :invalid-argument, :message invalid argument, :fn test-form} {:error :invalid-argument, :message invalid argument, :fn test-form} {:error :invalid-argument, :message invalid argument, :fn test-form}]");
     try expectOutput("(count (format \"%1048576s\" \"\"))", "1048576");
 }
 
@@ -1868,23 +1896,23 @@ test "integration: transients: transient, conj!, assoc!, dissoc!, disj!, pop!, p
     try expectOutput("(persistent! (disj! (conj! (transient #{1}) 2 3) 1))", "#{2 3}");
     try expectOutput("(persistent! (pop! (assoc! (transient [1 2 3]) 0 9)))", "[9 2]");
     try expectOutput("(let [t (transient [1 2])] [(count t) (nth t 1) (get t 0) (count (transient {:a 1})) (get (transient {:a 1}) :a) (contains? (transient #{1}) 1)])", "[2 2 1 1 1 true]");
-    try expectOutput("(let [t (transient [])] (persistent! t) (try (conj! t 1) (catch any e e)))", ":transient-used-after-persistent");
-    try expectOutput("(try (transient '(1)) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(let [t (transient [])] (persistent! t) (try (conj! t 1) (catch any e e)))", "{:error :transient-used-after-persistent, :message transient used after persistent!, :fn test-form}");
+    try expectOutput("(try (transient '(1)) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
     try expectOutput("(persistent! (conj! (transient {}) [:k 1]))", "{:k 1}");
     // conj! onto a transient map takes what conj onto a map takes: an
     // entry, a map or record whose entries are all added, or nil.
     try expectOutputProgram("(defrecord R [x]) (persistent! (conj! (transient {:a 1}) {:b 2 :c 3} nil [:d 4] (->R 5)))", "{:a 1, :b 2, :c 3, :d 4, :x 5}");
-    try expectOutput("[(try (conj! (transient {}) [1 2 3]) (catch any e e)) (try (conj! (transient {}) 1) (catch any e e))]", "[:arity-mismatch :kind-mismatch]");
+    try expectOutput("[(try (conj! (transient {}) [1 2 3]) (catch any e e)) (try (conj! (transient {}) 1) (catch any e e))]", "[{:error :arity-mismatch, :message arity mismatch, :fn test-form} {:error :kind-mismatch, :message kind mismatch, :fn test-form}]");
     // empty? counts a transient, as Clojure 1.12's does (CLJ-1872).
     try expectOutput("[(empty? (transient [])) (empty? (transient [1])) (empty? (transient {:a 1})) (empty? (transient #{}))]", "[true false false true]");
-    try expectOutput("(let [t (transient [])] (persistent! t) (try (empty? t) (catch any e e)))", ":transient-used-after-persistent");
+    try expectOutput("(let [t (transient [])] (persistent! t) (try (empty? t) (catch any e e)))", "{:error :transient-used-after-persistent, :message transient used after persistent!, :fn test-form}");
     // A transient is called, and looked up by a keyword, as its
     // persistent kind is.
     try expectOutput("[(:a (transient {:a 1})) (:b (transient {:a 1}) 7) ((transient {:a 1}) :a) ((transient {:a 1}) :b 9) ((transient [5 6]) 1) ((transient #{3}) 3) ((transient #{3}) 4) (:a (transient [1])) (map (transient {:a 1}) [:a :c])]", "[1 7 1 9 6 3 nil nil (1 nil)]");
-    try expectOutput("[(try ((transient [1 2]) 5) (catch any e e)) (try ((transient [1 2]) :a) (catch any e e)) (try ((transient #{1}) 1 2) (catch any e e))]", "[:index-out-of-bounds :kind-mismatch :arity-mismatch]");
-    try expectOutput("(let [t (transient {:a 1})] (persistent! t) [(try (:a t) (catch any e e)) (try (t :a) (catch any e e)) (try (get t :a) (catch any e e))])", "[:transient-used-after-persistent :transient-used-after-persistent :transient-used-after-persistent]");
+    try expectOutput("[(try ((transient [1 2]) 5) (catch any e e)) (try ((transient [1 2]) :a) (catch any e e)) (try ((transient #{1}) 1 2) (catch any e e))]", "[{:error :index-out-of-bounds, :message index 5 is out of bounds for a transient, :fn test-form} {:error :kind-mismatch, :message a transient takes an integer index, got a keyword, :fn test-form} {:error :arity-mismatch, :message a transient takes 1 argument, got 2, :fn test-form}]");
+    try expectOutput("(let [t (transient {:a 1})] (persistent! t) [(try (:a t) (catch any e e)) (try (t :a) (catch any e e)) (try (get t :a) (catch any e e))])", "[{:error :transient-used-after-persistent, :message transient used after persistent!, :fn test-form} {:error :transient-used-after-persistent, :message transient used after persistent!, :fn test-form} {:error :transient-used-after-persistent, :message transient used after persistent!, :fn test-form}]");
     try expectOutput("(let [t (transient [1 2 3])] (identical? t (assoc! t 3 4)))", "true");
-    try expectOutput("[(try (assoc! (transient [1]) 5 :x) (catch any e e)) (try (pop! (transient [])) (catch any e e))]", "[:index-out-of-bounds :index-out-of-bounds]");
+    try expectOutput("[(try (assoc! (transient [1]) 5 :x) (catch any e e)) (try (pop! (transient [])) (catch any e e))]", "[{:error :index-out-of-bounds, :message index out of bounds, :fn test-form} {:error :index-out-of-bounds, :message index out of bounds, :fn test-form}]");
     try expectOutput("[(pop [1 2 3]) (pop [1]) (count (reduce (fn [v _] (pop v)) (vec (range 2000)) (range 1990)))]", "[[1 2] [] 10]");
 }
 
@@ -1972,7 +2000,7 @@ test "integration: delay, force, realized?, delay?" {
     // A throw is cached: the body runs once and every deref rethrows it.
     try expectOutput("(let [n (atom 0) d (delay (swap! n inc) (throw :boom))] [(try @d (catch any e e)) (try (force d) (catch any e e)) @n (realized? d)])", "[:boom :boom 1 true]");
     try expectOutput("(let [d (delay nil)] [@d (realized? d) (= d d) (= d (delay nil))])", "[nil true true false]");
-    try expectOutput("[(try (realized? 1) (catch any e e)) (try (realized? nil) (catch any e e))]", "[:kind-mismatch :kind-mismatch]");
+    try expectOutput("[(try (realized? 1) (catch any e e)) (try (realized? nil) (catch any e e))]", "[{:error :kind-mismatch, :message kind mismatch, :fn test-form} {:error :kind-mismatch, :message kind mismatch, :fn test-form}]");
     try expectOutputUnderGc("(let [ds (mapv (fn [i] (delay (vec (range i)))) (range 50))] (reduce + (map (comp count deref) ds)))", "1225");
 }
 
@@ -1983,13 +2011,13 @@ test "integration: with-open closes each binding in reverse order, through Close
         \\[(with-open [a (->R 1) b (->R 2)] (swap! log conj :body) :result) @log
         \\ (try (with-open [c (->R 3)] (throw :boom)) (catch any e e)) @log (with-open [] 7)]
     , "[:result [:body 2 1] :boom [:body 2 1 3] 7]");
-    try expectOutput("(try (with-open [a 1] 2) (catch any e e))", ":no-protocol-impl");
-    try expectOutput("(try (macroexpand '(with-open [a] 1)) (catch any e e))", ":macro-expansion-failure");
+    try expectOutput("(try (with-open [a 1] 2) (catch any e e))", "{:error :no-protocol-impl, :message no impl of close for an integer, :fn test-form}");
+    try expectOutput("(try (macroexpand '(with-open [a] 1)) (catch any e e))", "{:error :macro-expansion-failure, :message macro expansion failure, :fn test-form}");
     try expectOutputProgramWithStore("with-open-conns",
         \\(def c (with-open [c (db/open "@STORE@")] c))
         \\(def n (with-open [n (nextomic/connect "@STORE@.nextomic")] n))
         \\[(try (db/begin-read c) (catch any e e)) (try (nextomic/db n) (catch any e (or (:error e) e)))]
-    , "[:db-closed :nextomic/closed]");
+    , "[{:error :db-closed, :message db closed, :fn test-form} :nextomic/closed]");
 }
 
 test "integration: tap> calls every tap, and a tap that throws is ignored" {
@@ -2005,7 +2033,7 @@ test "integration: class, type, instance?, var?, special-symbol?" {
     try expectOutput("(map class [nil true false \\a 1 99999999999999999999 1.5 :k 'x \"s\" '(1) [1] {:a 1} #{1} (i64-vector [1]) (fn [] 1) first (atom 1) (transient []) #'inc])", "(nil :boolean :boolean :char :fixnum :bignum :float :keyword :symbol :string :list :vector :map :set :typed_vector :function :native_fn :atom :transient :var_)");
     // A record's type is the symbol it prints with; :type metadata is type's.
     try expectOutput("(defrecord P [x]) [(class (->P 1)) (type (->P 1)) (symbol? (type (->P 1))) (type (with-meta [1] {:type :point})) (class (with-meta [1] {:type :point})) (type (with-meta (->P 1) {:type :q}))]", "[user.P user.P true :point :vector :q]");
-    try expectOutput("(defrecord P [x]) [(instance? :vector [1]) (instance? :map [1]) (instance? 'user.P (->P 1)) (instance? (type (->P 1)) (->P 2)) (instance? :map (->P 1)) (instance? :vector (with-meta [] {:type :t})) (try (instance? nil 1) (catch any e e))]", "[true false true true false true :kind-mismatch]");
+    try expectOutput("(defrecord P [x]) [(instance? :vector [1]) (instance? :map [1]) (instance? 'user.P (->P 1)) (instance? (type (->P 1)) (->P 2)) (instance? :map (->P 1)) (instance? :vector (with-meta [] {:type :t})) (try (instance? nil 1) (catch any e e))]", "[true false true true false true {:error :kind-mismatch, :message instance? takes a kind keyword or a record symbol, got nil, :fn test-form}]");
     try expectOutput("(def x 1) [(var? #'x) (var? x) (var? 'x) (var? (resolve 'inc))]", "[true false false true]");
     try expectOutput("(map special-symbol? '[if def let* fn* loop* letfn* quote var recur try catch finally throw do set! & let fn nexis.core/if])", "(true true true true true true true true true true true true true true true true false false false)");
     try expectOutput("[(special-symbol? \"if\") (special-symbol? :if)]", "[false false]");
@@ -2057,7 +2085,7 @@ test "hierarchies: derive builds the closures, refuses cycles, and keeps an exis
         \\  [#(derive family :user/child :user/child) #(derive family "s" :user/p) #(derive family :user/a "p")
         \\   #(derive :a :user/x) #(derive :user/a :x)])
     , "(\"Assert failed: (not= tag parent)\" \"Assert failed: (or (class? tag) (instance? clojure.lang.Named tag))\" \"Assert failed: (instance? clojure.lang.Named parent)\" \"Assert failed: (or (class? tag) (and (instance? clojure.lang.Named tag) (namespace tag)))\" \"Assert failed: (namespace parent)\")");
-    try expectOutputProgram("[(try (derive :user/a 1) (catch any e e)) (try (derive :user/a 'b) (catch any e (:error e)))]", "[:kind-mismatch :assertion-failed]");
+    try expectOutputProgram("[(try (derive :user/a 1) (catch any e e)) (try (derive :user/a 'b) (catch any e (:error e)))]", "[{:error :kind-mismatch, :message kind mismatch, :fn test-form} :assertion-failed]");
 }
 
 test "hierarchies: underive rebuilds from the remaining edges; isa? over the diamond and over vectors" {
@@ -2219,7 +2247,7 @@ test "multimethods: methods, get-method, prefers, remove-all-methods and what ea
         \\ (multifn? rv) (multifn? inc) (fn? rv) (ifn? rv) (= rv rv) (get {rv 1} rv) (meta rv)
         \\ (try (with-meta rv {:a 1}) (catch any e e)) (try (methods {}) (catch ClassCastException e e))
         \\ (try (defmethod {} :a [] 1) (catch any e e))]
-    , "[true true {:a #{:b}} true true {} {} true false true true true 1 nil :kind-mismatch :kind-mismatch :kind-mismatch]");
+    , "[true true {:a #{:b}} true true {} {} true false true true true 1 nil {:error :kind-mismatch, :message kind mismatch, :fn test-form} {:error :kind-mismatch, :message expected a multimethod, got a map, :fn test-form} {:error :kind-mismatch, :message expected a multimethod, got a map, :fn test-form}]");
     // get-method: an ambiguity throws as a call does; no match and no default is nil.
     try expectOutputProgram(
         \\(derive :user/a :user/c) (derive :user/b :user/c) (derive :user/ab :user/a) (derive :user/ab :user/b)
@@ -2258,7 +2286,7 @@ test "multimethods: :default and :hierarchy options; the cache follows the hiera
         \\(defmethod p :user/parent [_] :p)
         \\(swap! ah derive :user/kid :user/parent)
         \\[(p :user/kid) (try (defmulti bad identity :hierarchy {}) (catch ClassCastException e e))]
-    , "[:p :kind-mismatch]");
+    , "[:p {:error :kind-mismatch, :message make-multifn reads its hierarchy through a Var or an atom, got a map, :fn test-form}]");
 }
 
 test "multimethods: defmulti defines once; its docstring and attr-map reach the Var" {
@@ -2273,8 +2301,8 @@ test "multimethods: defmulti defines once; its docstring and attr-map reach the 
         \\[first-def second-def kept (methods r) ((juxt :doc :extra :name) (meta #'doc-m))]
     , "[#'user/r nil :one {} [the doc 1 doc-m]]");
     try expectOutputProgram(
-        \\[(try (eval '(defmulti s1 identity :default)) (catch any e ((juxt :error :detail) e)))
-        \\ (try (eval '(defmulti s2 identity :frob 1)) (catch any e ((juxt :error :detail) e)))]
+        \\[(try (eval '(defmulti s1 identity :default)) (catch any e ((juxt :error :message) e)))
+        \\ (try (eval '(defmulti s2 identity :frob 1)) (catch any e ((juxt :error :message) e)))]
     , "[[:compile-error macro defmulti threw The syntax for defmulti has changed. Example: (defmulti name dispatch-fn :default dispatch-value)] [:compile-error macro defmulti threw Only these options are valid: :default, :hierarchy]]");
 }
 
@@ -2302,7 +2330,7 @@ test "multimethods: #%mm-lookup reads a cache only while its hierarchy is the on
         \\[(lookup cache h :a) (lookup cache h [:v]) (lookup cache h :b) (do (reset! h {:parents {}}) (lookup cache h :a))
         \\ (lookup cache #'nexis.core/global-hierarchy :a)
         \\ (try (lookup {} h :a) (catch any e e)) (try (lookup cache {} :a) (catch any e e))]
-    , "[1 2 nil nil nil :kind-mismatch :kind-mismatch]");
+    , "[1 2 nil nil nil {:error :kind-mismatch, :message kind mismatch, :fn test-form} {:error :kind-mismatch, :message kind mismatch, :fn test-form}]");
 }
 
 test "multimethods: a multimethod is unserializable as any function" {
@@ -2310,7 +2338,7 @@ test "multimethods: a multimethod is unserializable as any function" {
         \\(defmulti m identity)
         \\(def c (db/open "@STORE@"))
         \\(try (db/put-key! (db/ref c :t "m") m) (catch :unserializable e e))
-    , ":unserializable");
+    , "{:error :unserializable, :message unserializable, :fn test-form}");
 }
 
 const apputil = [2][]const u8{ "app/util.nx", "(ns app.util)\n(def x 1)\n(defn- y [] 2)\n" };
@@ -2321,7 +2349,7 @@ test "integration: namespaces as their name symbols: the-ns, find-ns, ns-name, a
         \\[(the-ns 'app.util) (find-ns 'app.util) (find-ns 'nope) (ns-name 'user) (try (the-ns 'nope) (catch any e e))
         \\ (ns-publics 'app.util) (ns-interns 'app.util) (contains? (ns-publics 'user) 'x) (get (ns-publics 'nexis.core) 'inc)
         \\ (every? symbol? (all-ns)) (boolean (some #{'app.util} (all-ns))) (try (find-ns "user") (catch any e e))]
-    , "[app.util app.util nil user :no-such-namespace {x #'app.util/x} {x #'app.util/x, y #'app.util/y} false #'nexis.core/inc true true :kind-mismatch]");
+    , "[app.util app.util nil user {:error :no-such-namespace, :message no namespace named nope, :fn test-form} {x #'app.util/x} {x #'app.util/x, y #'app.util/y} false #'nexis.core/inc true true {:error :kind-mismatch, :message kind mismatch, :fn test-form}]");
 }
 
 test "integration: resolve and ns-resolve name a Var through the namespace's names" {
@@ -2331,11 +2359,11 @@ test "integration: resolve and ns-resolve name a Var through the namespace's nam
         \\[(resolve 'first) (resolve 'x) (resolve 'u/x) (resolve 'app.util/x) (resolve 's/join) (resolve 'own) (resolve 'nope) (resolve 'nope/x) (resolve 'u/nope)
         \\ (ns-resolve 'app.util 'x) (ns-resolve 'app.util 'own) (ns-resolve 'app.util 'inc) (resolve 'when) (@(resolve 'inc) 1)
         \\ (try (resolve "x") (catch any e e)) (try (ns-resolve 'nope 'x) (catch any e e))]
-    , "[#'nexis.core/first #'app.util/x #'app.util/x #'app.util/x #'nexis.string/join #'user/own nil nil nil #'app.util/x nil #'nexis.core/inc nil 2 :kind-mismatch :no-such-namespace]");
+    , "[#'nexis.core/first #'app.util/x #'app.util/x #'app.util/x #'nexis.string/join #'user/own nil nil nil #'app.util/x nil #'nexis.core/inc nil 2 {:error :kind-mismatch, :message kind mismatch, :fn test-form} {:error :no-such-namespace, :message no such namespace, :fn test-form}]");
 }
 
 test "vars: alter-var-root sets a Var's root through a function, beneath a binding too" {
-    try expectOutputProgram("(def x 1) (defn f [] x) [(alter-var-root #'x + 10 5) x (f) (try (alter-var-root 1 inc) (catch any e e))]", "[16 16 16 :kind-mismatch]");
+    try expectOutputProgram("(def x 1) (defn f [] x) [(alter-var-root #'x + 10 5) x (f) (try (alter-var-root 1 inc) (catch any e e))]", "[16 16 16 {:error :kind-mismatch, :message kind mismatch, :fn test-form}]");
     try expectOutputProgram("(def ^:dynamic *d* 1) [(binding [*d* 2] [(alter-var-root #'*d* inc) *d*]) *d*]", "[[2 2] 2]");
     // An unbound Var's root is nil to the function, and bound after.
     try expectOutputProgram("(def u) [(alter-var-root #'u (constantly 3)) u]", "[3 3]");
@@ -2347,7 +2375,7 @@ test "vars: with-redefs sets roots for its body and restores them on every exit"
     try expectOutputProgram("(def x 1) [(with-redefs-fn {#'x 5} (fn [] x)) x]", "[5 1]");
     try expectOutput("(with-redefs [rand-int (constantly 4)] (rand-int 100))", "4");
     // An unbound Var is unbound again afterwards, as Clojure restores its Unbound root.
-    try expectOutputProgram("(declare u) [(with-redefs [u (fn [] :r)] (u)) (bound? #'u) (try (u) (catch any e e)) (try (with-redefs-fn {#'u 1} (fn [] (throw :t))) (catch any e e)) (bound? #'u)]", "[:r false :unbound-var :t false]");
+    try expectOutputProgram("(declare u) [(with-redefs [u (fn [] :r)] (u)) (bound? #'u) (try (u) (catch any e e)) (try (with-redefs-fn {#'u 1} (fn [] (throw :t))) (catch any e e)) (bound? #'u)]", "[:r false {:error :unbound-var, :message unbound var, :fn test-form} :t false]");
 }
 
 test "vars: *ns* is the current namespace's name symbol where a form is compiled and run; flush is a no-op" {
@@ -2359,11 +2387,11 @@ test "vars: *ns* is the current namespace's name symbol where a form is compiled
 test "integration: a UUID is its canonical string" {
     try expectOutput("(let [u (random-uuid)] [(uuid? u) (string? u) (count u) (subs u 14 15) (contains? #{\\8 \\9 \\a \\b} (nth u 19)) (= u (parse-uuid u)) (not= u (random-uuid))])", "[true true 36 4 true true true]");
     try expectOutput("(pr-str [(parse-uuid \"0123ABCD-4567-89EF-0123-456789ABCDEF\") (parse-uuid \"nope\") (parse-uuid \"0123abcd-4567-89ef-0123-456789abcdef0\") (parse-uuid \"0123abcd+4567-89ef-0123-456789abcdef\") (parse-uuid \"0123abcd-4567-89ef-0123-456789abcdeg\")])", "[\"0123abcd-4567-89ef-0123-456789abcdef\" nil nil nil nil]");
-    try expectOutput("[(uuid? \"0123abcd-4567-89ef-0123-456789abcdef\") (uuid? \"0123ABCD-4567-89EF-0123-456789ABCDEF\") (uuid? 1) (uuid? nil) (try (parse-uuid nil) (catch any e e)) (try (parse-uuid 1) (catch any e e))]", "[true false false false :kind-mismatch :kind-mismatch]");
+    try expectOutput("[(uuid? \"0123abcd-4567-89ef-0123-456789abcdef\") (uuid? \"0123ABCD-4567-89EF-0123-456789ABCDEF\") (uuid? 1) (uuid? nil) (try (parse-uuid nil) (catch any e e)) (try (parse-uuid 1) (catch any e e))]", "[true false false false {:error :kind-mismatch, :message kind mismatch, :fn test-form} {:error :kind-mismatch, :message kind mismatch, :fn test-form}]");
 }
 
 test "integration: in-ns switches the namespace the next forms compile in" {
-    try expectOutputProgram("(in-ns 'other) (def x 1) (in-ns 'user) [other/x (try (in-ns \"s\") (catch any e e))]", "[1 :kind-mismatch]");
+    try expectOutputProgram("(in-ns 'other) (def x 1) (in-ns 'user) [other/x (try (in-ns \"s\") (catch any e e))]", "[1 {:error :kind-mismatch, :message kind mismatch, :fn test-form}]");
 }
 
 test "gc: a native that calls a native through callValue reaches a safe point" {
@@ -2415,7 +2443,7 @@ test "gc: a product of many integers in one call keeps no partial product" {
     // products would sum to about 6 MB.
     try harness.expectResult(&program, "", try program.run("(= (apply * xs) p)"), "true");
     try testing.expect(heap.peak_live_bytes -| start < 1 << 20);
-    try harness.expectResult(&program, "", try program.run("[(apply * 1 2 3 (range 4 30)) (* 4611686018427387904 2 3.0) (* 2 4611686018427387904 -1) (try (* 4611686018427387904 2 :x) (catch any e e))]"), "[8841761993739701954543616000000 2.7670116110564327E19 -9223372036854775808 :kind-mismatch]");
+    try harness.expectResult(&program, "", try program.run("[(apply * 1 2 3 (range 4 30)) (* 4611686018427387904 2 3.0) (* 2 4611686018427387904 -1) (try (* 4611686018427387904 2 :x) (catch any e e))]"), "[8841761993739701954543616000000 2.7670116110564327E19 -9223372036854775808 {:error :kind-mismatch, :message * expects numbers, got a keyword, :fn test-form}]");
 }
 
 test "integration: a sequence native walks a view from its offset, and a cons over one" {
@@ -2509,7 +2537,7 @@ test "db: read-line lets every held snapshot go before it waits" {
 }
 
 test "integration: *command-line-args* is nil without arguments; read-line needs the host's stdin" {
-    try expectOutput("[*command-line-args* (try (read-line) (catch any e e))]", "[nil :io-error]");
+    try expectOutput("[*command-line-args* (try (read-line) (catch any e e))]", "[nil {:error :io-error, :message io error, :fn test-form}]");
 }
 
 test "integration: =, compare, hash, set membership and printing of data nested past the stack are :stack-overflow; flatten walks it" {
@@ -2585,7 +2613,7 @@ test "integration: a transient `!` call is a loop: a wrong operand changes nothi
         \\   (try (conj! m [:y 1] [:w]) (catch any e e))
         \\   (count (persistent! s))
         \\   (let [p (persistent! m)] [(count p) (p :x) (p :y) (p :z) (p 0) (p 1)])])
-    , "[:stack-overflow :stack-overflow :stack-overflow :stack-overflow :kind-mismatch :arity-mismatch 20 [20 1 nil nil nil 1]]");
+    , "[{:error :stack-overflow, :message a value nests too deeply to compare, hash or print, :fn test-form} {:error :stack-overflow, :message a value nests too deeply to compare, hash or print, :fn test-form} {:error :stack-overflow, :message a value nests too deeply to compare, hash or print, :fn test-form} {:error :stack-overflow, :message a value nests too deeply to compare, hash or print, :fn test-form} {:error :kind-mismatch, :message kind mismatch, :fn test-form} {:error :arity-mismatch, :message arity mismatch, :fn test-form} 20 [20 1 nil nil nil 1]]");
 }
 
 test "integration: core.nx composite + HOFs" {
@@ -2703,7 +2731,7 @@ test "lazy: lazy-seq runs its body once, when first walked, and caches what it r
     try expectOutput("(do (def u (lazy-seq u)) [(seq u) (count u)])", "[nil 0]");
     // nth is a leaf; over a lazy seq it is re-issued as a full call.
     try expectOutput("(let [[a b & r] (lazy-seq [1 2 3 4])] [a b r])", "[1 2 (3 4)]");
-    try expectOutput("(let [s (lazy-seq [:a :b])] [(nth s 1) (try (nth s 2) (catch any e e)) (nth s -1 :d) (map (fn [i] (nth s i :z)) [0 1 2])])", "[:b :index-out-of-bounds :d (:a :b :z)]");
+    try expectOutput("(let [s (lazy-seq [:a :b])] [(nth s 1) (try (nth s 2) (catch any e e)) (nth s -1 :d) (map (fn [i] (nth s i :z)) [0 1 2])])", "[:b {:error :index-out-of-bounds, :message index out of bounds, :fn test-form} :d (:a :b :z)]");
 }
 
 test "lazy: a step that throws ends the seq at its block on the next walk" {
@@ -2728,8 +2756,8 @@ test "leaf natives: what a leaf body refuses goes the general way from every cal
     try expectOutput("(let [s (map inc [1 2 3])] [(count s) (count (lazy-seq nil)) (apply count [s]) (mapv count [s [1] \"ab\" nil {:a 1}])])", "[3 0 3 [3 1 2 0 1]]");
     try expectOutput("(let [s (map inc [1 2 3])] [(nthnext s 1) (nthnext [1 2 3] 2) (nthnext [1] 1) (nthnext (list 1 2) 1) (apply nthnext [s 2]) (mapv nthnext [s #{1} \"ab\" {:a 1}] [2 0 1 0])])", "[(3 4) (3) nil (2) (4) [(4) (1) (b) ([:a 1])]]");
     try expectOutput("[(conj [1] 2) (conj nil 1) (conj (list 1) 0) (conj #{} [1]) (conj {} [:a 1]) (conj (map inc [1]) 0) (apply conj [#{} 1]) (mapv conj [[] #{} {} (sorted-set)] [1 [2] [:k 3] 4]) (reduce conj [] (range 3)) (reduce conj #{} [1 1 2])]", "[[1 2] (1) (0 1) #{[1]} {:a 1} (0 2) #{1} [[1] #{[2]} {:k 3} #{4}] [0 1 2] #{1 2}]");
-    try expectOutput("(do (defrecord P [x]) [(assoc {} :a 1) (assoc nil 1 2 3 4) (assoc [1 2] 2 3) (assoc {} [1] :v \"k\" :w) (:x (assoc (->P 1) :x 2)) (assoc (sorted-map 2 :b) 1 :a) (try (assoc [1] 5 :x) (catch any e e)) (apply assoc [{} [2] 3]) (mapv assoc [{} (sorted-map) [0]] [:a 1 0] [1 2 3])])", "[{:a 1} {1 2, 3 4} [1 2 3] {[1] :v, k :w} 2 {1 :a, 2 :b} :index-out-of-bounds {[2] 3} [{:a 1} {1 2} [3]]]");
-    try expectOutput("(let [t (transient {}) v (transient [])] (assoc! t :a 1 [1] 2) (assoc! v 0 :x) (apply assoc! [t \"k\" 3]) (mapv assoc! [t v] [:b 1] [4 :y]) [(persistent! t) (persistent! v) (try (assoc! (transient #{}) 1 1) (catch any e e)) (try (assoc! t :c 1) (catch any e e))])", "[{:a 1, [1] 2, k 3, :b 4} [:x :y] :kind-mismatch :transient-used-after-persistent]");
+    try expectOutput("(do (defrecord P [x]) [(assoc {} :a 1) (assoc nil 1 2 3 4) (assoc [1 2] 2 3) (assoc {} [1] :v \"k\" :w) (:x (assoc (->P 1) :x 2)) (assoc (sorted-map 2 :b) 1 :a) (try (assoc [1] 5 :x) (catch any e e)) (apply assoc [{} [2] 3]) (mapv assoc [{} (sorted-map) [0]] [:a 1 0] [1 2 3])])", "[{:a 1} {1 2, 3 4} [1 2 3] {[1] :v, k :w} 2 {1 :a, 2 :b} {:error :index-out-of-bounds, :message index out of bounds, :fn test-form} {[2] 3} [{:a 1} {1 2} [3]]]");
+    try expectOutput("(let [t (transient {}) v (transient [])] (assoc! t :a 1 [1] 2) (assoc! v 0 :x) (apply assoc! [t \"k\" 3]) (mapv assoc! [t v] [:b 1] [4 :y]) [(persistent! t) (persistent! v) (try (assoc! (transient #{}) 1 1) (catch any e e)) (try (assoc! t :c 1) (catch any e e))])", "[{:a 1, [1] 2, k 3, :b 4} [:x :y] {:error :kind-mismatch, :message kind mismatch, :fn test-form} {:error :transient-used-after-persistent, :message transient used after persistent!, :fn test-form}]");
     try expectOutput("(pr-str [(str) (str nil 1 \\c \"s\") (str [1 (map inc [1])] :k 1.5) (apply str [1 :a]) (mapv str [1 nil (list 2) :k])])", "[\"\" \"1cs\" \"[1 (2)]:k1.5\" \"1:a\" [\"1\" \"\" \"(2)\" \":k\"]]");
 }
 
@@ -2774,7 +2802,7 @@ test "lazy: a macro's result, eval's form and an unquote-splice may be lazy" {
 
 test "lazy: range is lazy, 32 at a time, infinite without an end, and counts, reduces, indexes and drops without realizing" {
     try expectOutput("[(realized? (range 10)) (take 3 (range)) (take 3 (range 0 10 0)) (range 3 3 0) (count (range 1000000000000)) (reduce + (range 1000000)) (nth (range 10 100) 5) (drop 3 (range 6))]", "[false (0 1 2) (0 0 0) () 1000000000000 499999500000 15 (3 4 5)]");
-    try expectOutput("[(range 0) (class (range 0)) (seq (range 5 5)) (range 5 0 -2) (count (range 0 10 3)) (count (range 10 0 -3)) (nth (range 5) 7 :x) (try (nth (range 5) 7) (catch any e e)) (vec (range 3)) (into #{} (range 3)) (range 0 1 0.25) (range 3.0) (take 2 (range 1.5 1.5 0))]", "[() :list nil (5 3 1) 4 4 :x :index-out-of-bounds [0 1 2] #{0 1 2} (0 0.25 0.5 0.75) (0 1 2) ()]");
+    try expectOutput("[(range 0) (class (range 0)) (seq (range 5 5)) (range 5 0 -2) (count (range 0 10 3)) (count (range 10 0 -3)) (nth (range 5) 7 :x) (try (nth (range 5) 7) (catch any e e)) (vec (range 3)) (into #{} (range 3)) (range 0 1 0.25) (range 3.0) (take 2 (range 1.5 1.5 0))]", "[() :list nil (5 3 1) 4 4 :x {:error :index-out-of-bounds, :message index out of bounds, :fn test-form} [0 1 2] #{0 1 2} (0 0.25 0.5 0.75) (0 1 2) ()]");
     try expectOutput("[(reduce (fn [a x] (if (> x 10) (reduced a) (+ a x))) (range)) (reduce (fn [a x] (if (> a 10) (reduced a) (+ a x))) (range 1 2 0)) (reduce + 100 (range 3)) (reduce + (range 1 2)) (reduce (fn [a x] (if (= x 2) (reduced [a x]) x)) 0 (range 2 10 0))]", "[55 11 103 1 [0 2]]");
     // A realized range is walked, not recomputed; the first chunk is
     // 32 elements, the last what is left.
@@ -2787,8 +2815,8 @@ test "lazy: range is lazy, 32 at a time, infinite without an end, and counts, re
 
 test "lazy: a count is any number, a fraction rounding up as Clojure's counts one down; repeat's is truncated" {
     // Expected values from babashka, which agrees with JVM Clojure 1.12 here.
-    try expectOutput("[(take 2.5 (range 10)) (drop 1.5 (range 5)) (nthrest (range 5) 1.5) (nthrest [1 2 3] 1.5) (nthrest (list 1 2 3) 1.5) (nthrest (list 1 2 3) -0.5) (nthnext [1 2 3] 1.5) (repeat 2.9 :x) (repeat -2.5 :x) (repeat ##NaN :x) (try (repeat ##Inf :x) (catch any e e)) (take ##Inf [1 2]) (take ##NaN [1 2]) (drop ##NaN [1 2]) (drop ##Inf (list 1 2)) (take-last 1.5 [1 2 3]) (repeatedly 1.5 (constantly 0)) (split-at 1.5 [1 2 3]) (into [] (take 2.5) (range 10)) (into [] (drop 1.5) (range 4))]", "[(0 1 2) (2 3 4) (2 3 4) (3) (3) (1 2 3) (3) (:x :x) () () :invalid-argument (1 2) () (1 2) () (2 3) (0 0) [(1 2) (3)] [0 1 2] [2 3]]");
-    try expectOutput("[(try (take :a [1]) (catch any e e)) (try (repeat \"2\" 1) (catch any e e))]", "[:kind-mismatch :kind-mismatch]");
+    try expectOutput("[(take 2.5 (range 10)) (drop 1.5 (range 5)) (nthrest (range 5) 1.5) (nthrest [1 2 3] 1.5) (nthrest (list 1 2 3) 1.5) (nthrest (list 1 2 3) -0.5) (nthnext [1 2 3] 1.5) (repeat 2.9 :x) (repeat -2.5 :x) (repeat ##NaN :x) (try (repeat ##Inf :x) (catch any e e)) (take ##Inf [1 2]) (take ##NaN [1 2]) (drop ##NaN [1 2]) (drop ##Inf (list 1 2)) (take-last 1.5 [1 2 3]) (repeatedly 1.5 (constantly 0)) (split-at 1.5 [1 2 3]) (into [] (take 2.5) (range 10)) (into [] (drop 1.5) (range 4))]", "[(0 1 2) (2 3 4) (2 3 4) (3) (3) (1 2 3) (3) (:x :x) () () {:error :invalid-argument, :message invalid argument, :fn test-form} (1 2) () (1 2) () (2 3) (0 0) [(1 2) (3)] [0 1 2] [2 3]]");
+    try expectOutput("[(try (take :a [1]) (catch any e e)) (try (repeat \"2\" 1) (catch any e e))]", "[{:error :kind-mismatch, :message kind mismatch, :fn test-form} {:error :kind-mismatch, :message kind mismatch, :fn test-form}]");
 }
 
 test "lazy: map, filter, remove, keep, map-indexed and keep-indexed are lazy, 32 at a time over a chunked source" {
@@ -3019,7 +3047,7 @@ test "gc: a seq a local or a parameter holds is let go at its last move (COMPILE
 }
 
 test "lazy: iterate, repeat, repeatedly and cycle are lazy and may be infinite" {
-    try expectOutput("[(take 3 (iterate inc 0)) (take 3 (repeat 1)) (take 2 (repeatedly (constantly :r))) (take 5 (cycle [1 2])) (cycle []) (try (iterate inc 0 5) (catch any e e))]", "[(0 1 2) (1 1 1) (:r :r) (1 2 1 2 1) () :arity-mismatch]");
+    try expectOutput("[(take 3 (iterate inc 0)) (take 3 (repeat 1)) (take 2 (repeatedly (constantly :r))) (take 5 (cycle [1 2])) (cycle []) (try (iterate inc 0 5) (catch any e e))]", "[(0 1 2) (1 1 1) (:r :r) (1 2 1 2 1) () {:error :arity-mismatch, :message iterate takes 2 arguments, got 3, :fn test-form}]");
     try expectOutput("(let [n (atom 0) s (iterate (fn [x] (swap! n inc) (inc x)) 0)] (second s) @n)", "1");
     try expectOutput("(let [n (atom 0) s (repeatedly (fn [] (swap! n inc)))] [(first s) @n (doall (take 3 s)) @n])", "[1 1 (1 2 3) 3]");
     try expectOutput("[(repeat 3 :x) (repeat 0 :x) (repeat -1 :x) (count (repeat 1000000000 :x)) (nth (repeat 5 :y) 4) (drop 3 (repeat 5 :z)) (realized? (repeat 3 1)) (class (cycle [1]))]", "[(:x :x :x) () () 1000000000 :y (:z :z) false :lazy_seq]");
@@ -3082,7 +3110,7 @@ test "lazy: cons, conj, list*, with-meta, empty and doall over a lazy seq" {
     try expectOutput("(let [s (with-meta (lazy-seq [1 2]) {:m 1})] [(meta s) s (meta (rest s)) (meta (next s)) (= s [1 2])])", "[{:m 1} (1 2) nil nil true]");
     try expectOutput("(let [n (atom 0) f (fn f [i] (lazy-seq (swap! n inc) (when (< i 5) (cons i (f (inc i)))))) s (f 0)] [(realized? s) (do (dorun 2 s) @n) (identical? s (doall s)) @n (dorun s) (doall 2 [1 2 3])])", "[false 3 true 6 nil [1 2 3]]");
     try expectOutput("(take 4 (lazy-cat [1 2] [3] (list 4 5)))", "(1 2 3 4)");
-    try expectOutput("[(realized? (delay 1)) (let [d (delay 1)] @d (realized? d)) (try (realized? 1) (catch any e e))]", "[false true :kind-mismatch]");
+    try expectOutput("[(realized? (delay 1)) (let [d (delay 1)] @d (realized? d)) (try (realized? 1) (catch any e e))]", "[false true {:error :kind-mismatch, :message kind mismatch, :fn test-form}]");
 }
 
 test "integration: get (2-arg + 3-arg default)" {
@@ -3199,7 +3227,7 @@ test "integration: a built sequence is a list to every consumer, whatever its le
     try expectOutput("(keep (fn [x] (when (odd? x) (str x x))) (range 9))", "(11 33 55 77)");
     try expectOutput("[(= (map inc (range 5)) '(1 2 3 4 5)) (= (hash (map inc (range 5))) (hash '(1 2 3 4 5))) (= (remove odd? (range 10)) [0 2 4 6 8])]", "[true true true]");
     try expectOutput("[(conj (map inc (range 5)) 0) (cons :a (filter even? (range 10))) (rest (map inc (range 5))) (next (map inc (range 1)))]", "[(0 1 2 3 4 5) (:a 0 2 4 6 8) (2 3 4 5) nil]");
-    try expectOutput("[(try (peek (map inc (range 5))) (catch any e e)) (try (pop (map inc (range 5))) (catch any e e)) (nth (map inc (range 10)) 7) (count (map-indexed vector (range 7))) (last (range 100000))]", "[:kind-mismatch :kind-mismatch 8 7 99999]");
+    try expectOutput("[(try (peek (map inc (range 5))) (catch any e e)) (try (pop (map inc (range 5))) (catch any e e)) (nth (map inc (range 10)) 7) (count (map-indexed vector (range 7))) (last (range 100000))]", "[{:error :kind-mismatch, :message kind mismatch, :fn test-form} {:error :kind-mismatch, :message kind mismatch, :fn test-form} 8 7 99999]");
     try expectOutput("[(meta (with-meta (filter odd? (range 9)) {:a 1})) (meta (map inc (range 9))) (with-meta (map inc (range 5)) {:b 2})]", "[{:a 1} nil (1 2 3 4 5)]");
     try expectOutput("[(map inc []) (filter odd? [2 4 6 8]) (seq (map inc [])) (empty? (remove any? (range 5)))]", "[() () nil true]");
     try expectOutput("(let [xs (map inc (range 5))] {xs :v (vec xs) :w})", "{(1 2 3 4 5) :w}");
@@ -3375,7 +3403,7 @@ test "defmacro: a failing macro call names the macro and the cause, at the call"
     try expectMacroFailure("(defmacro m [a] a)", "(m (+ 1 `x))", "a syntax-quote is not data a macro can take", "`x");
     // A macro body has no `eval` or `load-string` (MACROEXPAND.md §1.2).
     try expectMacroFailure("(defmacro m [] (eval '(+ 1 2)))", "(m)", "macro m threw :no-compiler", "(m)");
-    try expectMacroFailure("(defmacro m [] (load-string \"(+ 1 2)\"))", "(m)", "macro m threw :no-compiler", "(m)");
+    try expectMacroFailure("(defmacro m [] (load-string \"(+ 1 2)\"))", "(m)", "macro m threw :no-compiler: no compiler", "(m)");
 }
 
 test "defmacro: a macro body runs against the program's record types, namespaces and protocols" {
@@ -3576,11 +3604,11 @@ test "compile: a routine of more than 4096 constants, Vars and closures runs" {
 // VmError propagates unchanged.
 
 test "integration: catchable — KindMismatch caught as :kind-mismatch" {
-    try expectOutput("(try (+ 1 :hello) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (+ 1 :hello) (catch any e e))", "{:error :kind-mismatch, :message + expects numbers, got a keyword, :fn test-form}");
 }
 
 test "integration: catchable — UnboundVar caught as :unbound-var" {
-    try expectOutput("(try (+ 1 nope) (catch any e e))", ":unbound-var");
+    try expectOutput("(try (+ 1 nope) (catch any e e))", "{:error :unbound-var, :message unbound var, :fn test-form}");
 }
 
 test "integration: catchable — KindMismatch BYPASSES translation when no handler" {
@@ -3729,7 +3757,7 @@ test "atom: swap! re-entrancy detection (:atom-re-entry)" {
     try expectOutput(
         \\(let [a (atom 0)]
         \\  (try (swap! a (fn [_] (reset! a 999))) (catch any e e)))
-    , ":atom-re-entry");
+    , "{:error :atom-re-entry, :message atom re-entry, :fn fn}");
     // After the failed re-entrant attempt, the outer swap! also
     // failed to write — atom remains at the original value.
     try expectOutput(
@@ -3741,7 +3769,7 @@ test "atom: swap! re-entrancy detection (:atom-re-entry)" {
     try expectOutput(
         \\(let [a (atom 0)]
         \\  (try (swap! a (fn [_] (compare-and-set! a 0 999))) (catch any e e)))
-    , ":atom-re-entry");
+    , "{:error :atom-re-entry, :message atom re-entry, :fn fn}");
 }
 
 test "atom: swap! deref of in-flight atom is allowed" {
@@ -3804,15 +3832,15 @@ test "atom: compare-and-set! uses identity, not =" {
 }
 
 test "atom: reset!/swap!/CAS type errors caught as :kind-mismatch" {
-    try expectOutput("(try (reset! 1 2) (catch any e e))", ":kind-mismatch");
-    try expectOutput("(try (swap! 1 inc) (catch any e e))", ":kind-mismatch");
-    try expectOutput("(try (compare-and-set! 1 1 2) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (reset! 1 2) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
+    try expectOutput("(try (swap! 1 inc) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
+    try expectOutput("(try (compare-and-set! 1 1 2) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
 }
 
 test "atom: swap! with non-callable f surfaces :not-callable" {
     try expectOutput(
         \\(try (swap! (atom 1) 2) (catch any e e))
-    , ":not-callable");
+    , "{:error :not-callable, :message an integer is not callable, :fn test-form}");
 }
 
 test "atom: atoms as map keys distinguish by identity" {
@@ -3862,17 +3890,17 @@ test "atom: a validator refuses a new state with :invalid-reference-state and th
         \\   (try (reset-vals! a -1) (catch any e e))
         \\   (try (compare-and-set! a 99 -1) (catch any e e))
         \\   (swap! a inc) @a])
-    , "[:invalid-reference-state :invalid-reference-state :invalid-reference-state :invalid-reference-state :invalid-reference-state 2 2]");
-    try expectOutput("(try (atom -1 :validator pos?) (catch any e e))", ":invalid-reference-state");
+    , "[{:error :invalid-reference-state, :message invalid reference state, :fn test-form} {:error :invalid-reference-state, :message invalid reference state, :fn test-form} {:error :invalid-reference-state, :message invalid reference state, :fn test-form} {:error :invalid-reference-state, :message invalid reference state, :fn test-form} {:error :invalid-reference-state, :message invalid reference state, :fn test-form} 2 2]");
+    try expectOutput("(try (atom -1 :validator pos?) (catch any e e))", "{:error :invalid-reference-state, :message invalid reference state, :fn test-form}");
     try expectOutput(
         \\(let [a (atom 1)]
         \\  [(try (set-validator! a neg?) (catch any e e)) (get-validator a)
         \\   (set-validator! a pos?) (= pos? (get-validator a))
         \\   (set-validator! a nil) (reset! a -5)])
-    , "[:invalid-reference-state nil nil true nil -5]");
+    , "[{:error :invalid-reference-state, :message invalid reference state, :fn test-form} nil nil true nil -5]");
     // A validator's own throw propagates, and nothing is written.
     try expectOutput("(let [a (atom 1 :validator (fn [x] (if (= x 3) (throw :boom) true)))] [(try (reset! a 3) (catch any e e)) @a])", "[:boom 1]");
-    try expectOutput("(try (set-validator! 1 pos?) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (set-validator! 1 pos?) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
 }
 
 test "atom: watches see key, atom, old and new after every change, and may change the atom" {
@@ -3895,7 +3923,7 @@ test "atom: watches see key, atom, old and new after every change, and may chang
     // atom again; a throw out of a watch leaves the change made.
     try expectOutput("(let [a (atom 1)] (add-watch a :k (fn [_ r _o n] (when (< n 5) (swap! r inc)))) (swap! a inc) @a)", "5");
     try expectOutput("(let [a (atom 1)] (add-watch a :k (fn [& _] (throw :w))) [(try (swap! a inc) (catch any e e)) @a])", "[:w 2]");
-    try expectOutput("[(try (add-watch 1 :k inc) (catch any e e)) (try (remove-watch [] :k) (catch any e e))]", "[:kind-mismatch :kind-mismatch]");
+    try expectOutput("[(try (add-watch 1 :k inc) (catch any e e)) (try (remove-watch [] :k) (catch any e e))]", "[{:error :kind-mismatch, :message kind mismatch, :fn test-form} {:error :kind-mismatch, :message kind mismatch, :fn test-form}]");
 }
 
 test "atom: the :meta option, and reset-meta! and alter-meta! on an atom" {
@@ -3903,8 +3931,8 @@ test "atom: the :meta option, and reset-meta! and alter-meta! on an atom" {
     try expectOutput("(let [a (atom 1)] [(reset-meta! a {:x 1}) (alter-meta! a assoc :y 2) (meta a) (reset-meta! a nil) (meta a)])", "[{:x 1} {:x 1, :y 2} {:x 1, :y 2} nil nil]");
     // Options in any order; a key `atom` does not take is ignored, as
     // in Clojure; a key with no value is :invalid-argument.
-    try expectOutput("(let [a (atom 1 :foo 2 :validator odd? :meta {:a 1})] [@a (meta a) (try (swap! a inc) (catch any e e))])", "[1 {:a 1} :invalid-reference-state]");
-    try expectOutput("[(try (atom 1 :validator) (catch any e e)) (try (atom 1 :meta 5) (catch any e e))]", "[:invalid-argument :kind-mismatch]");
+    try expectOutput("(let [a (atom 1 :foo 2 :validator odd? :meta {:a 1})] [@a (meta a) (try (swap! a inc) (catch any e e))])", "[1 {:a 1} {:error :invalid-reference-state, :message invalid reference state, :fn test-form}]");
+    try expectOutput("[(try (atom 1 :validator) (catch any e e)) (try (atom 1 :meta 5) (catch any e e))]", "[{:error :invalid-argument, :message invalid argument, :fn test-form} {:error :kind-mismatch, :message kind mismatch, :fn test-form}]");
     // Any map, a sorted one included, as with-meta takes.
     try expectOutput("(let [a (atom 1 :meta (sorted-map :b 2 :a 1))] [(meta a) (sorted? (meta a)) (reset-meta! a (sorted-map :z 1)) (meta a)])", "[{:a 1, :b 2} true {:z 1} {:z 1}]");
 }
@@ -3995,10 +4023,10 @@ test "string: nth on string: returns Kind.char at codepoint index" {
 }
 
 test "string: nth on string: out-of-bounds + default" {
-    try expectOutput("(try (nth \"ab\" 2) (catch any e e))", ":index-out-of-bounds");
-    try expectOutput("(try (nth \"\" 0) (catch any e e))", ":index-out-of-bounds");
+    try expectOutput("(try (nth \"ab\" 2) (catch any e e))", "{:error :index-out-of-bounds, :message index out of bounds, :fn test-form}");
+    try expectOutput("(try (nth \"\" 0) (catch any e e))", "{:error :index-out-of-bounds, :message index out of bounds, :fn test-form}");
     // Negative index: same keyword.
-    try expectOutput("(try (nth \"ab\" -1) (catch any e e))", ":index-out-of-bounds");
+    try expectOutput("(try (nth \"ab\" -1) (catch any e e))", "{:error :index-out-of-bounds, :message index out of bounds, :fn test-form}");
     // Default branch: out-of-bounds returns default instead of throwing.
     try expectOutput("(nth \"ab\" 5 :missing)", ":missing");
     try expectOutput("(nth \"ab\" -1 :neg)", ":neg");
@@ -4018,18 +4046,18 @@ test "string: subs: codepoint indices, two- and three-arity" {
 }
 
 test "string: subs: bounds errors as :index-out-of-bounds" {
-    try expectOutput("(try (subs \"ab\" -1) (catch any e e))", ":index-out-of-bounds");
-    try expectOutput("(try (subs \"ab\" 0 -1) (catch any e e))", ":index-out-of-bounds");
-    try expectOutput("(try (subs \"ab\" 3) (catch any e e))", ":index-out-of-bounds");
-    try expectOutput("(try (subs \"ab\" 0 3) (catch any e e))", ":index-out-of-bounds");
+    try expectOutput("(try (subs \"ab\" -1) (catch any e e))", "{:error :index-out-of-bounds, :message index out of bounds, :fn test-form}");
+    try expectOutput("(try (subs \"ab\" 0 -1) (catch any e e))", "{:error :index-out-of-bounds, :message index out of bounds, :fn test-form}");
+    try expectOutput("(try (subs \"ab\" 3) (catch any e e))", "{:error :index-out-of-bounds, :message index out of bounds, :fn test-form}");
+    try expectOutput("(try (subs \"ab\" 0 3) (catch any e e))", "{:error :index-out-of-bounds, :message index out of bounds, :fn test-form}");
     // start > end.
-    try expectOutput("(try (subs \"abc\" 2 1) (catch any e e))", ":index-out-of-bounds");
+    try expectOutput("(try (subs \"abc\" 2 1) (catch any e e))", "{:error :index-out-of-bounds, :message index out of bounds, :fn test-form}");
 }
 
 test "string: subs: kind-mismatch on non-string / non-fixnum index" {
-    try expectOutput("(try (subs 42 0) (catch any e e))", ":kind-mismatch");
-    try expectOutput("(try (subs \"ab\" :nope) (catch any e e))", ":kind-mismatch");
-    try expectOutput("(try (subs \"ab\" 0 :nope) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (subs 42 0) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
+    try expectOutput("(try (subs \"ab\" :nope) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
+    try expectOutput("(try (subs \"ab\" 0 :nope) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
 }
 
 test "string: str: Clojure-canonical concat shape" {
@@ -4076,9 +4104,9 @@ test "string: nth: kind-mismatch fires on non-indexable receiver" {
     // negative-index + default path never returns the default for
     // a non-indexable receiver. `(nth 123 -1 :d)` must be
     // `:kind-mismatch`, NOT `:d`.
-    try expectOutput("(try (nth 123 -1 :d) (catch any e e))", ":kind-mismatch");
-    try expectOutput("(try (nth :keyword 0 :d) (catch any e e))", ":kind-mismatch");
-    try expectOutput("(try (nth {:a 1} 0 :d) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (nth 123 -1 :d) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
+    try expectOutput("(try (nth :keyword 0 :d) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
+    try expectOutput("(try (nth {:a 1} 0 :d) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
     // Strings + vectors + lists + nil honor the default-on-OOB
     // contract.
     try expectOutput("(nth \"ab\" -1 :d)", ":d");
@@ -4153,7 +4181,7 @@ test "storage failures surface as :db/<reason> keywords inside try" {
         \\        (catch any e e))
         \\   (try (db/open "/nexis-no-such-directory/sub/store.edb")
         \\        (catch any e e))])
-    , "[:db/key-too-large :db/key-too-large :db/open-failed]");
+    , "[{:error :db/key-too-large, :message db key too large, :fn test-form} {:error :db/key-too-large, :message db key too large, :fn test-form} {:error :db/open-failed, :message db open failed, :fn test-form}]");
 }
 
 test "db/open and nextomic/connect refuse a path with a NUL byte, or an empty one, as spit does" {
@@ -4164,7 +4192,7 @@ test "db/open and nextomic/connect refuse a path with a NUL byte, or an empty on
         \\ (try (db/open "") (catch any e e))
         \\ (try (nextomic/connect "@STORE@\u0000.txt") (catch any e e))
         \\ (try (nextomic/connect "") (catch any e e))]
-    , "[:invalid-path :invalid-path :invalid-path :invalid-path]");
+    , "[{:error :invalid-path, :message invalid path, :fn test-form} {:error :invalid-path, :message invalid path, :fn test-form} {:error :invalid-path, :message invalid path, :fn test-form} {:error :invalid-path, :message invalid path, :fn test-form}]");
 }
 
 test "a value nested 100 000 deep is stored and read back through a durable ref" {
@@ -4189,7 +4217,7 @@ test "the VM keeps running after a caught storage failure" {
         \\  (def caught (try (with-tx [tx conn] (db/put! tx (db/ref conn :t long-key) 1))
         \\                   (catch any e e)))
         \\  [caught (inc (with-read-tx [t conn] (db/get t (db/ref conn :t :k))))])
-    , "[:db/key-too-large 42]");
+    , "[{:error :db/key-too-large, :message db key too large, :fn test-form} 42]");
 }
 
 test "db/close: a ref, a connection and a second close after it are :db-closed or nil" {
@@ -4204,7 +4232,7 @@ test "db/close: a ref, a connection and a second close after it are :db-closed o
         \\   (db/close c)
         \\   (try (db/ref c :t "k") (catch any e e))
         \\   (try (db/begin-read c) (catch any e e))])
-    , "[:db-closed :db-closed nil :db-closed :db-closed]");
+    , "[{:error :db-closed, :message db closed, :fn test-form} {:error :db-closed, :message db closed, :fn test-form} nil {:error :db-closed, :message db closed, :fn test-form} {:error :db-closed, :message db closed, :fn test-form}]");
 }
 
 test "db/close: aborts the connection's open transactions, whose handles then report :tx-closed" {
@@ -4224,7 +4252,7 @@ test "db/close: aborts the connection's open transactions, whose handles then re
         \\   (db/snapshot? tx)
         \\   (let [c2 (db/open "@STORE@") r2 (db/ref c2 :t "k")]
         \\     [(db/get-key r2) (do (db/put-key! r2 4) (db/get-key r2))])])
-    , "[nil :tx-closed :tx-closed :tx-closed nil false [1 4]]");
+    , "[nil {:error :tx-closed, :message tx closed, :fn test-form} {:error :tx-closed, :message tx closed, :fn test-form} {:error :tx-closed, :message tx closed, :fn test-form} nil false [1 4]]");
 }
 
 test "db/close: refused from a callback that holds one of the connection's transactions" {
@@ -4239,7 +4267,7 @@ test "db/close: refused from a callback that holds one of the connection's trans
         \\   (db/get wx r)
         \\   (db/close c)
         \\   (try (db/get wx r) (catch any e e))])
-    , "[:db/busy :db/busy 1 nil :tx-closed]");
+    , "[{:error :db/busy, :message db busy, :fn fn} {:error :db/busy, :message db busy, :fn fn} 1 nil {:error :tx-closed, :message tx closed, :fn test-form}]");
 }
 
 /// Run each of `steps`, which open `@STORE@`, on one VM under
@@ -4332,7 +4360,7 @@ test "db: a callback cannot finish the transaction db/alter! or db/reduce-tree i
         \\      (db/snapshot? rt)
         \\      (db/abort-read! rt)
         \\      (db/snapshot? rt)])])
-    , "[:db/busy :db/busy 1 [1 2] [:db/busy 300 nil] [:db/busy true nil false]]");
+    , "[{:error :db/busy, :message db busy, :fn fn} {:error :db/busy, :message db busy, :fn fn} 1 [1 2] [{:error :db/busy, :message db busy, :fn fn} 300 nil] [{:error :db/busy, :message db busy, :fn fn} true nil false]]");
 }
 
 test "db/put!: the lazy value it realizes cannot finish or close the transaction it writes in" {
@@ -4349,7 +4377,7 @@ test "db/put!: the lazy value it realizes cannot finish or close the transaction
         \\   (db/get-key r)
         \\   (try (db/put! tx r (lazy-seq [5])) (catch any e e))
         \\   (db/close c)])
-    , "[:db/busy :db/busy :db/busy nil nil (4) :tx-closed nil]");
+    , "[{:error :db/busy, :message db busy, :fn fn} {:error :db/busy, :message db busy, :fn fn} {:error :db/busy, :message db busy, :fn fn} nil nil (4) {:error :tx-closed, :message tx closed, :fn test-form} nil]");
 }
 
 test "db/close: a stale ref never reaches a store opened after the close" {
@@ -4371,7 +4399,7 @@ test "db/close: a stale ref never reaches a store opened after the close" {
     defer testing.allocator.free(tmpl);
     const src = try std.mem.replaceOwned(u8, testing.allocator, tmpl, "@OTHER@", b.path);
     defer testing.allocator.free(src);
-    try expectOutputProgram(src, "[:db-closed :from-b]");
+    try expectOutputProgram(src, "[{:error :db-closed, :message db closed, :fn test-form} :from-b]");
 }
 
 /// The store file behind a `db/open` or `d/connect` connection Value.
@@ -4410,7 +4438,7 @@ test "db/open: two connections to one file share its writer; a second write is :
         \\ (try (db/put-key! (db/ref b :t :x) 1) (catch any e e))
         \\ (do (db/abort-write! t1) (db/put-key! (db/ref b :t :x) 2) (db/get-key (db/ref a :t :x)))
         \\ (do (db/close a) (db/get-key (db/ref b :t :x)))]
-    , "[:db/busy :db/busy 2 2]");
+    , "[{:error :db/busy, :message db busy, :fn test-form} {:error :db/busy, :message db busy, :fn test-form} 2 2]");
 }
 
 const engineSyncs = nx.db.engineSyncs;
@@ -4458,7 +4486,7 @@ test "db/open: a commit syncs nothing unless the connection is :durable; db/sync
             \\ (try (db/open "@STORE@" [:durability :commit]) (catch any e e))
             \\ (db/get-key (db/ref (db/open "@STORE@" nil) :t :k))]
             ,
-            "[:db-closed :invalid-argument :invalid-argument :kind-mismatch 4]",
+            "[{:error :db-closed, :message db closed, :fn test-form} {:error :invalid-argument, :message invalid argument, :fn test-form} {:error :invalid-argument, :message invalid argument, :fn test-form} {:error :kind-mismatch, :message kind mismatch, :fn test-form} 4]",
             0,
         },
     });
@@ -4488,7 +4516,7 @@ test "db/* and Nextomic on one file: a write inside the other's transaction is r
         \\ (count (:tx-data (nextomic/transact! a [[:db.fn/call (fn [db] (when (db/get-key r) [{:n 9}]))]])))
         \\ (do (nextomic/transact! a [{:n 3}]) (db/put-key! r 4) (db/get-key r))
         \\ (nextomic/q '[:find ?v :where [_ :n ?v]] (nextomic/db a))]
-    , "[:db/busy :nextomic/nested :nextomic/nested nil 1 4 #{[3]}]");
+    , "[{:error :db/busy, :message db busy, :fn fn} {:error :nextomic/nested, :message the store's write transaction is held: a with scope, a transaction function or another connection is writing, :fn test-form} {:error :nextomic/nested, :message the store's write transaction is held: a with scope, a transaction function or another connection is writing, :fn test-form} nil 1 4 #{[3]}]");
 }
 
 test "db: Nextomic's nx/ trees are not reachable through db/*" {
@@ -4499,7 +4527,7 @@ test "db: Nextomic's nx/ trees are not reachable through db/*" {
         \\   (try (with-read-tx [t c] (db/scan t :nx/sys)) (catch any e e))
         \\   (try (with-read-tx [t c] (db/reduce-tree t :nx/txlog conj [])) (catch any e e))
         \\   (db/ref? (db/ref c :nxt "k"))])
-    , "[:db/invalid-key :db/invalid-key :db/invalid-key true]");
+    , "[{:error :db/invalid-key, :message db invalid key, :fn test-form} {:error :db/invalid-key, :message db invalid key, :fn test-form} {:error :db/invalid-key, :message db invalid key, :fn test-form} true]");
 }
 
 test "db: a value with no serialized form is :unserializable" {
@@ -4508,7 +4536,7 @@ test "db: a value with no serialized form is :unserializable" {
         \\  (def c (db/open "@STORE@"))
         \\  [(try (db/put-key! (db/ref c :t "f") inc) (catch :unserializable e e))
         \\   (try (with-tx [tx c] (db/put! tx (db/ref c :t "a") [1 (atom 2)])) (catch any e e))])
-    , "[:unserializable :unserializable]");
+    , "[{:error :unserializable, :message unserializable, :fn test-form} {:error :unserializable, :message unserializable, :fn test-form}]");
 }
 
 test "outside try a storage failure is the raw DbError" {
@@ -4558,7 +4586,7 @@ test "nexis.string: qualified-only (not auto-referred)" {
     // resolve to nexis.string/lower-case. Short names reach it
     // only through `(require ...)` with `:refer` or `:as`, or a
     // qualified call.
-    try expectOutput("(try (lower-case \"HI\") (catch any e e))", ":unbound-var");
+    try expectOutput("(try (lower-case \"HI\") (catch any e e))", "{:error :unbound-var, :message unbound var, :fn test-form}");
     try expectOutput("(nexis.string/lower-case \"HI\")", "hi");
 }
 
@@ -4619,8 +4647,8 @@ test "nexis.string: split: empty delim and non-string args" {
     // An empty separator splits between code points, as Clojure's
     // split on #"" does; non-string args are `:kind-mismatch`.
     try expectOutput("(pr-str [(nexis.string/split \"abc\" \"\") (nexis.string/split \"héb\" \"\" -1) (nexis.string/split \"abc\" \"\" 2) (nexis.string/split \"\" \"\")])", "[[\"a\" \"b\" \"c\"] [\"h\" \"é\" \"b\" \"\"] [\"a\" \"bc\"] [\"\"]]");
-    try expectOutput("(try (nexis.string/split \"abc\" 42) (catch any e e))", ":kind-mismatch");
-    try expectOutput("(try (nexis.string/split 1 \",\") (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (nexis.string/split \"abc\" 42) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
+    try expectOutput("(try (nexis.string/split 1 \",\") (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
 }
 
 test "nexis.string: escape and replace-first, with a literal match" {
@@ -4657,9 +4685,9 @@ test "nexis.string: join: any seqable; a non-string separator is :kind-mismatch"
     try expectOutput("(nexis.string/join \",\" {:a 1})", "[:a 1]");
     try expectOutput("(nexis.string/join \"-\" #{7})", "7");
     try expectOutput("(nexis.string/join [\"a\" [1 \"b\"]])", "a[1 \"b\"]");
-    try expectOutput("(try (nexis.string/join :sep [1 2]) (catch any e e))", ":kind-mismatch");
-    try expectOutput("(try (nexis.string/join 42 [1 2]) (catch any e e))", ":kind-mismatch");
-    try expectOutput("(try (nexis.string/join \",\" 42) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (nexis.string/join :sep [1 2]) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
+    try expectOutput("(try (nexis.string/join 42 [1 2]) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
+    try expectOutput("(try (nexis.string/join \",\" 42) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
 }
 
 test "nexis.string: join: round-trips with split" {
@@ -4690,7 +4718,7 @@ test "nexis.string: predicates and searches" {
     try expectOutput("(let [s \"hello world\"] [(nexis.string/starts-with? s \"hell\") (nexis.string/ends-with? s \"world\") (nexis.string/includes? s \"o w\") (nexis.string/includes? s \"x\") (nexis.string/starts-with? s \"\")])", "[true true true false true]");
     try expectOutput("[(nexis.string/index-of \"héllo\" \"l\") (nexis.string/index-of \"héllo\" \\l 3) (nexis.string/index-of \"abc\" \"z\") (nexis.string/last-index-of \"héllo\" \"l\") (nexis.string/last-index-of \"abcabc\" \"b\" 3)]", "[2 3 nil 3 1]");
     try expectOutput("[(nexis.string/blank? nil) (nexis.string/blank? \" \\t\\n\") (nexis.string/blank? \" x \")]", "[true true false]");
-    try expectOutput("(try (nexis.string/starts-with? 1 \"a\") (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (nexis.string/starts-with? 1 \"a\") (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
     // Java's lastIndexOf finds nothing before a negative index.
     try expectOutput("[(nexis.string/last-index-of \"abc\" \"a\" -1) (nexis.string/last-index-of \"abc\" \"a\" 0) (nexis.string/index-of \"abc\" \"a\" -5)]", "[nil 0 0]");
     // Whitespace is Java's Character/isWhitespace, as Clojure's blank?
@@ -4717,7 +4745,7 @@ test "nexis.string: replace: literal, all-non-overlapping" {
     // A char for a char, and an empty match between code points, as
     // Clojure's replace (Java's String.replace) does.
     try expectOutput("(pr-str [(nexis.string/replace \"aXbX\" \\X \\-) (nexis.string/replace \"héé\" \\é \\e) (nexis.string/replace \"abc\" \"\" \"-\") (nexis.string/replace \"\" \"\" \"-\")])", "[\"a-b-\" \"hee\" \"-a-b-c-\" \"-\"]");
-    try expectOutput("[(try (nexis.string/replace \"abc\" \\a \"x\") (catch any e e)) (try (nexis.string/replace \"abc\" \"a\" \\x) (catch any e e))]", "[:kind-mismatch :kind-mismatch]");
+    try expectOutput("[(try (nexis.string/replace \"abc\" \\a \"x\") (catch any e e)) (try (nexis.string/replace \"abc\" \"a\" \\x) (catch any e e))]", "[{:error :kind-mismatch, :message kind mismatch, :fn test-form} {:error :kind-mismatch, :message kind mismatch, :fn test-form}]");
     try expectOutput("(nexis.string/replace \"abc\" \"b\" \"X\")", "aXc");
     try expectOutput("(nexis.string/replace \"abababab\" \"ab\" \"X\")", "XXXX");
     // STDLIB.md §3 `replace`: after a match the cursor advances by the
@@ -4733,9 +4761,9 @@ test "nexis.string: replace: literal, all-non-overlapping" {
 }
 
 test "nexis.string: replace: non-string args" {
-    try expectOutput("(try (nexis.string/replace \"abc\" :nope \"x\") (catch any e e))", ":kind-mismatch");
-    try expectOutput("(try (nexis.string/replace \"abc\" \"b\" 42) (catch any e e))", ":kind-mismatch");
-    try expectOutput("(try (nexis.string/replace 42 \"b\" \"x\") (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (nexis.string/replace \"abc\" :nope \"x\") (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
+    try expectOutput("(try (nexis.string/replace \"abc\" \"b\" 42) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
+    try expectOutput("(try (nexis.string/replace 42 \"b\" \"x\") (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
 }
 
 test "nexis.string: replace: UTF-8 boundary safety" {
@@ -4770,8 +4798,8 @@ test "regex: a matcher advances with re-find, re-groups repeats its last match, 
     try expectOutput(
         \\(let [m (re-matcher (re-pattern "a(b)?") "a ab")]
         \\  (pr-str [(re-find m) (re-groups m) (re-find m) (re-find m) (re-find m) (try (re-groups m) (catch any e e))]))
-    , "[[\"a\" nil] [\"a\" nil] [\"ab\" \"b\"] nil nil :invalid-argument]");
-    try expectOutput("(try (re-groups (re-matcher (re-pattern \"a\") \"a\")) (catch any e e))", ":invalid-argument");
+    , "[[\"a\" nil] [\"a\" nil] [\"ab\" \"b\"] nil nil {:error :invalid-argument, :message \"re-groups: no match found\", :fn \"test-form\"}]");
+    try expectOutput("(try (re-groups (re-matcher (re-pattern \"a\") \"a\")) (catch any e e))", "{:error :invalid-argument, :message re-groups: no match found, :fn test-form}");
 }
 
 test "regex: a pattern is an identity value that prints as #\"...\" and whose str is its source" {
@@ -4780,7 +4808,7 @@ test "regex: a pattern is an identity value that prints as #\"...\" and whose st
         \\         (= (re-pattern "a") (re-pattern "a")) (let [p (re-pattern "a")] [(= p p) (identical? p (re-pattern p)) (count (hash-set p p))])
         \\         (class (re-pattern "a")) (type (re-matcher (re-pattern "a") "")) (re-matcher (re-pattern "a\\d") "")])
     , "[\"a\\\\d\" \"[#\\\"a\\\"]\" \"x+|1\" #\"é\\\"\" false [true true 1] :regex :matcher #<matcher #\"a\\d\">]");
-    try expectOutput("[(try (with-meta (re-pattern \"a\") {}) (catch any e e)) (meta (re-pattern \"a\")) (seqable? (re-pattern \"a\"))]", "[:kind-mismatch nil false]");
+    try expectOutput("[(try (with-meta (re-pattern \"a\") {}) (catch any e e)) (meta (re-pattern \"a\")) (seqable? (re-pattern \"a\"))]", "[{:error :kind-mismatch, :message kind mismatch, :fn test-form} nil false]");
 }
 
 test "regex: #\"...\" is a pattern constant; quote, macros and read-string see a pattern value" {
@@ -4791,7 +4819,7 @@ test "regex: #\"...\" is a pattern constant; quote, macros and read-string see a
         \\         (let [f (fn [] #"a")] (identical? (f) (f))) (= #"a" #"a") (count #{#"a" #"a"}) (count {#"a" 1 #"a" 2})
         \\         (loop [i 0 ps []] (if (< i 3) (recur (inc i) (conj ps #"z")) (apply identical? (take 2 ps))))
         \\         (read-string "#\"a+\"") (class (read-string "#\"a+\"")) (try (read-string "#\"(\"") (catch any e e))])
-    , "[\"12\" #\"a\\\"b\" #\"x\" :regex \"a\\\\d\" \"a\" \"bb\" true false 2 2 true #\"a+\" :regex :reader-error]");
+    , "[\"12\" #\"a\\\"b\" #\"x\" :regex \"a\\\\d\" \"a\" \"bb\" true false 2 2 true #\"a+\" :regex {:error :reader-error, :message \"reader error\", :fn \"test-form\"}]");
 }
 
 test "regex: nexis.string/split on a pattern is Java's Pattern.split" {
@@ -4821,7 +4849,7 @@ test "regex: a replacement Java refuses throws :invalid-replacement with its sen
     try expectOutput(
         \\(map #(try (%) (catch any e e))
         \\     [#(nexis.string/replace "a1" #"\d" (fn [m] 5)) #(nexis.string/replace "a" #"a" 1) #(nexis.string/split "a" #"a" "x") #(nexis.string/replace-first "a" #"a" \b) #(nexis.string/replace-first "abc" "b" 1) #(nexis.string/re-quote-replacement 1)])
-    , "(:kind-mismatch :not-callable :kind-mismatch :not-callable :kind-mismatch :kind-mismatch)");
+    , "({:error :kind-mismatch, :message kind mismatch, :fn fn} {:error :not-callable, :message an integer is not callable, :fn fn} {:error :kind-mismatch, :message kind mismatch, :fn fn} {:error :not-callable, :message a char is not callable, :fn fn} {:error :kind-mismatch, :message kind mismatch, :fn fn} {:error :kind-mismatch, :message kind mismatch, :fn fn})");
 }
 
 test "regex: an invalid pattern throws :invalid-regex with the sentence and the index; a wrong kind is :kind-mismatch" {
@@ -4832,7 +4860,7 @@ test "regex: an invalid pattern throws :invalid-regex with the sentence and the 
     try expectOutput(
         \\(map #(try (%) (catch any e e))
         \\     [#(re-find "a" "a") #(re-seq "a" "a") #(re-matches "a" "a") #(re-pattern 1) #(re-find (re-pattern "a") 1) #(re-matcher (re-pattern "a") nil) #(re-find 1) #(re-groups (re-pattern "a"))])
-    , "(:kind-mismatch :kind-mismatch :kind-mismatch :kind-mismatch :kind-mismatch :kind-mismatch :kind-mismatch :kind-mismatch)");
+    , "({:error :kind-mismatch, :message kind mismatch, :fn fn} {:error :kind-mismatch, :message kind mismatch, :fn fn} {:error :kind-mismatch, :message kind mismatch, :fn fn} {:error :kind-mismatch, :message kind mismatch, :fn fn} {:error :kind-mismatch, :message kind mismatch, :fn fn} {:error :kind-mismatch, :message kind mismatch, :fn fn} {:error :kind-mismatch, :message kind mismatch, :fn fn} {:error :kind-mismatch, :message kind mismatch, :fn fn})");
 }
 
 // =============================================================================
@@ -4892,27 +4920,27 @@ test "io: join: nil-element semantics" {
 // here.
 
 test "io: print / println / prn / pr-str: no vm.io → :io-error" {
-    try expectOutput("(try (print :a) (catch any e e))", ":io-error");
-    try expectOutput("(try (println :a) (catch any e e))", ":io-error");
-    try expectOutput("(try (prn :a) (catch any e e))", ":io-error");
+    try expectOutput("(try (print :a) (catch any e e))", "{:error :io-error, :message io error, :fn test-form}");
+    try expectOutput("(try (println :a) (catch any e e))", "{:error :io-error, :message io error, :fn test-form}");
+    try expectOutput("(try (prn :a) (catch any e e))", "{:error :io-error, :message io error, :fn test-form}");
     // pr-str does NOT touch vm.io (it returns a String); it
     // works regardless. Pin the contract.
     try expectOutput("(pr-str :a)", ":a");
 }
 
 test "io: slurp / spit: a missing file or directory is :file-not-found" {
-    try expectOutput("(try (slurp \"/nexis-no-such-dir/anything.txt\") (catch any e e))", ":file-not-found");
-    try expectOutput("(try (spit \"/nexis-no-such-dir/anything.txt\" \"x\") (catch any e e))", ":file-not-found");
+    try expectOutput("(try (slurp \"/nexis-no-such-dir/anything.txt\") (catch any e e))", "{:error :file-not-found, :message file not found, :fn test-form}");
+    try expectOutput("(try (spit \"/nexis-no-such-dir/anything.txt\" \"x\") (catch any e e))", "{:error :file-not-found, :message file not found, :fn test-form}");
 }
 
 test "io: slurp / spit: non-string path is :kind-mismatch" {
-    try expectOutput("(try (slurp 42) (catch any e e))", ":kind-mismatch");
-    try expectOutput("(try (spit :nope \"x\") (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (slurp 42) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
+    try expectOutput("(try (spit :nope \"x\") (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
 }
 
 test "io: slurp / spit: empty path is :invalid-path" {
-    try expectOutput("(try (slurp \"\") (catch any e e))", ":invalid-path");
-    try expectOutput("(try (spit \"\" \"x\") (catch any e e))", ":invalid-path");
+    try expectOutput("(try (slurp \"\") (catch any e e))", "{:error :invalid-path, :message invalid path, :fn test-form}");
+    try expectOutput("(try (spit \"\" \"x\") (catch any e e))", "{:error :invalid-path, :message invalid path, :fn test-form}");
 }
 
 // =============================================================================
@@ -4932,7 +4960,7 @@ test "sys: getenv reads one variable, or every one as a map" {
     try expectOutput("(every? string? (mapcat identity (nexis.sys/getenv)))", "true");
     // Bytes that are not UTF-8 read as U+FFFD, as Java decodes them.
     try expectOutput("(nexis.sys/getenv \"NEXIS_SYS_BYTES\")", "a\u{FFFD}b");
-    try expectOutput("(try (nexis.sys/getenv :path) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (nexis.sys/getenv :path) (catch any e (:error e)))", ":kind-mismatch");
 }
 
 test "sys: cwd is the working directory's absolute path" {
@@ -4987,16 +5015,16 @@ test "shell: sh runs in :dir and with :env, or *sh-dir* and *sh-env*" {
 }
 
 test "shell: sh refuses what it cannot run" {
-    try expectOutputWithIo("(try (nexis.shell/sh \"nexis-no-such-program\") (catch any e e))", ":file-not-found");
-    try expectOutputWithIo("(try (nexis.shell/sh \"pwd\" :dir \"/nexis-no-such-dir\") (catch any e e))", ":file-not-found");
-    try expectOutputWithIo("(try (nexis.shell/sh) (catch any e e))", ":invalid-argument");
-    try expectOutputWithIo("(try (nexis.shell/sh \"ls\" :out-enc :bytes) (catch any e e))", ":invalid-argument");
-    try expectOutputWithIo("(try (nexis.shell/sh \"ls\" :in 5) (catch any e e))", ":kind-mismatch");
-    try expectOutputWithIo("(try (nexis.shell/sh \"ls\" :env {\"A=B\" 1}) (catch any e e))", ":invalid-argument");
-    try expectOutputWithIo("(try (nexis.shell/sh \"echo\" \"a\\u0000b\") (catch any e e))", ":invalid-argument");
-    try expectOutputWithIo("(try (nexis.shell/sh \"ls\" :dir) (catch any e e))", ":arity-mismatch");
+    try expectOutputWithIo("(try (nexis.shell/sh \"nexis-no-such-program\") (catch any e (:error e)))", ":file-not-found");
+    try expectOutputWithIo("(try (nexis.shell/sh \"pwd\" :dir \"/nexis-no-such-dir\") (catch any e (:error e)))", ":file-not-found");
+    try expectOutputWithIo("(try (nexis.shell/sh) (catch any e (:error e)))", ":invalid-argument");
+    try expectOutputWithIo("(try (nexis.shell/sh \"ls\" :out-enc :bytes) (catch any e (:error e)))", ":invalid-argument");
+    try expectOutputWithIo("(try (nexis.shell/sh \"ls\" :in 5) (catch any e (:error e)))", ":kind-mismatch");
+    try expectOutputWithIo("(try (nexis.shell/sh \"ls\" :env {\"A=B\" 1}) (catch any e (:error e)))", ":invalid-argument");
+    try expectOutputWithIo("(try (nexis.shell/sh \"echo\" \"a\\u0000b\") (catch any e (:error e)))", ":invalid-argument");
+    try expectOutputWithIo("(try (nexis.shell/sh \"ls\" :dir) (catch any e (:error e)))", ":arity-mismatch");
     // A VM with no I/O spawns nothing.
-    try expectOutput("(try (nexis.shell/sh \"true\") (catch any e e))", ":io-error");
+    try expectOutput("(try (nexis.shell/sh \"true\") (catch any e (:error e)))", ":io-error");
 }
 
 test "time: format writes an instant as Java's Instant.toString does" {
@@ -5007,7 +5035,7 @@ test "time: format writes an instant as Java's Instant.toString does" {
     try expectOutput("(nexis.time/format -62167219200000)", "0000-01-01T00:00:00Z");
     try expectOutput("(nexis.time/format -62198755200000)", "-0001-01-01T00:00:00Z");
     try expectOutput("(nexis.time/format 1791549015120)", "2026-10-09T12:30:15.120Z");
-    try expectOutput("(try (nexis.time/format \"2026\") (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (nexis.time/format \"2026\") (catch any e (:error e)))", ":kind-mismatch");
 }
 
 test "time: parse reads ISO-8601 instants, a missing offset UTC" {
@@ -5022,17 +5050,17 @@ test "time: parse reads ISO-8601 instants, a missing offset UTC" {
     try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"-0001-01-01T00:00:00Z\"))", "-62198755200000");
     try expectOutput("(= (nexis.time/instant \"2026-10-09\") (nexis.time/parse \"2026-10-09T00:00:00.000Z\"))", "true");
     for ([_][]const u8{ "", "x", "2026-13-01", "2026-02-29", "2026-10-09T24:00Z", "2026-10-09T12:60Z", "2026-10-09T12:30:61Z", "2026-10-09T12Z", "2026-10-09T12:30:15.Z", "2026-10-09T12:30+25:00", "2026-10-09T12:30Zx", "26-10-09", "2026-1-09", "99999-01-01" }) |text| {
-        const src = try std.fmt.allocPrint(testing.allocator, "(try (nexis.time/parse \"{s}\") (catch any e e))", .{text});
+        const src = try std.fmt.allocPrint(testing.allocator, "(try (nexis.time/parse \"{s}\") (catch any e (:error e)))", .{text});
         defer testing.allocator.free(src);
         try expectOutput(src, ":invalid-argument");
     }
-    try expectOutput("(try (nexis.time/parse 5) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (nexis.time/parse 5) (catch any e (:error e)))", ":kind-mismatch");
 }
 
 test "time: nexis.core's inst? and inst-ms know an Instant, through Clojure's Inst protocol" {
     try expectOutput(
         \\[(inst? (nexis.time/now)) (inst? 5) (inst? {:ms 5}) (inst-ms (nexis.time/instant 7))
-        \\ (satisfies? Inst (nexis.time/instant 7)) (try (inst-ms 7) (catch any e e))]
+        \\ (satisfies? Inst (nexis.time/instant 7)) (try (inst-ms 7) (catch any e (:error e)))]
     , "[true false false 7 true :no-protocol-impl]");
     // A record of the program's own extends it as Clojure's types do.
     try expectOutputProgram(
@@ -5047,8 +5075,8 @@ test "time: instants, the clock, durations and order" {
     try expectOutput("(< 1767225600000 (nexis.time/inst-ms (nexis.time/now)))", "true");
     try expectOutput("(nexis.time/instant 5)", "#nexis.time.Instant{:ms 5}");
     try expectOutput("(let [i (nexis.time/instant 5)] (identical? i (nexis.time/instant i)))", "true");
-    try expectOutput("(try (nexis.time/instant :x) (catch any e e))", ":kind-mismatch");
-    try expectOutput("(try (nexis.time/inst-ms \"x\") (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (nexis.time/instant :x) (catch any e (ex-message e)))", "instant takes an Instant, an integer or ISO-8601 text, got a keyword");
+    try expectOutput("(try (nexis.time/inst-ms \"x\") (catch any e (ex-message e)))", "inst-ms takes an Instant or an integer, got a string");
     try expectOutput(
         \\(nexis.time/format (nexis.time/plus (nexis.time/parse "2026-10-09") (nexis.time/days 1) (nexis.time/hours 1) (nexis.time/minutes 30) (nexis.time/seconds 15) 7))
     , "2026-10-10T01:30:15.007Z");
@@ -5100,9 +5128,9 @@ test "json: read-str takes :key-fn and :value-fn as clojure.data.json does" {
         \\(defn vf [k v] (cond (= k :drop) vf (number? v) (* v 10) :else v))
         \\(pr-str (nexis.json/read-str "{\"a\": 1, \"drop\": 2, \"o\": {\"x\": 3, \"drop\": 4}, \"v\": [5]}" :key-fn keyword :value-fn vf))
     , "{:a 10, :o {:x 30}, :v [5]}");
-    try expectOutput("(try (nexis.json/read-str \"{\\\"\\\": 1}\" :key-fn keyword) (catch any e e))", ":invalid-argument");
-    try expectOutput("(try (nexis.json/read-str \"1\" :keywordize true) (catch any e e))", ":invalid-argument");
-    try expectOutput("(try (nexis.json/read-str 1) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (nexis.json/read-str \"{\\\"\\\": 1}\" :key-fn keyword) (catch any e (:error e)))", ":invalid-argument");
+    try expectOutput("(try (nexis.json/read-str \"1\" :keywordize true) (catch any e (:error e)))", ":invalid-argument");
+    try expectOutput("(try (nexis.json/read-str 1) (catch any e (:error e)))", ":kind-mismatch");
     try expectOutput("(try (nexis.json/read-str \"{\\\"a\\\": 1}\" :key-fn (fn [k] (throw :mine))) (catch any e e))", ":mine");
     // A function that grows the root stack past its capacity, which
     // moves it, still has its result kept.
@@ -5148,7 +5176,7 @@ test "json: malformed text is :json-error, with its line and column" {
 test "json: nesting deeper than the native stack reads, and writes as :stack-overflow" {
     try expectOutput(
         \\(def deep (nexis.json/read-str (str (apply str (repeat 200000 "[")) (apply str (repeat 200000 "]")))))
-        \\[(loop [x deep n 0] (if (seq x) (recur (first x) (inc n)) n)) (try (nexis.json/write-str deep) (catch any e e))]
+        \\[(loop [x deep n 0] (if (seq x) (recur (first x) (inc n)) n)) (try (nexis.json/write-str deep) (catch any e (:error e)))]
     , "[199999 :stack-overflow]");
 }
 
@@ -5195,7 +5223,7 @@ test "json: what JSON cannot hold is :json-error" {
     try expectOutput("(try (nexis.json/write-str {:a 1} :key-fn (fn [k] 1)) (catch :json-error e (ex-message e)))", "JSON: :key-fn returned a value of class fixnum, not a string");
     try expectOutput("(try (nexis.json/write-str inc) (catch :json-error e (ex-message e)))", "JSON: cannot write a value of class native_fn");
     try expectOutput("(try (nexis.json/write-str (atom 1)) (catch :json-error e (ex-message e)))", "JSON: cannot write a value of class atom");
-    try expectOutput("(try (nexis.json/write-str 1 :pretty true) (catch any e e))", ":invalid-argument");
+    try expectOutput("(try (nexis.json/write-str 1 :pretty true) (catch any e (:error e)))", ":invalid-argument");
 }
 
 test "json: a value written and read back is equal" {
@@ -5598,7 +5626,7 @@ test "protocol dispatch with NO impl raises :no-protocol-impl" {
         \\(do
         \\  (defprotocol IFoo (bar [this y]))
         \\  (try (bar 1 2) (catch any e e)))
-    , ":no-protocol-impl");
+    , "{:error :no-protocol-impl, :message no impl of bar for an integer, :fn test-form}");
     // Even when the receiver is a record, no impl means
     // :no-protocol-impl (different dispatch key but same
     // outcome).
@@ -5607,7 +5635,7 @@ test "protocol dispatch with NO impl raises :no-protocol-impl" {
         \\  (defprotocol IFoo (bar [this y]))
         \\  (defrecord Counter [n])
         \\  (try (bar (->Counter 5) 7) (catch any e e)))
-    , ":no-protocol-impl");
+    , "{:error :no-protocol-impl, :message no impl of bar for a record, :fn test-form}");
 }
 
 test "protocol dispatch: the integer tower is one target, fixnum or bignum" {
@@ -5633,7 +5661,7 @@ test "protocol dispatch with zero args raises :arity-mismatch" {
         \\(do
         \\  (defprotocol IFoo (bar [this y]))
         \\  (try (bar) (catch any e e)))
-    , ":arity-mismatch");
+    , "{:error :arity-mismatch, :message bar takes at least 1 argument, got 0, :fn test-form}");
 }
 
 // =============================================================================
@@ -5705,12 +5733,12 @@ test "protocol methods: several arities, in either Clojure spelling, dispatch by
         \\(defprotocol P (m [s] [s x] [s x y]))
         \\(extend-type :fixnum P (m ([n] n) ([n & xs] (apply + n xs))))
         \\[(m 1) (m 1 2 3) (try (m "x") (catch any e e))]
-    , "[1 6 :no-protocol-impl]");
+    , "[1 6 {:error :no-protocol-impl, :message no impl of m for a string, :fn test-form}]");
     try expectOutputProgram(
         \\(defprotocol P (m [s] [s x]))
         \\(defrecord R [a] P (m [this] 1))
         \\(try (m (->R 1) 2) (catch any e e))
-    , ":arity-mismatch");
+    , "{:error :arity-mismatch, :message fn takes 1 argument, got 2, :fn test-form}");
     // The same arity twice is the fn overload error.
     try expectMacroFailure("(defprotocol P (m [s]))", "(defrecord R [a] P (m [this] 1) (m [that] 2))", "fn: two overload clauses take 1 arguments", "(m [that] 2)");
     try expectMacroFailure("(defprotocol P (m [s]))", "(extend-type :string P (m ([s] 1) [s]))", "expected the method's parameter vector or its arities ([params] body...), not a vector", "[s]");
@@ -5859,7 +5887,7 @@ test "extend-protocol and extend-type: nil and Clojure class names, as Clojure c
         \\(extend-type Symbol P (f [_] :symbol-record))
         \\(extend-protocol P Var (f [_] :var-record) Keyword (f [_] :keyword))
         \\[(f (->Symbol 1)) (f (->Var 1)) (f :k) (try (f 'a) (catch any e e)) (try (f #'f) (catch any e e))]
-    , "[:symbol-record :var-record :keyword :no-protocol-impl :no-protocol-impl]");
+    , "[:symbol-record :var-record :keyword {:error :no-protocol-impl, :message no impl of f for a symbol, :fn test-form} {:error :no-protocol-impl, :message no impl of f for a var, :fn test-form}]");
     try expectMacroFailure("(defprotocol Q (q [x]))", "(extend-type java.util.Frob Q (q [_] 1))", "java.util.Frob names no record and no class nexis has; extend a kind keyword such as :string", "java.util.Frob");
     try expectMacroFailure("(defprotocol Q (q [x]))", "(extend-protocol Q (q [_] 1))", "a method needs a type before it", "(q [_] 1)");
     try expectMacroFailure("", "(defrecord P [x] Object (toString [_] \"p\"))", "defrecord: Object methods (toString, equals, hashCode) have no meaning here: nexis has no classes", "Object");
@@ -5880,21 +5908,21 @@ test "extend-protocol with bogus type-kw: :invalid-argument" {
         \\    (extend-protocol IFoo
         \\      :no-such-kind (bar [x] :nope))
         \\    (catch any e e)))
-    , ":invalid-argument");
+    , "{:error :invalid-argument, :message invalid argument, :fn test-form}");
 }
 
 test "record internals: a type id no defrecord registered is :invalid-argument" {
     // Qualified, the `#%` names are reachable (FORMS.md §8); each
     // validates what it is given.
-    try expectOutput("(try (nexis.internal/#%make-record 99999 {}) (catch any e e))", ":invalid-argument");
-    try expectOutput("(try (nexis.internal/#%make-record 99999999999999 {}) (catch any e e))", ":invalid-argument");
-    try expectOutput("(try (nexis.internal/#%make-record -1 {}) (catch any e e))", ":invalid-argument");
-    try expectOutput("(let [mk (resolve (symbol \"nexis.internal\" \"#%make-record\"))] (try (class (mk 77 {:x 1})) (catch any e e)))", ":invalid-argument");
+    try expectOutput("(try (nexis.internal/#%make-record 99999 {}) (catch any e e))", "{:error :invalid-argument, :message invalid argument, :fn test-form}");
+    try expectOutput("(try (nexis.internal/#%make-record 99999999999999 {}) (catch any e e))", "{:error :invalid-argument, :message invalid argument, :fn test-form}");
+    try expectOutput("(try (nexis.internal/#%make-record -1 {}) (catch any e e))", "{:error :invalid-argument, :message invalid argument, :fn test-form}");
+    try expectOutput("(let [mk (resolve (symbol \"nexis.internal\" \"#%make-record\"))] (try (class (mk 77 {:x 1})) (catch any e e)))", "{:error :invalid-argument, :message invalid argument, :fn test-form}");
     try expectOutputProgram(
         \\(defprotocol IFoo (bar [this]))
         \\[(try (nexis.internal/#%extend-record-impl IFoo :bar 4096 (fn [x] x)) (catch any e e))
         \\ (try (nexis.internal/#%extend-record-impl IFoo :bar 99999999999999 (fn [x] x)) (catch any e e))]
-    , "[:invalid-argument :invalid-argument]");
+    , "[{:error :invalid-argument, :message invalid argument, :fn test-form} {:error :invalid-argument, :message invalid argument, :fn test-form}]");
 }
 
 test "defrecord: map->R takes any map, as Clojure's does" {
@@ -5903,7 +5931,7 @@ test "defrecord: map->R takes any map, as Clojure's does" {
         \\(defrecord Q [x])
         \\[(map->P (sorted-map :z 2 :x 1)) (map->P nil) (map->P (->Q 5)) (P? (map->P (->Q 5)))
         \\ (try (map->P [1 2]) (catch any e e))]
-    , "[#user.P{:x 1, :z 2} #user.P{} #user.P{:x 5} true :kind-mismatch]");
+    , "[#user.P{:x 1, :z 2} #user.P{} #user.P{:x 5} true {:error :kind-mismatch, :message kind mismatch, :fn map->P}]");
 }
 
 // =============================================================================
@@ -6311,8 +6339,8 @@ test "numbers: special floats" {
 test "numbers: / by zero raises for every kind of number; a NaN operand passes through" {
     // Clojure's Numbers.divide(Object, Object): a NaN operand is the
     // result, then any zero divisor raises (SEMANTICS.md §2.2).
-    try expectOutput("(map #(try (/ %1 %2) (catch any e e)) [1.0 -1.0 0.0 1 1.0 1 -0.0] [0 0 0.0 0.0 -0.0 0 0])", "(:divide-by-zero :divide-by-zero :divide-by-zero :divide-by-zero :divide-by-zero :divide-by-zero :divide-by-zero)");
-    try expectOutput("[(try (/ 0.0) (catch any e e)) (try (/ 6 2 0.0) (catch any e e)) (try (apply / [1.0 0.0]) (catch any e e)) (let [z 0.0] (try (/ 1.0 z) (catch any e e)))]", "[:divide-by-zero :divide-by-zero :divide-by-zero :divide-by-zero]");
+    try expectOutput("(map #(try (/ %1 %2) (catch any e e)) [1.0 -1.0 0.0 1 1.0 1 -0.0] [0 0 0.0 0.0 -0.0 0 0])", "({:error :divide-by-zero, :message divide by zero, :fn fn} {:error :divide-by-zero, :message divide by zero, :fn fn} {:error :divide-by-zero, :message divide by zero, :fn fn} {:error :divide-by-zero, :message divide by zero, :fn fn} {:error :divide-by-zero, :message divide by zero, :fn fn} {:error :divide-by-zero, :message divide by zero, :fn fn} {:error :divide-by-zero, :message divide by zero, :fn fn})");
+    try expectOutput("[(try (/ 0.0) (catch any e e)) (try (/ 6 2 0.0) (catch any e e)) (try (apply / [1.0 0.0]) (catch any e e)) (let [z 0.0] (try (/ 1.0 z) (catch any e e)))]", "[{:error :divide-by-zero, :message divide by zero, :fn test-form} {:error :divide-by-zero, :message divide by zero, :fn test-form} {:error :divide-by-zero, :message divide by zero, :fn test-form} {:error :divide-by-zero, :message divide by zero, :fn test-form}]");
     try expectOutput("[(NaN? (/ ##NaN 0)) (NaN? (/ ##NaN 0.0)) (NaN? (/ 1.0 ##NaN)) (NaN? (/ 0 ##NaN)) (NaN? (apply / [##NaN 0.0]))]", "[true true true true true]");
     try expectOutput("[(/ ##Inf 2) (/ 1.0 ##Inf) (/ -1 ##Inf) (/ 1.0 1e-320)]", "[##Inf 0.0 -0.0 ##Inf]");
 }
@@ -6324,10 +6352,10 @@ test "numbers: the promoting and unchecked operators, num, float, ratio? and rat
     // a float or an integer beyond 64 bits computes as + does.
     try expectOutput("[(unchecked-add 9223372036854775807 1) (unchecked-subtract -9223372036854775808 1) (unchecked-multiply 9223372036854775807 2) (unchecked-inc 9223372036854775807) (unchecked-dec -9223372036854775808) (unchecked-negate -9223372036854775808)]", "[-9223372036854775808 9223372036854775807 -2 -9223372036854775808 9223372036854775807 -9223372036854775808]");
     try expectOutput("[(unchecked-add 1 2) (unchecked-add 1 2.5) (unchecked-add 99999999999999999999 1) (unchecked-multiply 3 -4)]", "[3 3.5 100000000000000000000 -12]");
-    try expectOutput("(try (unchecked-add nil 1) (catch any e e))", ":kind-mismatch");
-    try expectOutput("[(num 1) (num 1.5) (num nil) (try (num \"a\") (catch any e e))]", "[1 1.5 nil :kind-mismatch]");
+    try expectOutput("(try (unchecked-add nil 1) (catch any e e))", "{:error :kind-mismatch, :message + expects numbers, got nil, :fn test-form}");
+    try expectOutput("[(num 1) (num 1.5) (num nil) (try (num \"a\") (catch any e e))]", "[1 1.5 nil {:error :kind-mismatch, :message num takes a number or nil, got a string, :fn test-form}]");
     try expectOutput("[(float 1) (float 0.5) (NaN? (float ##NaN)) (float -3.4028234663852886E38)]", "[1.0 0.5 true -3.4028234663852886E38]");
-    try expectOutput("(map #(try (float %) (catch any e e)) [1e39 -1e39 ##Inf nil \\a \"1\"])", "(:invalid-argument :invalid-argument :invalid-argument :kind-mismatch :kind-mismatch :kind-mismatch)");
+    try expectOutput("(map #(try (float %) (catch any e e)) [1e39 -1e39 ##Inf nil \\a \"1\"])", "({:error :invalid-argument, :message invalid argument, :fn fn} {:error :invalid-argument, :message invalid argument, :fn fn} {:error :invalid-argument, :message invalid argument, :fn fn} {:error :kind-mismatch, :message kind mismatch, :fn fn} {:error :kind-mismatch, :message kind mismatch, :fn fn} {:error :kind-mismatch, :message kind mismatch, :fn fn})");
     try expectOutput("[(ratio? 1) (ratio? 0.5) (ratio? nil) (rational? 1) (rational? 99999999999999999999) (rational? 1.0) (rational? nil)]", "[false false false true true false false]");
 }
 
@@ -6384,10 +6412,10 @@ test "numbers: division" {
     try expectOutput("(mod 7.5 2)", "1.5");
     try expectOutput("(quot 7.5 2)", "3.0");
     try expectOutput("(rem 7.5 2)", "1.5");
-    try expectOutput("(try (/ 1 0) (catch any e e))", ":divide-by-zero");
-    try expectOutput("(try (quot 1 0) (catch any e e))", ":divide-by-zero");
-    try expectOutput("(try (rem 1.0 0) (catch any e e))", ":divide-by-zero");
-    try expectOutput("(try (mod 1 0.0) (catch any e e))", ":divide-by-zero");
+    try expectOutput("(try (/ 1 0) (catch any e e))", "{:error :divide-by-zero, :message divide by zero, :fn test-form}");
+    try expectOutput("(try (quot 1 0) (catch any e e))", "{:error :divide-by-zero, :message divide by zero, :fn test-form}");
+    try expectOutput("(try (rem 1.0 0) (catch any e e))", "{:error :divide-by-zero, :message divide by zero, :fn test-form}");
+    try expectOutput("(try (mod 1 0.0) (catch any e e))", "{:error :divide-by-zero, :message divide by zero, :fn test-form}");
 }
 
 test "numbers: comparison across kinds" {
@@ -6412,9 +6440,9 @@ test "numbers: comparison across kinds" {
     try expectOutput("(not= 1 1)", "false");
     try expectOutput("(not= 1 1.0)", "true");
     try expectOutput("(not= :a :a :a)", "false");
-    try expectOutput("(try (< 1 :a) (catch any e e))", ":kind-mismatch");
-    try expectOutput("(try (> \"a\" 1) (catch any e e))", ":kind-mismatch");
-    try expectOutput("(try (>= nil) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (< 1 :a) (catch any e e))", "{:error :kind-mismatch, :message < expects numbers, got a keyword, :fn test-form}");
+    try expectOutput("(try (> \"a\" 1) (catch any e e))", "{:error :kind-mismatch, :message > expects numbers, got a string, :fn test-form}");
+    try expectOutput("(try (>= nil) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
 }
 
 test "numbers: predicates over the tower" {
@@ -6423,8 +6451,8 @@ test "numbers: predicates over the tower" {
     try expectOutput("[(zero? 0) (zero? 0.0) (zero? -0.0) (zero? 0.5)]", "[true true true false]");
     try expectOutput("[(pos? 1) (pos? 0.5) (pos? -0.5) (neg? -1) (neg? -0.5) (neg? 0.0)]", "[true true false true true false]");
     try expectOutput("[(even? 2) (odd? 3)]", "[true true]");
-    try expectOutput("(try (even? 2.0) (catch any e e))", ":kind-mismatch");
-    try expectOutput("(try (zero? :a) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (even? 2.0) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
+    try expectOutput("(try (zero? :a) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
 }
 
 test "numbers: float equality and hashing agree with SEMANTICS" {
@@ -6460,8 +6488,8 @@ test "keyword-as-function: direct calls" {
     try expectOutput("(:a \"s\" :d)", ":d");
     try expectOutput("(:a #{:a :b})", ":a");
     try expectOutput("(:z #{:a :b})", "nil");
-    try expectOutput("(try (:a) (catch any e e))", ":arity-mismatch");
-    try expectOutput("(try (:a {} 1 2) (catch any e e))", ":arity-mismatch");
+    try expectOutput("(try (:a) (catch any e e))", "{:error :arity-mismatch, :message a keyword takes 1 to 2 arguments, got 0, :fn test-form}");
+    try expectOutput("(try (:a {} 1 2) (catch any e e))", "{:error :arity-mismatch, :message a keyword takes 1 to 2 arguments, got 3, :fn test-form}");
     // Nested and in tail position.
     try expectOutput("(:b (:a {:a {:b 2}}))", "2");
     try expectOutput("(-> {:a {:b 3}} :a :b)", "3");
@@ -6516,7 +6544,7 @@ test "symbol-as-function: a symbol looks itself up as a keyword does" {
     try expectOutput("('a #{'a})", "a");
     try expectOutput("('a 5)", "nil");
     try expectOutput("(map 'x [{'x 1} {'x 2} {}])", "(1 2 nil)");
-    try expectOutput("(try ('a) (catch any e e))", ":arity-mismatch");
+    try expectOutput("(try ('a) (catch any e e))", "{:error :arity-mismatch, :message a symbol takes 1 to 2 arguments, got 0, :fn test-form}");
 }
 
 test "collection-as-function: maps, sets and vectors" {
@@ -6525,16 +6553,16 @@ test "collection-as-function: maps, sets and vectors" {
     try expectOutput("({:a 1} :b :d)", ":d");
     try expectOutput("(#{1 2} 1)", "1");
     try expectOutput("(#{1 2} 3)", "nil");
-    try expectOutput("(try (#{1 2} 3 :d) (catch any e e))", ":arity-mismatch");
+    try expectOutput("(try (#{1 2} 3 :d) (catch any e e))", "{:error :arity-mismatch, :message a set takes 1 argument, got 2, :fn test-form}");
     try expectOutput("([10 20] 1)", "20");
-    try expectOutput("(try ([10 20] 2) (catch any e e))", ":index-out-of-bounds");
-    try expectOutput("(try ([10 20] :a) (catch any e e))", ":kind-mismatch");
-    try expectOutput("(try ([10 20] 0 :d) (catch any e e))", ":arity-mismatch");
+    try expectOutput("(try ([10 20] 2) (catch any e e))", "{:error :index-out-of-bounds, :message index 2 is out of bounds for a vector of 2, :fn test-form}");
+    try expectOutput("(try ([10 20] :a) (catch any e e))", "{:error :kind-mismatch, :message a vector takes an integer index, got a keyword, :fn test-form}");
+    try expectOutput("(try ([10 20] 0 :d) (catch any e e))", "{:error :arity-mismatch, :message a vector takes 1 argument, got 2, :fn test-form}");
     try expectOutput("(map {:a 1 :b 2} [:a :b :c])", "(1 2 nil)");
     try expectOutput("(filter #{2 4} [1 2 3 4])", "(2 4)");
     try expectOutput("(let [m {:x 1}] (m :x))", "1");
-    try expectOutput("(try (5 1) (catch any e e))", ":not-callable");
-    try expectOutput("(try (\"s\" 1) (catch any e e))", ":not-callable");
+    try expectOutput("(try (5 1) (catch any e e))", "{:error :not-callable, :message an integer is not callable, :fn test-form}");
+    try expectOutput("(try (\"s\" 1) (catch any e e))", "{:error :not-callable, :message a string is not callable, :fn test-form}");
 }
 
 test "integration: print writes a float's infinities and NaN as the reader does; str and %s of a bare float keep Java's spelling" {
@@ -6560,8 +6588,8 @@ test "integration: a Var calls, and derefs to, the value in force" {
     try expectOutput("[(#'inc 1) ((var +) 1 2 3) (apply #'max [3 9 4]) (map #'inc [1 2])]", "[2 6 9 (2 3)]");
     try expectOutput("(def ^:dynamic *f* inc) (binding [*f* dec] [(#'*f* 10) (@#'*f* 10) (*f* 10)])", "[9 9 9]");
     try expectOutput("(def ^:dynamic *x* 1) (binding [*x* 2] [@#'*x* (deref (var *x*))])", "[2 2]");
-    try expectOutput("(declare later) (try (#'later 1) (catch any e e))", ":unbound-var");
-    try expectOutput("(def n 5) (try (#'n 1) (catch any e e))", ":not-callable");
+    try expectOutput("(declare later) (try (#'later 1) (catch any e e))", "{:error :unbound-var, :message unbound var, :fn test-form}");
+    try expectOutput("(def n 5) (try (#'n 1) (catch any e e))", "{:error :not-callable, :message an integer is not callable, :fn test-form}");
 }
 
 // =============================================================================
@@ -6600,7 +6628,7 @@ test "core: seq over every seqable kind" {
         .{ .src = "(map identity \"hi\")", .expected = "(h i)" },
         .{ .src = "(apply str (reverse \"abc\"))", .expected = "cba" },
         .{ .src = "(sort (keys {:b 1 :a 2}))", .expected = "(:a :b)" },
-        .{ .src = "(try (seq 5) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(try (seq 5) (catch any e e))", .expected = "{:error :kind-mismatch, :message kind mismatch, :fn test-form}" },
     });
 }
 
@@ -6622,10 +6650,10 @@ test "core: reduce, range, assoc, dissoc, conj" {
         .{ .src = "(take 3 (range 0 1 0))", .expected = "(0 0 0)" },
         .{ .src = "(assoc [1 2 3] 1 :x)", .expected = "[1 :x 3]" },
         .{ .src = "(assoc [1 2 3] 3 :end)", .expected = "[1 2 3 :end]" },
-        .{ .src = "(try (assoc [1 2 3] 4 :x) (catch any e e))", .expected = ":index-out-of-bounds" },
-        .{ .src = "(try (assoc [1] :k 1) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(try (assoc [1 2 3] 4 :x) (catch any e e))", .expected = "{:error :index-out-of-bounds, :message index out of bounds, :fn test-form}" },
+        .{ .src = "(try (assoc [1] :k 1) (catch any e e))", .expected = "{:error :kind-mismatch, :message kind mismatch, :fn test-form}" },
         .{ .src = "(assoc {} :a 1 :b 2)", .expected = "{:a 1, :b 2}" },
-        .{ .src = "(try (assoc {} :a 1 :b) (catch any e e))", .expected = ":arity-mismatch" },
+        .{ .src = "(try (assoc {} :a 1 :b) (catch any e e))", .expected = "{:error :arity-mismatch, :message arity mismatch, :fn test-form}" },
         .{ .src = "(assoc nil :a 1)", .expected = "{:a 1}" },
         .{ .src = "(dissoc {:a 1 :b 2 :c 3} :a :c)", .expected = "{:b 2}" },
         .{ .src = "(dissoc {:a 1})", .expected = "{:a 1}" },
@@ -6698,7 +6726,7 @@ test "core: sequence functions" {
         .{ .src = "[(partition 3 1 [] [1 2]) (partitionv 2 1 [:p] [1 2 3])]", .expected = "[((1 2)) ([1 2] [2 3] [3 :p])]" },
         .{ .src = "(partition-all 2 [1 2 3 4 5])", .expected = "((1 2) (3 4) (5))" },
         .{ .src = "(partition-all 2 3 [1 2 3 4 5])", .expected = "((1 2) (4 5))" },
-        .{ .src = "(try (partition 0 [1]) (catch any e e))", .expected = ":invalid-argument" },
+        .{ .src = "(try (partition 0 [1]) (catch any e e))", .expected = "{:error :invalid-argument, :message invalid argument, :fn test-form}" },
         .{ .src = "(interleave [1 2 3] [:a :b])", .expected = "(1 :a 2 :b)" },
         .{ .src = "(interleave [1 2] [:a :b] [\"x\" \"y\"])", .expected = "(1 :a x 2 :b y)" },
         .{ .src = "(interleave)", .expected = "()" },
@@ -6768,7 +6796,7 @@ test "core: sorting and comparison" {
         .{ .src = "(sort [[2 1] [1 9] [1 2 0]])", .expected = "([1 9] [2 1] [1 2 0])" },
         .{ .src = "(sort [])", .expected = "()" },
         .{ .src = "(sort #{3 1 2})", .expected = "(1 2 3)" },
-        .{ .src = "(try (sort [1 :a]) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(try (sort [1 :a]) (catch any e e))", .expected = "{:error :kind-mismatch, :message kind mismatch, :fn test-form}" },
         .{ .src = "(sort-by :age [{:age 30 :n :a} {:age 20 :n :b}])", .expected = "({:age 20, :n :b} {:age 30, :n :a})" },
         .{ .src = "(sort-by count [[1 2] [1] []])", .expected = "([] [1] [1 2])" },
         .{ .src = "(sort-by :k > [{:k 1} {:k 3} {:k 2}])", .expected = "({:k 3} {:k 2} {:k 1})" },
@@ -6834,7 +6862,7 @@ test "core: predicates, names and conversions" {
         .{ .src = "(name :abc)", .expected = "abc" },
         .{ .src = "(name 'x/y)", .expected = "y" },
         .{ .src = "(name \"s\")", .expected = "s" },
-        .{ .src = "(try (name 1) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(try (name 1) (catch any e e))", .expected = "{:error :kind-mismatch, :message kind mismatch, :fn test-form}" },
         .{ .src = "(keyword \"k\")", .expected = ":k" },
         .{ .src = "(keyword 'k)", .expected = ":k" },
         .{ .src = "(= (keyword \"k\") :k)", .expected = "true" },
@@ -6955,23 +6983,23 @@ fn expectThrowingOutput(src: []const u8, expected: []const u8) !void {
 }
 
 test "native throw: caught by the innermost handler wherever the native runs" {
-    try expectThrowingOutput("(try (boom) (catch any e e))", ":boom");
+    try expectThrowingOutput("(try (boom) (catch any e e))", "{:error :boom, :message boom, :fn test-form}");
     try expectThrowingOutput("(try (boom-with {:kind :custom}) (catch any e (:kind e)))", ":custom");
     try expectThrowingOutput("(try (boom-with 42) (catch any e (inc e)))", "43");
     // Through a closure, a higher-order native, apply and nesting.
-    try expectThrowingOutput("(try ((fn [] (boom))) (catch any e e))", ":boom");
+    try expectThrowingOutput("(try ((fn [] (boom))) (catch any e e))", "{:error :boom, :message boom, :fn fn}");
     try expectThrowingOutput("(try (doall (map (fn [x] (boom-with x)) [1 2])) (catch any e e))", "1");
     try expectThrowingOutput("(try (reduce (fn [a x] (if (= x 3) (boom-with a) (+ a x))) 0 [1 2 3 4]) (catch any e e))", "3");
-    try expectThrowingOutput("(try (apply boom []) (catch any e e))", ":boom");
-    try expectThrowingOutput("(try (try (boom) (catch any e (boom-with [:again e]))) (catch any e e))", "[:again :boom]");
+    try expectThrowingOutput("(try (apply boom []) (catch any e e))", "{:error :boom, :message boom, :fn test-form}");
+    try expectThrowingOutput("(try (try (boom) (catch any e (boom-with [:again e]))) (catch any e e))", "[:again {:error :boom, :message boom, :fn test-form}]");
     // finally runs on the way out, and the VM keeps working afterwards.
     try expectThrowingOutput(
         \\(do
         \\  (def log (atom []))
         \\  (def r (try (boom) (catch any e (swap! log conj :caught) e) (finally (swap! log conj :finally))))
         \\  [r @log (+ 1 2)])
-    , "[:boom [:caught :finally] 3]");
-    try expectThrowingOutput("(do (defn safe [f] (try (f) (catch any e [:err e]))) [(safe boom) (safe (fn [] :ok))])", "[[:err :boom] :ok]");
+    , "[{:error :boom, :message boom, :fn test-form} [:caught :finally] 3]");
+    try expectThrowingOutput("(do (defn safe [f] (try (f) (catch any e [:err e]))) [(safe boom) (safe (fn [] :ok))])", "[[:err {:error :boom, :message boom, :fn safe}] :ok]");
 }
 
 test "native throw: uncaught surfaces as UncaughtThrow with the value recorded" {
@@ -7079,7 +7107,7 @@ test "ex-info: a map thrown and caught, read back with ex-data and ex-message" {
     try expectOutputProgram("[(ex-data 1) (ex-message :k) (ex-data {:x 1}) (:cause (ex-info \"m\" {}))]", "[nil nil nil nil]");
     // As Clojure's: nil data is {}, a nil message stays nil, and data
     // that is not a map or a message that is not a string is refused.
-    try expectOutputProgram("[(ex-data (ex-info \"x\" nil)) (ex-message (ex-info nil {})) (ex-data (ex-info \"s\" (sorted-map :a 1))) (try (ex-info \"x\" 1) (catch any e e)) (try (ex-info 1 {}) (catch any e e))]", "[{} nil {:a 1} :kind-mismatch :kind-mismatch]");
+    try expectOutputProgram("[(ex-data (ex-info \"x\" nil)) (ex-message (ex-info nil {})) (ex-data (ex-info \"s\" (sorted-map :a 1))) (try (ex-info \"x\" 1) (catch any e e)) (try (ex-info 1 {}) (catch any e e))]", "[{} nil {:a 1} {:error :kind-mismatch, :message kind mismatch, :fn test-form} {:error :kind-mismatch, :message kind mismatch, :fn test-form}]");
     // A tag catches an ex-info map through the `:error` of its data.
     try expectOutputProgram(
         "(try (throw (ex-info \"nf\" {:error :not-found :id 3})) (catch :other e :no) (catch :not-found e [(ex-message e) (:id (ex-data e))]))",
@@ -7154,7 +7182,7 @@ test "read-string: an options map's :eof is the value of a string that holds no 
     , "[:bad :bad :bad :bad :bad]");
     try expectOutput(
         \\[(try (read-string {} "") (catch any e e)) (try (read-string 1 "1") (catch any e e)) (try (read-string {:eof 1} 2) (catch any e e))]
-    , "[:reader-error :kind-mismatch :kind-mismatch]");
+    , "[{:error :reader-error, :message reader error, :fn test-form} {:error :kind-mismatch, :message kind mismatch, :fn test-form} {:error :kind-mismatch, :message kind mismatch, :fn test-form}]");
 }
 
 test "edn: nexis.edn/read-string reads one value as data and evaluates nothing" {
@@ -7168,7 +7196,7 @@ test "edn: nexis.edn/read-string reads one value as data and evaluates nothing" 
         \\[(try (nexis.edn/read-string "#inst \"2020\"") (catch any e e))
         \\ (try (nexis.edn/read-string {:readers {'foo inc}} "#foo 1") (catch any e e))
         \\ (try (nexis.edn/read-string {} "") (catch any e e)) (read-string "[1]")]
-    , "[:reader-error :reader-error :reader-error [1]]");
+    , "[{:error :reader-error, :message reader error, :fn test-form} {:error :reader-error, :message reader error, :fn test-form} {:error :reader-error, :message reader error, :fn test-form} [1]]");
 }
 
 // =============================================================================
@@ -7186,7 +7214,7 @@ test "eval: a form as data compiles in the current namespace and runs on the cal
     try expectOutput("(let [f (eval '(fn [x] (* x 10)))] (f 4))", "40");
     try expectOutput("(map eval ['(+ 1 1) '(str \"a\" \"b\")])", "(2 ab)");
     // A lexical name is not in scope for the evaluated form.
-    try expectOutput("(let [x 1] (try (eval 'x) (catch :compile-error e (:message e))))", "UnresolvedSymbol");
+    try expectOutput("(let [x 1] (try (eval 'x) (catch :compile-error e (:message e))))", "unable to resolve symbol: x");
 }
 
 test "eval: def binds in the current namespace; a macro it defines serves a later eval" {
@@ -7207,14 +7235,17 @@ test "eval: def binds in the current namespace; a macro it defines serves a late
 }
 
 test "eval: a compile error is a catchable map; a throw inside the form is an ordinary throw" {
-    try expectOutput("(try (eval '(nope 1)) (catch :compile-error e [(:error e) (:message e) (:form e)]))", "[:compile-error UnresolvedSymbol (nope 1)]");
-    try expectOutput("(try (eval '(recur 1)) (catch :compile-error e (:message e)))", "RecurOutsideTail");
-    try expectOutput("(try (eval '(quote)) (catch :compile-error e (:message e)))", "MalformedForm");
-    try expectOutput("(try (eval '(let* [x] x)) (catch :compile-error e (:message e)))", "MacroExpansionFailure");
-    try expectOutput("(try (eval (list 'a (fn [] 1))) (catch :compile-error e (:message e)))", "UnsupportedForm");
-    try expectOutput("(ex-message (try (eval '(nope)) (catch :compile-error e e)))", "UnresolvedSymbol");
+    // The message is the compiler's sentence, the CompileError's name
+    // in words when it has none; :kind is the name.
+    try expectOutput("(try (eval '(nope 1)) (catch :compile-error e [(:error e) (:message e) (:form e) (:kind e)]))", "[:compile-error unable to resolve symbol: nope (nope 1) UnresolvedSymbol]");
+    try expectOutput("(try (eval '(recur 1)) (catch :compile-error e [(:kind e) (:message e)]))", "[RecurOutsideTail recur outside tail]");
+    try expectOutput("(try (eval '(quote)) (catch :compile-error e [(:kind e) (:message e)]))", "[MalformedForm malformed form]");
+    try expectOutput("(try (eval '(let* [x] x)) (catch :compile-error e [(:kind e) (:message e)]))", "[MacroExpansionFailure let*: the binding vector needs an even number of forms]");
+    try expectOutput("(try (eval (list 'a (fn [] 1))) (catch :compile-error e [(:kind e) (:message e)]))", "[UnsupportedForm unsupported form]");
+    try expectOutput("(ex-message (try (eval '(nope)) (catch :compile-error e e)))", "unable to resolve symbol: nope");
+    try expectOutput("(ex-message (try (eval '(Math/sqrt 2)) (catch :compile-error e e)))", "unable to resolve symbol: Math/sqrt; nexis has no Java interop: use nexis.math/sqrt (clojure.math/sqrt)");
     try expectOutput("(try (eval '(throw :x)) (catch :x e [:caught e]))", "[:caught :x]");
-    try expectOutput("(try (eval '(/ 1 0)) (catch :divide-by-zero e e))", ":divide-by-zero");
+    try expectOutput("(try (eval '(/ 1 0)) (catch :divide-by-zero e e))", "{:error :divide-by-zero, :message divide by zero, :fn <eval>}");
     try expectOutput("(eval '(try (throw :in) (catch :in e :handled)))", ":handled");
     try expectOutput("(try (eval '(eval '(throw :deep))) (catch :deep e e))", ":deep");
     try expectOutput("[(try (eval '(throw :x)) (catch :x e e)) (eval '(+ 1 1))]", "[:x 2]");
@@ -7265,7 +7296,7 @@ test "eval: a VM without compiler hooks throws :no-compiler" {
     try program.init();
     defer program.deinit();
     program.v.compiler_hooks = null;
-    const out = try program.run("(try (eval '(+ 1 1)) (catch :no-compiler e e))");
+    const out = try program.run("(try (eval '(+ 1 1)) (catch :no-compiler e (:error e)))");
     try testing.expectEqualStrings("no-compiler", program.interner.keywordName(out.asKeywordId()));
 }
 
@@ -7354,22 +7385,22 @@ test "typed vectors: equality, hash and identity" {
 
 test "typed vectors: constructor errors and the absent update operations" {
     try runCoreCases(&.{
-        .{ .src = "(try (i64-vector [1.5]) (catch any e e))", .expected = ":kind-mismatch" },
-        .{ .src = "(try (i64-vector [:a]) (catch any e e))", .expected = ":kind-mismatch" },
-        .{ .src = "(try (i64-vector [18446744073709551616]) (catch any e e))", .expected = ":kind-mismatch" },
-        .{ .src = "(try (f64-vector [\"1\"]) (catch any e e))", .expected = ":kind-mismatch" },
-        .{ .src = "(try (i64-vector 5) (catch any e e))", .expected = ":kind-mismatch" },
-        .{ .src = "(try (typed-vector-type [1]) (catch any e e))", .expected = ":kind-mismatch" },
-        .{ .src = "(try (nth (i64-vector [1]) 1) (catch any e e))", .expected = ":index-out-of-bounds" },
-        .{ .src = "(try (nth (i64-vector [1]) -1) (catch any e e))", .expected = ":index-out-of-bounds" },
-        .{ .src = "(try (nth (f64-vector []) 0) (catch any e e))", .expected = ":index-out-of-bounds" },
-        .{ .src = "(try (conj (i64-vector [1]) 2) (catch any e e))", .expected = ":kind-mismatch" },
-        .{ .src = "(try (assoc (i64-vector [1]) 0 2) (catch any e e))", .expected = ":kind-mismatch" },
-        .{ .src = "(try (pop (i64-vector [1])) (catch any e e))", .expected = ":kind-mismatch" },
-        .{ .src = "(try (peek (i64-vector [1])) (catch any e e))", .expected = ":kind-mismatch" },
-        .{ .src = "(try (subvec (i64-vector [1]) 0) (catch any e e))", .expected = ":kind-mismatch" },
-        .{ .src = "(try (empty (i64-vector [1])) (catch any e e))", .expected = ":kind-mismatch" },
-        .{ .src = "(try ((i64-vector [1]) 0) (catch any e e))", .expected = ":not-callable" },
+        .{ .src = "(try (i64-vector [1.5]) (catch any e e))", .expected = "{:error :kind-mismatch, :message kind mismatch, :fn test-form}" },
+        .{ .src = "(try (i64-vector [:a]) (catch any e e))", .expected = "{:error :kind-mismatch, :message kind mismatch, :fn test-form}" },
+        .{ .src = "(try (i64-vector [18446744073709551616]) (catch any e e))", .expected = "{:error :kind-mismatch, :message kind mismatch, :fn test-form}" },
+        .{ .src = "(try (f64-vector [\"1\"]) (catch any e e))", .expected = "{:error :kind-mismatch, :message kind mismatch, :fn test-form}" },
+        .{ .src = "(try (i64-vector 5) (catch any e e))", .expected = "{:error :kind-mismatch, :message kind mismatch, :fn test-form}" },
+        .{ .src = "(try (typed-vector-type [1]) (catch any e e))", .expected = "{:error :kind-mismatch, :message kind mismatch, :fn test-form}" },
+        .{ .src = "(try (nth (i64-vector [1]) 1) (catch any e e))", .expected = "{:error :index-out-of-bounds, :message index out of bounds, :fn test-form}" },
+        .{ .src = "(try (nth (i64-vector [1]) -1) (catch any e e))", .expected = "{:error :index-out-of-bounds, :message index out of bounds, :fn test-form}" },
+        .{ .src = "(try (nth (f64-vector []) 0) (catch any e e))", .expected = "{:error :index-out-of-bounds, :message index out of bounds, :fn test-form}" },
+        .{ .src = "(try (conj (i64-vector [1]) 2) (catch any e e))", .expected = "{:error :kind-mismatch, :message kind mismatch, :fn test-form}" },
+        .{ .src = "(try (assoc (i64-vector [1]) 0 2) (catch any e e))", .expected = "{:error :kind-mismatch, :message kind mismatch, :fn test-form}" },
+        .{ .src = "(try (pop (i64-vector [1])) (catch any e e))", .expected = "{:error :kind-mismatch, :message kind mismatch, :fn test-form}" },
+        .{ .src = "(try (peek (i64-vector [1])) (catch any e e))", .expected = "{:error :kind-mismatch, :message kind mismatch, :fn test-form}" },
+        .{ .src = "(try (subvec (i64-vector [1]) 0) (catch any e e))", .expected = "{:error :kind-mismatch, :message kind mismatch, :fn test-form}" },
+        .{ .src = "(try (empty (i64-vector [1])) (catch any e e))", .expected = "{:error :kind-mismatch, :message kind mismatch, :fn test-form}" },
+        .{ .src = "(try ((i64-vector [1]) 0) (catch any e e))", .expected = "{:error :not-callable, :message a typed vector is not callable, :fn test-form}" },
     });
 }
 
@@ -7389,24 +7420,24 @@ test "typed vectors: nexis.simd kernels" {
         .{ .src = "(nexis.simd/dot (i64-vector [1 2 3]) (i64-vector [4 5 6]))", .expected = "32" },
         .{ .src = "(nexis.simd/dot (f64-vector [1 2 3 4 5]) (f64-vector [1 1 1 1 1]))", .expected = "15.0" },
         .{ .src = "(nexis.simd/dot (f64-vector []) (f64-vector []))", .expected = "0.0" },
-        .{ .src = "(try (nexis.simd/dot (i64-vector [1]) (f64-vector [1])) (catch any e e))", .expected = ":kind-mismatch" },
-        .{ .src = "(try (nexis.simd/dot (i64-vector [1]) (i64-vector [1 2])) (catch any e e))", .expected = ":invalid-argument" },
+        .{ .src = "(try (nexis.simd/dot (i64-vector [1]) (f64-vector [1])) (catch any e e))", .expected = "{:error :kind-mismatch, :message kind mismatch, :fn test-form}" },
+        .{ .src = "(try (nexis.simd/dot (i64-vector [1]) (i64-vector [1 2])) (catch any e e))", .expected = "{:error :invalid-argument, :message invalid argument, :fn test-form}" },
         .{ .src = "(nexis.simd/dot (i64-vector [4611686018427387904]) (i64-vector [4]))", .expected = "18446744073709551616" },
         .{ .src = "(nexis.simd/dot (i64-vector [-9223372036854775808 -9223372036854775808 -9223372036854775808 -9223372036854775808]) (i64-vector [-9223372036854775808 -9223372036854775808 -9223372036854775808 -9223372036854775808]))", .expected = "340282366920938463463374607431768211456" },
         .{ .src = "(nexis.simd/dot (i64-vector [-9223372036854775808 -9223372036854775808 -9223372036854775808 -9223372036854775808 1]) (i64-vector [-9223372036854775808 -9223372036854775808 -9223372036854775808 -9223372036854775808 -1]))", .expected = "340282366920938463463374607431768211455" },
         .{ .src = "(let [xs (i64-vector [9223372036854775807 -9223372036854775808 3]) ys (i64-vector [9223372036854775807 9223372036854775807 -1])] (= (nexis.simd/dot xs ys) (reduce + (map * xs ys))))", .expected = "true" },
-        .{ .src = "(try (nexis.simd/dot [1] (i64-vector [1])) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(try (nexis.simd/dot [1] (i64-vector [1])) (catch any e e))", .expected = "{:error :kind-mismatch, :message kind mismatch, :fn test-form}" },
         .{ .src = "(nexis.simd/scale (i64-vector [1 2 3]) 10)", .expected = "#i64[10 20 30]" },
         .{ .src = "(nexis.simd/scale (f64-vector [1 2 3 4 5]) 0.5)", .expected = "#f64[0.5 1.0 1.5 2.0 2.5]" },
         .{ .src = "(nexis.simd/scale (f64-vector [1 2]) 2)", .expected = "#f64[2.0 4.0]" },
-        .{ .src = "(try (nexis.simd/scale (i64-vector [1]) 1.5) (catch any e e))", .expected = ":kind-mismatch" },
-        .{ .src = "(try (nexis.simd/scale (i64-vector [4611686018427387904]) 2) (catch any e e))", .expected = ":arithmetic-overflow" },
+        .{ .src = "(try (nexis.simd/scale (i64-vector [1]) 1.5) (catch any e e))", .expected = "{:error :kind-mismatch, :message kind mismatch, :fn test-form}" },
+        .{ .src = "(try (nexis.simd/scale (i64-vector [4611686018427387904]) 2) (catch any e e))", .expected = "{:error :arithmetic-overflow, :message arithmetic overflow, :fn test-form}" },
         .{ .src = "(nexis.simd/map (fn [x] (* x x)) (i64-vector [1 2 3]))", .expected = "#i64[1 4 9]" },
         .{ .src = "(nexis.simd/map (fn [x] (/ x 2)) (f64-vector [1 2 3]))", .expected = "#f64[0.5 1.0 1.5]" },
         .{ .src = "(nexis.simd/map (fn [x] (/ x 2)) (i64-vector [4 6]))", .expected = "#i64[2 3]" },
         .{ .src = "(nexis.simd/map inc (f64-vector []))", .expected = "#f64[]" },
-        .{ .src = "(try (nexis.simd/map (fn [x] (/ x 2)) (i64-vector [1])) (catch any e e))", .expected = ":kind-mismatch" },
-        .{ .src = "(try (nexis.simd/map str (f64-vector [1])) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(try (nexis.simd/map (fn [x] (/ x 2)) (i64-vector [1])) (catch any e e))", .expected = "{:error :kind-mismatch, :message kind mismatch, :fn test-form}" },
+        .{ .src = "(try (nexis.simd/map str (f64-vector [1])) (catch any e e))", .expected = "{:error :kind-mismatch, :message kind mismatch, :fn test-form}" },
         .{ .src = "(try (nexis.simd/map (fn [x] (throw :inner)) (i64-vector [1])) (catch :inner e :caught))", .expected = ":caught" },
         .{ .src = "(nexis.simd/map (fn [x] (* x 140737488355328)) (i64-vector [1 2]))", .expected = "#i64[140737488355328 281474976710656]" },
     });
@@ -7670,12 +7701,12 @@ test "binding: a throw through binding restores the root before the catch runs" 
 }
 
 test "binding: only a dynamic Var can be bound; set! rebinds the innermost binding" {
-    try expectOutputProgram("(def plain 1) (try (binding [plain 2] plain) (catch :not-dynamic e e))", ":not-dynamic");
-    try expectOutputProgram("(def plain 1) (def ^:dynamic *x* 1) [(try (binding [*x* 2 plain 2] plain) (catch :not-dynamic e e)) (thread-bound? (var *x*))]", "[:not-dynamic false]");
+    try expectOutputProgram("(def plain 1) (try (binding [plain 2] plain) (catch :not-dynamic e e))", "{:error :not-dynamic, :message not dynamic, :fn test-form}");
+    try expectOutputProgram("(def plain 1) (def ^:dynamic *x* 1) [(try (binding [*x* 2 plain 2] plain) (catch :not-dynamic e e)) (thread-bound? (var *x*))]", "[{:error :not-dynamic, :message not dynamic, :fn test-form} false]");
     try expectOutputProgram("(def ^:dynamic *x* 1) (defn read-x [] *x*) [(binding [*x* 2] (set! *x* 7) (read-x)) *x*]", "[7 1]");
     try expectOutputProgram("(def ^:dynamic *x* 1) (binding [*x* 2] (binding [*x* 3] (set! *x* 4)) *x*)", "2");
-    try expectOutputProgram("(def ^:dynamic *x* 1) (try (set! *x* 5) (catch :no-thread-binding e [e *x*]))", "[:no-thread-binding 1]");
-    try expectOutputProgram("(def plain 1) (try (set! plain 5) (catch :not-dynamic e [e plain]))", "[:not-dynamic 1]");
+    try expectOutputProgram("(def ^:dynamic *x* 1) (try (set! *x* 5) (catch :no-thread-binding e [e *x*]))", "[{:error :no-thread-binding, :message no thread binding, :fn test-form} 1]");
+    try expectOutputProgram("(def plain 1) (try (set! plain 5) (catch :not-dynamic e [e plain]))", "[{:error :not-dynamic, :message not dynamic, :fn test-form} 1]");
     try expectOutputProgram("(def ^:dynamic *x* 1) (meta (var *x*))", "{:dynamic true, :name *x*, :ns user}");
 }
 
@@ -7761,6 +7792,92 @@ test "runtime errors: a closure called back from a native is the frame named fn"
     try testing.expectError(vm.VmError.DivideByZero, runLocated(&program, &info));
     try expectFrame(&program, &info, 0, "fn", 1, 15, "(/ 1 x)");
     try expectFrame(&program, &info, 1, "<top>", 1, 1, "(mapv (fn [x] (/ 1 x)) [1 0])");
+}
+
+/// `src` run as `runLocated` runs it, its value printed as the REPL
+/// prints it, readably.
+fn expectLocatedOutput(src: []const u8, expected: []const u8) !void {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const info = vm.SourceInfo{ .path = "t.nx", .text = src };
+    const out = try runLocated(&program, &info);
+    var w = std.Io.Writer.Allocating.init(testing.allocator);
+    defer w.deinit();
+    try format_mod.format(out, .readable, &w.writer, program.interner);
+    try testing.expectEqualStrings(expected, w.written());
+}
+
+test "runtime errors: a caught error is a map of its tag, its message and where it was raised" {
+    try expectLocatedOutput("(defn f [x]\n  (+ x \"a\"))\n(try (f 1) (catch any e e))",
+        \\{:error :kind-mismatch, :message "+ expects numbers, got a string", :fn "f", :file "t.nx", :line 2, :column 3}
+    );
+    // With no sentence from the raise site the message is the tag in
+    // words; at top level the function is `<top>`.
+    try expectLocatedOutput("(try (nth [1] 5) (catch :index-out-of-bounds e e))",
+        \\{:error :index-out-of-bounds, :message "index out of bounds", :fn "<top>", :file "t.nx", :line 1, :column 6}
+    );
+    // A native's own error keyword travels the same way.
+    try expectLocatedOutput("(try (with-meta 1 {}) (catch any e e))",
+        \\{:error :no-metadata-on-immediate, :message "no metadata on immediate", :fn "<top>", :file "t.nx", :line 1, :column 6}
+    );
+}
+
+test "runtime errors: a form a user macro was given keeps its own place in the expansion" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const info = vm.SourceInfo{ .path = "t.nx", .text = "(doseq [x [1]]\n  (inc x)\n  (/ 1 0))" };
+    try testing.expectError(vm.VmError.DivideByZero, runLocated(&program, &info));
+    try expectFrame(&program, &info, 0, "<top>", 3, 3, "(/ 1 0)");
+    try expectLocatedOutput("(defmacro twice [& body] `(do ~@body ~@body))\n(defn f [x]\n  (twice\n    [(+ x \"a\")]))\n(try (f 1) (catch any e [(:line e) (:column e)]))",
+        \\[4 6]
+    );
+}
+
+test "runtime errors: the library's own refusals are error maps with a sentence" {
+    try expectLocatedOutput("(try (num \"1\") (catch any e e))",
+        \\{:error :kind-mismatch, :message "num takes a number or nil, got a string", :fn "<top>", :file "t.nx", :line 1, :column 6}
+    );
+    try expectLocatedOutput(
+        \\(defmulti m identity)
+        \\[(ex-message (try (parse-boolean 1) (catch :kind-mismatch e e)))
+        \\ (ex-message (try (instance? "x" 1) (catch :kind-mismatch e e)))
+        \\ (ex-message (try (the-ns 'nope) (catch :no-such-namespace e e)))
+        \\ (ex-message (try (var-get 1) (catch :kind-mismatch e e)))
+        \\ (ex-message (try (methods {}) (catch :kind-mismatch e e)))
+        \\ (ex-message (try (make-multifn "m" identity :default {}) (catch :kind-mismatch e e)))
+        \\ (ex-message (try (nexis.test/use-fixtures :always identity) (catch :invalid-argument e e)))]
+    ,
+        \\["parse-boolean takes a string, got an integer" "instance? takes a kind keyword or a record symbol, got a string" "no namespace named nope" "var-get takes a Var, got an integer" "expected a multimethod, got a map" "make-multifn reads its hierarchy through a Var or an atom, got a map" "use-fixtures takes :once or :each, not :always"]
+    );
+}
+
+test "runtime errors: an error inside a library function is placed at the program's call" {
+    try expectLocatedOutput("(defn g [m]\n  (update m :a inc))\n(try (g {:a \"x\"}) (catch any e [(:fn e) (:file e) (:line e) (:column e)]))",
+        \\["g" "t.nx" 2 3]
+    );
+}
+
+test "runtime errors: each place is its own, a handler in a loop included" {
+    try expectLocatedOutput("(defn f [x] (/ 1 x))\n(defn g [x]\n  (+ x :a))\n[(try (f 0) (catch any e (:line e))) (try (g 1) (catch any e (:line e))) (try (f 0) (catch any e (:line e))) (mapv (fn [x] (try (f x) (catch any e (:column e)))) [0 0])]",
+        \\[1 3 1 [13 13]]
+    );
+}
+
+test "runtime errors: ex-message, ex-data and ex-cause read a caught error; catch takes it by tag and by class" {
+    try expectLocatedOutput("[(try (nth [] 1) (catch :index-out-of-bounds e (ex-message e))) (try (/ 1 0) (catch ArithmeticException e (:error (ex-data e)))) (try (/ 1 0) (catch any e (ex-cause e))) (try (first 1 2) (catch :arity-mismatch e (ex-message e)))]",
+        \\["index out of bounds" :divide-by-zero nil "first takes 1 argument, got 2"]
+    );
+    // An ex-info map's data is its :data; an error map is its own data;
+    // any other value has none.
+    try expectLocatedOutput("[(ex-data (ex-info \"m\" {:a 1})) (ex-data {:error :x :message \"y\"}) (ex-data {:a 1}) (ex-data :kw) (ex-message {:error :x :message \"y\"})]",
+        \\[{:a 1} {:error :x, :message "y"} nil nil "y"]
+    );
+    // Code that compared the caught value to a keyword reads its tag.
+    try expectLocatedOutput("[(= :divide-by-zero (try (/ 1 0) (catch any e e))) (= :divide-by-zero (try (/ 1 0) (catch any e (:error e))))]",
+        \\[false true]
+    );
 }
 
 /// Compile one form of `src` into a routine the caller owns, the
@@ -7956,7 +8073,7 @@ test "ns: (:refer-clojure :exclude [names]) leaves those names to the namespace"
     // A form compiled before the namespace's own + calls it, not core's inlined +.
     try expectOutputProgram("(ns ex (:refer-clojure :exclude [+ when])) (defn f [] (+ 1 2)) (defn + [a b] (str a b)) (f)", "12");
     try expectOutputProgram("(ns ex (:refer-clojure :exclude [when])) (defn when [x] [:mine x]) (when 1)", "[:mine 1]");
-    try expectOutputProgram("(ns ex (:refer-clojure :exclude [inc])) [(nexis.core/inc 1) (try (inc 1) (catch any e e))]", "[2 :unbound-var]");
+    try expectOutputProgram("(ns ex (:refer-clojure :exclude [inc])) [(nexis.core/inc 1) (try (inc 1) (catch any e e))]", "[2 {:error :unbound-var, :message unbound var, :fn test-form}]");
     try expectOutputProgram("(ns ex (:refer-clojure :exclude [inc])) `(inc 1)", "(ex/inc 1)");
     try expectOutputProgram("(ns ex (:refer-clojure)) (inc 1)", "2");
     // Without :exclude, a Var the namespace defines hides a host macro too.
@@ -8153,6 +8270,8 @@ test "require: a file that cannot be loaded is diagnosed where it failed, in the
         .{ .src = "(require 'unresolved)", .label = "compile error: unable to resolve symbol: nope", .file = "unresolved.nx", .line = 2 },
         .{ .src = "(require 'cyca)", .label = "require: cyclic require of cyca", .file = "cycb.nx", .line = 2 },
         .{ .src = "(require 'nope)", .label = "require: no file nope.nx on the load path" },
+        // A Clojure library nexis lacks says what to use instead.
+        .{ .src = "(require '[clojure.java.io :as io])", .label = "require: no file clojure/java/io.nx on the load path; nexis has no clojure.java.io: slurp and spit read and write a file, read-line reads stdin" },
     };
     for (cases) |c| {
         if (files.compileOne(&program, c.src)) |_| return error.TestUnexpectedResult else |_| {}
@@ -8339,7 +8458,7 @@ test "nexis.test: run-tests counts tests, assertions, failures and errors and re
         \\(def r (nexis.test/run-tests))
         \\[(:test r) (:pass r) (:fail r) (:error r) @log]
     ,
-        \\[4 4 3 1 [FAIL in user/failing-test (wrong): (= 5 (area 2 2)) expected: 5 actual: 4 ; areas multiply FAIL in user/failing-test (wrong): (empty? [1]) expected: true actual: false FAIL in user/throwing-test: (nexis.test/thrown? :boom (+ 1 1)) expected: :boom actual: 2 ERROR in user/erroring-test: :divide-by-zero Ran 4 tests containing 7 assertions. 3 failures, 1 errors.]]
+        \\[4 4 3 1 [FAIL in user/failing-test (wrong): (= 5 (area 2 2)) expected: 5 actual: 4 ; areas multiply FAIL in user/failing-test (wrong): (empty? [1]) expected: true actual: false FAIL in user/throwing-test: (nexis.test/thrown? :boom (+ 1 1)) expected: :boom actual: 2 ERROR in user/erroring-test: :divide-by-zero divide by zero Ran 4 tests containing 7 assertions. 3 failures, 1 errors.]]
     );
 }
 
@@ -8428,7 +8547,7 @@ test "nexis.test: use-fixtures wraps a namespace's run (:once) and each test (:e
         \\(def r (nexis.test/run-all-tests))
         \\[@user/log (:test r) (nexis.test/successful? r) (nexis.test/successful? {:fail 1 :error 0})
         \\ (try (nexis.test/use-fixtures :always identity) (catch any e e))]
-    , "[[:once :outer :inner :a :done :outer :inner :b :done :once-end :c] 3 true false :invalid-argument]");
+    , "[[:once :outer :inner :a :done :outer :inner :b :done :once-end :c] 3 true false {:error :invalid-argument, :message use-fixtures takes :once or :each, not :always, :fn test-form}]");
 }
 
 test "nexis.test, nexis.pprint: :refer :all brings the API, not the private helpers" {

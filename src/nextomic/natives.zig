@@ -60,6 +60,8 @@ const pull_mod = @import("pull.zig");
 const query = @import("query.zig");
 const query_natives = @import("query/natives.zig");
 const marshal = @import("marshal.zig");
+const format_mod = @import("../format.zig");
+const intern_mod = @import("../intern.zig");
 const seq_mod = @import("../seq.zig");
 
 const Allocator = std.mem.Allocator;
@@ -231,15 +233,16 @@ pub const Detail = struct {
     cas: ?struct { expected: Value, actual: Value } = null,
     /// `:format` of a store refused as another format's.
     format: ?u16 = null,
-
-    fn empty(self: Detail) bool {
-        return self.message == null and self.clause == null and self.attr == null and self.value == null and self.e == null and self.cas == null and self.format == null;
-    }
+    /// The type a value of the wrong type was refused for, which the
+    /// message names.
+    value_type: ?key.ValueType = null,
 };
 
 /// Surface `err` to the program. VM errors pass through unchanged;
-/// everything else is thrown as its keyword, or as the map `{:error
-/// keyword ...}` carrying `detail` when there is any.
+/// everything else is thrown as the map `{:error keyword :message m
+/// ...}` carrying `detail`, its message the sentence `detail` gives or
+/// one made of what it knows (`messageOf`), placed at the failing call
+/// when a handler is in force (`VM.throwErrorMap`).
 pub fn fail(vm: *VM, err: anyerror) VmError {
     return failWith(vm, err, .{});
 }
@@ -248,19 +251,94 @@ pub fn failWith(vm: *VM, err: anyerror, detail: Detail) VmError {
     inline for (@typeInfo(VmError).error_set.error_names.?) |name| {
         if (err == @field(anyerror, name)) return @field(VmError, name);
     }
-    const name = errorKeyword(err);
-    if (detail.empty()) return vm.throwKeyword(name);
     // A conflict names its datom as `:e` and `:a`.
     const attr_key: []const u8 = if (err == error.Conflict) "a" else "attr";
-    const payload = payloadMap(vm, name, detail, attr_key) catch return VmError.OutOfMemory;
-    return vm.throwValue(payload);
+    var buf: [message_capacity]u8 = undefined;
+    var d = detail;
+    if (d.message == null) d.message = messageOf(vm, err, detail, &buf);
+    const payload = payloadMap(vm, errorKeyword(err), d, attr_key) catch return VmError.OutOfMemory;
+    return vm.throwErrorMap(payload);
 }
 
 /// Throw the map a syntax error travels as: `{:error name :message
 /// message :clause clause}`, `:clause` present when given.
 pub fn throwSyntax(vm: *VM, name: []const u8, message: []const u8, clause: ?usize) VmError {
     const payload = payloadMap(vm, name, .{ .message = message, .clause = clause }, "attr") catch return VmError.OutOfMemory;
-    return vm.throwValue(payload);
+    return vm.throwErrorMap(payload);
+}
+
+/// The longest message `messageOf` writes; a longer one is cut at a
+/// character and ends in `…`.
+const message_capacity = 240;
+
+/// The sentence an error says when its raise site gave none, naming
+/// the attribute, value or entity `detail` knows (§7), in `buf`.
+fn messageOf(vm: *VM, err: anyerror, detail: Detail, buf: *[message_capacity]u8) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    writeMessage(&w, vm.ensureInterner(), err, detail) catch {
+        // Too long: keep what fits, cut at a character, and mark it.
+        const mark = "…";
+        var end = buf.len - mark.len;
+        while (end > 0 and buf[end] & 0xC0 == 0x80) end -= 1;
+        @memcpy(buf[end..][0..mark.len], mark);
+        return buf[0 .. end + mark.len];
+    };
+    return w.buffered();
+}
+
+fn writeMessage(w: *std.Io.Writer, interner: *const intern_mod.Interner, err: anyerror, d: Detail) !void {
+    const Shown = struct {
+        v: Value,
+        interner: *const intern_mod.Interner,
+        pub fn format(self: @This(), out: *std.Io.Writer) std.Io.Writer.Error!void {
+            format_mod.format(self.v, .readable, out, self.interner) catch |e| switch (e) {
+                error.WriteFailed => return error.WriteFailed,
+                else => try out.writeAll("#<unprintable>"),
+            };
+        }
+    };
+    const attr: ?Shown = if (d.attr) |a| .{ .v = a, .interner = interner } else null;
+    const val: ?Shown = if (d.value) |v| .{ .v = v, .interner = interner } else null;
+    switch (err) {
+        error.UnknownAttribute => if (attr) |a| try w.print("{f} names no attribute", .{a}) else try w.writeAll("no such attribute"),
+        error.ValueType => if (attr != null and val != null and d.value_type != null)
+            try w.print("{f} takes a :{s}, not {f}", .{ attr.?, d.value_type.?.identName(), val.? })
+        else if (val != null and d.value_type != null)
+            try w.print("{f} is not a :{s}", .{ val.?, d.value_type.?.identName() })
+        else if (attr != null and val != null)
+            try w.print("{f} does not take {f}", .{ attr.?, val.? })
+        else
+            try w.writeAll("a value of the wrong type for its attribute or operation"),
+        error.Unique => if (attr != null and val != null)
+            try w.print("{f} {f} belongs to another entity", .{ attr.?, val.? })
+        else
+            try w.writeAll("a unique value belongs to another entity"),
+        error.Conflict => if (attr != null and d.e != null)
+            try w.print("two claims of one transaction disagree about {f} of entity {d}", .{ attr.?, d.e.? })
+        else
+            try w.writeAll("two claims of one transaction disagree"),
+        error.NoEntity => if (attr != null and val != null)
+            try w.print("the lookup ref [{f} {f}] names no entity", .{ attr.?, val.? })
+        else if (val) |v|
+            try w.print("{f} names no entity", .{v})
+        else
+            try w.writeAll("no such entity"),
+        error.Cas => if (attr != null and d.cas != null)
+            try w.print("{f} holds {f}, not the {f} the cas expected", .{ attr.?, Shown{ .v = d.cas.?.actual, .interner = interner }, Shown{ .v = d.cas.?.expected, .interner = interner } })
+        else
+            try w.writeAll("a cas found another value than it expected"),
+        error.BasisInFuture => try w.writeAll("the db-value is newer than its store"),
+        error.Closed => try w.writeAll("the connection is released, or the with scope of this db-value has ended"),
+        error.Busy => try w.writeAll("release while a read, a transact! or a with is in flight on the connection"),
+        error.Nested => try w.writeAll("the store's write transaction is held: a with scope, a transaction function or another connection is writing"),
+        error.HistoryView => try w.writeAll("entity and pull read a current, as-of or since db-value, not a history one"),
+        error.UnboundPattern => try w.writeAll("a pattern with nothing bound: no constant, and no variable an earlier clause or :in binds"),
+        error.Format, error.UnknownIdent => try w.writeAll("the store's bytes do not decode"),
+        else => {
+            // `:db/key-too-large` says "db key too large".
+            for (errorKeyword(err)) |c| try w.writeByte(if (c == '-' or c == '/') ' ' else c);
+        },
+    }
 }
 
 fn payloadMap(vm: *VM, name: []const u8, detail: Detail, attr_key: []const u8) !Value {
@@ -295,7 +373,7 @@ fn payloadMap(vm: *VM, name: []const u8, detail: Detail, attr_key: []const u8) !
 /// value the connection can no longer render (its keyword was minted
 /// by the failed transaction) is left out.
 fn detailOf(vm: *VM, conn: *Conn, fault: *const Fault) Detail {
-    var d: Detail = .{ .message = fault.message, .attr = fault.attr, .e = fault.e };
+    var d: Detail = .{ .message = fault.message, .attr = fault.attr, .e = fault.e, .value = fault.given, .value_type = fault.value_type };
     if (fault.value != null or fault.cas != null) {
         if (conn.store.beginRead()) |txn| {
             defer txn.abort();
@@ -756,7 +834,11 @@ fn fnPull(vm: *VM, args: []const Value) VmError!Value {
     const listed = try ListedArgs.of(vm, args);
     defer listed.deinit(vm);
     var diag: Diag = .{};
-    return pullNative(vm, listed.args, &diag) catch |err| failDiag(vm, err, &diag);
+    return pullNative(vm, listed.args, &diag) catch |err| switch (err) {
+        // The entity argument names nothing.
+        error.NoEntity => failWith(vm, err, .{ .value = listed.args[2] }),
+        else => failDiag(vm, err, &diag),
+    };
 }
 
 /// `(pull db pattern e)`: the pattern's map for `e`; nil when the
@@ -792,6 +874,7 @@ pub fn failDiag(vm: *VM, err: anyerror, diag: *const Diag) VmError {
         error.QuerySyntax, error.PullSyntax => throwSyntax(vm, errorKeyword(err), diag.message, diag.clause),
         error.UnknownAttribute => failWith(vm, err, .{ .attr = diag.attr }),
         error.TxData => failWith(vm, err, .{ .message = if (diag.message.len == 0) null else diag.message, .attr = diag.attr }),
+        error.ValueType => failWith(vm, err, .{ .message = if (diag.message.len == 0) null else diag.message, .attr = diag.attr, .value = diag.given, .value_type = diag.value_type }),
         else => fail(vm, err),
     };
 }
@@ -1020,6 +1103,15 @@ fn identNative(vm: *VM, args: []const Value) !Value {
     }
 }
 
+/// `marshal.valOf` under `attr`, which the program named as `name`:
+/// a value of the wrong type names the attribute in `fault`.
+fn valOfAttr(rd: *Read, arena: Allocator, attr: Attr, name: Value, v: Value, fault: *Fault) !?Val {
+    return marshal.valOf(rd, arena, attr.value_type, v, fault) catch |err| {
+        if (err == error.ValueType and fault.attr == null) fault.attr = name;
+        return err;
+    };
+}
+
 const fnDatoms = wrap(datomsNative);
 
 /// `(datoms db index & components)`: the index's three components in
@@ -1030,6 +1122,7 @@ fn datomsNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
     defer sc.close();
     var fault: Fault = .{};
     errdefer detail.* = detailOf(vm, sc.db.conn, &fault);
+    var attr_arg: ?Value = null;
     const index = try indexOf(vm, args[1]);
     const arena = sc.arena();
     const b = &sc.b;
@@ -1044,13 +1137,17 @@ fn datomsNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
             .e => comps.e = (try marshal.entity(&sc.rd, arena, arg, &fault)) orelse return empty,
             .a => {
                 attr = try marshal.attrOf(&sc.rd, arg, &fault);
+                attr_arg = arg;
                 comps.a = attr.?.id;
             },
             .v => {
                 const val: Val = if (index == .vaet)
                     .{ .ref = (try marshal.entity(&sc.rd, arena, arg, &fault)) orelse return empty }
                 else
-                    (try marshal.valOf(&sc.rd, arena, (attr orelse return error.ValueType).value_type, arg, &fault)) orelse return empty;
+                    (try valOfAttr(&sc.rd, arena, attr orelse {
+                        fault = .{ .message = "a value component is read under its attribute, which comes before it", .given = arg };
+                        return error.ValueType;
+                    }, attr_arg.?, arg, &fault)) orelse return empty;
                 comps.v = try key.valBytes(arena, val);
             },
         }
@@ -1089,8 +1186,8 @@ fn indexRangeNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
         fault = .{ .message = "index-range reads an indexed or unique attribute", .attr = args[1] };
         return error.TxData;
     }
-    const start: ?Val = if (args[2].isNil()) null else (try marshal.valOf(&sc.rd, arena, attr.value_type, args[2], &fault)) orelse return error.ValueType;
-    const end: ?Val = if (args[3].isNil()) null else (try marshal.valOf(&sc.rd, arena, attr.value_type, args[3], &fault)) orelse return error.ValueType;
+    const start: ?Val = if (args[2].isNil()) null else (try valOfAttr(&sc.rd, arena, attr, args[1], args[2], &fault)) orelse return error.ValueType;
+    const end: ?Val = if (args[3].isNil()) null else (try valOfAttr(&sc.rd, arena, attr, args[1], args[3], &fault)) orelse return error.ValueType;
 
     const abuf = try key.prefixBytes(arena, .avet, .{ .a = attr.id });
     const lo: []const u8 = if (start) |v| try std.mem.concat(arena, u8, &.{ abuf, try rangeBound(arena, v) }) else abuf;

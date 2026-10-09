@@ -95,7 +95,12 @@ const Sources = struct {
         errdefer out.close();
         for (query.in, args) |b, a| {
             if (b != .src) continue;
-            items[b.src] = if (b.src == 0 and db != null) .{ .db = try openRead(arena, db.?) } else if (try tuples(arena, a)) |rows| .{ .coll = rows } else blk: {
+            const given = b.src == 0 and db != null;
+            const rows = if (given) null else tuples(arena, a) catch |err| {
+                if (err == error.ValueType) diag.* = .{ .message = "a collection source holds tuples: vectors or lists of values" };
+                return err;
+            };
+            items[b.src] = if (given) .{ .db = try openRead(arena, db.?) } else if (rows) |r| .{ .coll = r } else blk: {
                 const db_of = options.db_of orelse {
                     diag.* = .{ .message = "a data source takes a db value or a collection of tuples" };
                     return error.QuerySyntax;

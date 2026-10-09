@@ -140,7 +140,9 @@
 (show "blue doors" (search db :person/bio "blue doors"))
 (show "blue as of 7" (search (d/as-of db 7) :person/bio "blue"))
 (show "city rome" (search db :addr/city "ROME"))
-(show "city as of 12" (try (search (d/as-of db 12) :addr/city "rome") (catch any e e)))
+; The error without the place it was raised at, which names this
+; run's path to the script.
+(show "city as of 12" (try (search (d/as-of db 12) :addr/city "rome") (catch any e (dissoc e :fn :file :line :column))))
 
 (println "-- tx-range")
 (doseq [{:keys [t instant data excised]} (d/tx-range n)]

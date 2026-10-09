@@ -137,7 +137,7 @@ test "keyword and symbol refuse an empty name catchably and take a namespace" {
         \\ (try (symbol "") (catch any e e))
         \\ (keyword "a" "b") (symbol "a" "b") (keyword nil "b")
         \\ (namespace (keyword "a" "b")) (name (symbol "a" "b"))]
-    , "[:invalid-argument :invalid-argument :a/b a/b :b a b]");
+    , "[{:error :invalid-argument, :message invalid argument, :fn test-form} {:error :invalid-argument, :message invalid argument, :fn test-form} :a/b a/b :b a b]");
 }
 
 // ---- vectors grow and update by path copy ----
@@ -172,5 +172,5 @@ test "set, subvec, identical?, keys/vals of {}, max/min operands, strings under 
         \\ (keys {}) (vals {}) (keys nil) (count (keys {:a 1}))
         \\ (max 2 1.0) (max 1 2.0) (min 2 1.0) (min 2.0 1) (max 1 1.0) (min 0.0 -0.0)
         \\ (get "ab" 1) (get "ab" 5) (get "ab" -1 :d) (get "ab" :k) (contains? "ab" 0) (contains? "ab" 2)]
-    , "[2 true #{} [2 3] [2 3] [] :index-out-of-bounds true false true true nil nil nil 1 2 2.0 1.0 1 1.0 -0.0 b nil :d nil true false]");
+    , "[2 true #{} [2 3] [2 3] [] {:error :index-out-of-bounds, :message index out of bounds, :fn test-form} true false true true nil nil nil 1 2 2.0 1.0 1 1.0 -0.0 b nil :d nil true false]");
 }

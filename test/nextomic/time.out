@@ -41,7 +41,7 @@ ok and from history
 [[9 [4294967297] 1] [10 [4294967297] 1] [11 [4294967297] 1]]
 ok the untouched entity keeps its rows
 {:error :nextomic/tx-data, :message excision takes a user entity}
-:nextomic/no-entity
+{:error :nextomic/no-entity, :message 4294967395 names no entity, :value 4294967395}
 [true nil false]
 [true :db.unique/identity false]
 {:error :nextomic/tx-data, :message a lookup ref needs a unique attribute, :attr :doc/code}

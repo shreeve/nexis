@@ -497,8 +497,10 @@ const Runtime = struct {
         try label.writer.print("runtime error: {s}", .{@errorName(err)});
         if (rt.v.error_detail.len > 0) try label.writer.print(": {s}", .{rt.v.error_detail});
         if (err == vm.VmError.UncaughtThrow) if (rt.v.unhandled_throw) |payload| {
+            // An error map a handler rethrew carries the place the
+            // caret and the trace show.
             try label.writer.writeAll(" ");
-            format_mod.format(payload, .readable, &label.writer, rt.v.ensureInterner()) catch try label.writer.writeAll("#<unprintable>");
+            format_mod.format(rt.v.withoutPlace(payload), .readable, &label.writer, rt.v.ensureInterner()) catch try label.writer.writeAll("#<unprintable>");
         };
 
         const trace = rt.v.error_trace.items;
@@ -784,7 +786,7 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
         info.* = .{ .path = "<repl>", .text = try rt.persistent().dupe(u8, std.mem.trimEnd(u8, pending.items, "\n")) };
         _ = rt.loader.evalSource(info, .{ .allocator = rt.persistent(), .on_value = .{ .ctx = &results, .call = &Results.call } }) catch |err| {
             if (err == error.Diagnosed and rt.loader.diagnostic.?.incomplete) continue;
-            const e = if (err == error.RunFailed) rt.v.unhandled_throw orelse errorKeyword(rt) else nil;
+            const e = if (err == error.RunFailed) rt.v.unhandled_throw orelse errorValue(rt) else nil;
             _ = try rt.report(err);
             // The frames, handlers and bindings an aborted run left
             // must not leak into the next input.
@@ -838,13 +840,17 @@ const Balance = struct {
     }
 };
 
-/// The keyword a caught runtime error would be (`DivideByZero` is
-/// `:divide-by-zero`), for `*e`; one no `catch` sees is named the same
-/// way (`:out-of-memory`).
-fn errorKeyword(rt: *Runtime) Value {
+/// What a `catch` would have taken for the runtime error that ended
+/// the run (`VM.errorValue`: `{:error :divide-by-zero ...}`), for
+/// `*e`; one no `catch` sees is its keyword, named the same way
+/// (`:out-of-memory`).
+fn errorValue(rt: *Runtime) Value {
     const err = rt.v.traced_error orelse return value_mod.nilValue();
-    const name = vm.vmErrorToKeywordName(err) orelse if (err == vm.VmError.OutOfMemory) "out-of-memory" else @errorName(err);
-    return rt.v.ensureInterner().internKeywordValue(name) catch value_mod.nilValue();
+    const catchable = vm.vmErrorToKeywordName(err);
+    const name = catchable orelse if (err == vm.VmError.OutOfMemory) "out-of-memory" else @errorName(err);
+    const tag = rt.v.ensureInterner().internKeywordValue(name) catch return value_mod.nilValue();
+    if (catchable == null) return tag;
+    return rt.v.errorValue(tag, rt.v.error_detail, rt.v.raiseSite());
 }
 
 // =============================================================================

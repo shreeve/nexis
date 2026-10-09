@@ -160,7 +160,7 @@ Each line prints the value after `;; =>` when run with `bin/nexis`
 (= 1 1.0)                                   ;; => false
 (== 1 1.0)                                  ;; => true
 (* 1000000000 1000000000)                   ;; => 1000000000000000000, a bignum
-(try (/ 1 0) (catch any e e))               ;; => :divide-by-zero
+(try (/ 1 0) (catch any e (ex-message e)))  ;; => "divide by zero"; e is {:error :divide-by-zero ...}
 (re-seq #"(\w+)=(\d+)" "a=1 b=22")           ;; => (["a=1" "a" "1"] ["b=22" "b" "22"])
 (nexis.string/replace "2026-10-06" #"(\d+)-(\d+)-(\d+)" "$3/$2/$1") ;; => "06/10/2026"
 

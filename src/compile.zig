@@ -1867,10 +1867,15 @@ fn lowerForm(
 fn unresolved(allocator: std.mem.Allocator, diag: ?*LowerDiag, span: ?reader_mod.SrcSpan, ns: ?[]const u8, name: []const u8) CompileError {
     const d = diag orelse return CompileError.UnresolvedSymbol;
     if (span) |sp| d.span = sp;
-    if (d.detail == null) d.detail = (if (ns) |n|
-        allocator.print("unable to resolve symbol: {s}/{s}", .{ n, name })
-    else
-        allocator.print("unable to resolve symbol: {s}", .{name})) catch return CompileError.OutOfMemory;
+    if (d.detail == null) {
+        // A Clojure name nexis lacks says what to use instead.
+        const hint = expand_mod.idiomHint(allocator, ns, name) catch return CompileError.OutOfMemory;
+        const sep: []const u8 = if (hint != null) "; " else "";
+        d.detail = (if (ns) |n|
+            allocator.print("unable to resolve symbol: {s}/{s}{s}{s}", .{ n, name, sep, hint orelse "" })
+        else
+            allocator.print("unable to resolve symbol: {s}{s}{s}", .{ name, sep, hint orelse "" })) catch return CompileError.OutOfMemory;
+    }
     return CompileError.UnresolvedSymbol;
 }
 
@@ -2953,27 +2958,35 @@ pub const RuntimeHooks = struct {
     }
 
     /// Out of memory stays an error; anything else `eval` could not
-    /// compile throws `{:error :compile-error :message name :form
-    /// form}`, where `name` is the `CompileError` variant, with
-    /// `:detail` the expander's reason when it gave one.
+    /// compile throws `{:error :compile-error :message m :form form
+    /// :kind name}`: `m` the compiler's sentence (`detail`), or with
+    /// none `name`, the `CompileError` variant, in words; placed as a
+    /// runtime error is when a handler is in force (VM.md §13).
     fn compileFailure(v: *vm.VM, err: anyerror, name: []const u8, form: value_mod.Value, detail: ?[]const u8) vm.VmError {
         if (err == error.OutOfMemory) return vm.VmError.OutOfMemory;
-        return v.throwValue(failureMap(v, name, form, detail) catch return vm.VmError.OutOfMemory);
+        return v.throwErrorMap(failureMap(v, name, form, detail) catch return vm.VmError.OutOfMemory);
     }
 
     fn failureMap(v: *vm.VM, name: []const u8, form: value_mod.Value, detail: ?[]const u8) !value_mod.Value {
         const heap = v.ensureHeap();
         const interner = v.ensureInterner();
+        // `UnresolvedSymbol` says "unresolved symbol".
+        var words: [64]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&words);
+        for (name, 0..) |c, i| {
+            if (std.ascii.isUpper(c) and i > 0) w.writeByte(' ') catch break;
+            w.writeByte(std.ascii.toLower(c)) catch break;
+        }
+        const message = detail orelse w.buffered();
         var m = try champ_mod.mapEmpty(heap);
-        const entries = [_]struct { key: []const u8, value: ?value_mod.Value }{
+        const entries = [_]struct { key: []const u8, value: value_mod.Value }{
             .{ .key = "error", .value = try interner.internKeywordValue("compile-error") },
-            .{ .key = "message", .value = try string_mod.fromBytes(heap, name) },
+            .{ .key = "message", .value = try string_mod.fromBytes(heap, message) },
             .{ .key = "form", .value = form },
-            .{ .key = "detail", .value = if (detail) |d| try string_mod.fromBytes(heap, d) else null },
+            .{ .key = "kind", .value = try string_mod.fromBytes(heap, name) },
         };
         for (entries) |e| {
-            const value = e.value orelse continue;
-            m = try champ_mod.mapAssoc(heap, m, try interner.internKeywordValue(e.key), value, &dispatch_mod.hashValue, &dispatch_mod.equal);
+            m = try champ_mod.mapAssoc(heap, m, try interner.internKeywordValue(e.key), e.value, &dispatch_mod.hashValue, &dispatch_mod.equal);
         }
         return m;
     }

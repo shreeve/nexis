@@ -77,7 +77,7 @@ const setup =
     \\(def db (nextomic/db c))
     \\(def ent (nextomic/entity db ann))
     \\(def home (:db/id (:person/home ent)))
-    \\(defmacro caught [& body] `(try (do ~@body :no-error) (catch any e# e#)))
+    \\(defmacro caught [& body] `(try (do ~@body :no-error) (catch any e# (if (map? e#) (:error e#) e#))))
     \\
 ;
 
