@@ -16,6 +16,7 @@
 //! shapes (a bulk load, small transactions, churn, long strings) and
 //! prints where each one's bytes go, tree by tree (docs/PERF.md §3.36).
 
+const builtin = @import("builtin");
 const std = @import("std");
 const nx = @import("nexis");
 const bench = nx.bench;
@@ -445,12 +446,26 @@ pub fn runStore(gpa: Allocator, io: std.Io, path: [:0]const u8) !void {
             try build(&fx, @field(Shape, name));
             try sizeTable(&fx, &out.writer, name);
         }
-        var st: std.c.Stat = undefined;
-        if (std.c.stat(path.ptr, &st) != 0) return error.StatFailed;
-        const allocated: u64 = @intCast(st.blocks * 512);
+        const allocated = try allocatedBytes(path);
         try out.writer.print("file allocated {d:.1} MB\n\n", .{@as(f64, @floatFromInt(allocated)) / 1e6});
         try std.Io.File.stdout().writeStreamingAll(io, out.written());
     }
+}
+
+/// The bytes the file system has allocated to `path`: its 512-byte
+/// blocks, from `statx` on Linux, whose libc `stat` the standard
+/// library does not declare, and from `stat` elsewhere.
+fn allocatedBytes(path: [:0]const u8) !u64 {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var sx: linux.Statx = undefined;
+        if (linux.errno(linux.statx(linux.AT.FDCWD, path.ptr, 0, .{ .BLOCKS = true }, &sx)) != .SUCCESS)
+            return error.StatFailed;
+        return sx.blocks * 512;
+    }
+    var st: std.c.Stat = undefined;
+    if (std.c.stat(path.ptr, &st) != 0) return error.StatFailed;
+    return @intCast(st.blocks * 512);
 }
 
 fn removeStore(path: [:0]const u8) void {
