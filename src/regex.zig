@@ -10,8 +10,9 @@
 //! Nothing backtracks: a search adds each (instruction, position)
 //! pair at most once, so it costs O(n·m·k) for n input bytes, m
 //! instructions and k slots, and the limits `compile` enforces bound
-//! m and m·k. A find loop can be quadratic (docs/REGEX.md §3.5). Constructs that need backtracking are refused when the
-//! pattern compiles, with a sentence naming them.
+//! m and m·k. A find loop can be quadratic (docs/REGEX.md §3.5).
+//! Constructs that need backtracking are refused when the pattern
+//! compiles, with a sentence naming them.
 //!
 //! The Unicode data, the case mappings `(?iu)` folds by and the
 //! general categories, are generated from Java's own tables
@@ -190,7 +191,7 @@ fn compileIn(arena: Allocator, source: []const u8, flags: Flags) (Allocator.Erro
         .ngroups = 0,
         .nhidden = 0,
         .literal = lit,
-        .prefix = lit,
+        .prefix = "",
         .first_bytes = null,
         .anchored = false,
     } };
@@ -717,11 +718,11 @@ const Parser = struct {
                 '(' => (try p.group()) orelse continue,
                 '[' => blk: {
                     p.pos += 1;
-                    break :blk try p.classNode(try p.class(true));
+                    break :blk try p.node(.{ .class = try p.class(true) });
                 },
                 '.' => blk: {
                     p.pos += 1;
-                    break :blk try p.classNode(if (p.flags.s) &sets.all else if (p.flags.d) &sets.dot_unix else &sets.dot);
+                    break :blk try p.node(.{ .class = if (p.flags.s) &sets.all else if (p.flags.d) &sets.dot_unix else &sets.dot });
                 },
                 '^' => blk: {
                     p.pos += 1;
@@ -751,10 +752,6 @@ const Parser = struct {
         };
     }
 
-    fn classNode(p: *Parser, set: []const Range) Fail!*Node {
-        return p.node(.{ .class = set });
-    }
-
     /// A run of literal characters, as Java's `atom` collects one: it
     /// ends at a metacharacter or a non-literal escape, and gives back
     /// its last character when a quantifier follows, so the quantifier
@@ -777,7 +774,7 @@ const Parser = struct {
                     const at = p.pos;
                     if (p.rawIs(at + 1, 'p') or p.rawIs(at + 1, 'P')) {
                         if (cps.items.len > 0) break;
-                        return p.classNode(try p.family());
+                        return p.node(.{ .class = try p.family() });
                     }
                     switch (try p.escape(false, false)) {
                         .lit => |cp| {
@@ -789,7 +786,7 @@ const Parser = struct {
                                 p.pos = at;
                                 break;
                             }
-                            return p.classNode(s);
+                            return p.node(.{ .class = s });
                         },
                         .node => |n| {
                             if (cps.items.len > 0) {
@@ -1165,14 +1162,7 @@ const Parser = struct {
             0xFF, 0xB5, 'I', 'i', 'S', 's', 'K', 'k', 0xC5, 0xE5 => true,
             else => false,
         };
-        return .{ .set = try p.foldSingle(lo, false), .bits = lo < 256 and !special };
-    }
-
-    /// A single character under the flags in force: Java's `single`,
-    /// or, for a character of a run of two or more under `(?iu)`, its
-    /// slice rule (every code point with the same `fold`).
-    fn foldSingle(p: *Parser, c: u21, slice: bool) Allocator.Error![]const Range {
-        return foldChar(p.arena, c, p.foldMode(), slice);
+        return .{ .set = try foldChar(p.arena, lo, p.foldMode(), false), .bits = lo < 256 and !special };
     }
 
     /// A class range under the flags in force: Java's `CIRange` and `CIRangeU`.
@@ -1516,48 +1506,64 @@ fn addLeads(set: *std.bit_set.Static(256), lo: u32, hi: u32) void {
 }
 
 fn firstBytes(arena: Allocator, insts: []const Inst, ranges: []const Range) Allocator.Error!?std.bit_set.Static(256) {
-    var set: std.bit_set.Static(256) = .empty;
-    const seen = try arena.alloc(bool, insts.len);
-    @memset(seen, false);
-    var todo: std.ArrayList(u32) = .empty;
-    try todo.append(arena, 0);
-    while (todo.pop()) |pc| {
-        if (seen[pc]) continue;
-        seen[pc] = true;
-        const in = insts[pc];
-        switch (in.op) {
-            .char => addLeads(&set, in.a, in.a),
-            .class => for (ranges[in.a..][0..in.b]) |r| addLeads(&set, r[0], r[1]),
-            .match => return null,
-            .split => try todo.appendSlice(arena, &.{ in.a, in.b }),
-            .jmp => try todo.append(arena, in.a),
-            .if_empty => try todo.appendSlice(arena, &.{ pc + 1, in.b }),
-            .save, .mark, .assert => try todo.append(arena, pc + 1),
+    const Leads = struct {
+        set: std.bit_set.Static(256) = .empty,
+        ranges: []const Range,
+        fn visit(l: *@This(), in: Inst) Step {
+            switch (in.op) {
+                .char => addLeads(&l.set, in.a, in.a),
+                .class => for (l.ranges[in.a..][0..in.b]) |r| addLeads(&l.set, r[0], r[1]),
+                .match => return .abort,
+                else => return .next,
+            }
+            return .stop;
         }
-    }
+    };
+    var leads: Leads = .{ .ranges = ranges };
+    if (!try walk(arena, insts, 0, &leads, Leads.visit)) return null;
     var ascii = true;
-    for (0..0x80) |b| ascii = ascii and set.isSet(b);
-    return if (ascii) null else set;
+    for (0..0x80) |b| ascii = ascii and leads.set.isSet(b);
+    return if (ascii) null else leads.set;
 }
 
 /// Every path from the start passes `\A` or `^` before it consumes a
 /// code point or matches, so a match can start only at offset 0.
 fn anchoredAt(arena: Allocator, insts: []const Inst) Allocator.Error!bool {
+    const Begin = struct {
+        fn visit(_: void, in: Inst) Step {
+            if (in.op != .assert) return .abort;
+            return if (in.a == @backingInt(Assert.begin)) .stop else .next;
+        }
+    };
+    return walk(arena, insts, 1, {}, Begin.visit);
+}
+
+const Step = enum { next, stop, abort };
+
+/// Follow every path from `start` through the instructions that
+/// consume nothing and assert nothing, reaching each instruction once;
+/// at a `char`, `class`, `assert` or `match`, `visit` says whether the
+/// path goes on past it, ends there, or ends the walk, which then
+/// returns false.
+fn walk(arena: Allocator, insts: []const Inst, start: u32, ctx: anytype, comptime visit: fn (@TypeOf(ctx), Inst) Step) Allocator.Error!bool {
     const seen = try arena.alloc(bool, insts.len);
     @memset(seen, false);
     var todo: std.ArrayList(u32) = .empty;
-    try todo.append(arena, 1);
+    try todo.append(arena, start);
     while (todo.pop()) |pc| {
         if (seen[pc]) continue;
         seen[pc] = true;
         const in = insts[pc];
         switch (in.op) {
-            .char, .class, .match => return false,
-            .assert => if (in.a != @backingInt(Assert.begin)) try todo.append(arena, pc + 1),
             .split => try todo.appendSlice(arena, &.{ in.a, in.b }),
             .jmp => try todo.append(arena, in.a),
             .if_empty => try todo.appendSlice(arena, &.{ pc + 1, in.b }),
             .save, .mark => try todo.append(arena, pc + 1),
+            .char, .class, .assert, .match => switch (visit(ctx, in)) {
+                .next => try todo.append(arena, pc + 1),
+                .stop => {},
+                .abort => return false,
+            },
         }
     }
     return true;
@@ -1596,7 +1602,7 @@ const List = struct {
 
 /// A run `[lo, hi)` of non-spacing marks whose base character is (or
 /// is not) a letter or digit, for `\b`.
-pub const Marks = struct { lo: usize = 1, hi: usize = 0, base: bool = false };
+pub const Marks = extern struct { lo: usize = 1, hi: usize = 0, base: bool = false };
 
 /// The scratch space of searches with one program, reused across them.
 pub const Vm = struct {
@@ -1870,7 +1876,7 @@ pub const Finder = struct {
     occurrences: ?string.Matches = null,
 
     pub fn find(f: *Finder) bool {
-        if (f.vm.prog.literal) |lit| if (lit.len > 0) return f.findLiteral(lit);
+        if (f.vm.prog.literal) |lit| return f.findLiteral(lit);
         if (f.done or f.next > f.hay.len or !f.vm.exec(f.hay, f.next, f.last_end, false)) {
             f.done = true;
             return false;
@@ -1973,13 +1979,10 @@ pub const MatcherBox = extern struct {
     next: u64,
     /// The end of the last match, where `\G` holds.
     last_end: u64,
-    /// The `\b` cache of the input (`Marks`), carried from one
-    /// `re-find` to the next.
-    marks_lo: u64 = 1,
-    marks_hi: u64 = 0,
+    /// The `\b` cache of the input, carried from one `re-find` to the
+    /// next.
+    marks: Marks = .{},
     state: State,
-    marks_base: bool = false,
-    _pad: [6]u8 = @splat(0),
 
     pub const State = enum(u8) { fresh, matched, failed };
 };
@@ -2014,13 +2017,11 @@ pub fn matcherFind(gpa: Allocator, v: Value) Allocator.Error!bool {
     var vm: Vm = try .init(gpa, programOf(b.pattern), true);
     defer vm.deinit(gpa);
     const hay = string.asBytes(b.input);
-    vm.marks = .{ .lo = b.marks_lo, .hi = b.marks_hi, .base = b.marks_base };
+    vm.marks = b.marks;
     vm.marks_of = hay;
     var f: Finder = .{ .vm = &vm, .hay = hay, .next = b.next, .last_end = b.last_end };
     const found = f.find();
-    b.marks_lo = vm.marks.lo;
-    b.marks_hi = vm.marks.hi;
-    b.marks_base = vm.marks.base;
+    b.marks = vm.marks;
     if (!found) {
         b.state = .failed;
         return false;
@@ -2418,7 +2419,7 @@ test "regex: a matcher carries the \\b cache from one find to the next" {
     for ([_]usize{ 1, 3, 5 }) |at| {
         try testing.expect(try matcherFind(testing.allocator, m));
         try testing.expectEqual(at, matcherGroup(m, 0).?[0]);
-        try testing.expectEqual(@as(u64, 1), matcherBox(m).marks_lo);
+        try testing.expectEqual(@as(usize, 1), matcherBox(m).marks.lo);
     }
     try testing.expect(!try matcherFind(testing.allocator, m));
 }
@@ -2462,7 +2463,6 @@ test "regex: re-matches needs the whole input and prefers the first such path" {
     defer vm.deinit(testing.allocator);
     try testing.expect(vm.exec("a", 0, 0, true));
     try testing.expect(vm.group(2) == null);
-    try testing.expectEqual(@as(?u32, 1), prog.groupIndex("x") orelse 1);
 }
 
 test "regex: a replacement string reads $n, ${name} and escapes as Java's appendReplacement does" {
