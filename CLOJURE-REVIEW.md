@@ -57,7 +57,7 @@ complete from the start; `core.clj`'s two-stage bootstrap (a trivial
 
 `ATransientMap.ensureEditable` checks ownership on every operation, and
 `persistent!` ends it. nexis transients check an owner token on every
-operation and freeze on `persistent!` (§3.5). As in Clojure, an
+operation and freeze on `persistent!`. As in Clojure, an
 operation edits the nodes the transient owns in place and copies a
 shared node once; the token lives in the node header's hash field,
 which an internal node does not use (`docs/TRANSIENT.md`).
@@ -183,7 +183,6 @@ are the map for someone who knows Clojure.
 | Construct | Clojure | nexis | Why |
 |---|---|---|---|
 | Radix integer | `2r101`, `16rFF` | only `0x` and `0b` prefixes | a smaller grammar |
-| `+42` | the integer 42 | a symbol | no signed-variant tokens |
 | Ratio `22/7` | a Ratio | `:bad-number-literal` | no rationals (§23 #10) |
 | `42N` | a BigInt | `42`; any integer literal reads as an integer, and one beyond i64 is a bignum | one integer domain (§23 #10) |
 | `3.14M` | a BigDecimal | `:bad-number-literal` | no decimals |
@@ -191,7 +190,7 @@ are the map for someone who knows Clojure.
 | `1.` | `1.0` | `:bad-number-literal` | a real has digits on both sides of the dot |
 | `1abc`, `1-2` | "Invalid number" | `:bad-number-literal` for the whole token | a number token ends where a symbol would |
 | `\o377` | an octal char | unsupported | `\uHHHH` and `\u{...}` cover it |
-| String escapes | `\b \f`, octal, `\uHHHH` | `\n \t \r \\ \" \uHHHH \u{HEX}` | a narrow set; `\u{HEX}` names any scalar in one escape (§23 #26) |
+| String escapes | `\b \f`, octal, `\uHHHH` | Clojure's, and `\u{HEX}` | `\u{HEX}` names any scalar in one escape (§23 #26) |
 | `#:ns{:a 1}`, `::k` | namespaced map, auto-resolved keyword | parse error | no current namespace at read time |
 | `#?(...)` | reader conditional | parse error | one target (PLAN §4) |
 | `#inst`, `#uuid` | tagged literals | parse error; `nexis.time/parse` reads an instant's text | PLAN §4, §24 #3 |
@@ -215,7 +214,7 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | inexact `(/ a b)` of integers | a Ratio | an f64; exact quotients stay integers | §23 #10 |
 | `(long x)` | throws beyond 64 bits; NaN is 0 | never rejects a size (`(long 1e30)` is a bignum); NaN is 0, as in Clojure, and an infinity is `:invalid-argument`; `int`, `short` and `byte` check Java's ranges and make NaN 0, as Clojure's do; `float` checks the float range and returns the f64 unrounded; `bigint` and `biginteger` are `long`, since an integer of any size is one kind | `docs/SEMANTICS.md` §2.2, `docs/STDLIB.md` §2 |
 | the seq of a map, set, string, or of a list `sort` or `keys` builds | walked one element at a time | a vector's view past three elements, so `map` over it takes 32 at a time | `docs/LAZY.md` §9 |
-| a lazy seq a local holds | let go as it is walked (locals clearing) | let go as it is walked: a local's slot is cleared at its last move, the last time it is passed to a call or moved by `let` or `recur`; a last read in place (an `if` test), a local a closure captures (Clojure clears a `^:once` body's) and the argument of a native that walks to the end without consuming it (`sort`, `sort-by`, `set`, `zipmap`'s values) keep it | `docs/LAZY.md` §9, `docs/COMPILER.md` §4.9 |
+| a lazy seq a local holds | let go as it is walked (locals clearing) | let go as it is walked, but for the cases `docs/LAZY.md` §9 lists (a last read in place, a local a closure captures, a native that walks without consuming) | `docs/LAZY.md` §9, `docs/COMPILER.md` §4.9 |
 | `(apply f (range))` | can stay lazy | does not end: `apply` realizes its last argument | `docs/LAZY.md` §9 |
 | `(str (map inc [1]))` | `"clojure.lang.LazySeq@..."` | `"(2)"` | `docs/LAZY.md` §9 |
 | a lazy key of a map of up to eight entries (`assoc`, `frequencies`, `group-by`) | left unrealized: the array map compares and hashes nothing | realized when the map takes it, its throw raised by that call, as a hash set's in both | `docs/LAZY.md` §9 |

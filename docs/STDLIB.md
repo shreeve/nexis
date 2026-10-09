@@ -42,7 +42,7 @@ Any other failure there is a bug in an embedded file or the image and
 panics with the loader's diagnostic or the image's error.
 
 **The image.** Evaluating the sources at every start would read,
-expand, compile and run 66 KB of nexis; instead the build does it once
+expand, compile and run 100 KB of nexis; instead the build does it once
 and every binary loads the result (`src/image.zig`). `zig build` runs
 `src/imagegen.zig`, built for the host over a runtime without an
 image: it boots the sources (`stdlib.writeImage`), writes the image of
@@ -104,7 +104,7 @@ Var inside a `binding`.
 
 | Namespace | Natives (`src/stdlib.zig`) | nexis source | Contract |
 |---|---|---|---|
-| `nexis.core` | `core_natives` | `core.nx` | text §2, printing §5, I/O §6, the rest of Clojure's core §8; `=` and `hash` SEMANTICS.md; `compare`, sorted collections, `subseq` and `rseq` SORTED.md; atoms ATOM.md; transients TRANSIENT.md; typed vectors TYPED_VECTOR.md §7.1; records and protocols PROTOCOLS.md; hierarchies and multimethods §9; the macros MACROEXPAND.md §2b |
+| `nexis.core` | `core_natives` | `core.nx` | text §2, printing §5, I/O §6, the rest of Clojure's core §8; `=` and `hash` SEMANTICS.md; `compare`, sorted collections, `subseq` and `rseq` SORTED.md; atoms ATOM.md; transients TRANSIENT.md; typed vectors TYPED_VECTOR.md §7.1; records and protocols PROTOCOLS.md; hierarchies and multimethods §9; the host macros MACROEXPAND.md §10 |
 | `db` | `db_natives` | (`with-tx`, `with-read-tx`, `with-snapshot` in `core.nx`) | DB.md §12 |
 | `nextomic` | `src/nextomic/natives.zig` | `nextomic.nx` (`with-conn`) | NEXTOMIC.md |
 | `nexis.string` | `string_natives` | `string.nx` | §3 |
@@ -341,9 +341,8 @@ their elements in the same mode. Who uses which:
 |---|---|
 | nil, booleans | `nil`, `true`, `false` |
 | fixnum, bignum | Decimal, no suffix |
-| float | SEMANTICS.md §6.3: `1.0`, `-0.0`, `1.0E10`, `1.0E-4`; `##NaN`, `##Inf`, `##-Inf` in both modes (`str` and `%s` of a bare float write Java's `NaN`, `Infinity`, `-Infinity`) |
-| char | display: its UTF-8. readable: `\space`, `\newline`, `\tab`, `\return`, `\formfeed`, `\backspace`, `\\`, the other ASCII controls and DEL as `\u{HEX}` (`\u{0}`), anything else as `\` and the char itself, as Clojure prints it (`\a`, `\é`) |
-| string | display: its bytes. readable: double-quoted, `\" \\ \n \t \r` escaped, other ASCII controls and DEL as `\u{HEX}`, every other byte as itself (`"é"`) |
+| float | SEMANTICS.md §6.3, in both modes (`str` and `%s` of a bare float write Java's `NaN`, `Infinity`, `-Infinity`) |
+| char, string | display: a char's UTF-8, a string's bytes. readable: SEMANTICS.md §6.4, §6.5 |
 | keyword, symbol | `:ns/name`, `ns/name`; names are not escaped |
 | list, vector, set | `(a b)`, `[a b]`, `#{a b}`, elements separated by one space; a sorted set in its order |
 | lazy seq | as a list, `(a b)`, `()` when empty. The printer runs no code: every caller but an error report realizes the value first, and a block whose body has not run prints as `...`, as does a cell of a realized cycle met again (`docs/LAZY.md` §8) |
@@ -423,14 +422,9 @@ the VM, so none needs a root scope (GC.md §11.5).
 
 ### 7. Tests
 
-`test/integration/eval_pipeline.zig` pins the text natives
-(`parse-long` and `parse-double` included), `format`,
-`nexis.string`, printing in both modes, `with-out-str`, `slurp` and
-`spit` end to end; `src/format.zig` carries the per-kind printer
-tests; `test/golden/cli/` pins `read-line` (`stdin`),
-`*command-line-args*` (`args`) and `exit` (`exit-status`) through
-`bin/nexis`; `test/integration/numbers.zig` pins the float
-spellings.
+`test/integration/eval_pipeline.zig` pins this document end to end,
+`src/format.zig` the printer kind by kind, `test/golden/cli/` what
+needs `bin/nexis` (`read-line`, `*command-line-args*`, `exit`).
 
 ---
 
@@ -485,7 +479,7 @@ returns a realized list where Clojure returns a lazy seq.
 | `qualified-ident?`, `simple-ident?` | 1 | Whether `x` is a keyword or symbol with a namespace, without one |
 | `bit-and-not`, `bit-flip` | 2+, 2 | `(bit-and x (bit-not y))` over each further argument; `bit-flip` is `bit-set` or `bit-clear` of the bit, as `bit-test` finds it |
 | `alter-var-root` | 2+ | `(alter-var-root v f & args)`: sets the root of the Var `v` to `(apply f root args)` and returns it; a `binding` in force is left as it is. An unbound Var's root is nil to `f` and bound after (Clojure passes its `Unbound` object). A non-Var is `:kind-mismatch` |
-| `with-redefs-fn`, `with-redefs` | 2, macro | `(with-redefs-fn {#'v val ...} f)` calls `f` with each Var's root set to its value; `(with-redefs [name val ...] body...)` does it for the body, the names resolved as `var` resolves them. Root writes, not bindings, so every caller sees them and a Var need not be dynamic; each root is restored on every exit, a throw included, and a Var that was unbound is unbound again (`nexis.internal/#%unbind-root`), as Clojure restores its `Unbound` root. A call the compiler inlines (the arithmetic and comparison functions, COMPILER.md) does not go through the Var |
+| `with-redefs-fn`, `with-redefs` | 2, macro | `(with-redefs-fn {#'v val ...} f)` calls `f` with each Var's root set to its value; `(with-redefs [name val ...] body...)` does it for the body, the names resolved as `var` resolves them. Root writes, not bindings, so every caller sees them and a Var need not be dynamic; each root is restored on every exit, a throw included, and a Var that was unbound is unbound again (`nexis.internal/#%unbind-root`), as Clojure restores its `Unbound` root. A call the compiler inlines (the arithmetic and comparison functions and `not`, COMPILER.md) does not go through the Var |
 | `*ns*` | Var | The namespace a form is compiled in, as its name symbol: the compiler sets the root before it expands each top-level form, and `in-ns` when it switches, so `(ns-name *ns*)` in a file or a macro names the file's namespace. Dynamic, but a `binding` of it does not change where forms compile |
 | `ex-info`, `ex-data`, `ex-message`, `ex-cause` | 2–3, 1, 1, 1 | `(ex-info msg data cause?)` is the map `{:message msg :data data}` (`:cause` with a third argument), `msg` a string or nil and `data` a map, nil meaning `{}`, else `:kind-mismatch`. `ex-message` is a map's `:message`; `ex-data` an `ex-info` map's `:data`, and an error map (one with an `:error` and no `:data`: a caught runtime error, a Nextomic error) is its own data, so `(:error (ex-data e))` is the tag of either; `ex-cause` a map's `:cause`; each nil for anything else (`docs/VM.md` §13) |
 | `special-symbol?` | 1 | Whether `s` is a name the compiler takes as a special form: `def if do let* fn* loop* letfn* quote var recur try catch finally throw set! &` |
@@ -846,14 +840,6 @@ other class (a function, an atom). A text that is not a string, or an
 options map that is not a map, is `:kind-mismatch`; a string that is
 not UTF-8 `:utf8-error`; a throw from an option's function passes
 through.
-
-**Speed.** An optimized build (`-Doptimize=fast`, the Apple M5, one
-core under the machine's queue) reads a 10.5 MB document of 42,000
-records (nested objects, arrays, strings with escapes and non-ASCII
-text, doubles, integers to 10^12) in 41–56 ms, 30–43 ms with keyword
-keys, and writes it back in 42–47 ms (5 runs in one process); the
-process peaks at 203 MB. Babashka's cheshire takes 121–175 ms and
-60–161 ms on the same document.
 
 `test/integration/eval_pipeline.zig` pins every value kind both ways,
 the options, each error and its position, a round trip of every kind

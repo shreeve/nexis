@@ -265,7 +265,7 @@
   "bindings is [name val ...]. Evaluates body with the root of each Var
   a name resolves to set to its val, as with-redefs-fn does, and every
   root restored afterwards. A call the compiler inlines (arithmetic,
-  comparison) does not go through the Var."
+  comparison, not) does not go through the Var."
   [bindings & body]
   `(with-redefs-fn ~(var-map bindings) (fn [] ~@body)))
 
