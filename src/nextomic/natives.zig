@@ -60,7 +60,6 @@ const pull_mod = @import("pull.zig");
 const query = @import("query.zig");
 const query_natives = @import("query/natives.zig");
 const marshal = @import("marshal.zig");
-const format_mod = @import("../format.zig");
 const intern_mod = @import("../intern.zig");
 const seq_mod = @import("../seq.zig");
 
@@ -287,16 +286,7 @@ fn messageOf(vm: *VM, err: anyerror, detail: Detail, buf: *[message_capacity]u8)
 }
 
 fn writeMessage(w: *std.Io.Writer, interner: *const intern_mod.Interner, err: anyerror, d: Detail) !void {
-    const Shown = struct {
-        v: Value,
-        interner: *const intern_mod.Interner,
-        pub fn format(self: @This(), out: *std.Io.Writer) std.Io.Writer.Error!void {
-            format_mod.format(self.v, .readable, out, self.interner) catch |e| switch (e) {
-                error.WriteFailed => return error.WriteFailed,
-                else => try out.writeAll("#<unprintable>"),
-            };
-        }
-    };
+    const Shown = query.parse.Shown;
     const attr: ?Shown = if (d.attr) |a| .{ .v = a, .interner = interner } else null;
     const val: ?Shown = if (d.value) |v| .{ .v = v, .interner = interner } else null;
     switch (err) {
@@ -872,6 +862,7 @@ fn pullManyNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
 pub fn failDiag(vm: *VM, err: anyerror, diag: *const Diag) VmError {
     return switch (err) {
         error.QuerySyntax, error.PullSyntax => throwSyntax(vm, errorKeyword(err), diag.message, diag.clause),
+        error.UnboundPattern => failWith(vm, err, .{ .message = diag.message, .clause = diag.clause }),
         error.UnknownAttribute => failWith(vm, err, .{ .attr = diag.attr }),
         error.TxData => failWith(vm, err, .{ .message = if (diag.message.len == 0) null else diag.message, .attr = diag.attr }),
         error.ValueType => failWith(vm, err, .{ .message = if (diag.message.len == 0) null else diag.message, .attr = diag.attr, .value = diag.given, .value_type = diag.value_type }),

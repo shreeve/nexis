@@ -38,6 +38,7 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 const plan_mod = @import("plan.zig");
+const parse_mod = @import("parse.zig");
 const exec_mod = @import("exec.zig");
 const relation = @import("../relation.zig");
 const stack = @import("../../stack.zig");
@@ -242,8 +243,12 @@ fn collectRuleCalls(arena: Allocator, clauses: []const Clause, name: u32, out: *
 // =============================================================================
 
 fn defsOf(ctx: *Ctx, name: u32, args: []const ir.Arg) ![]const ir.Rule {
-    const defs = ctx.rules.byName(name) orelse return ctx.syntax("unknown rule");
-    if (defs[0].head.len != args.len) return ctx.syntax("a rule is called with the wrong number of arguments");
+    const rule = ctx.interner.symbolName(name);
+    const defs = ctx.rules.byName(name) orelse {
+        if (ctx.rules.rules.len == 0) return ctx.syntaxFmt("({s} ...) calls a rule, and :in binds no rule set (%)", .{rule});
+        return ctx.syntaxFmt("({s} ...) calls a rule the rule set does not define", .{rule});
+    };
+    if (defs[0].head.len != args.len) return ctx.syntaxFmt("rule {s} takes {d} argument{s}, and a call passes {d}", .{ rule, defs[0].head.len, parse_mod.plural(defs[0].head.len), args.len });
     return defs;
 }
 
@@ -274,7 +279,7 @@ pub fn callEstimate(ctx: *Ctx, name: u32, args: []const ir.Arg, src: ?ir.Src, bo
 pub fn planCall(ctx: *Ctx, name: u32, args: []const ir.Arg, src: ?ir.Src, bound: *Bound, steps: *std.ArrayList(Step), rows: *u64) Failure!void {
     const defs = try defsOf(ctx, name, args);
     ctx.rule_calls += 1;
-    if (ctx.rule_calls > max_calls) return ctx.syntax("rule calls expand past 10000 in one query; a rule body calling another rule more than once doubles the expansion per level");
+    if (ctx.rule_calls > max_calls) return ctx.syntaxFmt("rule calls expand past 10000 in one query, at a call to {s}; a rule body calling another rule more than once doubles the expansion per level", .{ctx.interner.symbolName(name)});
     const arg_vars = try ctx.arena.alloc(Var, args.len);
     for (args, arg_vars) |a, *v| {
         v.* = switch (a) {
@@ -285,11 +290,11 @@ pub fn planCall(ctx: *Ctx, name: u32, args: []const ir.Arg, src: ?ir.Src, bound:
                 try bound.add(ctx.arena, g.bind.out.scalar);
                 break :blk g.bind.out.scalar;
             },
-            .src => return ctx.syntax("$ cannot be a rule argument"),
+            .src => return ctx.syntaxFmt("a data source is no argument of rule {s}; prefix the call with it, ($src {s} ...)", .{ ctx.interner.symbolName(name), ctx.interner.symbolName(name) }),
         };
     }
     for (arg_vars[0..defs[0].required]) |v| {
-        if (!bound.has(v)) return ctx.syntax("a required rule argument is unbound");
+        if (!bound.has(v)) return ctx.syntaxFmt("{s} is a required argument of rule {s} and is unbound where the call runs", .{ ctx.varName(v), ctx.interner.symbolName(name) });
     }
 
     const info = try ctx.ruleInfo();
@@ -557,7 +562,7 @@ const Renamer = struct {
                                 try out.append(arena, g);
                                 break :blk g.bind.out.scalar;
                             },
-                            .src => return self.ctx.syntax("$ cannot be a rule argument"),
+                            .src => return self.ctx.syntaxFmt("a data source is no argument of rule {s}; prefix the call with it, ($src {s} ...)", .{ self.ctx.interner.symbolName(r.name), self.ctx.interner.symbolName(r.name) }),
                         };
                         const slot = try arena.create(plan_mod.SourceSlot);
                         slot.* = .{};

@@ -233,8 +233,17 @@ const Parser = struct {
         return error.PullSyntax;
     }
 
+    fn failFmt(self: *Parser, comptime fmt: []const u8, args: anytype) error{PullSyntax} {
+        self.diag.set(self.index, fmt, args);
+        return error.PullSyntax;
+    }
+
+    fn shown(self: *Parser, v: Value) parse_mod.Shown {
+        return .{ .v = v, .interner = self.interner };
+    }
+
     fn elems(self: *Parser, v: Value) ![]Value {
-        return (try marshal.sequence(self.arena, v)) orelse self.fail("pattern must be a vector");
+        return (try marshal.sequence(self.arena, v)) orelse self.failFmt("a pattern is a vector, not {f}", .{self.shown(v)});
     }
 
     fn isSym(self: *Parser, v: Value, name: []const u8) bool {
@@ -268,24 +277,24 @@ const Parser = struct {
                 try specs.append(self.arena, try self.attrSpec(v.asKeywordId()));
             },
             .symbol => {
-                if (!self.isSym(v, "*")) return self.fail("unknown symbol in pattern");
+                if (!self.isSym(v, "*")) return self.failFmt("{f} in a pull pattern is no attribute; a symbol there is *", .{self.shown(v)});
                 pat.wildcard = true;
             },
             .string => {
-                if (!std.mem.eql(u8, string_mod.asBytes(v), "*")) return self.fail("unknown string in pattern");
+                if (!std.mem.eql(u8, string_mod.asBytes(v), "*")) return self.failFmt("{f} in a pull pattern is no attribute; a string there is \"*\"", .{self.shown(v)});
                 pat.wildcard = true;
             },
             .persistent_map => {
                 var it = champ.mapIter(v);
                 while (it.next()) |entry| {
                     var spec = try self.parseKey(entry.key);
-                    if (spec.attr.value_type != .ref) return self.fail("map specification on a non-ref attribute");
+                    if (spec.attr.value_type != .ref) return self.failFmt("{f} takes no sub-pattern: it is no ref attribute", .{self.shown(entry.key)});
                     spec.sub = try self.parseSub(entry.value);
                     try specs.append(self.arena, spec);
                 }
             },
             .list, .persistent_vector => try specs.append(self.arena, try self.parseExpr(v)),
-            else => return self.fail("unknown element in pattern"),
+            else => return self.failFmt("{f} in a pull pattern is no attribute, *, map or attribute expression", .{self.shown(v)}),
         }
     }
 
@@ -294,7 +303,7 @@ const Parser = struct {
         return switch (v.kind()) {
             .keyword => self.attrSpec(v.asKeywordId()),
             .list, .persistent_vector => self.parseExpr(v),
-            else => self.fail("map key must be an attribute or an attribute expression"),
+            else => self.failFmt("a pull map's key is an attribute or an attribute expression, not {f}", .{self.shown(v)}),
         };
     }
 
@@ -302,7 +311,7 @@ const Parser = struct {
         switch (v.kind()) {
             .symbol => {
                 if (self.isSym(v, "...")) return .{ .recurse = null };
-                return self.fail("map value must be a pattern, ... or a depth");
+                return self.failFmt("a pull map's value is a pattern, ... or a depth, not {f}", .{self.shown(v)});
             },
             .fixnum => {
                 const n = v.asFixnum();
@@ -310,7 +319,7 @@ const Parser = struct {
                 return .{ .recurse = @intCast(n) };
             },
             .persistent_vector, .list => return .{ .pattern = try self.parsePattern(v) },
-            else => return self.fail("map value must be a pattern, ... or a depth"),
+            else => return self.failFmt("a pull map's value is a pattern, ... or a depth, not {f}", .{self.shown(v)}),
         }
     }
 
@@ -326,17 +335,17 @@ const Parser = struct {
                 spec.limit = try self.limitOf(items[2]);
             } else if (self.isSym(head, "default")) {
                 spec.default = items[2];
-            } else return self.fail("unknown attribute expression");
+            } else return self.failFmt("({f} ...) is no attribute expression; one of (limit attr n) and (default attr v)", .{self.shown(head)});
             return spec;
         }
-        if (head.kind() != .keyword) return self.fail("attribute expression must start with an attribute");
+        if (head.kind() != .keyword) return self.failFmt("an attribute expression starts with an attribute, not {f}", .{self.shown(head)});
         var spec = try self.attrSpec(head.asKeywordId());
         if ((items.len - 1) % 2 != 0) return self.fail("attribute options come in pairs");
         var i: usize = 1;
         while (i < items.len) : (i += 2) {
             const opt = items[i];
             const arg = items[i + 1];
-            if (opt.kind() != .keyword) return self.fail("attribute option must be a keyword");
+            if (opt.kind() != .keyword) return self.failFmt("an attribute option is a keyword, not {f}", .{self.shown(opt)});
             const k = opt.asKeywordId();
             if (k == self.k_limit) {
                 spec.limit = try self.limitOf(arg);
@@ -344,14 +353,14 @@ const Parser = struct {
                 spec.default = arg;
             } else if (k == self.k_as) {
                 spec.key = arg;
-            } else return self.fail("unknown attribute option");
+            } else return self.failFmt("{f} is no attribute option; one of :as, :limit and :default", .{self.shown(opt)});
         }
         return spec;
     }
 
     fn limitOf(self: *Parser, v: Value) !?u64 {
         if (v.isNil()) return null;
-        if (v.kind() != .fixnum or v.asFixnum() < 0) return self.fail(":limit needs a non-negative integer or nil");
+        if (v.kind() != .fixnum or v.asFixnum() < 0) return self.failFmt(":limit takes a non-negative integer or nil, not {f}", .{self.shown(v)});
         return @intCast(v.asFixnum());
     }
 
@@ -373,7 +382,7 @@ const Parser = struct {
             self.diag.* = .{ .clause = self.index, .message = "unknown attribute", .attr = self.interner.keywordValue(k) };
             return error.UnknownAttribute;
         };
-        if (reverse and attr.value_type != .ref) return self.fail("reverse reference on a non-ref attribute");
+        if (reverse and attr.value_type != .ref) return self.failFmt("{f} is a reverse reference, and {f} is no ref attribute", .{ self.shown(self.interner.keywordValue(k)), self.shown(self.interner.keywordValue(attr_k)) });
         const spec: Spec = .{
             .attr = attr,
             .reverse = reverse,
@@ -926,21 +935,21 @@ test "limit, default, as, expression forms, pull-many, syntax diagnostics" {
     // Diagnostics carry the top-level spec index.
     const Bad = struct { pattern: Value, message: []const u8, clause: ?usize };
     const bad = [_]Bad{
-        .{ .pattern = try fx.str("x"), .message = "pattern must be a vector", .clause = null },
+        .{ .pattern = try fx.str("x"), .message = "a pattern is a vector, not \"x\"", .clause = null },
         .{ .pattern = try fx.vec(&.{}), .message = "empty pattern", .clause = null },
-        .{ .pattern = try fx.vec(&.{ try fx.kw("p/name"), Fx.int(3) }), .message = "unknown element in pattern", .clause = 1 },
-        .{ .pattern = try fx.vec(&.{try fx.sym("?x")}), .message = "unknown symbol in pattern", .clause = 0 },
-        .{ .pattern = try fx.vec(&.{try fx.map(&.{ try fx.kw("p/name"), try fx.vec(&.{try fx.kw("p/name")}) })}), .message = "map specification on a non-ref attribute", .clause = 0 },
-        .{ .pattern = try fx.vec(&.{try fx.map(&.{ try fx.kw("p/friend"), try fx.str("no") })}), .message = "map value must be a pattern, ... or a depth", .clause = 0 },
+        .{ .pattern = try fx.vec(&.{ try fx.kw("p/name"), Fx.int(3) }), .message = "3 in a pull pattern is no attribute, *, map or attribute expression", .clause = 1 },
+        .{ .pattern = try fx.vec(&.{try fx.sym("?x")}), .message = "?x in a pull pattern is no attribute; a symbol there is *", .clause = 0 },
+        .{ .pattern = try fx.vec(&.{try fx.map(&.{ try fx.kw("p/name"), try fx.vec(&.{try fx.kw("p/name")}) })}), .message = ":p/name takes no sub-pattern: it is no ref attribute", .clause = 0 },
+        .{ .pattern = try fx.vec(&.{try fx.map(&.{ try fx.kw("p/friend"), try fx.str("no") })}), .message = "a pull map's value is a pattern, ... or a depth, not \"no\"", .clause = 0 },
         .{ .pattern = try fx.vec(&.{try fx.map(&.{ try fx.kw("p/friend"), Fx.int(-1) })}), .message = "recursion depth must be a non-negative integer", .clause = 0 },
-        .{ .pattern = try fx.vec(&.{try fx.kw("p/_name")}), .message = "reverse reference on a non-ref attribute", .clause = 0 },
+        .{ .pattern = try fx.vec(&.{try fx.kw("p/_name")}), .message = ":p/_name is a reverse reference, and :p/name is no ref attribute", .clause = 0 },
         .{ .pattern = try fx.vec(&.{try fx.lst(&.{ try fx.kw("p/tags"), try fx.kw("limit") })}), .message = "attribute options come in pairs", .clause = 0 },
-        .{ .pattern = try fx.vec(&.{try fx.lst(&.{ try fx.kw("p/tags"), try fx.kw("limit"), try fx.str("x") })}), .message = ":limit needs a non-negative integer or nil", .clause = 0 },
-        .{ .pattern = try fx.vec(&.{try fx.lst(&.{ try fx.kw("p/tags"), try fx.kw("zap"), Fx.int(1) })}), .message = "unknown attribute option", .clause = 0 },
-        .{ .pattern = try fx.vec(&.{ try fx.kw("p/name"), try fx.lst(&.{ try fx.sym("zap"), try fx.kw("p/tags"), Fx.int(1) }) }), .message = "unknown attribute expression", .clause = 1 },
+        .{ .pattern = try fx.vec(&.{try fx.lst(&.{ try fx.kw("p/tags"), try fx.kw("limit"), try fx.str("x") })}), .message = ":limit takes a non-negative integer or nil, not \"x\"", .clause = 0 },
+        .{ .pattern = try fx.vec(&.{try fx.lst(&.{ try fx.kw("p/tags"), try fx.kw("zap"), Fx.int(1) })}), .message = ":zap is no attribute option; one of :as, :limit and :default", .clause = 0 },
+        .{ .pattern = try fx.vec(&.{ try fx.kw("p/name"), try fx.lst(&.{ try fx.sym("zap"), try fx.kw("p/tags"), Fx.int(1) }) }), .message = "(zap ...) is no attribute expression; one of (limit attr n) and (default attr v)", .clause = 1 },
         .{ .pattern = try fx.vec(&.{try fx.lst(&.{})}), .message = "empty attribute expression", .clause = 0 },
-        .{ .pattern = try fx.vec(&.{try fx.lst(&.{Fx.int(1)})}), .message = "attribute expression must start with an attribute", .clause = 0 },
-        .{ .pattern = try fx.vec(&.{try fx.map(&.{ Fx.int(1), try fx.vec(&.{try fx.kw("p/name")}) })}), .message = "map key must be an attribute or an attribute expression", .clause = 0 },
+        .{ .pattern = try fx.vec(&.{try fx.lst(&.{Fx.int(1)})}), .message = "an attribute expression starts with an attribute, not 1", .clause = 0 },
+        .{ .pattern = try fx.vec(&.{try fx.map(&.{ Fx.int(1), try fx.vec(&.{try fx.kw("p/name")}) })}), .message = "a pull map's key is an attribute or an attribute expression, not 1", .clause = 0 },
     };
     for (bad) |b| {
         fx.diag = .{};

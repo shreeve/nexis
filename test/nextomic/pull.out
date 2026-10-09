@@ -41,8 +41,8 @@ ok since has nothing for an untouched entity
 ok pull-many over a list
 ok pull-many over nothing
 {:error :nextomic/history-view, :message entity and pull read a current, as-of or since db-value, not a history one}
-{:error :nextomic/pull-syntax, :message unknown element in pattern, :clause 1}
-{:error :nextomic/pull-syntax, :message :limit needs a non-negative integer or nil, :clause 0}
+{:error :nextomic/pull-syntax, :message 42 in a pull pattern is no attribute, *, map or attribute expression, :clause 1}
+{:error :nextomic/pull-syntax, :message :limit takes a non-negative integer or nil, not :lots, :clause 0}
 {:error :kind-mismatch, :message kind mismatch}
 {:error :nextomic/tx-data, :message a lookup ref needs a unique attribute, :attr :person/name}
 {:error :nextomic/no-entity, :message [:person/email "nobody@x"] names no entity, :value [:person/email nobody@x]}

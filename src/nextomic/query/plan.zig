@@ -694,7 +694,7 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *Bound, steps: *std.Ar
         // The cheapest source next.
         var best: ?*Pending = null;
         var best_cost: u64 = std.math.maxInt(u64);
-        var unbound_pattern = false;
+        var unbound: ?usize = null;
         for (pending, 0..) |*p, idx| {
             if (p.done) continue;
             if (p.cost == .stale) {
@@ -706,13 +706,15 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *Bound, steps: *std.Ar
                     best_cost = c;
                     best = p;
                 },
-                .unbound_pattern => unbound_pattern = true,
+                .unbound_pattern => unbound = unbound orelse idx,
                 .blocked, .stale => {},
             }
         }
         const p = best orelse {
-            if (unbound_pattern) return error.UnboundPattern;
-            return neverBound(ctx, pending, bound);
+            const idx = unbound orelse return neverBound(ctx, pending, bound);
+            if (ctx.depth == 1) ctx.clause_index = idx;
+            ctx.diag.set(ctx.clause_index, "{f} has nothing bound in e, a or v: no constant, and no variable an earlier clause or :in binds", .{PatternText{ .ctx = ctx, .p = pending[idx].clause.pattern }});
+            return error.UnboundPattern;
         };
         if (ctx.depth == 1) ctx.clause_index = (@intFromPtr(p) - @intFromPtr(pending.ptr)) / @sizeOf(Pending);
         switch (p.clause) {
@@ -843,7 +845,7 @@ fn checkGetElse(ctx: *Ctx, call: ir.Call) !void {
     const a = call.args[2];
     if (a != .constant or a.constant != .keyword) return;
     const attr = (try ctx.attrByKeyword(a.constant.keyword)) orelse return;
-    if (attr.many()) return ctx.syntax("get-else takes a cardinality-one attribute");
+    if (attr.many()) return ctx.syntaxFmt("get-else takes a cardinality-one attribute, and :{s} is cardinality-many", .{ctx.interner.keywordName(a.constant.keyword)});
 }
 
 /// A call can run once its function (when a variable) and every
@@ -1445,6 +1447,36 @@ pub fn explainCell(c: Cell, ctx: *const Ctx, w: *std.Io.Writer) !void {
         .vm => try w.writeAll("#value"),
     }
 }
+
+/// A data pattern as the query wrote it, for a message.
+const PatternText = struct {
+    ctx: *const Ctx,
+    p: ir.Pattern,
+
+    pub fn format(self: PatternText, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const terms = self.p.terms();
+        var n: usize = terms.len;
+        while (n > 3 and terms[n - 1] == .blank) n -= 1;
+        try w.writeByte('[');
+        if (self.p.src) |src| try w.print("{s} ", .{self.ctx.interner.symbolName(self.ctx.source_names[src])});
+        for (terms[0..n], 0..) |t, i| {
+            if (i > 0) try w.writeByte(' ');
+            switch (t) {
+                .blank => try w.writeAll("_"),
+                .variable => |v| try w.writeAll(self.ctx.varName(v)),
+                .constant => |c| switch (c) {
+                    .cell => |cell| try explainCell(cell, self.ctx, w),
+                    .lookup => |l| {
+                        try w.print("[:{s} ", .{self.ctx.interner.keywordName(l.attr)});
+                        try explainCell(l.v, self.ctx, w);
+                        try w.writeByte(']');
+                    },
+                },
+            }
+        }
+        try w.writeByte(']');
+    }
+};
 
 fn explainCall(call: ir.Call, ctx: *const Ctx, w: *std.Io.Writer) !void {
     try w.writeByte('(');
