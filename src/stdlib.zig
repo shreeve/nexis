@@ -6401,13 +6401,21 @@ fn fnSpit(vm: *VM, args: []const Value) VmError!Value {
     defer w.deinit();
     try appendStrValue(vm, &w, args[1]);
     const io = ioOf(vm);
-    const file = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = !append }) catch |err| switch (err) {
+    // A stream, so a pipe, a FIFO or a device takes it; `:append`
+    // opens with O_APPEND, so each write lands at the end whatever
+    // another process appends meanwhile.
+    const file: std.Io.File = if (append) .{
+        .handle = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, 0o666) catch |err| switch (err) {
+            error.FileNotFound => return VmError.FileNotFound,
+            else => return VmError.IoError,
+        },
+        .flags = .{ .nonblocking = false },
+    } else std.Io.Dir.cwd().createFile(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return VmError.FileNotFound,
         else => return VmError.IoError,
     };
     defer file.close(io);
-    const at = if (append) file.length(io) catch return VmError.IoError else 0;
-    file.writePositionalAll(io, w.written(), at) catch return VmError.IoError;
+    file.writeStreamingAll(io, w.written()) catch return VmError.IoError;
     return value_mod.nilValue();
 }
 

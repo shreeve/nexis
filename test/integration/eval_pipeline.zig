@@ -8700,3 +8700,40 @@ test "gc: into a hash target keeps the entries a map walk built" {
     try expectOutputUnderGc(mk_lazy ++ "(sort (map count (vals (into {} (hash-map :a (mk 300) :b (mk 301) :c (mk 302) :d (mk 303))))))", "(300 301 302 303)");
     try expectOutputUnderGc(mk_lazy ++ "(count (into #{} {(mk 1500) 1 (mk 1600) 2 (mk 1700) 3 (mk 1800) 4}))", "4");
 }
+
+// =============================================================================
+// spit streams its text (STDLIB.md §6)
+// =============================================================================
+
+/// `expectOutputWithIo` for a program whose `@STORE@` names a fresh
+/// path in a directory private to the call.
+fn expectOutputWithIoAt(name: []const u8, template: []const u8, expected: []const u8) !void {
+    var store = try SeamStore.init(name);
+    defer store.deinit();
+    const src = try store.source(template);
+    defer testing.allocator.free(src);
+    try expectOutputWithIo(src, expected);
+}
+
+test "io: spit writes to a FIFO, replacing or appending" {
+    try expectOutputWithIoAt("spit-fifo",
+        \\(defn through-fifo [f & opts]
+        \\  (nexis.shell/sh "rm" "-f" f (str f ".got"))
+        \\  (nexis.shell/sh "mkfifo" f)
+        \\  (nexis.shell/sh "sh" "-c" "(cat \"$0\" > \"$0.tmp\"; mv \"$0.tmp\" \"$0.got\") >/dev/null 2>&1 &" f)
+        \\  (apply spit f "through a fifo" opts)
+        \\  (nexis.shell/sh "sh" "-c" "while [ ! -e \"$0.got\" ]; do sleep 0.01; done" f)
+        \\  (slurp (str f ".got")))
+        \\[(through-fifo "@STORE@") (through-fifo "@STORE@" :append true)]
+    , "[through a fifo through a fifo]");
+}
+
+test "io: spit :append lands at the end while another process appends" {
+    try expectOutputWithIoAt("spit-appenders",
+        \\(def f "@STORE@")
+        \\(nexis.shell/sh "sh" "-c" "(i=0; while [ $i -lt 400 ]; do echo b >> \"$0\"; i=$((i+1)); done; touch \"$0.done\") >/dev/null 2>&1 &" f)
+        \\(dotimes [_ 400] (spit f "a\n" :append true))
+        \\(nexis.shell/sh "sh" "-c" "while [ ! -e \"$0.done\" ]; do sleep 0.01; done" f)
+        \\(let [lines (nexis.string/split-lines (slurp f))] [(count (filter #{"a"} lines)) (count (filter #{"b"} lines))])
+    , "[400 400]");
+}
