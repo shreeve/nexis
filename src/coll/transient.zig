@@ -5,7 +5,7 @@
 //! `docs/SEMANTICS.md` §2.6 (identity equality and hash),
 //! `docs/CODEC.md` §3 (not serializable), `docs/VALUE.md` §2.2 (kind
 //! 27, local-enum subkinds 0/1/2), `docs/GC.md` §5 (trace contract),
-//! CLOJURE-REVIEW §1.2, §3.5.
+//! CLOJURE-REVIEW §1.2.
 //!
 //! A transient holds a root of its own and an edit token; the `!`
 //! operations edit that root and every node stamped with the token in
@@ -19,10 +19,7 @@
 //!   - Wrong subkind (mapAssocBang on a set wrapper) →
 //!     `error.TransientKindMismatch`.
 //!
-//! Imports: value, heap, `champ.zig` and `vector.zig` (never
-//! dispatch; hash and equality arrive as callbacks). Importers: the
-//! `.transient` arms of `src/dispatch.zig`, `src/gc.zig` (this
-//! module's `trace`), `src/codec.zig` and `src/stdlib.zig`.
+//! Never imports dispatch: hash and equality arrive as callbacks.
 
 const std = @import("std");
 const value = @import("../value.zig");

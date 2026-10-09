@@ -1,41 +1,7 @@
 //! test/prop/champ.zig — randomized properties for the persistent map
-//! and set heap kinds (CHAMP): M1–M11 for maps, S1–S9 for sets.
-//!
-//! Primary purpose: pin the map and set invariant
-//! `(= a b) ⇒ hash(a) = hash(b)` across both subkinds. M6 is the
-//! map property parallel to
-//! `test/prop/vector.zig` V3 (sequential category) and V9 (cross-kind
-//! at structural boundaries).
-//!
-//! Properties (CHAMP.md §12.4):
-//!   M1. `mapFromEntries` + `mapGet` round-trip: every inserted
-//!       (k, v) looks up to exactly `v`; absent keys return `.absent`.
-//!   M2. `mapAssoc` + `mapDissoc` random sequences preserve the entry
-//!       multiset (minus dissoc'd keys).
-//!   M2b. At 2000 and 30000 keys, assoc and dissoc keep the canonical
-//!       trie layout (`champ.canonicalTrie`), and equal maps built in
-//!       different orders iterate in the same order.
-//!   M3. `mapAssoc` replace-value: associng `(k, v1)` then `(k, v2)`
-//!       yields `mapGet(m, k) == .present = v2` with unchanged count.
-//!   M4. `assoc` same-value short-circuit returns the same map pointer.
-//!   M5. Equality laws over random maps: reflexive, symmetric,
-//!       transitive (pairwise).
-//!   M6. **Cross-subkind hash equivalence** for maps: 2000 random
-//!       maps of 1..8 entries
-//!       built two ways — one stays array-map, one promotes to CHAMP
-//!       and dissocs back to the same entries — hash and equal
-//!       identically.
-//!   M7. Cross-category never-equal: a map is never `=` to any non-
-//!       associative Value (an immediate, a list or vector, a string,
-//!       a set, a record), and the hashes differ.
-//!   M8. Persistent immutability: `mapAssoc(m, k, v)` does not mutate
-//!       `m`; `mapGet(m, k)` still returns the pre-assoc result.
-//!   M9. Keyword-keyed fast-path correctness: maps keyed entirely by
-//!       keywords produce identical semantic results to maps keyed by
-//!       non-interned values (the fast path is an optimization only).
-//!   M10. Collision-bucket stress: synthetic hash-collision fixture
-//!        forces ≥5 entries into a collision node; round-trip + dissoc
-//!        + equality all hold.
+//! and set heap kinds (CHAMP): M1–M11 for maps, S1–S9 for sets, each
+//! described in CHAMP.md §12.2 and §12.4. The invariant they pin first
+//! is `(= a b) ⇒ hash(a) = hash(b)` across both subkinds.
 
 const std = @import("std");
 const nx = @import("nexis");
