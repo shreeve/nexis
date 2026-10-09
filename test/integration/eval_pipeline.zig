@@ -6590,6 +6590,7 @@ test "integration: a Var calls, and derefs to, the value in force" {
     try expectOutput("(def ^:dynamic *x* 1) (binding [*x* 2] [@#'*x* (deref (var *x*))])", "[2 2]");
     try expectOutput("(declare later) (try (#'later 1) (catch any e e))", "{:error :unbound-var, :message unbound var, :fn test-form}");
     try expectOutput("(def n 5) (try (#'n 1) (catch any e e))", "{:error :not-callable, :message an integer is not callable, :fn test-form}");
+    try expectOutput("(def ^:dynamic *u*) [(binding [*u* 3] @#'*u*) (try @#'*u* (catch :unbound-var _ :unbound))]", "[3 :unbound]");
 }
 
 // =============================================================================
