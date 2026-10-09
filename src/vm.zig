@@ -1443,7 +1443,7 @@ pub fn pathArg(v: Value) VmError![]const u8 {
 // Discipline:
 //   - Never hold a `[]Value` slice into `vm.stack.items` across an
 //     operation that might grow `stack`; ArrayList reallocation
-//     invalidates it. Use `slotPtr()` for one-shot access, or
+//     invalidates it. Use `slotPtrIn()` for one-shot access, or
 //     snapshot the frame's `base_slot` into a local.
 //   - Never hold a `*Frame` across `pushFrame`, for the same
 //     reason. Helpers that take a frame pointer are one-shot.
@@ -1619,6 +1619,12 @@ pub const ProtocolEntry = struct {
     ns_name: []const u8,
     name: []const u8,
     methods: std.ArrayList(ProtocolMethod) = .empty,
+
+    /// The method named by the interned id `name_id`.
+    pub fn method(self: *ProtocolEntry, name_id: u32) ?*ProtocolMethod {
+        for (self.methods.items) |*m| if (m.name_id == name_id) return m;
+        return null;
+    }
 };
 
 pub const ProtocolMethod = struct {
@@ -3074,13 +3080,8 @@ pub const VM = struct {
         impl: Value,
     ) !void {
         const proto = self.protocolById(protocol_id) orelse return error.NoProtocolMethod;
-        for (proto.methods.items) |*method| {
-            if (method.name_id == method_name_id) {
-                try method.impls.put(self.home().allocator, key.canonical(), impl);
-                return;
-            }
-        }
-        return error.NoProtocolMethod;
+        const method = proto.method(method_name_id) orelse return error.NoProtocolMethod;
+        try method.impls.put(self.home().allocator, key.canonical(), impl);
     }
 
     /// Call the protocol fn `callee` with `args`: find the impl for
@@ -3095,16 +3096,7 @@ pub const VM = struct {
         const protocol_id = protocol_mod.protocolFnProtocolId(callee);
         const method_name_id = protocol_mod.protocolFnMethodNameId(callee);
         const proto = self.protocolById(protocol_id) orelse return VmError.NoProtocolImpl;
-
-        // Find the method by name_id.
-        var method_ptr: ?*ProtocolMethod = null;
-        for (proto.methods.items) |*m| {
-            if (m.name_id == method_name_id) {
-                method_ptr = m;
-                break;
-            }
-        }
-        const method = method_ptr orelse return VmError.NoProtocolMethod;
+        const method = proto.method(method_name_id) orelse return VmError.NoProtocolMethod;
         if (args.len == 0) return self.arityError(method.name, 1, null, 0);
 
         // Look up impl by dispatch key (receiver is args[0]).
@@ -3734,26 +3726,9 @@ pub const VM = struct {
         return &self.frames.items[self.frames.items.len - 1];
     }
 
-    /// Resolve a slot operand to a pointer into the backing stack.
-    /// Returns `OperandOutOfRange` if the slot index exceeds the
-    /// current frame's `slot_count`. **Single-shot use only**: the
-    /// returned pointer is invalidated by any `stack.append` /
-    /// `stack.appendNTimes`.
-    ///
-    /// The bound is the frame's `slot_count`, which catches bad
-    /// bytecode: call:call produces overlapping frame windows where
-    /// `stack.items.len > base_slot + slot_count` for the caller even
-    /// after the callee has been popped, so the logical bound is what
-    /// defines a frame's visible slot range. That the stack covers
-    /// the current frame's window is the frame discipline's invariant
-    /// (§7), asserted, not tested.
-    fn slotPtr(self: *VM, slot_index: u12) VmError!*Value {
-        return self.slotPtrIn(self.currentFrame(), slot_index);
-    }
-
-    /// `slotPtr` against `frame`, the current frame a caller has
-    /// already fetched: the hot handlers resolve every operand
-    /// through one frame pointer instead of re-deriving it.
+    /// Slot `slot_index` of `frame`, `OperandOutOfRange` past the
+    /// frame's `slot_count`, which bounds what the frame sees of the
+    /// stack it shares (§7). One-shot: growing the stack moves it.
     inline fn slotPtrIn(self: *VM, frame: *const Frame, slot_index: u12) VmError!*Value {
         if (slot_index >= frame.routine.slot_count) return VmError.OperandOutOfRange;
         return self.slotAt(frame, slot_index);
@@ -3767,21 +3742,8 @@ pub const VM = struct {
         return &self.stack.items.ptr[absolute];
     }
 
-    /// Resolve an operand to a `Value` (read side).
-    ///
-    /// For `.upvalue` operands:
-    /// `U` is the **cell-contents** operand kind. `resolve(u:N)`
-    /// reads the current frame's `upvalues[N]` (a `*UpvalCell`),
-    /// validates it's `initialized = true`, and returns the
-    /// cell's value. Closure construction needs RAW cell pointers
-    /// (not contents) and does NOT go through `resolve()` — it
-    /// reads `frame.upvalues[u]` directly via a dedicated path
-    /// in `execClosureMake`. Do not conflate the two.
-    fn resolve(self: *VM, op: Operand) VmError!Value {
-        return self.resolveIn(self.currentFrame(), op);
-    }
-
-    /// `resolve` against `frame`, the current frame.
+    /// The value operand `op` reads in `frame` (VM.md §4): a `u` operand
+    /// reads its cell's contents, never the cell.
     inline fn resolveIn(self: *VM, frame: *const Frame, op: Operand) VmError!Value {
         var tmp: Value = undefined;
         return (try self.operandPtr(frame, op, &tmp)).*;
@@ -3975,31 +3937,9 @@ pub const VM = struct {
         };
     }
 
-    /// Write a `Value` into a destination operand.
-    ///
-    /// Only `.slot` is a valid destination for the generic store
-    /// path. Other kinds split into two categories per VM.md §13:
-    ///
-    ///   - `.upvalue`: a recognized destination kind with no
-    ///     store path (nothing writes through cells via U).
-    ///     Returns `UnimplementedOpcode`.
-    ///   - `.constant`, `.intern`, `.durable`: read-only
-    ///     operand kinds; writing to them is invalid in this
-    ///     opcode context, NOT "not wired." Surface
-    ///     `InvalidOperandKind` per VM.md §13's not-catchable
-    ///     table.
-    ///   - `.var_`: var writes go through `var:store-var` (a
-    ///     dedicated opcode), not the generic store path. Generic
-    ///     store with a `.var_` destination is a handler bug.
-    ///     Surface `InvalidOperandKind`.
-    ///   - `.unused`: invalid in any context with a destination
-    ///     operand.
-    fn store(self: *VM, op: Operand, v: Value) VmError!void {
-        return self.storeIn(self.currentFrame(), op, v);
-    }
-
-    /// `store` against `frame`, the current frame: a slot in range
-    /// inline, every other case out of line.
+    /// Store `v` through the destination `op` of `frame`: a slot, as
+    /// VM.md §4 allows; a slot in range inline, every other case out
+    /// of line.
     inline fn storeIn(self: *VM, frame: *const Frame, op: Operand, v: Value) VmError!void {
         if (op.kind == .slot and op.index < frame.routine.slot_count) {
             self.slotAt(frame, op.index).* = v;
@@ -4114,7 +4054,7 @@ pub const VM = struct {
     /// returns how many entries it wrote.
     fn captureTrace(self: *VM, out: []TraceFrame) usize {
         const frames = self.frames.items;
-        const lowest: usize = if (frames[0].routine == &idle_routine) 1 else 0;
+        const lowest = self.lowestLiveFrame();
         const depth = frames.len - lowest;
         const elided = if (depth > trace_capacity) depth - (trace_innermost + trace_outermost) else 0;
         var n: usize = 0;
@@ -4127,9 +4067,7 @@ pub const VM = struct {
                 i -= elided - 1;
                 continue;
             }
-            const f = frames[i];
-            const pc: u32 = if (f.pc > 0) f.pc - 1 else 0;
-            out[n] = .{ .name = f.routine.name, .pc = pc, .span = f.routine.spanAt(pc), .source = f.routine.source };
+            out[n] = traceFrameOf(frames[i]);
             n += 1;
         }
         return n;
@@ -4335,7 +4273,7 @@ pub const VM = struct {
     /// is the program's. Null outside any run.
     pub fn raiseSite(self: *VM) ?TraceFrame {
         const frames = self.frames.items;
-        const lowest: usize = if (frames[0].routine == &idle_routine) 1 else 0;
+        const lowest = self.lowestLiveFrame();
         if (frames.len == lowest) return null;
         var i = frames.len;
         const at = while (i > lowest) {
@@ -4343,8 +4281,19 @@ pub const VM = struct {
             const source = frames[i].routine.source orelse break i;
             if (!source.library) break i;
         } else frames.len - 1;
-        const f = frames[at];
-        const pc: u32 = if (f.pc > 0) f.pc - 1 else 0;
+        return traceFrameOf(frames[at]);
+    }
+
+    /// The index of the outermost frame a run stands on: past a top
+    /// frame parked on `idle_routine`, which is part of none.
+    fn lowestLiveFrame(self: *const VM) usize {
+        return @intFromBool(self.frames.items[0].routine == &idle_routine);
+    }
+
+    /// `f` in a trace: the instruction it was executing, the one before
+    /// its `pc` (§8), and that instruction's span.
+    fn traceFrameOf(f: Frame) TraceFrame {
+        const pc: u32 = f.pc -| 1;
         return .{ .name = f.routine.name, .pc = pc, .span = f.routine.spanAt(pc), .source = f.routine.source };
     }
 
@@ -4459,8 +4408,8 @@ pub const VM = struct {
         t[opcode(.mov, Mov.load_true)] = fastLoad(value_mod.fromBool(true));
         t[opcode(.mov, Mov.load_false)] = fastLoad(value_mod.fromBool(false));
         t[opcode(.jump, Jump.jmp)] = &fastJmp;
-        t[opcode(.jump, Jump.if_false)] = &opIfFalse;
-        t[opcode(.jump, Jump.if_true)] = &opIfTrue;
+        t[opcode(.jump, Jump.if_false)] = branchHandler(false);
+        t[opcode(.jump, Jump.if_true)] = branchHandler(true);
         for (std.meta.tags(NumCmp)) |c| t[opcode(.cmp, c)] = cmpHandler(c);
         t[opcode(.var_, VarOp.load_var)] = &opLoadVar;
         t[opcode(.closure, Closure_.get_cell)] = &opGetCell;
@@ -4469,7 +4418,7 @@ pub const VM = struct {
         t[opcode(.call, Call.lookup)] = &opLookup;
         t[opcode(.call, Call.lookup_or)] = &opLookup;
         t[opcode(.call, Call.@"return")] = &opReturn;
-        t[opcode(.call, Call.return_nil)] = &opReturnNil;
+        t[opcode(.call, Call.return_nil)] = &opReturn;
         t[opcode(.call, Call.tailcall)] = &opUnimplemented;
         for (0..4096) |op| {
             if (Quick.of(op) != null) t[op] = &opQuickened;
@@ -4629,7 +4578,7 @@ pub const VM = struct {
 
     fn opClosure(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         frame.pc = @intCast(pc);
-        self.execClosure(inst) catch |e| return .of(e);
+        self.execClosure(frame, inst) catch |e| return .of(e);
         return self.nextSafe(frame);
     }
 
@@ -4657,20 +4606,17 @@ pub const VM = struct {
         return self.next(frame);
     }
 
-    fn opIfFalse(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
-        frame.pc = @intCast(pc);
-        var tmp: Value = undefined;
-        const v = self.operandPtr(frame, inst.a, &tmp) catch |e| return .of(e);
-        if (v.isFalsy()) applyJump(frame, inst.wide()) catch |e| return .of(e);
-        return self.next(frame);
-    }
-
-    fn opIfTrue(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
-        frame.pc = @intCast(pc);
-        var tmp: Value = undefined;
-        const v = self.operandPtr(frame, inst.a, &tmp) catch |e| return .of(e);
-        if (v.isTruthy()) applyJump(frame, inst.wide()) catch |e| return .of(e);
-        return self.next(frame);
+    /// `jump:if-true` (`when`) and `jump:if-false`.
+    fn branchHandler(comptime when: bool) OpHandler {
+        return &struct {
+            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
+                frame.pc = @intCast(pc);
+                var tmp: Value = undefined;
+                const v = self.operandPtr(frame, inst.a, &tmp) catch |e| return .of(e);
+                if (v.isTruthy() == when) applyJump(frame, inst.wide()) catch |e| return .of(e);
+                return self.next(frame);
+            }
+        }.run;
     }
 
     fn opGetCell(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
@@ -4799,19 +4745,12 @@ pub const VM = struct {
         return self.nextSafe(caller);
     }
 
+    /// `call:return` and `call:return-nil`. The value is read before
+    /// the frame pops, which frees its slots.
     fn opReturn(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         frame.pc = @intCast(pc);
-        // Read the value while the callee frame is still active;
-        // popping first would invalidate the slot.
-        const v = self.resolveIn(frame, inst.a) catch |e| return .of(e);
+        const v = if (inst.variant == @backingInt(Call.return_nil)) value_mod.nilValue() else self.resolveIn(frame, inst.a) catch |e| return .of(e);
         self.returnValue(v) catch |e| return .of(e);
-        if (!self.running()) return .ok;
-        return self.next(self.currentFrame());
-    }
-
-    fn opReturnNil(self: *VM, frame: *Frame, _: Inst, pc: usize) callconv(handler_cc) Status {
-        frame.pc = @intCast(pc);
-        self.returnValue(value_mod.nilValue()) catch |e| return .of(e);
         if (!self.running()) return .ok;
         return self.next(self.currentFrame());
     }
@@ -5304,7 +5243,7 @@ pub const VM = struct {
         // never reads a block after its call (`COMPILER.md` §4.4), so
         // it keeps nothing it held alive until a later call reuses it.
         nilSlots(self.stack.items[args_base - 1 ..][0 .. argc + 1]);
-        storeResult(try self.slotPtr(result_dst), &result);
+        storeResult(try self.slotPtrIn(self.currentFrame(), result_dst), &result);
     }
 
     /// Push `frame`. The caller has already grown the stack into
@@ -5378,159 +5317,73 @@ pub const VM = struct {
     // Group `closure` (VM.md §10.5)
     // -------------------------------------------------------------------------
 
-    fn execClosure(self: *VM, inst: Inst) VmError!void {
+    fn execClosure(self: *VM, frame: *const Frame, inst: Inst) VmError!void {
         const variant: Closure_ = @fromBackingInt(@intCast(inst.variant));
         switch (variant) {
-            .make => try self.execClosureMake(inst),
-            .box_local => try self.execClosureBoxLocal(inst),
+            .make => try self.execClosureMake(frame, inst),
+            .box_local => try self.execClosureBoxLocal(frame, inst),
             // `op_table` routes `get-cell` to `opGetCell`.
             .get_cell => unreachable,
-            .new_cell => try self.execClosureNewCell(inst),
-            .init_cell => try self.execClosureInitCell(inst),
+            .new_cell => try self.execClosureNewCell(frame, inst),
+            .init_cell => try self.execClosureInitCell(frame, inst),
             _ => return VmError.BytecodeCorruption,
         }
     }
 
-    /// `closure:box-local A=slot _ _` — wrap slot[A]'s current
-    /// value into a fresh, initialized UpvalCell. Replaces
-    /// slot[A] with the cell-internal Value pointing at the cell.
-    /// Per VM.md §6.
-    ///
-    /// Errors:
-    ///   - InvalidCellState if slot[A] already holds a cell
-    ///     pointer (double-box). Indicates compiler bug.
-    fn execClosureBoxLocal(self: *VM, inst: Inst) VmError!void {
+    /// `closure:box-local A`: `slot[A]`'s value into a fresh cell, in
+    /// its place. Allocating a cell leaves `vm.stack` as it is.
+    fn execClosureBoxLocal(self: *VM, frame: *const Frame, inst: Inst) VmError!void {
         if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
-        const ptr = try self.slotPtr(inst.a.index);
-        const current = ptr.*;
-        if (current.kind() == value_mod.Kind.cell_internal) {
-            return VmError.InvalidCellState;
-        }
-        const cell_value = self.allocCell(current, true) catch return VmError.OutOfMemory;
-        // allocCell touches the heap, not `vm.stack`, so `ptr` is
-        // still valid.
-        ptr.* = cell_value;
+        const ptr = try self.slotPtrIn(frame, inst.a.index);
+        if (ptr.kind() == .cell_internal) return VmError.InvalidCellState;
+        ptr.* = self.allocCell(ptr.*, true) catch return VmError.OutOfMemory;
     }
 
-    /// `closure:get-cell A=dst_slot B=cell_slot _` — read the
-    /// contents of an UpvalCell whose pointer lives in slot[B];
-    /// write to slot[A]. Used by same-frame reads of a boxed
-    /// local.
-    ///
-    /// Errors:
-    ///   - ExpectedCell if slot[B] doesn't hold a cell pointer.
-    ///   - UninitializedCell if cell.initialized = false.
+    /// `closure:get-cell A B`: the contents of the cell in `slot[B]`.
     fn execClosureGetCell(self: *VM, frame: *const Frame, inst: Inst) VmError!void {
         if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
         if (inst.b.kind != .slot) return VmError.InvalidOperandKind;
-        const cell_v = (try self.slotPtrIn(frame, inst.b.index)).*;
-        const cell = try VM.asCell(cell_v);
+        const cell = try VM.asCell((try self.slotPtrIn(frame, inst.b.index)).*);
         if (!cell.initialized) return VmError.UninitializedCell;
         try self.storeIn(frame, inst.a, cell.value);
     }
 
-    /// `closure:new-cell A=slot _ _` — allocate an
-    /// uninitialized UpvalCell, store its cell-internal Value
-    /// at slot[A]. Used by `letfn*` lowering and
-    /// named `fn*` self-reference to allocate placeholder
-    /// cells that subsequent `closure:make` instructions
-    /// capture (raw cell pointer copied), and that
-    /// `closure:init-cell` later fills in with the constructed
-    /// closure value.
-    ///
-    /// Per VM.md §6. The cell starts with
-    /// `initialized = false`; reading it via U-operand or
-    /// `closure:get-cell` before init traps `UninitializedCell`.
-    fn execClosureNewCell(self: *VM, inst: Inst) VmError!void {
+    /// `closure:new-cell A`: a placeholder cell, `init-cell` to fill.
+    fn execClosureNewCell(self: *VM, frame: *const Frame, inst: Inst) VmError!void {
         if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
-        // Initial value doesn't matter (it'll be overwritten by
-        // init-cell before any read). Use nil as a sentinel
-        // recognizable in dumps.
         const cell_v = self.allocCell(value_mod.nilValue(), false) catch return VmError.OutOfMemory;
-        try self.store(inst.a, cell_v);
+        try self.storeIn(frame, inst.a, cell_v);
     }
 
-    /// `closure:init-cell A=cell_slot B=value_op _` — fill an
-    /// uninitialized cell with a value, flip `initialized = true`.
-    /// Used by `letfn*` and named `fn*` lowerings to
-    /// finalize placeholder cells with the constructed closure
-    /// value, after `closure:make` has constructed the closure
-    /// (which captured the still-uninitialized cell).
-    ///
-    /// Per VM.md §6.
-    ///
-    /// Errors:
-    ///   - ExpectedCell if slot[A] doesn't hold a cell pointer.
-    ///   - InvalidCellState if the cell is already initialized
-    ///     (double-init). Indicates compiler bug.
-    fn execClosureInitCell(self: *VM, inst: Inst) VmError!void {
+    /// `closure:init-cell A B`: `resolve(B)` into the placeholder cell
+    /// in `slot[A]`. The cell is checked before B is read, so a cell
+    /// filled twice is `InvalidCellState` whatever B is.
+    fn execClosureInitCell(self: *VM, frame: *const Frame, inst: Inst) VmError!void {
         if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
-        // Validate destination cell state BEFORE resolving B:
-        // the destination contract is the
-        // primary contract of init-cell. Reading a malformed
-        // source operand before checking the cell would surface
-        // the wrong error (e.g., UninitializedCell on the
-        // source upvalue instead of InvalidCellState on the
-        // already-initialized destination).
-        const cell_v = (try self.slotPtr(inst.a.index)).*;
-        const cell = try VM.asCell(cell_v);
+        const cell = try VM.asCell((try self.slotPtrIn(frame, inst.a.index)).*);
         if (cell.initialized) return VmError.InvalidCellState;
-        // B may be any operand kind that resolve() accepts.
-        const value = try self.resolve(inst.b);
-        cell.value = value;
+        cell.value = try self.resolveIn(frame, inst.b);
         cell.initialized = true;
     }
 
-    /// `closure:make A=result_slot W=capture_descriptor` per VM.md
-    /// §6: a closure over the descriptor's routine.
-    fn execClosureMake(self: *VM, inst: Inst) VmError!void {
+    /// `closure:make A W`: a closure over descriptor W's routine, its
+    /// cells copied from the descriptor's sources (VM.md §6). Nothing
+    /// allocates between the block and its cells, so the block is
+    /// whole before a safe point can see it.
+    fn execClosureMake(self: *VM, frame: *const Frame, inst: Inst) VmError!void {
         if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
-        const frame = self.currentFrame();
         const cap_idx = inst.wide();
         if (cap_idx >= frame.routine.capture_descs.len) return VmError.OperandOutOfRange;
         const desc = frame.routine.capture_descs[cap_idx];
-        const child_routine = desc.routine;
-
-        // Source count must match child routine's expectation.
-        if (desc.sources.len != child_routine.upvalue_count) {
-            return VmError.CaptureCountMismatch;
-        }
-
-        // Allocate the closure block, then fill its cell array
-        // from the capture sources in descriptor order:
-        //   .local_cell_slot(s): slot[s] must hold a cell-
-        //     internal Value (boxed by prior closure:box-local).
-        //   .inherited_upvalue(u): caller's frame.upvalues[u]
-        //     is already a *UpvalCell pointer — copy directly.
-        // Nothing allocates between the two steps, so the block is
-        // complete before a safe point can see it.
-        const closure_v = self.allocClosure(child_routine, desc.sources.len) catch
-            return VmError.OutOfMemory;
+        if (desc.sources.len != desc.routine.upvalue_count) return VmError.CaptureCountMismatch;
+        const closure_v = self.allocClosure(desc.routine, desc.sources.len) catch return VmError.OutOfMemory;
         const upvalues = closureUpvaluesMut(closure_v);
-        for (desc.sources, 0..) |source, i| {
-            upvalues[i] = switch (source) {
-                .local_cell_slot => |s| blk: {
-                    const cell_v = (try self.slotPtr(s)).*;
-                    // Must be a cell pointer (the
-                    // `ExpectedCell` trap). The compiler's
-                    // capture pre-analysis guarantees this in
-                    // well-formed bytecode; malformed bytecode
-                    // (e.g., descriptor source referencing an
-                    // un-boxed slot) traps here.
-                    break :blk try VM.asCell(cell_v);
-                },
-                .inherited_upvalue => |u| blk: {
-                    if (u >= frame.upvalues.len) return VmError.UpvalueOutOfRange;
-                    // Direct raw-cell access — NOT via
-                    // resolve(u), which would deref to
-                    // cell-contents (raw-vs-contents
-                    // distinction).
-                    break :blk frame.upvalues[u];
-                },
-            };
-        }
-
-        try self.store(inst.a, closure_v);
+        for (desc.sources, upvalues) |source, *cell| cell.* = switch (source) {
+            .local_cell_slot => |slot| try VM.asCell((try self.slotPtrIn(frame, slot)).*),
+            // The cell itself, not its contents as a `u` operand reads.
+            .inherited_upvalue => |u| if (u < frame.upvalues.len) frame.upvalues[u] else return VmError.UpvalueOutOfRange,
+        };
+        try self.storeIn(frame, inst.a, closure_v);
     }
 
     // -------------------------------------------------------------------------
@@ -5898,7 +5751,7 @@ pub const VM = struct {
     /// value into `VM.unhandled_throw` and returns
     /// `VmError.UncaughtThrow`.
     fn execCtrlThrow(self: *VM, inst: Inst) VmError!void {
-        const value = try self.resolve(inst.a);
+        const value = try self.resolveIn(self.currentFrame(), inst.a);
         try self.unwindThrow(value, self.originFor(value, null, false));
     }
 
@@ -6008,8 +5861,7 @@ pub const VM = struct {
                 if (matched.binding_slot >= frame.routine.slot_count) {
                     return VmError.InvalidHandlerState;
                 }
-                const ptr = try self.slotPtr(matched.binding_slot);
-                ptr.* = value;
+                self.slotAt(frame, matched.binding_slot).* = value;
 
                 // Jump to catch entry.
                 frame.pc = matched.catch_pc;
@@ -6796,7 +6648,7 @@ test "VM frames: slotPtr through backing stack with base_slot indirection" {
     defer vm.deinit();
 
     // Manually verify slotPtr returns a pointer into vm.stack.items.
-    const ptr = try vm.slotPtr(0);
+    const ptr = try vm.slotPtrIn(vm.currentFrame(), 0);
     try testing.expectEqual(&vm.stack.items[0], ptr);
 
     const result = try vm.run();
@@ -6809,8 +6661,8 @@ test "VM frames: slotPtr out-of-range surfaces OperandOutOfRange" {
     const routine = makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 3, "slotptr-oob");
     var vm = try VM.init(testing.allocator, &routine);
     defer vm.deinit();
-    try testing.expectError(VmError.OperandOutOfRange, vm.slotPtr(3));
-    try testing.expectError(VmError.OperandOutOfRange, vm.slotPtr(4095));
+    try testing.expectError(VmError.OperandOutOfRange, vm.slotPtrIn(vm.currentFrame(), 3));
+    try testing.expectError(VmError.OperandOutOfRange, vm.slotPtrIn(vm.currentFrame(), 4095));
 }
 
 /// One hand-assembled routine and what running it on a fresh VM
