@@ -1331,6 +1331,18 @@ damaged page is `:db/corrupted` (§7), never a short scan.
 - **`tx-range` takes the connection.** `(d/tx-range conn from to)`,
   either bound optional or nil, returns the entries as a vector of
   maps; Datomic's reads a log value.
+- **`pull` takes no `:xform`** (§6.2): an attribute option is `:as`,
+  `:limit` or `:default`, and `(:person/name :xform str)` is
+  `:nextomic/pull-syntax` naming the option. Datomic's pull applies
+  an `:xform` function to the attribute's value.
+- **`min` and `max` take values of mixed kinds** (§5 "Aggregates"):
+  they order by the cell order (nil, booleans, numbers, strings,
+  keywords, then other values), where Datomic compares with `compare`
+  and throws on two kinds it cannot compare.
+- **An `:in` lookup ref or ident resolves once per query** (§5): in
+  the source of the first step that reads its variable as an entity,
+  and every later clause reads that eid. Datomic resolves it in the
+  source of each clause that reads it.
 - **Values are the VM's.** A long or an instant is an integer in i64,
   a fixnum or a bignum by its size (§2.2), and an instant is
   milliseconds as a long; Datomic takes a 64-bit long and a
