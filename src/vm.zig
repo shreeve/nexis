@@ -3972,9 +3972,29 @@ pub const VM = struct {
         storeWide(dst, loadWords(src));
     }
 
-    /// `@memcpy(dst, src)` a value at a time (`copyWide`).
+    /// A value a native returned through memory, where it lies: on
+    /// x86-64 read a word at a time, the width the native stored it.
+    inline fn returned(src: *const Value) Value {
+        return if (wide_stores) loadWords(src) else src.*;
+    }
+
+    /// `dst.* = src.*` of a value a native returned, for a native to
+    /// read (`returned`, `storeWide`).
+    inline fn storeResult(dst: *Value, src: *const Value) void {
+        if (wide_stores) copyWide(dst, src) else dst.* = src.*;
+    }
+
+    /// `@memcpy(dst, src)` for a native to read: on x86-64 a value at a
+    /// time (`copyWide`).
     fn copyRun(dst: []Value, src: []const Value) void {
+        if (!wide_stores) return copySlots(dst, src);
         for (dst, src) |*d, *s| copyWide(d, s);
+    }
+
+    /// A call of its own, which the optimizer cannot fold an inline
+    /// copy beside it into.
+    noinline fn copySlots(dst: []Value, src: []const Value) void {
+        @memcpy(dst, src);
     }
 
     /// `copyRun` of key, value pairs, each stored as one 32-byte entry
@@ -5118,7 +5138,7 @@ pub const VM = struct {
             else => return .of(err),
         };
         countNative(native);
-        copyWide(self.verifiedSlot(frame, inst.c), &result);
+        storeResult(self.verifiedSlot(frame, inst.c), &result);
         return self.nextSafeAt(frame, pc);
     }
 
@@ -5133,8 +5153,12 @@ pub const VM = struct {
         if (argc < native.min_arity or argc > max or argc > max_native_args) return self.general(frame, inst, pc);
         const base: usize = @as(usize, frame.base_slot) + inst.a.index + 1;
         frame.pc = @intCast(pc);
+        // A whole buffer copies inline where the stack's capacity
+        // covers it, but on x86-64, where each value goes as one store.
         var buf: [max_native_args]Value = undefined;
-        copyRun(buf[0..argc], self.stack.items[base..][0..argc]);
+        if (!wide_stores and base + max_native_args <= self.stack.capacity) {
+            buf = self.stack.items.ptr[base..][0..max_native_args].*;
+        } else copyRun(buf[0..argc], self.stack.items[base..][0..argc]);
         if (native.consumes and argc > 0) self.stack.items[base + argc - 1] = value_mod.nilValue();
         countNative(native);
         const overflows = dispatch_mod.spoilCount();
@@ -5149,7 +5173,7 @@ pub const VM = struct {
         // The arguments are dead once the call returns (§6); the callee
         // is a native, which holds no heap value.
         for (self.stack.items.ptr[base..][0..argc]) |*slot| slot.* = value_mod.nilValue();
-        copyWide(self.slotAt(caller, inst.c.index), &result);
+        storeResult(self.slotAt(caller, inst.c.index), &result);
         return self.nextSafe(caller);
     }
 
@@ -5164,7 +5188,7 @@ pub const VM = struct {
         const base: usize = @as(usize, frame.base_slot) + inst.a.index + 1;
         const default = if (argc == 2) self.stack.items[base + 1] else value_mod.nilValue();
         const result = lookupInPlace(callee, self.stack.items[base], default) orelse return self.general(frame, inst, pc);
-        copyWide(self.slotAt(frame, inst.c.index), &result);
+        storeResult(self.slotAt(frame, inst.c.index), &result);
         return self.nextAt(frame, pc);
     }
 
@@ -5185,7 +5209,7 @@ pub const VM = struct {
         const target = loadWords(self.fastOperand(frame, inst.b).ptr);
         const default = if (inst.variant == @backingInt(Call.lookup_or)) self.slotAt(frame, @as(usize, inst.b.index) + 1).* else value_mod.nilValue();
         const result = lookupInPlace(key, target, default) orelse return self.general(frame, inst, pc);
-        copyWide(self.verifiedSlot(frame, inst.a), &result);
+        storeResult(self.verifiedSlot(frame, inst.a), &result);
         return self.nextAt(frame, pc);
     }
 
@@ -5317,7 +5341,7 @@ pub const VM = struct {
         // never reads a block after its call (`COMPILER.md` §4.4), so
         // it keeps nothing it held alive until a later call reuses it.
         nilSlots(self.stack.items[args_base - 1 ..][0 .. argc + 1]);
-        copyWide(try self.slotPtr(result_dst), &result);
+        storeResult(try self.slotPtr(result_dst), &result);
     }
 
     /// Push `frame`. The caller has already grown the stack into
@@ -5739,15 +5763,15 @@ pub const VM = struct {
         errdefer self.dropSpoils(overflows);
         // Each result is read a word at a time where it is returned.
         const result: Value = switch (variant) {
-            .list => loadWords(&(list_mod.fromSlice(heap, args) catch return VmError.OutOfMemory)),
-            .vector => loadWords(&(vector_mod.fromSlice(heap, args) catch return VmError.OutOfMemory)),
+            .list => returned(&(list_mod.fromSlice(heap, args) catch return VmError.OutOfMemory)),
+            .vector => returned(&(vector_mod.fromSlice(heap, args) catch return VmError.OutOfMemory)),
             .map => blk: {
                 if (argc % 2 != 0) return VmError.BytecodeCorruption;
                 // Flat key, value pairs are `Entry`s laid end to end.
                 const entries: [*]const champ_mod.Entry = @ptrCast(args.ptr);
-                break :blk loadWords(&(champ_mod.mapFromEntries(heap, entries[0 .. argc / 2], hash, eql) catch return VmError.OutOfMemory));
+                break :blk returned(&(champ_mod.mapFromEntries(heap, entries[0 .. argc / 2], hash, eql) catch return VmError.OutOfMemory));
             },
-            .set => loadWords(&(champ_mod.setFromElements(heap, args, hash, eql) catch return VmError.OutOfMemory)),
+            .set => returned(&(champ_mod.setFromElements(heap, args, hash, eql) catch return VmError.OutOfMemory)),
             .concat => blk: {
                 // A lazy part's spine is realized before anything is
                 // gathered: realizing runs code that may collect, and
@@ -5762,7 +5786,7 @@ pub const VM = struct {
                     error.KindMismatch => VmError.KindMismatch,
                     else => VmError.OutOfMemory,
                 };
-                break :blk loadWords(&(list_mod.fromSlice(heap, elements.items) catch return VmError.OutOfMemory));
+                break :blk returned(&(list_mod.fromSlice(heap, elements.items) catch return VmError.OutOfMemory));
             },
             _ => return VmError.BytecodeCorruption,
         };

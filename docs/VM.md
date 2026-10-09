@@ -588,16 +588,17 @@ constant, cell and upvalue loads that fill a call's block, and a call's
 result (`VM.storeWide`). A value whose next reader is a handler on the
 dispatch's chain is stored as two 8-byte words, which its 8-byte loads
 take a cycle sooner than from a 16-byte store: a Var's value (a
-callee), a return, a callback's window and its results. arm64 stores
-every value as two words. The rest of the native boundary keeps the
-same widths: a native's result, returned through memory, is read a
-word at a time where the call stores it (`call:call`, the buffered and
-the general call, `call:lookup`, `coll:*`); the arguments a buffered
+callee), a return, a callback's window and its results. The rest of
+the native boundary keeps the same widths on x86-64: a native's
+result, returned through memory, is read a word at a time where the
+call stores it (`call:call`, the buffered and the general call,
+`call:lookup`, `coll:*`; `VM.storeResult`); the arguments a buffered
 or general call and a collection's construction copy off the stack are
-copied a value at a time, a map's key and value as one 32-byte entry
-on x86-64, the width its constructor reads (`VM.copyRun`,
-`VM.copyEntries`); `max` and `min` read their winner a word at a time
-(`docs/PERF.md` "A width-consistent native boundary").
+copied a value at a time, a map's key and value as one 32-byte entry,
+the width its constructor reads (`VM.copyRun`, `VM.copyEntries`).
+arm64 stores every value as two words and copies results and argument
+runs whole. On both, `max` and `min` read their winner a word at a
+time (`docs/PERF.md` "A width-consistent native boundary").
 
 - `op_table` holds every opcode's **general handler**, which takes
   every case and raises every trap. Every variant of `mov`, `jump` and
