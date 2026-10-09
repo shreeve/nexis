@@ -582,10 +582,32 @@
   [bindings & body]
   `(letfn* ~bindings ~@body))
 
-; One loop per pair:
+; Fails the expansion of the binding macro `who` unless its bindings
+; are a vector of pairs whose first is a binding, as Clojure's
+; assert-args does.
+(defn- check-seq-exprs [who bindings]
+  (when-not (vector? bindings)
+    (throw (ex-info (str who " requires a vector for its binding") {})))
+  (when (odd? (count bindings))
+    (throw (ex-info (str who " requires an even number of forms in binding vector") {})))
+  (when (keyword? (first bindings))
+    (throw (ex-info (str who ": a modifier needs a binding before it") {}))))
+
+; The modifiers of one binding of doseq or for, [[k v] ...] in source
+; order, wrapped around leaf, the first outermost: :let binds, :when
+; evaluates skip when false, :while ends the walk (nil).
+(defn- wrap-mods [who mods skip leaf]
+  (reduce (fn [inner [k v]]
+            (cond (= k :let) `(let ~v ~inner)
+                  (= k :when) `(if ~v ~inner ~skip)
+                  (= k :while) `(when ~v ~inner)
+                  true (throw (ex-info (str who ": unknown modifier " k) {}))))
+          leaf
+          (reverse mods)))
+
+; One loop per binding, the modifiers around the rest:
 ;   (loop* [s (seq xs)]
-;     (if s (let [x (first s)] <modifiers around
-;                               (do (doseq [rest...] body...) (recur (next s)))>)
+;     (if s (let [x (first s)] <(do (doseq [rest...] body...) (recur (next s)))>)
 ;           nil))
 (defmacro doseq
   "bindings is [x xs modifiers... y ys ...]. Evaluates body for each x
@@ -593,27 +615,18 @@
   destructure, and :let [b], :when t and :while t modifiers work as in
   for. Returns nil."
   [bindings & body]
+  (check-seq-exprs "doseq" bindings)
   (if (empty? bindings)
     `(do ~@body nil)
-    (let* [pat (first bindings)
-           src (second bindings)
-           s (gensym "s")]
-      (loop* [more (rest (rest bindings)) mods (list)]
-        (if (and (seq more) (keyword? (first more)))
-          (recur (rest (rest more)) (cons [(first more) (second more)] mods))
-          (let* [inner (reduce (fn* [inner mod]
-                                 (let* [k (first mod) v (second mod)]
-                                   (cond
-                                     (= k :let) `(let ~v ~inner)
-                                     (= k :when) `(if ~v ~inner (recur (next ~s)))
-                                     (= k :while) `(if ~v ~inner nil)
-                                     true (throw (str "doseq: unknown modifier " k)))))
-                               `(do (doseq ~(vec more) ~@body) (recur (next ~s)))
-                               mods)]
-            `(loop* [~s (seq ~src)]
-               (if ~s
-                 (let [~pat (first ~s)] ~inner)
-                 nil))))))))
+    (let* [s (gensym "s")
+           pairs (partition 2 (drop 2 bindings))
+           mods (take-while (fn* [p] (keyword? (first p))) pairs)
+           more (vec (apply concat (drop (count mods) pairs)))]
+      `(loop* [~s (seq ~(second bindings))]
+         (if ~s
+           (let [~(first bindings) (first ~s)]
+             ~(wrap-mods "doseq" mods `(recur (next ~s)) `(do (doseq ~more ~@body) (recur (next ~s)))))
+           nil)))))
 
 ; Clojure 1.12's for (docs/LAZY.md §7): one iterator per binding, each
 ; a lazy-seq over the seq of its coll; the innermost walks a chunk at a
@@ -626,10 +639,9 @@
   varying fastest. Modifiers: :let [b], :when t (skip the element) and
   :while t (end that binding's walk)."
   [seq-exprs body-expr]
-  (when (or (not (vector? seq-exprs)) (zero? (count seq-exprs)) (odd? (count seq-exprs)))
-    (throw (ex-info "for requires an even number of forms in the binding vector" {})))
-  (when (keyword? (first seq-exprs))
-    (throw (ex-info "for: a modifier needs a binding before it" {})))
+  (check-seq-exprs "for" seq-exprs)
+  (when (empty? seq-exprs)
+    (throw (ex-info "for requires a binding" {})))
   (if (= 2 (count seq-exprs))
     `(map (fn* [x#] (let [~(first seq-exprs) x#] ~body-expr)) ~(second seq-exprs))
     (let [groups (reduce (fn* [groups pair]
@@ -637,9 +649,6 @@
                              (conj (pop groups) (conj (peek groups) pair))
                              (conj groups [(first pair) (second pair)])))
                          [] (partition 2 seq-exprs))
-          check (fn* [k]
-                  (when-not (contains? #{:let :when :while} k)
-                    (throw (ex-info (str "for: unknown modifier " k) {}))))
           emit-bind
           (fn emit-bind [groups]
             (let [group (first groups)
@@ -647,38 +656,22 @@
                   mod-pairs (drop 2 group)
                   next-groups (next groups)
                   giter (gensym "iter__")
-                  gxs (gensym "s__")
-                  do-mod (fn do-mod [mods]
-                           (let [k (first (first mods)) v (second (first mods))]
-                             (when k (check k))
-                             (cond
-                               (= k :let) `(let ~v ~(do-mod (rest mods)))
-                               (= k :while) `(when ~v ~(do-mod (rest mods)))
-                               (= k :when) `(if ~v ~(do-mod (rest mods)) (recur (rest ~gxs)))
-                               next-groups `(let [iterys# ~(emit-bind next-groups)
-                                                  fs# (seq (iterys# ~(second (first next-groups))))]
-                                              (if fs#
-                                                (concat fs# (~giter (rest ~gxs)))
-                                                (recur (rest ~gxs))))
-                               true `(cons ~body-expr (~giter (rest ~gxs))))))]
+                  gxs (gensym "s__")]
               (if next-groups
                 `(fn ~giter [~gxs]
                    (lazy-seq
                      (loop [~gxs ~gxs]
                        (when-first [~bind ~gxs]
-                         ~(do-mod mod-pairs)))))
+                         ~(wrap-mods "for" mod-pairs `(recur (rest ~gxs))
+                                     `(let [iterys# ~(emit-bind next-groups)
+                                            fs# (seq (iterys# ~(second (first next-groups))))]
+                                        (if fs#
+                                          (concat fs# (~giter (rest ~gxs)))
+                                          (recur (rest ~gxs)))))))))
                 (let [gi (gensym "i__")
                       gb (gensym "b__")
                       gc (gensym "c__")
-                      gsize (gensym "size__")
-                      do-cmod (fn do-cmod [mods]
-                                (let [k (first (first mods)) v (second (first mods))]
-                                  (when k (check k))
-                                  (cond
-                                    (= k :let) `(let ~v ~(do-cmod (rest mods)))
-                                    (= k :while) `(when ~v ~(do-cmod (rest mods)))
-                                    (= k :when) `(if ~v ~(do-cmod (rest mods)) (recur (inc ~gi)))
-                                    true `(do (chunk-append ~gb ~body-expr) (recur (inc ~gi))))))]
+                      gsize (gensym "size__")]
                   `(fn ~giter [~gxs]
                      (lazy-seq
                        (loop [~gxs ~gxs]
@@ -690,12 +683,14 @@
                                (if (loop [~gi 0]
                                      (if (< ~gi ~gsize)
                                        (let [~bind (nth ~gc ~gi)]
-                                         ~(do-cmod mod-pairs))
+                                         ~(wrap-mods "for" mod-pairs `(recur (inc ~gi))
+                                                     `(do (chunk-append ~gb ~body-expr) (recur (inc ~gi)))))
                                        true))
                                  (chunk-cons (chunk ~gb) (~giter (chunk-rest ~gxs)))
                                  (chunk-cons (chunk ~gb) nil)))
                              (let [~bind (first ~gxs)]
-                               ~(do-mod mod-pairs)))))))))))]
+                               ~(wrap-mods "for" mod-pairs `(recur (rest ~gxs))
+                                           `(cons ~body-expr (~giter (rest ~gxs))))))))))))))]
       `(let [iter# ~(emit-bind groups)]
          (iter# ~(second seq-exprs))))))
 

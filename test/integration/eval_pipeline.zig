@@ -8722,3 +8722,16 @@ test "nexis.set/difference walks the smaller set and keeps the first's kind" {
         \\   (nexis.set/difference (sorted-set 3 1 2) #{1 7 8 9} #{3}) (sorted? (nexis.set/difference (sorted-set 3 1 2) big)) (nexis.set/difference #{1})])
     , "[#{-2} #{1 3} #{1 3 4 5} #{2} true #{1}]");
 }
+
+test "doseq and for share one modifier expander and check their bindings as Clojure's assert-args" {
+    try expectOutput(
+        \\[(for [x (range 5) :let [y (* x x)] :when (odd? x) z [1 2] :while (< z 2)] [x y z])
+        \\ (for [x (range 40) :when (even? x) :while (< x 9)] x) (for [x (list 1 2 3) :when (odd? x)] x)
+        \\ (with-out-str (doseq [x [1 2 3 4] :let [y (inc x)] :when (odd? y) z [:a :b] :while (= z :a)] (print x y z)))
+        \\ (with-out-str (doseq [] (print 1)))
+        \\ (map (fn [f] (try (eval f) (catch :compile-error e (ex-message e))))
+        \\      '((doseq [x] x) (doseq (x 1) x) (doseq [x [1] :foo 1] x) (doseq [:when 1] 2) (for [] 1) (for [x [1] y [2] :bar 1] 2)))]
+    ,
+        \\[([1 1 1] [3 9 1]) (0 2 4 6 8) (1 3) 2 3 :a4 5 :a 1 (macro doseq threw doseq requires an even number of forms in binding vector macro doseq threw doseq requires a vector for its binding macro doseq threw doseq: unknown modifier :foo macro doseq threw doseq: a modifier needs a binding before it macro for threw for requires a binding macro for threw for: unknown modifier :bar)]
+    );
+}
