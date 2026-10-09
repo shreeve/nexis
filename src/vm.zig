@@ -3941,25 +3941,40 @@ pub const VM = struct {
 
     /// `dst.* = v` a word at a time (`loadWords`).
     inline fn storeWords(dst: *Value, v: Value) void {
-        if (wide_stores) {
-            const pair: @Vector(2, u64) = .{ v.tag, v.payload };
-            @as(*align(8) volatile @Vector(2, u64), @ptrCast(dst)).* = pair;
-            return;
-        }
         @as(*volatile u64, &dst.tag).* = v.tag;
         @as(*volatile u64, &dst.payload).* = v.payload;
     }
-
-    const wide_stores = builtin.cpu.arch == .x86_64;
 
     /// `dst.* = src.*` a word at a time (`loadWords`).
     inline fn copyWords(dst: *Value, src: *const Value) void {
         storeWords(dst, loadWords(src));
     }
 
-    /// `@memcpy(dst, src)` a word at a time (`loadWords`).
+    /// Whether a value a native may read is stored whole. Compiled Zig
+    /// reads a whole value, a native's argument among them, with one
+    /// 16-byte load, which on x86-64 takes its data from one 16-byte
+    /// store in flight and waits for two 8-byte stores to reach the
+    /// cache; a handler's 8-byte loads take theirs from either, a cycle
+    /// later from the 16-byte one, so a value whose reader is a handler
+    /// on the dispatch's chain (a callee, a return) is stored a word at
+    /// a time (§8).
+    const wide_stores = builtin.cpu.arch == .x86_64;
+
+    /// `storeWords`, as one 16-byte store on x86-64 (`wide_stores`).
+    inline fn storeWide(dst: *Value, v: Value) void {
+        if (!wide_stores) return storeWords(dst, v);
+        const pair: @Vector(2, u64) = .{ v.tag, v.payload };
+        @as(*align(8) volatile @Vector(2, u64), @ptrCast(dst)).* = pair;
+    }
+
+    /// `copyWords`, stored as one 16-byte store on x86-64.
+    inline fn copyWide(dst: *Value, src: *const Value) void {
+        storeWide(dst, loadWords(src));
+    }
+
+    /// `@memcpy(dst, src)` a value at a time (`copyWide`).
     fn copyRun(dst: []Value, src: []const Value) void {
-        for (dst, src) |*d, *s| copyWords(d, s);
+        for (dst, src) |*d, *s| copyWide(d, s);
     }
 
     /// `copyRun` of key, value pairs, each stored as one 32-byte entry
@@ -3973,7 +3988,7 @@ pub const VM = struct {
             const entry: @Vector(4, u64) = .{ k.tag, k.payload, v.tag, v.payload };
             @as(*align(8) volatile @Vector(4, u64), @ptrCast(&dst[i])).* = entry;
         }
-        if (i < dst.len) copyWords(&dst[i], &src[i]);
+        if (i < dst.len) copyWide(&dst[i], &src[i]);
     }
 
     /// Slot `op` of `frame`, an operand verification proved a slot
@@ -4834,12 +4849,12 @@ pub const VM = struct {
         const dst = self.verifiedSlot(frame, inst.a);
         const v = self.fastOperand(frame, inst.b);
         if (!v.ok) return self.general(frame, inst, pc);
-        copyWords(dst, v.ptr);
+        copyWide(dst, v.ptr);
         return self.nextAt(frame, pc);
     }
 
     fn fastLoadConst(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) callconv(handler_cc) Status {
-        copyWords(self.verifiedSlot(frame, inst.a), &frame.routine.consts[inst.wide()]);
+        copyWide(self.verifiedSlot(frame, inst.a), &frame.routine.consts[inst.wide()]);
         return self.nextAt(frame, pc);
     }
 
@@ -4987,7 +5002,7 @@ pub const VM = struct {
     }
 
     fn fastMoveSlot(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) callconv(handler_cc) Status {
-        copyWords(self.verifiedSlot(frame, inst.a), self.verifiedSlot(frame, inst.b));
+        copyWide(self.verifiedSlot(frame, inst.a), self.verifiedSlot(frame, inst.b));
         return self.nextAt(frame, pc);
     }
 
@@ -5001,7 +5016,7 @@ pub const VM = struct {
         const src = self.verifiedSlot(frame, inst.b);
         const v = loadWords(src);
         src.* = comptime value_mod.nilValue();
-        storeWords(dst, v);
+        storeWide(dst, v);
         return self.nextAt(frame, pc);
     }
 
@@ -5009,7 +5024,7 @@ pub const VM = struct {
         proved(inst.b.kind == .upvalue and inst.b.index < frame.upvalues.len);
         const cell = frame.upvalues[inst.b.index];
         if (!cell.initialized) return self.general(frame, inst, pc);
-        copyWords(self.verifiedSlot(frame, inst.a), &cell.value);
+        copyWide(self.verifiedSlot(frame, inst.a), &cell.value);
         return self.nextAt(frame, pc);
     }
 
@@ -5031,7 +5046,7 @@ pub const VM = struct {
         if (cell_v.kind() != .cell_internal) return self.general(frame, inst, pc);
         const cell = heap_mod.Heap.bodyOf(UpvalCell, @ptrFromInt(cell_v.payload));
         if (!cell.initialized) return self.general(frame, inst, pc);
-        copyWords(self.verifiedSlot(frame, inst.a), &cell.value);
+        copyWide(self.verifiedSlot(frame, inst.a), &cell.value);
         return self.nextAt(frame, pc);
     }
 
@@ -5103,7 +5118,7 @@ pub const VM = struct {
             else => return .of(err),
         };
         countNative(native);
-        copyWords(self.verifiedSlot(frame, inst.c), &result);
+        copyWide(self.verifiedSlot(frame, inst.c), &result);
         return self.nextSafeAt(frame, pc);
     }
 
@@ -5134,7 +5149,7 @@ pub const VM = struct {
         // The arguments are dead once the call returns (§6); the callee
         // is a native, which holds no heap value.
         for (self.stack.items.ptr[base..][0..argc]) |*slot| slot.* = value_mod.nilValue();
-        copyWords(self.slotAt(caller, inst.c.index), &result);
+        copyWide(self.slotAt(caller, inst.c.index), &result);
         return self.nextSafe(caller);
     }
 
@@ -5149,7 +5164,7 @@ pub const VM = struct {
         const base: usize = @as(usize, frame.base_slot) + inst.a.index + 1;
         const default = if (argc == 2) self.stack.items[base + 1] else value_mod.nilValue();
         const result = lookupInPlace(callee, self.stack.items[base], default) orelse return self.general(frame, inst, pc);
-        copyWords(self.slotAt(frame, inst.c.index), &result);
+        copyWide(self.slotAt(frame, inst.c.index), &result);
         return self.nextAt(frame, pc);
     }
 
@@ -5170,7 +5185,7 @@ pub const VM = struct {
         const target = loadWords(self.fastOperand(frame, inst.b).ptr);
         const default = if (inst.variant == @backingInt(Call.lookup_or)) self.slotAt(frame, @as(usize, inst.b.index) + 1).* else value_mod.nilValue();
         const result = lookupInPlace(key, target, default) orelse return self.general(frame, inst, pc);
-        copyWords(self.verifiedSlot(frame, inst.a), &result);
+        copyWide(self.verifiedSlot(frame, inst.a), &result);
         return self.nextAt(frame, pc);
     }
 
@@ -5302,7 +5317,7 @@ pub const VM = struct {
         // never reads a block after its call (`COMPILER.md` §4.4), so
         // it keeps nothing it held alive until a later call reuses it.
         nilSlots(self.stack.items[args_base - 1 ..][0 .. argc + 1]);
-        copyWords(try self.slotPtr(result_dst), &result);
+        copyWide(try self.slotPtr(result_dst), &result);
     }
 
     /// Push `frame`. The caller has already grown the stack into
@@ -5752,7 +5767,7 @@ pub const VM = struct {
             _ => return VmError.BytecodeCorruption,
         };
         try self.checkDeepData(overflows);
-        storeWords(try self.slotPtrIn(self.currentFrame(), inst.c.index), result);
+        storeWide(try self.slotPtrIn(self.currentFrame(), inst.c.index), result);
     }
 
     /// Append the elements of the seqable `v` to `out`; a map
