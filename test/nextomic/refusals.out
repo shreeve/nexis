@@ -28,3 +28,4 @@ ok no user entity carries a schema attribute
 {:error :nextomic/schema, :message "a bootstrap ident is never renamed", :attr :db/ident}
 ok asserting a bootstrap ident's own name is a no-op
 ok the bootstrap idents keep their names
+ok a lookup ref by attribute id resolves in a read

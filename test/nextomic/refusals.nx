@@ -56,3 +56,8 @@
 (prn (t/caught (d/transact! c [[:db/add :db/ident :db/ident :my/ident]])))
 (t/check "asserting a bootstrap ident's own name is a no-op" (map? (d/transact! c [[:db/add :db/doc :db/ident :db/doc]])))
 (t/check "the bootstrap idents keep their names" (= 22 (d/entid (d/db c) :db/fulltext)))
+
+; A lookup ref names its attribute by keyword or by id, in tx-data and
+; in reads alike.
+(def ea (d/entid (d/db c) :u/email))
+(t/check "a lookup ref by attribute id resolves in a read" (= x (d/entid (d/db c) [ea "x"])))

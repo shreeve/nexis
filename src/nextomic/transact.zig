@@ -1105,18 +1105,6 @@ const Ctx = struct {
 
     fn convertValue(self: *Ctx, attr: *const Attr, v: Value, use: Use) Failure!PVal {
         switch (attr.value_type) {
-            .boolean => {
-                if (!v.isBool()) return error.ValueType;
-                return .{ .val = .{ .boolean = v.asBool() } };
-            },
-            .long => return .{ .val = .{ .long = datom_mod.longOf(v) orelse return error.ValueType } },
-            .double => {
-                if (v.kind() != .float) return error.ValueType;
-                const d = v.asFloat();
-                if (std.math.isNan(d)) return error.ValueType;
-                return .{ .val = .{ .double = d } };
-            },
-            .instant => return .{ .val = .{ .instant = datom_mod.longOf(v) orelse return error.ValueType } },
             .keyword => {
                 if (v.kind() != .keyword) return error.ValueType;
                 if (use == .assert and !try self.enumAllows(attr.id, v.asKeywordId())) return self.notEnum(attr, v);
@@ -1132,17 +1120,13 @@ const Ctx = struct {
                 }
                 return pvalOf(try self.entityFromVm(v));
             },
-            .string => {
-                if (v.kind() != .string) return error.ValueType;
-                return .{ .val = .{ .string = try self.arena.dupe(u8, string_mod.asBytes(v)) } };
-            },
-            .uuid => {
-                if (v.kind() != .string) return error.ValueType;
-                return .{ .val = .{ .uuid = datom_mod.uuidFromCanonical(string_mod.asBytes(v)) orelse return error.ValueType } };
-            },
-            .bytes => {
-                if (v.kind() != .string) return error.ValueType;
-                return .{ .val = .{ .bytes = try self.arena.dupe(u8, string_mod.asBytes(v)) } };
+            else => {
+                // The arena keeps a string's bytes past the tx-data.
+                return .{ .val = switch (try marshal.scalarVal(attr.value_type, v)) {
+                    .string => |b| .{ .string = try self.arena.dupe(u8, b) },
+                    .bytes => |b| .{ .bytes = try self.arena.dupe(u8, b) },
+                    else => |x| x,
+                } };
             },
         }
     }

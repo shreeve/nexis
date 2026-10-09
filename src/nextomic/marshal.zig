@@ -4,7 +4,7 @@
 //!
 //! Contracts:
 //!   - `entity`: an entity reference is a fixnum id, a keyword ident or
-//!     a lookup ref `[attr v]`. A fixnum below 1 is `NoEntity` (a
+//!     a lookup ref `[attr v]`, its attribute a keyword or an id. A fixnum below 1 is `NoEntity` (a
 //!     fixnum cannot exceed `key.id_max`, which is `value.fixnum_max`);
 //!     an ident or lookup that names nothing in the view is
 //!     null, and the caller decides what that means; a lookup ref on an
@@ -124,7 +124,8 @@ pub fn entity(rd: *Read, arena: Allocator, v: Value, fault: *Fault) Error!?u64 {
         },
         .keyword => return rd.entid(arena, .{ .ident = v.asKeywordId() }),
         .persistent_vector => {
-            if (vector_mod.count(v) != 2 or vector_mod.nth(v, 0).kind() != .keyword) {
+            const head = if (vector_mod.count(v) == 2) vector_mod.nth(v, 0).kind() else .nil;
+            if (head != .keyword and head != .fixnum) {
                 fault.* = .{ .message = "a lookup ref is [attr value]" };
                 return error.TxData;
             }
@@ -159,18 +160,6 @@ pub fn valOf(rd: *Read, arena: Allocator, vt: key.ValueType, v: Value, fault: *F
 
 fn convertVal(rd: *Read, arena: Allocator, vt: key.ValueType, v: Value, fault: *Fault) Error!?Val {
     switch (vt) {
-        .boolean => {
-            if (!v.isBool()) return error.ValueType;
-            return .{ .boolean = v.asBool() };
-        },
-        .long => return .{ .long = datom_mod.longOf(v) orelse return error.ValueType },
-        .double => {
-            if (v.kind() != .float) return error.ValueType;
-            const d = v.asFloat();
-            if (std.math.isNan(d)) return error.ValueType;
-            return .{ .double = d };
-        },
-        .instant => return .{ .instant = datom_mod.longOf(v) orelse return error.ValueType },
         .keyword => {
             if (v.kind() != .keyword) return error.ValueType;
             const id = (try rd.db.conn.idents.idOf(rd.txn, v.asKeywordId())) orelse return null;
@@ -183,18 +172,30 @@ fn convertVal(rd: *Read, arena: Allocator, vt: key.ValueType, v: Value, fault: *
             };
             return .{ .ref = e orelse return null };
         },
-        .string => {
+        else => return try scalarVal(vt, v),
+    }
+}
+
+/// The datom value of `v` under `vt`, any type but keyword and ref,
+/// whose values name idents and entities: `ValueType` on a kind
+/// mismatch, a NaN, an integer outside i64 or a uuid's text not
+/// canonical. A string or a byte array borrows `v`'s bytes.
+pub fn scalarVal(vt: key.ValueType, v: Value) error{ValueType}!Val {
+    switch (vt) {
+        .boolean => return if (v.isBool()) .{ .boolean = v.asBool() } else error.ValueType,
+        .long => return .{ .long = datom_mod.longOf(v) orelse return error.ValueType },
+        .double => return if (v.kind() == .float and !std.math.isNan(v.asFloat())) .{ .double = v.asFloat() } else error.ValueType,
+        .instant => return .{ .instant = datom_mod.longOf(v) orelse return error.ValueType },
+        .string, .uuid, .bytes => {
             if (v.kind() != .string) return error.ValueType;
-            return .{ .string = string_mod.asBytes(v) };
+            const b = string_mod.asBytes(v);
+            return switch (vt) {
+                .string => .{ .string = b },
+                .bytes => .{ .bytes = b },
+                else => .{ .uuid = datom_mod.uuidFromCanonical(b) orelse return error.ValueType },
+            };
         },
-        .uuid => {
-            if (v.kind() != .string) return error.ValueType;
-            return .{ .uuid = datom_mod.uuidFromCanonical(string_mod.asBytes(v)) orelse return error.ValueType };
-        },
-        .bytes => {
-            if (v.kind() != .string) return error.ValueType;
-            return .{ .bytes = string_mod.asBytes(v) };
-        },
+        .keyword, .ref => unreachable,
     }
 }
 
