@@ -5029,6 +5029,18 @@ test "time: parse reads ISO-8601 instants, a missing offset UTC" {
     try expectOutput("(try (nexis.time/parse 5) (catch any e e))", ":kind-mismatch");
 }
 
+test "time: nexis.core's inst? and inst-ms know an Instant, through Clojure's Inst protocol" {
+    try expectOutput(
+        \\[(inst? (nexis.time/now)) (inst? 5) (inst? {:ms 5}) (inst-ms (nexis.time/instant 7))
+        \\ (satisfies? Inst (nexis.time/instant 7)) (try (inst-ms 7) (catch any e e))]
+    , "[true false false 7 true :no-protocol-impl]");
+    // A record of the program's own extends it as Clojure's types do.
+    try expectOutputProgram(
+        \\(defrecord Stamp [s] Inst (inst-ms* [_] (* s 1000)))
+        \\[(inst? (->Stamp 2)) (inst-ms (->Stamp 2)) (nexis.time/format (inst-ms (->Stamp 2)))]
+    , "[true 2000 1970-01-01T00:00:02Z]");
+}
+
 test "time: instants, the clock, durations and order" {
     try expectOutput("(nexis.time/inst? (nexis.time/now))", "true");
     try expectOutput("[(nexis.time/inst? 5) (nexis.time/inst? {:ms 5})]", "[false false]");

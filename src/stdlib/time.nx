@@ -3,7 +3,9 @@
 ; src/stdlib.zig internal_natives. Embedded via @embedFile and
 ; bootstrapped with nexis.time as the current namespace.
 
-(defrecord Instant [ms])
+(defrecord Instant [ms]
+  nexis.core/Inst
+  (inst-ms* [_] ms))
 
 ; defrecord's Vars, documented as the defns below are.
 (doseq [[v doc] [[#'Instant "The record type of an instant, whose one field :ms is its epoch\n  milliseconds."]

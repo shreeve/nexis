@@ -473,7 +473,9 @@ returns a realized list where Clojure returns a lazy seq.
 | `load-string`, `load-file` | 1 | Read each form of the string (of the file's text) in turn and compile and run it in the current namespace, so a form that does not read (a stray closing delimiter, an unfinished form) raises `:reader-error` after the ones before it ran; the namespace in force when it was called is restored afterwards, whether it returns or throws, as Clojure's `Compiler.load` binds `*ns*`; the last form's value, nil for none. Each form is compiled as read, as a file's form is (`CompilerHooks.load`, `docs/VM.md` §9.1), never made a value first, so a syntax-quote in the text loads; a form that does not compile throws as `eval`'s does, its `:form` nil when it has no value form |
 | `array-map` | 0+ | `(apply hash-map kvs)`: a map of up to eight entries keeps its insertion order (§5), all that Clojure's array map promises; a larger one is a hash map, as Clojure's becomes one past eight |
 | `bigint`, `biginteger` | 1 | `long`: one integer domain (BIGNUM.md), so a number truncated to an integer of any size |
-| `decimal?`, `inst?` | 1 | false: there are no decimals (PLAN §4), and an instant is `nexis.time`'s record (§11), which `nexis.time/inst?` knows and this one does not (`TODO.md` #22) |
+| `decimal?` | 1 | false: there are no decimals (PLAN §4) |
+| `Inst`, `inst-ms*` | protocol | Clojure's `Inst`: an instant is a value of a type extended to it, whose `inst-ms*` is its epoch milliseconds. `nexis.time`'s `Instant` extends it (§12), and so may any record |
+| `inst?`, `inst-ms` | 1 | `(satisfies? Inst x)`; `(inst-ms* inst)`, `:no-protocol-impl` for anything else (an integer included: `nexis.time/inst-ms` takes one too) |
 | `qualified-ident?`, `simple-ident?` | 1 | Whether `x` is a keyword or symbol with a namespace, without one |
 | `bit-and-not`, `bit-flip` | 2+, 2 | `(bit-and x (bit-not y))` over each further argument; `bit-flip` is `bit-set` or `bit-clear` of the bit, as `bit-test` finds it |
 | `alter-var-root` | 2+ | `(alter-var-root v f & args)`: sets the root of the Var `v` to `(apply f root args)` and returns it; a `binding` in force is left as it is. An unbound Var's root is nil to `f` and bound after (Clojure passes its `Unbound` object). A non-Var is `:kind-mismatch` |
@@ -735,8 +737,9 @@ no new value kind (PLAN §23): it is `=` and hashes by its `:ms`,
 `(:ms i)` reads it, and it prints as `#nexis.time.Instant{:ms
 1791549015123}`. It is not `compare`-able, as records are not
 (`docs/SORTED.md` §6): sort instants with `(sort-by t/inst-ms xs)`.
-`nexis.core`'s `inst?` is false of everything (§8) and there is no
-`#inst` literal (PLAN §4; `TODO.md` has the design note). The range is
+It extends `nexis.core`'s `Inst` protocol, so Clojure's `inst?` and
+`inst-ms` take it (§8). There is no `#inst` literal (PLAN §4;
+`TODO.md` #22 has the design note). The range is
 the fixnum's, ±2^47 ms: -2490-03-17 to 6429-10-17.
 
 **Nextomic.** A `:db.type/instant` value, `:db/txInstant` included, is
