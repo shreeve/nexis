@@ -117,7 +117,7 @@ Var inside a `binding`.
 | `nexis.test` | — | `test.nx` | TOOLING.md §3 |
 | `nexis.pprint` | — | `pprint.nx` | TOOLING.md §4 |
 | `nexis.simd` | `simd_natives` | — | TYPED_VECTOR.md §7.2 |
-| `nexis.internal` | `internal_natives` | — | the `#%` helpers macros emit: records and protocols (PROTOCOLS.md §7), `#%catch-matches?` (`try`), `#%raise` (the library's own error, `(#%raise :tag "sentence, got" x)`: the error map of `docs/VM.md` §13, its message naming the kind of `x`), `#%kwargs` (`& {:keys ...}`), `#%current-ns` (TOOLING.md §3), `#%delay` (`delay`, §8), `#%sorted-map` / `#%sorted-set` (a sorted collection a macro returns, MACROEXPAND.md §5), `#%push-out` / `#%pop-out` (`with-out-str`, §6), `#%mm-lookup` (a multimethod's call, §9.3), and the natives the namespaces of §11–§13 call |
+| `nexis.internal` | `internal_natives` | — | the `#%` helpers macros emit: records and protocols (PROTOCOLS.md §7), `#%catch-matches?` (`try`), `#%raise` (the library's own error, `(#%raise :tag "sentence, got" x)`: the error map of `docs/VM.md` §13, its message naming the kind of `x`; `(#%raise m)` throws the error map `m`; either carries the place of the program's call, as a runtime error does), `#%kwargs` (`& {:keys ...}`), `#%current-ns` (TOOLING.md §3), `#%delay` (`delay`, §8), `#%sorted-map` / `#%sorted-set` (a sorted collection a macro returns, MACROEXPAND.md §5), `#%push-out` / `#%pop-out` (`with-out-str`, §6), `#%mm-lookup` (a multimethod's call, §9.3), and the natives the namespaces of §11–§13 call |
 
 **Resolution.** Every other namespace has `nexis.core` as its parent,
 so an unqualified symbol a namespace does not define resolves in
@@ -826,16 +826,17 @@ stack is a catchable `:stack-overflow`.
 | `write` | 2+ | `(write x path & opts)`: `write-str` of `x` into the file, replacing it (`spit`); nil |
 
 **Errors.** Malformed text throws the map `{:error :json-error
-:message "JSON: <what> at line L, column C" :line L :column C}` (as
-the multimethod errors are maps, §9.4), the column counted in
-characters, so `(catch :json-error e (ex-message e))` takes it; the
+:message "JSON: <what> at line L, column C" :json-line L :json-column
+C}`, the column counted in characters, with the place of the
+program's call (`:fn`, `:file`, `:line`, `:column`) as every error a
+native raises; `(catch :json-error e (ex-message e))` takes it. The
 `<what>`s are `the text ends before its value`, `the text ends inside
 a string` (an `object`, an `array`), `text follows the value`,
 `unexpected 'c'`, `expected a string key`, `expected ':' after a
 key`, `expected ',' or '}'` (`']'`), `a malformed number`, `a control
 character in a string`, `an unknown escape`, `a lone surrogate`.
 Writing what JSON cannot hold throws `{:error :json-error :message
-...}` without a position: `NaN` or an infinity, a nil key, a key of
+...}`, placed, with no position in a text: `NaN` or an infinity, a nil key, a key of
 another class, a `:key-fn` result that is not a string, a value of any
 other class (a function, an atom). A text that is not a string, or an
 options map that is not a map, is `:kind-mismatch`; a string that is

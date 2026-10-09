@@ -639,7 +639,7 @@ const internal_rows = .{
     .{ "#%extend-default-impl", 3, 3, &fnExtendDefaultImpl },
     // try: the keyword-matcher test the expander emits.
     .{ "#%catch-matches?", 2, 2, &fnCatchMatches },
-    .{ "#%raise", 2, 3, &fnRaise },
+    .{ "#%raise", 1, 3, &fnRaise },
     // `& {:keys ...}`: the rest seq as a map.
     .{ "#%kwargs", 1, 1, &fnKwargs },
     .{ "#%load-next", 2, 2, &fnLoadNext },
@@ -3630,7 +3630,7 @@ fn nativeVarMeta(vm: *VM, v: *vm_mod.Var) VmError!Value {
         d.name.len == v.ns.len + 1 + v.name.len and std.mem.startsWith(u8, d.name, v.ns) and d.name[v.ns.len] == '/' and std.mem.endsWith(u8, d.name, v.name);
     if (!home) return value_mod.nilValue();
     const doc = nativeDoc(d) orelse return value_mod.nilValue();
-    return docMap(vm, &.{
+    return keywordMap(vm, &.{
         .{ "arglists", try readDocForm(vm, doc.arglists) },
         .{ "doc", string_mod.fromBytes(vm.ensureHeap(), doc.doc) catch return VmError.OutOfMemory },
         .{ "name", vm.ensureInterner().internSymbolValue(v.name) catch return VmError.OutOfMemory },
@@ -3707,13 +3707,20 @@ fn readDocForm(vm: *VM, text: []const u8) VmError!Value {
     return (try hooks.read_string(hooks.user_data, vm, text)) orelse value_mod.nilValue();
 }
 
+/// A keyword's name and its value in a map `keywordMap` builds.
+const KeywordField = struct { []const u8, Value };
+
 /// A map of keyword keys to values. `Heap.alloc` never collects, so
 /// the values need no root while it is built.
-fn docMap(vm: *VM, fields: []const struct { []const u8, Value }) VmError!Value {
-    const heap = vm.ensureHeap();
-    var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
-    for (fields) |f| m = try mapPut(heap, m, vm.ensureInterner().internKeywordValue(f[0]) catch return VmError.OutOfMemory, f[1]);
-    return m;
+fn keywordMap(vm: *VM, fields: []const KeywordField) VmError!Value {
+    return keywordAssoc(vm, champ_mod.mapEmpty(vm.ensureHeap()) catch return VmError.OutOfMemory, fields);
+}
+
+/// `m` with each of `fields` assoc'd.
+fn keywordAssoc(vm: *VM, m: Value, fields: []const KeywordField) VmError!Value {
+    var out = m;
+    for (fields) |f| out = try mapPut(vm.ensureHeap(), out, vm.ensureInterner().internKeywordValue(f[0]) catch return VmError.OutOfMemory, f[1]);
+    return out;
 }
 
 /// A special form's or host macro's documentation: `forms`, the text
@@ -3736,13 +3743,13 @@ fn fnSpecialDocs(vm: *VM, _: []const Value) VmError!Value {
         const forms = try readDocForm(vm, s.forms);
         const name = interner.internSymbolValue(s.name) catch return VmError.OutOfMemory;
         const doc = string_mod.fromBytes(vm.ensureHeap(), s.doc) catch return VmError.OutOfMemory;
-        try scope.push(if (s.macro) try docMap(vm, &.{
+        try scope.push(if (s.macro) try keywordMap(vm, &.{
             .{ "ns", interner.internSymbolValue("nexis.core") catch return VmError.OutOfMemory },
             .{ "name", name },
             .{ "arglists", forms },
             .{ "doc", doc },
             .{ "macro", yes },
-        }) else try docMap(vm, &.{
+        }) else try keywordMap(vm, &.{
             .{ "name", name },
             .{ "forms", forms },
             .{ "doc", doc },
@@ -5726,18 +5733,11 @@ fn fnRePattern(vm: *VM, args: []const Value) VmError!Value {
         .ok => |p| return p,
         .err => |e| {
             defer vm.allocator.free(e.msg);
-            const heap = vm.ensureHeap();
-            const interner = vm.ensureInterner();
             const index = std.unicode.utf8CountCodepoints(source[0..e.offset]) catch e.offset;
-            const fields = [_]struct { []const u8, Value }{
-                .{ "error", interner.internKeywordValue("invalid-regex") catch return VmError.OutOfMemory },
-                .{ "message", string_mod.fromBytes(heap, e.msg) catch return VmError.OutOfMemory },
+            return raise(vm, "invalid-regex", e.msg, &.{
                 .{ "pattern", args[0] },
                 .{ "index", value_mod.fromFixnum(@intCast(index)).? },
-            };
-            var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
-            for (fields) |f| m = try mapPut(heap, m, interner.internKeywordValue(f[0]) catch return VmError.OutOfMemory, f[1]);
-            return vm.throwErrorMap(m);
+            });
         },
     }
 }
@@ -6089,13 +6089,7 @@ fn replacePattern(vm: *VM, s: Value, re: Value, replacement: Value, all: bool) V
 
 /// Throw `{:error :invalid-replacement :message message}`.
 fn throwInvalidReplacement(vm: *VM, message: []const u8) VmError {
-    const heap = vm.ensureHeap();
-    const interner = vm.ensureInterner();
-    var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
-    const kind = interner.internKeywordValue("invalid-replacement") catch return VmError.OutOfMemory;
-    m = try mapPut(heap, m, interner.internKeywordValue("error") catch return VmError.OutOfMemory, kind);
-    m = try mapPut(heap, m, interner.internKeywordValue("message") catch return VmError.OutOfMemory, string_mod.fromBytes(heap, message) catch return VmError.OutOfMemory);
-    return vm.throwErrorMap(m);
+    return raise(vm, "invalid-replacement", message, &.{});
 }
 
 /// `(nexis.string/re-quote-replacement s)` → `s` with `\` and `$`
@@ -6895,25 +6889,14 @@ fn jsonOptions(vm: *VM, opts: Value, comptime names: []const []const u8) VmError
     return out;
 }
 
-/// Throw `{:error :json-error :message message}`, with `:line` and
-/// `:column` when `at` is a position in the text read, as the
-/// multimethod errors are maps (§9.4); `catch :json-error` takes it.
+/// Throw `{:error :json-error :message message}`, with `:json-line`
+/// and `:json-column` when `at` is a position in the text read.
 fn throwJson(vm: *VM, message: []const u8, at: ?struct { line: i64, column: i64 }) VmError {
-    const heap = vm.ensureHeap();
-    const interner = vm.ensureInterner();
-    var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
-    const kw = struct {
-        fn of(i: *intern_mod.Interner, name: []const u8) VmError!Value {
-            return i.internKeywordValue(name) catch VmError.OutOfMemory;
-        }
-    }.of;
-    m = try mapPut(heap, m, try kw(interner, "error"), try kw(interner, "json-error"));
-    m = try mapPut(heap, m, try kw(interner, "message"), string_mod.fromBytes(heap, message) catch return VmError.OutOfMemory);
-    if (at) |pos| {
-        m = try mapPut(heap, m, try kw(interner, "line"), try integerValue(vm, pos.line));
-        m = try mapPut(heap, m, try kw(interner, "column"), try integerValue(vm, pos.column));
-    }
-    return vm.throwValue(m);
+    const pos = at orelse return raise(vm, "json-error", message, &.{});
+    return raise(vm, "json-error", message, &.{
+        .{ "json-line", try integerValue(vm, pos.line) },
+        .{ "json-column", try integerValue(vm, pos.column) },
+    });
 }
 
 /// `throwJson` of `JSON: <what> at line L, column C` for the byte `at`
@@ -7746,18 +7729,35 @@ fn fnKwargs(vm: *VM, args: []const Value) VmError!Value {
 /// `(#%raise tag message x?)` → throws the library's own error `tag`
 /// as the runtime throws one of its own (docs/VM.md §13): the map
 /// `{:error tag :message m}`, `m` being `message` followed by the kind
-/// of `x` when given ("num takes a number or nil, got a string"), and
+/// of `x` when given ("num takes a number or nil, got a string"), with
 /// the place of the program's call when a handler is in force.
+/// `(#%raise m)` throws the error map `m`, placed the same way.
 fn fnRaise(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 1) {
+        if (args[0].kind() != .persistent_map) return VmError.KindMismatch;
+        return vm.throwErrorMap(args[0]);
+    }
     if (args[0].kind() != .keyword or args[1].kind() != .string) return VmError.KindMismatch;
-    var buf: [256]u8 = undefined;
     const text = string_mod.asBytes(args[1]);
-    const message = if (args.len == 3)
-        std.mem.print(&buf, "{s} {s}", .{ text, vm_mod.kindPhrase(args[2].kind()) }) catch text
-    else
-        text;
-    const m = vm.errorValue(args[0], message, null);
+    if (args.len == 2) return raiseTagged(vm, args[0], text, &.{});
+    const message = vm.allocator.print("{s} {s}", .{ text, vm_mod.kindPhrase(args[2].kind()) }) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(message);
+    return raiseTagged(vm, args[0], message, &.{});
+}
+
+/// Throw the library's error `{:error :tag :message message}` with the
+/// `fields` added, as the runtime throws its own (docs/VM.md §13): with
+/// the place of the program's call when a handler is in force; the
+/// bare keyword when memory is exhausted.
+fn raise(vm: *VM, comptime tag: []const u8, message: []const u8, fields: []const KeywordField) VmError {
+    const kw = vm.ensureInterner().internKeywordValue(tag) catch return VmError.OutOfMemory;
+    return raiseTagged(vm, kw, message, fields);
+}
+
+fn raiseTagged(vm: *VM, tag: Value, message: []const u8, fields: []const KeywordField) VmError {
+    var m = vm.errorValue(tag, message, null);
     if (m.kind() != .persistent_map) return vm.throwValue(m);
+    m = try keywordAssoc(vm, m, fields);
     return vm.throwErrorMap(m);
 }
 

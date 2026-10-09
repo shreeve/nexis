@@ -5151,7 +5151,7 @@ test "json: read-str takes :key-fn and :value-fn as clojure.data.json does" {
     , "{:a {:b 1}}");
 }
 
-test "json: malformed text is :json-error, with its line and column" {
+test "json: malformed text is :json-error, with its line and column in the text" {
     const cases = [_]struct { []const u8, []const u8 }{
         .{ "", "[1 1 \"JSON: the text ends before its value at line 1, column 1\"]" },
         .{ "  ", "[1 3 \"JSON: the text ends before its value at line 1, column 3\"]" },
@@ -5177,7 +5177,7 @@ test "json: malformed text is :json-error, with its line and column" {
         .{ "[[[", "[1 4 \"JSON: the text ends before its value at line 1, column 4\"]" },
     };
     for (cases) |case| {
-        const src = try std.fmt.allocPrint(testing.allocator, "(pr-str (try (nexis.json/read-str \"{s}\") (catch :json-error e [(:line e) (:column e) (ex-message e)])))", .{case[0]});
+        const src = try std.fmt.allocPrint(testing.allocator, "(pr-str (try (nexis.json/read-str \"{s}\") (catch :json-error e [(:json-line e) (:json-column e) (ex-message e)])))", .{case[0]});
         defer testing.allocator.free(src);
         try expectOutput(src, case[1]);
     }
@@ -8736,4 +8736,20 @@ test "io: spit :append lands at the end while another process appends" {
         \\(nexis.shell/sh "sh" "-c" "while [ ! -e \"$0.done\" ]; do sleep 0.01; done" f)
         \\(let [lines (nexis.string/split-lines (slurp f))] [(count (filter #{"a"} lines)) (count (filter #{"b"} lines))])
     , "[400 400]");
+}
+
+// =============================================================================
+// A library error carries the place, as a runtime error does (VM.md §13)
+// =============================================================================
+
+test "json: a :json-error carries the program's place; the text's position is :json-line and :json-column" {
+    try expectOutput("(try (nexis.json/read-str \"[1,\\n 2,]\") (catch :json-error e [(:fn e) (:json-line e) (:json-column e) (contains? e :line)]))", "[test-form 2 4 false]");
+    try expectOutput("(try (nexis.json/write-str ##NaN) (catch :json-error e [(:fn e) (contains? e :json-line)]))", "[test-form false]");
+    try expectLocatedOutput("(try (nexis.json/read-str \"x\") (catch :json-error e (select-keys e [:file :line :column :json-column])))", "{:file \"t.nx\", :line 1, :column 6, :json-column 1}");
+}
+
+test "#%raise of a map throws it with the place of the program's call" {
+    try expectOutput("(try (nexis.internal/#%raise {:error :no-method :value 1 :message \"m\"}) (catch :no-method e [(:fn e) (:value e) (:message e)]))", "[test-form 1 m]");
+    try expectOutput("(try (nexis.internal/#%raise :kind-mismatch \"f takes a number, got\" \"s\") (catch any e [(:fn e) (:message e)]))", "[test-form f takes a number, got a string]");
+    try expectOutput("(try (nexis.internal/#%raise [1]) (catch any e (:error e)))", ":kind-mismatch");
 }
