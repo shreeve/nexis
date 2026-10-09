@@ -1291,26 +1291,25 @@ fn callUserMacro(
     sub_vm.gc_enabled = false;
     sub_vm.io = ctx.io;
     if (ctx.namespace) |ns| if (ns.registry) |reg| if (reg.vm) |owner| sub_vm.borrowRegistries(owner);
-    const result_value = sub_vm.callValue(macro_var.root, arg_values) catch |err| {
-        if (err == error.OutOfMemory) return ExpandError.OutOfMemory;
-        if (err == error.UncaughtThrow) if (sub_vm.unhandled_throw) |thrown| {
-            return ctx.fail(span, "macro {s} threw {s}", .{ name, try describeThrown(ctx, thrown) });
-        };
-        if (sub_vm.error_detail.len > 0) return ctx.fail(span, "macro {s} failed: {s}: {s}", .{ name, @errorName(err), sub_vm.error_detail });
-        return ctx.fail(span, "macro {s} failed: {s}", .{ name, @errorName(err) });
-    };
+    const result_value = sub_vm.callValue(macro_var.root, arg_values) catch |err| return macroFailure(ctx, &sub_vm, name, span, err);
     // The form is data: every lazy seq in it is realized, on the
     // sub-VM, and made a list (docs/LAZY.md §8).
     const saved = sub_vm.installLazyHost();
     defer lazy_mod.host = saved;
-    const listed = seq_mod.asLists(&sub_vm, result_value) catch |err| {
-        if (err == error.OutOfMemory) return ExpandError.OutOfMemory;
-        if (err == error.UncaughtThrow) if (sub_vm.unhandled_throw) |thrown| {
-            return ctx.fail(span, "macro {s} threw {s}", .{ name, try describeThrown(ctx, thrown) });
-        };
-        return ctx.fail(span, "macro {s} failed: {s}", .{ name, @errorName(err) });
-    };
+    const listed = seq_mod.asLists(&sub_vm, result_value) catch |err| return macroFailure(ctx, &sub_vm, name, span, err);
     return try valueToForm(ctx, listed, span);
+}
+
+/// The failure of the macro `name`, whose sub-VM failed with `err`
+/// while it ran or while its result was realized: what it threw, or
+/// the error and what the VM said of it.
+fn macroFailure(ctx: *ExpandContext, sub_vm: *const vm_mod.VM, name: []const u8, span: SrcSpan, err: anyerror) ExpandError {
+    if (err == error.OutOfMemory) return ExpandError.OutOfMemory;
+    if (err == error.UncaughtThrow) if (sub_vm.unhandled_throw) |thrown| {
+        return ctx.fail(span, "macro {s} threw {s}", .{ name, try describeThrown(ctx, thrown) });
+    };
+    if (sub_vm.error_detail.len > 0) return ctx.fail(span, "macro {s} failed: {s}: {s}", .{ name, @errorName(err), sub_vm.error_detail });
+    return ctx.fail(span, "macro {s} failed: {s}", .{ name, @errorName(err) });
 }
 
 /// A thrown value in a failure message: a string as itself, a

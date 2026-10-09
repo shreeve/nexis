@@ -8690,3 +8690,7 @@ test "clojure.core is a permanent name for nexis.core" {
     try expectOutputWithFiles(&.{}, "(require '[clojure.core :as c]) [(c/inc 1) (c/when true 2)]", "[2 2]");
     try expectOutputWithFiles(&.{}, "(require '[clojure.core :refer [inc]]) (inc 1)", "2");
 }
+
+test "defmacro: a lazy result whose realization fails says why, as a failing call does" {
+    try expectMacroFailure("(defn g [x] x) (defmacro m [] (lazy-seq [(g)]))", "(m)", "macro m failed: ArityMismatch: g takes 1 argument, got 0", "(m)");
+}
