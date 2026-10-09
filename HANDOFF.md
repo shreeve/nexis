@@ -58,7 +58,7 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 244/244 steps succeeded; 1614/1614 tests passed
+Build Summary: 244/244 steps succeeded; 1637/1637 tests passed
 ```
 
 With `../nexus` checked out the gate includes `parser-check`'s two
@@ -254,10 +254,11 @@ only results into the VM heap; a Nextomic error is a map
 
 `nexis.core` (auto-referred), `db`, `nextomic`, `nexis.string`,
 `nexis.set`, `nexis.walk`, `nexis.edn`, `nexis.test`, `nexis.pprint`,
-`nexis.math`, `nexis.simd` and `nexis.internal`, with
-`clojure.string`, `clojure.set`, `clojure.walk`, `clojure.edn`,
-`clojure.math`, `clojure.test` and `clojure.pprint` accepted as names
-in `require`.
+`nexis.math`, `nexis.sys`, `nexis.shell`, `nexis.time`, `nexis.json`,
+`nexis.simd` and `nexis.internal`, with `clojure.string`,
+`clojure.set`, `clojure.walk`, `clojure.edn`, `clojure.math`,
+`clojure.test`, `clojure.pprint`, `clojure.java.shell` and
+`clojure.data.json` accepted as names in `require`.
 The native tables are in `src/stdlib.zig`, the library written in
 nexis in `src/stdlib/*.nx`, embedded and booted in order by
 `stdlib.boot` (`docs/STDLIB.md` §1).

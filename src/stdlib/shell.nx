@@ -1,0 +1,37 @@
+; src/stdlib/shell.nx — the `nexis.shell` namespace, Clojure's
+; clojure.java.shell (docs/STDLIB.md §11): `sh` over the native
+; `#%sh` in src/stdlib.zig internal_natives. Embedded via @embedFile
+; and bootstrapped with nexis.shell as the current namespace.
+
+(def ^:dynamic *sh-dir*
+  "The working directory `sh` runs a command in when no :dir is given;
+  nil for the process's own."
+  nil)
+
+(def ^:dynamic *sh-env*
+  "The environment `sh` gives a command when no :env is given; nil for
+  the process's own."
+  nil)
+
+(defmacro with-sh-dir
+  "Evaluates body with *sh-dir* bound to dir."
+  [dir & body]
+  `(binding [*sh-dir* ~dir] ~@body))
+
+(defmacro with-sh-env
+  "Evaluates body with *sh-env* bound to env."
+  [env & body]
+  `(binding [*sh-env* ~env] ~@body))
+
+(defn sh
+  "Runs a program and waits for it: (sh \"ls\" \"-l\" :dir \"/tmp\").
+  The leading strings are the program, found on the PATH, and its
+  arguments; options follow. :in is text written to its stdin (else it
+  reads end of input at once); :dir its working directory (*sh-dir*);
+  :env a map of every variable of its environment, names by `name` and
+  values by `str` (*sh-env*). Returns {:exit status :out text :err text},
+  a signal's status 128 plus its number; a program it cannot run is
+  :file-not-found."
+  [& args]
+  (let [[cmd opts] (split-with string? args)]
+    (nexis.internal/#%sh (vec cmd) (merge {:dir *sh-dir* :env *sh-env*} (apply hash-map opts)))))

@@ -53,6 +53,7 @@ const loader_mod = @import("loader.zig");
 const image_mod = @import("image.zig");
 const expand_mod = @import("expand.zig");
 const reader_mod = @import("reader.zig");
+const stack = @import("stack.zig");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;
@@ -240,6 +241,15 @@ pub const embedded = [_]image_mod.Source{
     .{ .ns = "nexis.string", .info = .{ .path = "string.nx", .text = @embedFile("stdlib/string.nx") } },
     // Set algebra (Clojure's clojure.set).
     .{ .ns = "nexis.set", .info = .{ .path = "set.nx", .text = @embedFile("stdlib/set.nx") } },
+    // The environment and the working directory.
+    .{ .ns = "nexis.sys", .info = .{ .path = "sys.nx", .text = @embedFile("stdlib/sys.nx") } },
+    // Clojure's clojure.java.shell.
+    .{ .ns = "nexis.shell", .info = .{ .path = "shell.nx", .text = @embedFile("stdlib/shell.nx") } },
+    // Instants, ISO-8601 text and durations.
+    .{ .ns = "nexis.time", .info = .{ .path = "time.nx", .text = @embedFile("stdlib/time.nx") } },
+    // JSON, in clojure.data.json's shape; after time.nx, whose
+    // instants it writes.
+    .{ .ns = "nexis.json", .info = .{ .path = "json.nx", .text = @embedFile("stdlib/json.nx") } },
 };
 
 const core_rows = .{
@@ -652,6 +662,18 @@ const internal_rows = .{
     .{ "#%special-docs", 0, 0, &fnSpecialDocs },
     .{ "#%namespace-doc", 1, 1, &fnNamespaceDoc },
     .{ "#%the-ns-name", 1, 1, &fnTheNsName },
+    // The natives under nexis.sys (sys.nx, STDLIB.md §11).
+    .{ "#%getenv", 0, 1, &fnGetenv },
+    .{ "#%cwd", 0, 0, &fnCwd },
+    // nexis.shell/sh (shell.nx, STDLIB.md §11).
+    .{ "#%sh", 2, 2, &fnSh },
+    // The natives under nexis.time (time.nx, STDLIB.md §12).
+    .{ "#%now-ms", 0, 0, &fnNowMs },
+    .{ "#%format-instant", 1, 1, &fnFormatInstant },
+    .{ "#%parse-instant", 1, 1, &fnParseInstant },
+    // The natives under nexis.json (json.nx, STDLIB.md §13).
+    .{ "#%json-read", 2, 2, &fnJsonRead },
+    .{ "#%json-write", 2, 2, &fnJsonWrite },
 };
 const internal_natives = table("nexis.internal", internal_rows);
 
@@ -3754,6 +3776,10 @@ const namespace_docs = std.StaticStringMap([]const u8).initComptime(.{
     .{ "nexis.math", "Clojure's clojure.math, which names it: sqrt, pow, the trigonometric\n  and exponential functions, floor, ceil, round, PI and E." },
     .{ "nexis.test", "Clojure's clojure.test, which names it: deftest, is, are, testing,\n  fixtures and run-tests. `nexis test FILE` runs a file's tests." },
     .{ "nexis.pprint", "Clojure's clojure.pprint, which names it: pprint and pprint-str." },
+    .{ "nexis.sys", "The process's environment and working directory: getenv and cwd.\n  exit and *command-line-args* are nexis.core's." },
+    .{ "nexis.shell", "Clojure's clojure.java.shell: sh runs a program and returns\n  {:exit :out :err}; with-sh-dir and with-sh-env set its defaults." },
+    .{ "nexis.time", "Instants, the record Instant of epoch milliseconds: now, parse and\n  format (ISO-8601), durations in milliseconds, plus, minus, between.\n  Each takes Nextomic's epoch-millisecond longs as well." },
+    .{ "nexis.json", "JSON in clojure.data.json's shape: read-str, write-str, read and\n  write, with :key-fn, :value-fn and :indent." },
     .{ "nexis.simd", "Kernels over typed vectors (i64-vector, f64-vector): sum, dot,\n  scale and map." },
     .{ "nexis.internal", "The helpers macro expansions call. Not for programs." },
 });
@@ -6399,6 +6425,995 @@ fn fnExit(vm: *VM, args: []const Value) VmError!Value {
 }
 
 // =============================================================================
+// The process's environment (nexis.sys, STDLIB.md §11)
+// =============================================================================
+//
+// Every native here reads its arguments, allocates its result last and
+// never calls back into the VM (GC.md §11.5, class 1).
+
+/// `bytes` as a string, each byte that starts no well-formed UTF-8
+/// sequence read as U+FFFD, as Java decodes text it did not make: an
+/// environment variable or a process's output is any bytes.
+fn lossyString(vm: *VM, bytes: []const u8) VmError!Value {
+    const heap = vm.ensureHeap();
+    if (std.unicode.utf8ValidateSlice(bytes)) return string_mod.fromBytes(heap, bytes) catch VmError.OutOfMemory;
+    var w = std.Io.Writer.Allocating.init(vm.allocator);
+    defer w.deinit();
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const n: usize = std.unicode.utf8ByteSequenceLength(bytes[i]) catch 0;
+        const ok = n > 0 and i + n <= bytes.len and if (std.unicode.utf8Decode(bytes[i..][0..n])) |_| true else |_| false;
+        w.writer.writeAll(if (ok) bytes[i..][0..n] else "\u{FFFD}") catch return VmError.OutOfMemory;
+        i += if (ok) n else 1;
+    }
+    return string_mod.fromBytes(heap, w.written()) catch VmError.OutOfMemory;
+}
+
+/// `(#%getenv)` → every variable of the process's environment as a map
+/// of name to value; `(#%getenv name)` → the value of one, nil when it
+/// is not set. libc's environment, which the runtime never changes.
+fn fnGetenv(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 1) {
+        if (args[0].kind() != .string) return VmError.KindMismatch;
+        const name = string_mod.asBytes(args[0]);
+        if (name.len == 0 or std.mem.findScalar(u8, name, 0) != null) return value_mod.nilValue();
+        const name_z = vm.allocator.dupeSentinel(u8, name, 0) catch return VmError.OutOfMemory;
+        defer vm.allocator.free(name_z);
+        const v = std.c.getenv(name_z.ptr) orelse return value_mod.nilValue();
+        return lossyString(vm, std.mem.span(v));
+    }
+    var m = champ_mod.mapEmpty(vm.ensureHeap()) catch return VmError.OutOfMemory;
+    var i: usize = 0;
+    while (std.c.environ[i]) |entry| : (i += 1) {
+        const text = std.mem.span(entry);
+        const eq = std.mem.findScalar(u8, text, '=') orelse continue;
+        m = try mapPut(vm.ensureHeap(), m, try lossyString(vm, text[0..eq]), try lossyString(vm, text[eq + 1 ..]));
+    }
+    return m;
+}
+
+/// `(#%cwd)` → the absolute path of the working directory.
+fn fnCwd(vm: *VM, _: []const Value) VmError!Value {
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = std.process.currentPath(ioOf(vm), &buf) catch return VmError.IoError;
+    return lossyString(vm, buf[0..n]);
+}
+
+/// `(#%sh argv opts)` → `{:exit status :out text :err text}`: runs the
+/// program `argv` names (its first string, found on the PATH as the
+/// shell finds it) with the rest as its arguments, and waits for it.
+/// `opts` maps `:in` to the text written to its stdin (nil: none, the
+/// child reads end of input at once), `:dir` to its working directory
+/// and `:env` to the whole of its environment, each nil for the
+/// process's own. One thread feeds stdin and drains stdout and stderr
+/// together, so neither side waits on a full pipe. A VM with no `io`
+/// spawns nothing (`:io-error`).
+fn fnSh(vm: *VM, args: []const Value) VmError!Value {
+    const io = vm.io orelse return VmError.IoError;
+    var arena_state = std.heap.ArenaAllocator.init(vm.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const interner = vm.ensureInterner();
+
+    if (args[0].kind() != .persistent_vector) return VmError.KindMismatch;
+    const argc = vector_mod.count(args[0]);
+    if (argc == 0) return vm.fail(VmError.InvalidArgument, "sh: no command to run", .{});
+    const argv = arena.alloc([]const u8, argc) catch return VmError.OutOfMemory;
+    for (argv, 0..) |*a, i| {
+        const s = vector_mod.nth(args[0], i);
+        if (s.kind() != .string) return VmError.KindMismatch;
+        a.* = string_mod.asBytes(s);
+        if (std.mem.findScalar(u8, a.*, 0) != null) return vm.fail(VmError.InvalidArgument, "sh: an argument holds a NUL byte", .{});
+    }
+
+    var input: ?[]const u8 = null;
+    var cwd: std.process.Child.Cwd = .inherit;
+    var env: ?std.process.Environ.Map = null;
+    if (!args[1].isNil()) {
+        if (args[1].kind() != .persistent_map) return VmError.KindMismatch;
+        var it = champ_mod.mapIter(args[1]);
+        while (it.next()) |e| {
+            const name = if (e.key.kind() == .keyword) interner.keywordName(e.key.asKeywordId()) else "";
+            if (std.mem.eql(u8, name, "in")) {
+                if (e.value.isNil()) continue;
+                if (e.value.kind() != .string) return VmError.KindMismatch;
+                input = string_mod.asBytes(e.value);
+            } else if (std.mem.eql(u8, name, "dir")) {
+                if (!e.value.isNil()) cwd = .{ .path = try vm_mod.pathArg(e.value) };
+            } else if (std.mem.eql(u8, name, "env")) {
+                if (e.value.isNil()) continue;
+                if (!isMap(e.value.kind())) return VmError.KindMismatch;
+                env = try shEnviron(vm, arena, e.value);
+            } else return vm.fail(VmError.InvalidArgument, "sh: no option {s}", .{name});
+        }
+    }
+
+    var child = std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = cwd,
+        .environ_map = if (env) |*m| m else null,
+        .stdin = if (input != null) .pipe else .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => VmError.OutOfMemory,
+        error.FileNotFound => vm.fail(VmError.FileNotFound, "sh: cannot run {s}", .{argv[0]}),
+        else => vm.fail(VmError.IoError, "sh: cannot run {s}: {t}", .{ argv[0], err }),
+    };
+    defer child.kill(io);
+
+    var out: [2]std.ArrayList(u8) = .{ .empty, .empty };
+    defer for (&out) |*o| o.deinit(vm.allocator);
+    try shExchange(vm, io, &child, input orelse "", &out);
+    const term = child.wait(io) catch return VmError.IoError;
+    const status: i64 = switch (term) {
+        .exited => |code| code,
+        .signal, .stopped => |sig| 128 + @as(i64, @backingInt(sig)),
+        .unknown => |code| code,
+    };
+
+    const heap = vm.ensureHeap();
+    var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
+    const fields = [_]struct { []const u8, Value }{
+        .{ "exit", value_mod.fromFixnum(status) orelse return VmError.ArithmeticOverflow },
+        .{ "out", try lossyString(vm, out[0].items) },
+        .{ "err", try lossyString(vm, out[1].items) },
+    };
+    for (fields) |f| m = try mapPut(heap, m, interner.internKeywordValue(f[0]) catch return VmError.OutOfMemory, f[1]);
+    return m;
+}
+
+/// The environment `:env` gives a command: each key's name (a string
+/// as it is, a keyword or symbol by `name`) bound to its value's
+/// `str`, as Clojure's `as-env-strings` makes it.
+fn shEnviron(vm: *VM, arena: std.mem.Allocator, map: Value) VmError!std.process.Environ.Map {
+    var env = std.process.Environ.Map.init(arena);
+    // Each entry lies in the map, reachable from it across the call
+    // back into the VM that realizing a value can make.
+    var it = MapEntries.of(map).?;
+    while (it.next()) |entry| {
+        const key = entry.key;
+        const name = if (key.kind() == .string) string_mod.asBytes(key) else intern_mod.Interner.splitQualified(try internedName(vm, key)).name;
+        var w = std.Io.Writer.Allocating.init(arena);
+        try appendStrValue(vm, &w, entry.value);
+        if (!std.process.Environ.Map.validateKeyForPut(name) or std.mem.findScalar(u8, w.written(), 0) != null)
+            return vm.fail(VmError.InvalidArgument, "sh: no environment variable can be named {s}", .{name});
+        env.put(name, w.written()) catch return VmError.OutOfMemory;
+    }
+    return env;
+}
+
+/// Write `input` to the child's stdin while reading its stdout and
+/// stderr into `out`, until both reach their end. A write never
+/// exceeds the 512 bytes POSIX guarantees a pipe that polls writable
+/// takes at once, so it never blocks; a child that closes its stdin
+/// early leaves the rest of `input` unwritten.
+fn shExchange(vm: *VM, io: std.Io, child: *std.process.Child, input: []const u8, out: *[2]std.ArrayList(u8)) VmError!void {
+    var storage: [3]std.Io.Operation.Storage = undefined;
+    var batch = std.Io.Batch.init(&storage);
+    defer batch.cancel(io);
+    var bufs: [2][16 * 1024]u8 = undefined;
+    var read_vecs: [2][1][]u8 = .{ .{&bufs[0]}, .{&bufs[1]} };
+    const files = [2]std.Io.File{ child.stdout.?, child.stderr.? };
+    for (0..2) |i| batch.addAt(@intCast(i), .{ .file_read_streaming = .{ .file = files[i], .data = &read_vecs[i] } });
+    var rest = input;
+    var write_vec: [1][]const u8 = undefined;
+    var open: usize = 2;
+    if (child.stdin) |stdin| {
+        if (rest.len == 0) {
+            stdin.close(io);
+            child.stdin = null;
+        } else {
+            write_vec[0] = rest[0..@min(rest.len, 512)];
+            batch.addAt(2, .{ .file_write_streaming = .{ .file = stdin, .data = &write_vec } });
+            open += 1;
+        }
+    }
+    while (open > 0) {
+        batch.awaitConcurrent(io, .none) catch return VmError.IoError;
+        while (batch.next()) |done| switch (done.index) {
+            0, 1 => {
+                const i = done.index;
+                const n = done.result.file_read_streaming catch |err| switch (err) {
+                    error.EndOfStream => {
+                        open -= 1;
+                        continue;
+                    },
+                    else => return VmError.IoError,
+                };
+                out[i].appendSlice(vm.allocator, bufs[i][0..n]) catch return VmError.OutOfMemory;
+                batch.addAt(i, .{ .file_read_streaming = .{ .file = files[i], .data = &read_vecs[i] } });
+            },
+            else => {
+                const n = done.result.file_write_streaming catch |err| switch (err) {
+                    error.BrokenPipe => rest.len,
+                    else => return VmError.IoError,
+                };
+                rest = rest[n..];
+                if (rest.len == 0) {
+                    child.stdin.?.close(io);
+                    child.stdin = null;
+                    open -= 1;
+                    continue;
+                }
+                write_vec[0] = rest[0..@min(rest.len, 512)];
+                batch.addAt(2, .{ .file_write_streaming = .{ .file = child.stdin.?, .data = &write_vec } });
+            },
+        };
+    }
+}
+
+// =============================================================================
+// Instants (nexis.time, STDLIB.md §12)
+// =============================================================================
+//
+// An instant is a count of milliseconds since 1970-01-01T00:00:00Z on
+// the proleptic Gregorian calendar, as Nextomic's `:db.type/instant`
+// values are; these natives turn one into ISO-8601 text and back.
+
+const ms_per_day = 86_400_000;
+
+/// The days from 1970-01-01 to the date `year-month-day` (Hinnant's
+/// `days_from_civil`, exact for every year).
+fn daysFromCivil(year: i64, month: u32, day: u32) i64 {
+    const y = if (month <= 2) year - 1 else year;
+    const era = @divFloor(y, 400);
+    const yoe = y - era * 400;
+    const mp: i64 = if (month > 2) month - 3 else month + 9;
+    const doy = @divFloor(153 * mp + 2, 5) + day - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146_097 + doe - 719_468;
+}
+
+const Civil = struct { year: i64, month: u32, day: u32 };
+
+/// The date `days` after 1970-01-01 (`civil_from_days`).
+fn civilFromDays(days: i64) Civil {
+    const z = days + 719_468;
+    const era = @divFloor(z, 146_097);
+    const doe = z - era * 146_097;
+    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36_524) - @divFloor(doe, 146_096), 365);
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp = @divFloor(5 * doy + 2, 153);
+    const month = if (mp < 10) mp + 3 else mp - 9;
+    return .{
+        .year = yoe + era * 400 + @intFromBool(month <= 2),
+        .month = @intCast(month),
+        .day = @intCast(doy - @divFloor(153 * mp + 2, 5) + 1),
+    };
+}
+
+fn daysInMonth(year: i64, month: u32) u32 {
+    return switch (month) {
+        2 => if (@mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0)) 29 else 28,
+        4, 6, 9, 11 => 30,
+        else => 31,
+    };
+}
+
+/// The instant `ms` as Java's `Instant.toString` writes it, to the
+/// millisecond: `2026-10-09T12:30:15.123Z`, the fraction left out when
+/// it is zero, a year before 1 with a `-` and one past 9999 with a `+`.
+fn writeInstant(w: *std.Io.Writer, ms: i64) std.Io.Writer.Error!void {
+    const in_day: u64 = @intCast(@mod(ms, ms_per_day));
+    const date = civilFromDays(@divFloor(ms, ms_per_day));
+    if (date.year < 0) try w.writeByte('-') else if (date.year > 9999) try w.writeByte('+');
+    try w.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}", .{ @abs(date.year), date.month, date.day, in_day / 3_600_000, in_day / 60_000 % 60, in_day / 1000 % 60 });
+    if (in_day % 1000 != 0) try w.print(".{d:0>3}", .{in_day % 1000});
+    try w.writeByte('Z');
+}
+
+/// The instant the ISO-8601 text `s` names, in epoch milliseconds, or
+/// null when `s` is not one. The grammar is Clojure's `#inst`, which
+/// RFC 3339 is a part of: `[+-]YYYY`, then optionally `-MM`, `-DD`,
+/// `THH:MM`, `:SS` and a fraction of 1 to 9 digits (truncated to the
+/// millisecond), each only after the one before; then `Z`, an offset
+/// `+HH:MM` (or `+HHMM`), or nothing, which is UTC. `T` and `Z` may be
+/// lower case.
+fn parseInstant(s: []const u8) ?i64 {
+    const Scan = struct {
+        s: []const u8,
+        i: usize = 0,
+
+        fn eat(p: *@This(), set: []const u8) bool {
+            if (p.i >= p.s.len or std.mem.findScalar(u8, set, p.s[p.i]) == null) return false;
+            p.i += 1;
+            return true;
+        }
+
+        fn digits(p: *@This(), n: usize) ?u32 {
+            if (p.s.len - p.i < n) return null;
+            var v: u32 = 0;
+            for (p.s[p.i..][0..n]) |c| {
+                if (!std.ascii.isDigit(c)) return null;
+                v = v * 10 + (c - '0');
+            }
+            p.i += n;
+            return v;
+        }
+    };
+    var p: Scan = .{ .s = s };
+    const negative = p.eat("-");
+    if (!negative) _ = p.eat("+");
+    const year: i64 = @as(i64, p.digits(4) orelse return null) * @as(i64, if (negative) -1 else 1);
+    var month: u32 = 1;
+    var day: u32 = 1;
+    var hour: u32 = 0;
+    var minute: u32 = 0;
+    var second: u32 = 0;
+    var milli: u32 = 0;
+    if (p.eat("-")) {
+        month = p.digits(2) orelse return null;
+        if (p.eat("-")) {
+            day = p.digits(2) orelse return null;
+            if (p.eat("Tt")) {
+                hour = p.digits(2) orelse return null;
+                if (!p.eat(":")) return null;
+                minute = p.digits(2) orelse return null;
+                if (p.eat(":")) {
+                    second = p.digits(2) orelse return null;
+                    if (p.eat(".")) {
+                        const start = p.i;
+                        while (p.i < s.len and std.ascii.isDigit(s[p.i])) p.i += 1;
+                        const n = p.i - start;
+                        if (n == 0 or n > 9) return null;
+                        for (0..3) |k| milli = milli * 10 + if (k < n) s[start + k] - '0' else 0;
+                    }
+                }
+            }
+        }
+    }
+    var offset: i64 = 0;
+    if (!p.eat("Zz") and p.i < s.len and (s[p.i] == '+' or s[p.i] == '-')) {
+        const sign: i64 = if (s[p.i] == '-') -1 else 1;
+        p.i += 1;
+        const oh = p.digits(2) orelse return null;
+        _ = p.eat(":");
+        const om = p.digits(2) orelse return null;
+        if (oh > 23 or om > 59) return null;
+        offset = sign * (oh * 60 + om);
+    }
+    if (p.i != s.len) return null;
+    if (month < 1 or month > 12 or day < 1 or day > daysInMonth(year, month)) return null;
+    if (hour > 23 or minute > 59 or second > 59) return null;
+    const seconds = (@as(i64, hour) * 60 + minute - offset) * 60 + second;
+    return daysFromCivil(year, month, day) * ms_per_day + seconds * 1000 + milli;
+}
+
+/// `(#%now-ms)` → the wall clock in epoch milliseconds.
+fn fnNowMs(vm: *VM, _: []const Value) VmError!Value {
+    const now = std.Io.Clock.real.now(ioOf(vm));
+    return value_mod.fromFixnum(@intCast(@divFloor(now.nanoseconds, std.time.ns_per_ms))) orelse VmError.ArithmeticOverflow;
+}
+
+/// `(#%format-instant ms)` → the ISO-8601 text of the instant `ms`.
+fn fnFormatInstant(vm: *VM, args: []const Value) VmError!Value {
+    var buf: [40]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    writeInstant(&w, try requireFixnum(args[0])) catch unreachable;
+    return string_mod.fromBytes(vm.ensureHeap(), w.buffered()) catch VmError.OutOfMemory;
+}
+
+/// `(#%parse-instant s)` → the instant the ISO-8601 text `s` names, in
+/// epoch milliseconds; `:invalid-argument` for any other text, or an
+/// instant past the fixnum range (-2490-03-17 to 6429-10-17).
+fn fnParseInstant(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .string) return VmError.KindMismatch;
+    const s = string_mod.asBytes(args[0]);
+    const ms = parseInstant(s) orelse return vm.fail(VmError.InvalidArgument, "not an ISO-8601 instant: \"{s}\"", .{s});
+    return value_mod.fromFixnum(ms) orelse vm.fail(VmError.InvalidArgument, "an instant past the fixnum range: \"{s}\"", .{s});
+}
+
+// =============================================================================
+// JSON (nexis.json, STDLIB.md §13)
+// =============================================================================
+
+/// The options map of a JSON native: the value of each keyword of
+/// `names` (nil when absent; a nil map is no options). Any other key
+/// is `:invalid-argument`.
+fn jsonOptions(vm: *VM, opts: Value, comptime names: []const []const u8) VmError![names.len]Value {
+    var out: [names.len]Value = @splat(value_mod.nilValue());
+    if (opts.isNil()) return out;
+    if (opts.kind() != .persistent_map) return VmError.KindMismatch;
+    const interner = vm.ensureInterner();
+    var it = champ_mod.mapIter(opts);
+    next: while (it.next()) |e| {
+        if (e.key.kind() == .keyword) {
+            const name = interner.keywordName(e.key.asKeywordId());
+            for (names, 0..) |n, i| if (std.mem.eql(u8, name, n)) {
+                out[i] = e.value;
+                continue :next;
+            };
+        }
+        const accepted = comptime blk: {
+            var text: []const u8 = "";
+            for (names, 0..) |n, i| text = text ++ (if (i > 0) ", :" else ":") ++ n;
+            break :blk text;
+        };
+        return vm.fail(VmError.InvalidArgument, "JSON: an option other than " ++ accepted, .{});
+    }
+    return out;
+}
+
+/// Throw `{:error :json-error :message message}`, with `:line` and
+/// `:column` when `at` is a position in the text read, as the
+/// multimethod errors are maps (§9.4); `catch :json-error` takes it.
+fn throwJson(vm: *VM, message: []const u8, at: ?struct { line: i64, column: i64 }) VmError {
+    const heap = vm.ensureHeap();
+    const interner = vm.ensureInterner();
+    var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
+    const kw = struct {
+        fn of(i: *intern_mod.Interner, name: []const u8) VmError!Value {
+            return i.internKeywordValue(name) catch VmError.OutOfMemory;
+        }
+    }.of;
+    m = try mapPut(heap, m, try kw(interner, "error"), try kw(interner, "json-error"));
+    m = try mapPut(heap, m, try kw(interner, "message"), string_mod.fromBytes(heap, message) catch return VmError.OutOfMemory);
+    if (at) |pos| {
+        m = try mapPut(heap, m, try kw(interner, "line"), try integerValue(vm, pos.line));
+        m = try mapPut(heap, m, try kw(interner, "column"), try integerValue(vm, pos.column));
+    }
+    return vm.throwValue(m);
+}
+
+/// `throwJson` of `JSON: <what> at line L, column C` for the byte `at`
+/// of `text`, the column counted in characters.
+fn jsonSyntaxError(vm: *VM, text: []const u8, at: usize, comptime what: []const u8, args: anytype) VmError {
+    var line: i64 = 1;
+    var line_start: usize = 0;
+    for (text[0..at], 0..) |c, k| if (c == '\n') {
+        line += 1;
+        line_start = k + 1;
+    };
+    const column: i64 = @intCast((std.unicode.utf8CountCodepoints(text[line_start..at]) catch at - line_start) + 1);
+    var buf: [160]u8 = undefined;
+    const message = std.fmt.bufPrint(&buf, "JSON: " ++ what ++ " at line {d}, column {d}", args ++ .{ line, column }) catch &buf;
+    return throwJson(vm, message, .{ .line = line, .column = column });
+}
+
+/// Whether `f` is `nexis.core/keyword`, which `:key-fn` names to read
+/// keys as keywords: the reader interns them itself, with no call and
+/// no string made.
+fn isKeywordFn(f: Value) bool {
+    return f.kind() == .native_fn and vm_mod.asNativeFn(f).call == &fnKeyword;
+}
+
+/// A JSON text read into values, without recursion: every value read
+/// waits on the root stack until the array or object it is in closes,
+/// and is then built into that collection, so the text may nest as
+/// deep as memory allows and every value is rooted across the calls
+/// `:key-fn` and `:value-fn` make.
+const JsonReader = struct {
+    vm: *VM,
+    heap: *heap_mod.Heap,
+    s: []const u8,
+    i: usize = 0,
+    scope: vm_mod.RootScope,
+    key_fn: Value,
+    value_fn: Value,
+    /// The arrays and objects open, innermost last.
+    open: std.ArrayList(Open) = .empty,
+    /// A string's bytes once it holds an escape.
+    scratch: std.ArrayList(u8) = .empty,
+
+    /// An open collection: its first slot on the root stack, and
+    /// whether it is an object, whose slots alternate key and value.
+    const Open = struct { base: usize, object: bool };
+
+    fn deinit(r: *JsonReader) void {
+        r.open.deinit(r.vm.allocator);
+        r.scratch.deinit(r.vm.allocator);
+    }
+
+    fn fail(r: *JsonReader, at: usize, comptime what: []const u8, args: anytype) VmError {
+        return jsonSyntaxError(r.vm, r.s, at, what, args);
+    }
+
+    fn unexpected(r: *JsonReader) VmError {
+        const n: usize = std.unicode.utf8ByteSequenceLength(r.s[r.i]) catch 1;
+        return r.fail(r.i, "unexpected '{s}'", .{r.s[r.i..][0..@min(n, r.s.len - r.i)]});
+    }
+
+    fn skipSpace(r: *JsonReader) void {
+        while (r.i < r.s.len) switch (r.s[r.i]) {
+            ' ', '\t', '\n', '\r' => r.i += 1,
+            else => return,
+        };
+    }
+
+    fn peek(r: *JsonReader, c: u8) bool {
+        return r.i < r.s.len and r.s[r.i] == c;
+    }
+
+    fn push(r: *JsonReader, v: Value) VmError!void {
+        return r.scope.push(v);
+    }
+
+    fn top(r: *JsonReader) *Value {
+        return &r.vm.roots.items[r.vm.roots.items.len - 1];
+    }
+
+    fn openCollection(r: *JsonReader, object: bool) VmError!void {
+        r.i += 1;
+        r.open.append(r.vm.allocator, .{ .base = r.vm.roots.items.len, .object = object }) catch return VmError.OutOfMemory;
+        r.skipSpace();
+    }
+
+    /// The text's one value.
+    fn read(r: *JsonReader) VmError!Value {
+        value: while (true) {
+            r.skipSpace();
+            if (r.i >= r.s.len) return r.fail(r.i, "the text ends before its value", .{});
+            switch (r.s[r.i]) {
+                '{' => {
+                    try r.openCollection(true);
+                    if (!r.peek('}')) {
+                        try r.key();
+                        continue :value;
+                    }
+                    r.i += 1;
+                    try r.close();
+                },
+                '[' => {
+                    try r.openCollection(false);
+                    if (!r.peek(']')) continue :value;
+                    r.i += 1;
+                    try r.close();
+                },
+                '"' => try r.push(string_mod.fromBytes(r.heap, try r.string()) catch return VmError.OutOfMemory),
+                '-', '0'...'9' => try r.push(try r.number()),
+                't' => try r.literal("true", value_mod.fromBool(true)),
+                'f' => try r.literal("false", value_mod.fromBool(false)),
+                'n' => try r.literal("null", value_mod.nilValue()),
+                else => return r.unexpected(),
+            }
+            // A value is whole: end each collection it completes.
+            while (r.open.getLastOrNull()) |o| {
+                if (o.object) try r.member();
+                r.skipSpace();
+                if (r.peek(',')) {
+                    r.i += 1;
+                    if (o.object) try r.key();
+                    continue :value;
+                }
+                const end: u8 = if (o.object) '}' else ']';
+                if (!r.peek(end)) {
+                    if (r.i >= r.s.len) return r.fail(r.i, "the text ends inside an {s}", .{if (o.object) "object" else "array"});
+                    return r.fail(r.i, "expected ',' or '{c}'", .{end});
+                }
+                r.i += 1;
+                try r.close();
+            }
+            r.skipSpace();
+            if (r.i < r.s.len) return r.fail(r.i, "text follows the value", .{});
+            return r.top().*;
+        }
+    }
+
+    /// Build the innermost open collection from its slots.
+    fn close(r: *JsonReader) VmError!void {
+        const o = r.open.pop().?;
+        const items = r.vm.roots.items[o.base..];
+        const v = if (!o.object)
+            vector_mod.fromSlice(r.heap, items)
+        else if (items.len == 0)
+            champ_mod.mapEmpty(r.heap)
+        else
+            champ_mod.mapFromEntries(r.heap, @as([*]const champ_mod.Entry, @ptrCast(items.ptr))[0 .. items.len / 2], &dispatch_mod.hashValue, &dispatch_mod.equal);
+        r.vm.roots.shrinkRetainingCapacity(o.base);
+        try r.push(v catch return VmError.OutOfMemory);
+    }
+
+    /// An object's key and its colon, the key through `:key-fn`.
+    fn key(r: *JsonReader) VmError!void {
+        r.skipSpace();
+        if (!r.peek('"')) {
+            if (r.i >= r.s.len) return r.fail(r.i, "the text ends inside an object", .{});
+            return r.fail(r.i, "expected a string key", .{});
+        }
+        if (isKeywordFn(r.key_fn)) {
+            const name = try r.string();
+            if (name.len == 0) return r.vm.fail(VmError.InvalidArgument, "JSON: the empty key names no keyword", .{});
+            try r.push(r.vm.ensureInterner().internKeywordValue(name) catch return VmError.OutOfMemory);
+        } else {
+            try r.push(string_mod.fromBytes(r.heap, try r.string()) catch return VmError.OutOfMemory);
+            if (!r.key_fn.isNil()) {
+                // The call may move the root stack: its slot is found
+                // again after it.
+                const k = try r.vm.callValue(r.key_fn, &.{r.top().*});
+                r.top().* = k;
+            }
+        }
+        r.skipSpace();
+        if (!r.peek(':')) return r.fail(r.i, "expected ':' after a key", .{});
+        r.i += 1;
+    }
+
+    /// The member whose key and value end the root stack, through
+    /// `:value-fn`: its result replaces the value, or drops the member
+    /// when it is `:value-fn` itself.
+    fn member(r: *JsonReader) VmError!void {
+        if (r.value_fn.isNil()) return;
+        const n = r.vm.roots.items.len;
+        const kv = [2]Value{ r.vm.roots.items[n - 2], r.vm.roots.items[n - 1] };
+        const v = try r.vm.callValue(r.value_fn, &kv);
+        if (v.tag == r.value_fn.tag and v.payload == r.value_fn.payload) {
+            r.vm.roots.shrinkRetainingCapacity(n - 2);
+        } else r.vm.roots.items[n - 1] = v;
+    }
+
+    fn literal(r: *JsonReader, word: []const u8, v: Value) VmError!void {
+        if (!std.mem.startsWith(u8, r.s[r.i..], word)) return r.unexpected();
+        r.i += word.len;
+        try r.push(v);
+    }
+
+    /// The string at the opening quote, its escapes decoded; the bytes
+    /// lie in the text or in `scratch`, until the next string.
+    fn string(r: *JsonReader) VmError![]const u8 {
+        const s = r.s;
+        const start = r.i + 1;
+        var j = start;
+        while (j < s.len) : (j += 1) switch (s[j]) {
+            '"' => {
+                r.i = j + 1;
+                return s[start..j];
+            },
+            '\\' => break,
+            0...0x1f => return r.fail(j, "a control character in a string", .{}),
+            else => {},
+        } else return r.fail(s.len, "the text ends inside a string", .{});
+        const gpa = r.vm.allocator;
+        r.scratch.clearRetainingCapacity();
+        r.scratch.appendSlice(gpa, s[start..j]) catch return VmError.OutOfMemory;
+        while (true) {
+            var k = j;
+            while (k < s.len and s[k] != '"' and s[k] != '\\' and s[k] >= 0x20) k += 1;
+            r.scratch.appendSlice(gpa, s[j..k]) catch return VmError.OutOfMemory;
+            j = k;
+            if (j >= s.len) return r.fail(s.len, "the text ends inside a string", .{});
+            switch (s[j]) {
+                '"' => {
+                    r.i = j + 1;
+                    return r.scratch.items;
+                },
+                '\\' => {},
+                else => return r.fail(j, "a control character in a string", .{}),
+            }
+            const at = j;
+            if (j + 1 >= s.len) return r.fail(s.len, "the text ends inside a string", .{});
+            j += 2;
+            const simple: u8 = switch (s[j - 1]) {
+                '"' => '"',
+                '\\' => '\\',
+                '/' => '/',
+                'b' => 8,
+                'f' => 12,
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                'u' => 0,
+                else => return r.fail(at, "an unknown escape", .{}),
+            };
+            if (s[j - 1] != 'u') {
+                r.scratch.append(gpa, simple) catch return VmError.OutOfMemory;
+                continue;
+            }
+            var cp: u21 = try r.hex4(at, j);
+            j += 4;
+            if (cp >= 0xDC00 and cp <= 0xDFFF) return r.fail(at, "a lone surrogate", .{});
+            if (cp >= 0xD800 and cp <= 0xDBFF) {
+                if (j + 6 > s.len or s[j] != '\\' or s[j + 1] != 'u') return r.fail(at, "a lone surrogate", .{});
+                const low = try r.hex4(at, j + 2);
+                if (low < 0xDC00 or low > 0xDFFF) return r.fail(at, "a lone surrogate", .{});
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                j += 6;
+            }
+            var enc: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(cp, &enc) catch unreachable;
+            r.scratch.appendSlice(gpa, enc[0..n]) catch return VmError.OutOfMemory;
+        }
+    }
+
+    /// The four hex digits at `j` of the `\u` escape at `at`.
+    fn hex4(r: *JsonReader, at: usize, j: usize) VmError!u21 {
+        if (j + 4 > r.s.len) return r.fail(at, "an unknown escape", .{});
+        var cp: u21 = 0;
+        for (r.s[j..][0..4]) |c| cp = cp * 16 + (std.fmt.charToDigit(c, 16) catch return r.fail(at, "an unknown escape", .{}));
+        return cp;
+    }
+
+    /// The number at `i`, in JSON's grammar: an integer a fixnum or a
+    /// bignum, anything with a fraction or an exponent a double.
+    fn number(r: *JsonReader) VmError!Value {
+        const s = r.s;
+        const start = r.i;
+        var j = start + @intFromBool(s[start] == '-');
+        const digits = struct {
+            fn run(text: []const u8, from: usize) usize {
+                var k = from;
+                while (k < text.len and std.ascii.isDigit(text[k])) k += 1;
+                return k;
+            }
+        }.run;
+        if (j < s.len and s[j] == '0') j += 1 else {
+            const k = digits(s, j);
+            if (k == j) return r.fail(start, "a malformed number", .{});
+            j = k;
+        }
+        var integer = true;
+        if (j < s.len and s[j] == '.') {
+            const k = digits(s, j + 1);
+            if (k == j + 1) return r.fail(start, "a malformed number", .{});
+            j = k;
+            integer = false;
+        }
+        if (j < s.len and (s[j] == 'e' or s[j] == 'E')) {
+            j += 1;
+            if (j < s.len and (s[j] == '+' or s[j] == '-')) j += 1;
+            const k = digits(s, j);
+            if (k == j) return r.fail(start, "a malformed number", .{});
+            j = k;
+            integer = false;
+        }
+        r.i = j;
+        const text = s[start..j];
+        if (!integer) return value_mod.fromFloat(std.fmt.parseFloat(f64, text) catch unreachable);
+        if (text.len <= 18) return integerValue(r.vm, std.fmt.parseInt(i64, text, 10) catch unreachable);
+        return (bignum_mod.parseDecimal(r.heap, text) catch return VmError.OutOfMemory) orelse unreachable;
+    }
+};
+
+/// `(#%json-read s opts)` → the value of the JSON text `s`: an object
+/// a map, an array a vector, a string a string, a number a fixnum,
+/// bignum or double, true, false and null themselves. `opts` maps
+/// `:key-fn` to a function of each key's string (`keyword` interns it
+/// directly) and `:value-fn` to a function of each object member's key
+/// and value whose result replaces the value, or drops the member when
+/// it is `:value-fn` itself (clojure.data.json's options).
+fn fnJsonRead(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .string) return VmError.KindMismatch;
+    const opts = try jsonOptions(vm, args[1], &.{ "key-fn", "value-fn" });
+    const text = string_mod.asBytes(args[0]);
+    if (!std.unicode.utf8ValidateSlice(text)) return VmError.Utf8Error;
+    var r: JsonReader = .{ .vm = vm, .heap = vm.ensureHeap(), .s = text, .scope = vm.rootScope(), .key_fn = opts[0], .value_fn = opts[1] };
+    defer r.scope.release();
+    defer r.deinit();
+    return r.read();
+}
+
+/// The class name `class` gives a value of kind `k`, for messages.
+fn className(k: Kind) []const u8 {
+    return switch (k) {
+        .true_, .false_ => "boolean",
+        .persistent_vector => "vector",
+        .persistent_map => "map",
+        .persistent_set => "set",
+        else => @tagName(k),
+    };
+}
+
+/// Values written as JSON text into `w`. The walk recurses on the
+/// data's depth under the stack guard; each `:value-fn` result is
+/// rooted while it is written.
+const JsonWriter = struct {
+    vm: *VM,
+    w: *std.Io.Writer,
+    scope: vm_mod.RootScope,
+    key_fn: Value,
+    value_fn: Value,
+    indent: bool,
+    escape_unicode: bool,
+    escape_slash: bool,
+    depth: usize = 0,
+
+    fn put(jw: *JsonWriter, bytes: []const u8) VmError!void {
+        jw.w.writeAll(bytes) catch return VmError.OutOfMemory;
+    }
+
+    fn newline(jw: *JsonWriter) VmError!void {
+        if (!jw.indent) return;
+        try jw.put("\n");
+        jw.w.splatByteAll(' ', 2 * jw.depth) catch return VmError.OutOfMemory;
+    }
+
+    fn value(jw: *JsonWriter, v: Value) VmError!void {
+        stack.check() catch return VmError.StackOverflow;
+        const interner = jw.vm.ensureInterner();
+        switch (v.kind()) {
+            .nil => try jw.put("null"),
+            .true_ => try jw.put("true"),
+            .false_ => try jw.put("false"),
+            .fixnum => jw.w.print("{d}", .{v.asFixnum()}) catch return VmError.OutOfMemory,
+            .bignum => bignum_mod.formatDecimal(v, jw.w) catch return VmError.OutOfMemory,
+            .float => {
+                const f = v.asFloat();
+                if (std.math.isNan(f)) return throwJson(jw.vm, "JSON: cannot write NaN", null);
+                if (std.math.isInf(f)) return throwJson(jw.vm, if (f > 0) "JSON: cannot write Infinity" else "JSON: cannot write -Infinity", null);
+                format_mod.formatFloatJava(f, jw.w) catch return VmError.OutOfMemory;
+            },
+            .string => try jw.string(string_mod.asBytes(v)),
+            .char => {
+                var b: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(v.asChar(), &b) catch return VmError.Utf8Error;
+                try jw.string(b[0..n]);
+            },
+            .keyword => try jw.string(interner.keywordName(v.asKeywordId())),
+            .symbol => try jw.string(interner.symbolName(v.asSymbolId())),
+            .persistent_map, .sorted_map => try jw.object(v),
+            .record => if (jw.instantMs(v)) |ms| {
+                var buf: [40]u8 = undefined;
+                var fixed: std.Io.Writer = .fixed(&buf);
+                writeInstant(&fixed, ms) catch unreachable;
+                try jw.string(fixed.buffered());
+            } else try jw.object(v),
+            .nextomic_entity => {
+                const m = try (seq_mod.entity_map orelse return VmError.KindMismatch)(jw.vm, v);
+                try jw.scope.push(m);
+                try jw.object(m);
+            },
+            .persistent_vector, .list, .lazy_seq, .persistent_set, .sorted_set, .typed_vector => try jw.array(v),
+            else => |k| {
+                var buf: [80]u8 = undefined;
+                return throwJson(jw.vm, std.fmt.bufPrint(&buf, "JSON: cannot write a value of class {s}", .{className(k)}) catch unreachable, null);
+            },
+        }
+    }
+
+    /// The epoch milliseconds of a `nexis.time.Instant`, null for any
+    /// other record (STDLIB.md §12).
+    fn instantMs(jw: *JsonWriter, v: Value) ?i64 {
+        const t = jw.vm.recordType(record_mod.typeId(v)) orelse return null;
+        if (!std.mem.eql(u8, t.ns_name, "nexis.time") or !std.mem.eql(u8, t.type_name, "Instant")) return null;
+        const ms_key = jw.vm.ensureInterner().internKeywordValue("ms") catch return null;
+        const ms = switch (champ_mod.mapGet(record_mod.fieldsOf(v), ms_key, &dispatch_mod.hashValue, &dispatch_mod.equal)) {
+            .present => |x| x,
+            .absent => return null,
+        };
+        return if (ms.kind() == .fixnum) ms.asFixnum() else null;
+    }
+
+    fn array(jw: *JsonWriter, v: Value) VmError!void {
+        var it = try makeSeqIter(jw.vm, v);
+        try jw.put("[");
+        jw.depth += 1;
+        var first = true;
+        while (try it.next()) |x| {
+            if (!first) try jw.put(",");
+            first = false;
+            try jw.newline();
+            try jw.value(x);
+        }
+        jw.depth -= 1;
+        if (!first) try jw.newline();
+        try jw.put("]");
+    }
+
+    fn object(jw: *JsonWriter, m: Value) VmError!void {
+        var it = MapEntries.of(m).?;
+        try jw.put("{");
+        jw.depth += 1;
+        var first = true;
+        while (it.next()) |e| {
+            const mark = jw.vm.roots.items.len;
+            defer jw.vm.roots.shrinkRetainingCapacity(mark);
+            var v = e.value;
+            if (!jw.value_fn.isNil()) {
+                v = try jw.vm.callValue(jw.value_fn, &.{ e.key, e.value });
+                if (v.tag == jw.value_fn.tag and v.payload == jw.value_fn.payload) continue;
+                try jw.scope.push(v);
+                try seq_mod.realizeAll(jw.vm, v);
+            }
+            if (!first) try jw.put(",");
+            first = false;
+            try jw.newline();
+            try jw.key(e.key);
+            try jw.put(if (jw.indent) ": " else ":");
+            try jw.value(v);
+        }
+        jw.depth -= 1;
+        if (!first) try jw.newline();
+        try jw.put("}");
+    }
+
+    /// A member's key: `:key-fn`'s string, else a string as it is, a
+    /// keyword or symbol by its whole name and an integer by its digits.
+    fn key(jw: *JsonWriter, k: Value) VmError!void {
+        var buf: [80]u8 = undefined;
+        if (!jw.key_fn.isNil()) {
+            const out = try jw.vm.callValue(jw.key_fn, &.{k});
+            if (out.kind() != .string) return throwJson(jw.vm, std.fmt.bufPrint(&buf, "JSON: :key-fn returned a value of class {s}, not a string", .{className(out.kind())}) catch unreachable, null);
+            return jw.string(string_mod.asBytes(out));
+        }
+        switch (k.kind()) {
+            .string, .keyword, .symbol => return jw.value(k),
+            .fixnum, .bignum => {
+                try jw.put("\"");
+                try jw.value(k);
+                try jw.put("\"");
+            },
+            .nil => return throwJson(jw.vm, "JSON: cannot write a nil key", null),
+            else => |kind| return throwJson(jw.vm, std.fmt.bufPrint(&buf, "JSON: cannot write a key of class {s}", .{className(kind)}) catch unreachable, null),
+        }
+    }
+
+    /// `bytes` as a JSON string: `"` and `\` escaped, a control
+    /// character by its short escape or `\u00XX`, `/` and every
+    /// character past ASCII (`\uXXXX`, a pair past the BMP) when the
+    /// options ask.
+    fn string(jw: *JsonWriter, bytes: []const u8) VmError!void {
+        if (!std.unicode.utf8ValidateSlice(bytes)) return VmError.Utf8Error;
+        try jw.put("\"");
+        var i: usize = 0;
+        var plain: usize = 0;
+        while (i < bytes.len) {
+            const c = bytes[i];
+            const needs = c < 0x20 or c == '"' or c == '\\' or (c == '/' and jw.escape_slash) or (c >= 0x80 and jw.escape_unicode);
+            if (!needs) {
+                i += 1;
+                continue;
+            }
+            try jw.put(bytes[plain..i]);
+            var len: usize = 1;
+            switch (c) {
+                '"' => try jw.put("\\\""),
+                '\\' => try jw.put("\\\\"),
+                '/' => try jw.put("\\/"),
+                '\n' => try jw.put("\\n"),
+                '\r' => try jw.put("\\r"),
+                '\t' => try jw.put("\\t"),
+                8 => try jw.put("\\b"),
+                12 => try jw.put("\\f"),
+                0...7, 11, 14...0x1f => jw.w.print("\\u{x:0>4}", .{c}) catch return VmError.OutOfMemory,
+                else => {
+                    len = std.unicode.utf8ByteSequenceLength(c) catch unreachable;
+                    const cp = std.unicode.utf8Decode(bytes[i..][0..len]) catch unreachable;
+                    if (cp < 0x10000) {
+                        jw.w.print("\\u{x:0>4}", .{cp}) catch return VmError.OutOfMemory;
+                    } else {
+                        const v = cp - 0x10000;
+                        jw.w.print("\\u{x:0>4}\\u{x:0>4}", .{ 0xD800 + (v >> 10), 0xDC00 + (v & 0x3FF) }) catch return VmError.OutOfMemory;
+                    }
+                },
+            }
+            i += len;
+            plain = i;
+        }
+        try jw.put(bytes[plain..]);
+        try jw.put("\"");
+    }
+};
+
+/// `(#%json-write x opts)` → the JSON text of `x`: a map (hash, sorted,
+/// a record, a Nextomic entity) an object, any other collection or seq
+/// an array, a string, character, keyword or symbol a string (the
+/// keyword's whole name, without its colon), a `nexis.time.Instant` its
+/// ISO-8601 text, numbers, booleans and nil themselves. `opts` maps
+/// `:key-fn`, `:value-fn`, `:indent`, `:escape-unicode` and
+/// `:escape-slash` (STDLIB.md §13).
+fn fnJsonWrite(vm: *VM, args: []const Value) VmError!Value {
+    const opts = try jsonOptions(vm, args[1], &.{ "key-fn", "value-fn", "indent", "escape-unicode", "escape-slash" });
+    // Every lazy seq in `x` is realized first, so the walk calls back
+    // into the VM only for the options' functions.
+    try seq_mod.realizeAll(vm, args[0]);
+    var out = std.Io.Writer.Allocating.init(vm.allocator);
+    defer out.deinit();
+    var jw: JsonWriter = .{
+        .vm = vm,
+        .w = &out.writer,
+        .scope = vm.rootScope(),
+        .key_fn = opts[0],
+        .value_fn = opts[1],
+        .indent = opts[2].isTruthy(),
+        .escape_unicode = opts[3].isTruthy(),
+        .escape_slash = opts[4].isTruthy(),
+    };
+    defer jw.scope.release();
+    try jw.value(args[0]);
+    return string_mod.fromBytes(vm.ensureHeap(), out.written()) catch VmError.OutOfMemory;
+}
+
+// =============================================================================
 // Record internals (PROTOCOLS.md §7)
 // =============================================================================
 //
@@ -7887,5 +8902,44 @@ test "stdlib: reduce over an infinite range past the fixnum range keeps its elem
         defer w.deinit();
         try format_mod.format(got, .readable, &w.writer, vm.ensureInterner());
         try testing.expectEqualStrings(case.want, w.written());
+    }
+}
+
+test "stdlib: the civil calendar agrees with std.time.epoch and walks day by day" {
+    var day: i64 = 0;
+    while (day < 60_000) : (day += 1) {
+        const yd = (std.time.epoch.EpochDay{ .day = @intCast(day) }).calculateYearDay();
+        const md = yd.calculateMonthDay();
+        const c = civilFromDays(day);
+        try testing.expectEqual(@as(i64, yd.year), c.year);
+        try testing.expectEqual(@as(u32, @backingInt(md.month)), c.month);
+        try testing.expectEqual(@as(u32, md.day_index) + 1, c.day);
+    }
+    // Every day of years -2500 to 6500 follows the one before it.
+    var prev = civilFromDays(-1_633_000);
+    day = -1_632_999;
+    while (day < 1_660_000) : (day += 1) {
+        const c = civilFromDays(day);
+        try testing.expectEqual(day, daysFromCivil(c.year, c.month, c.day));
+        if (c.day == 1) {
+            try testing.expectEqual(daysInMonth(prev.year, prev.month), prev.day);
+            try testing.expectEqual(if (c.month == 1) prev.year + 1 else prev.year, c.year);
+        } else try testing.expectEqual(prev.day + 1, c.day);
+        prev = c;
+    }
+}
+
+test "stdlib: an instant's text reads back as the same instant" {
+    var buf: [40]u8 = undefined;
+    var rng = std.Random.DefaultPrng.init(0x1505);
+    for (0..20_000) |i| {
+        const ms: i64 = switch (i) {
+            0 => value_mod.fixnum_min,
+            1 => value_mod.fixnum_max,
+            else => rng.random().intRangeAtMost(i64, value_mod.fixnum_min, value_mod.fixnum_max),
+        };
+        var w: std.Io.Writer = .fixed(&buf);
+        try writeInstant(&w, ms);
+        try testing.expectEqual(ms, parseInstant(w.buffered()).?);
     }
 }

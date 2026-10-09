@@ -1,0 +1,40 @@
+; src/stdlib/json.nx — the `nexis.json` namespace, in the shape of
+; clojure.data.json (docs/STDLIB.md §13), over the natives in
+; src/stdlib.zig internal_natives. Embedded via @embedFile and
+; bootstrapped with nexis.json as the current namespace.
+
+(defn read-str
+  "The value of the JSON text s: an object a map, an array a vector, a
+  number a long, bignum or double, null nil. Options: :key-fn, a
+  function of each key's string (keyword makes keyword keys);
+  :value-fn, a function of each object member's key (after :key-fn)
+  and value, whose result replaces the value, or drops the member when
+  it is :value-fn itself. Malformed text throws {:error :json-error
+  :message ... :line ... :column ...}."
+  [s & {:as opts}]
+  (nexis.internal/#%json-read s opts))
+
+(defn write-str
+  "The JSON text of x: a map an object, any other collection or seq an
+  array, a keyword or symbol its name with its namespace, an Instant
+  its ISO-8601 text. Options: :key-fn, a function of each map key to
+  its string (else a keyword's or symbol's whole name, an integer's
+  digits); :value-fn, a function of each map entry's key and value
+  whose result is written, the entry left out when it is :value-fn
+  itself; :indent true, two spaces a level; :escape-unicode true, every
+  character past ASCII as \\uXXXX; :escape-slash true, / as \\/. What
+  JSON cannot hold (NaN, a function) throws {:error :json-error}."
+  [x & {:as opts}]
+  (nexis.internal/#%json-write x opts))
+
+(defn read
+  "The value of the JSON text in the file at path, with read-str's
+  options."
+  [path & {:as opts}]
+  (nexis.internal/#%json-read (slurp path) opts))
+
+(defn write
+  "Writes the JSON text of x to the file at path, replacing it, with
+  write-str's options; nil."
+  [x path & {:as opts}]
+  (spit path (nexis.internal/#%json-write x opts)))

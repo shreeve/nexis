@@ -3,7 +3,9 @@
 The contract for the parts of the standard library that no kind doc
 owns: the namespaces and how they boot, the core text natives,
 `nexis.string`, `nexis.set`, printing (`src/format.zig`), the I/O
-natives and the documentation `doc` reads (§10). The natives are in
+natives, the documentation `doc` reads (§10), the process and its
+programs (`nexis.sys`, `nexis.shell`, §11), instants (`nexis.time`,
+§12) and JSON (`nexis.json`, §13). The natives are in
 `src/stdlib.zig`, one table per namespace; the rest of the library is
 nexis in `src/stdlib/*.nx`.
 Errors are catchable keywords; a wrong argument count is
@@ -26,7 +28,8 @@ registry; the CLI (`cli.zig` `Runtime.init`) and the test harness
 3. The image of the embedded sources is loaded (below). Without one,
    the sources themselves are evaluated, each with its namespace
    current: `core.nx`, `nextomic.nx`, `walk.nx`, `edn.nx`, `test.nx`,
-   `pprint.nx`, `math.nx`, `string.nx`, `set.nx`.
+   `pprint.nx`, `math.nx`, `string.nx`, `set.nx`, `sys.nx`,
+   `shell.nx`, `time.nx`, `json.nx`.
 4. Every namespace in the registry is marked loaded, so a `require`
    of one only makes the alias.
 
@@ -106,10 +109,14 @@ Var inside a `binding`.
 | `nexis.walk` | — | `walk.nx` | §4 |
 | `nexis.edn` | — | `edn.nx` | §4 |
 | `nexis.math` | `math_natives` | `math.nx` (`PI`, `E`, `floor-div`, `floor-mod`) | TOOLING.md §4 |
+| `nexis.sys` | (`#%getenv`, `#%cwd` in `internal_natives`) | `sys.nx` | §11 |
+| `nexis.shell` | (`#%sh` in `internal_natives`) | `shell.nx` | §11 |
+| `nexis.time` | (`#%now-ms`, `#%format-instant`, `#%parse-instant` in `internal_natives`) | `time.nx` | §12 |
+| `nexis.json` | (`#%json-read`, `#%json-write` in `internal_natives`) | `json.nx` | §13 |
 | `nexis.test` | — | `test.nx` | TOOLING.md §3 |
 | `nexis.pprint` | — | `pprint.nx` | TOOLING.md §4 |
 | `nexis.simd` | `simd_natives` | — | TYPED_VECTOR.md §7.2 |
-| `nexis.internal` | `internal_natives` | — | the `#%` helpers macros emit: records and protocols (PROTOCOLS.md §7), `#%catch-matches?` (`try`), `#%kwargs` (`& {:keys ...}`), `#%current-ns` (TOOLING.md §3), `#%delay` (`delay`, §8), `#%sorted-map` / `#%sorted-set` (a sorted collection a macro returns, MACROEXPAND.md §5), `#%push-out` / `#%pop-out` (`with-out-str`, §6), `#%mm-lookup` (a multimethod's call, §9.3) |
+| `nexis.internal` | `internal_natives` | — | the `#%` helpers macros emit: records and protocols (PROTOCOLS.md §7), `#%catch-matches?` (`try`), `#%kwargs` (`& {:keys ...}`), `#%current-ns` (TOOLING.md §3), `#%delay` (`delay`, §8), `#%sorted-map` / `#%sorted-set` (a sorted collection a macro returns, MACROEXPAND.md §5), `#%push-out` / `#%pop-out` (`with-out-str`, §6), `#%mm-lookup` (a multimethod's call, §9.3), and the natives the namespaces of §11–§13 call |
 
 **Resolution.** Every other namespace has `nexis.core` as its parent,
 so an unqualified symbol a namespace does not define resolves in
@@ -121,11 +128,12 @@ are defined in `core.nx` as the atom operations: one isolate, one
 thread.
 
 **Clojure's names.** The loader (`clojure_names` in
-`src/loader.zig`) accepts seven Clojure library namespaces:
+`src/loader.zig`) accepts nine Clojure library namespaces:
 `clojure.string` → `nexis.string`, `clojure.set` → `nexis.set`,
 `clojure.test` → `nexis.test`, `clojure.pprint` → `nexis.pprint`,
 `clojure.walk` → `nexis.walk`, `clojure.edn` → `nexis.edn`,
-`clojure.math` → `nexis.math`.
+`clojure.math` → `nexis.math`, `clojure.java.shell` → `nexis.shell`
+(§11) and `clojure.data.json` → `nexis.json` (§13).
 Requiring one creates a namespace of that name holding the nexis
 namespace's Vars (the same Var objects), so `(require
 '[clojure.string :as str])` and, after it, `clojure.string/join`
@@ -468,7 +476,9 @@ returns a realized list where Clojure returns a lazy seq.
 | `load-string`, `load-file` | 1 | Read each form of the string (of the file's text) in turn and compile and run it in the current namespace, so a form that does not read (a stray closing delimiter, an unfinished form) raises `:reader-error` after the ones before it ran; the namespace in force when it was called is restored afterwards, whether it returns or throws, as Clojure's `Compiler.load` binds `*ns*`; the last form's value, nil for none. Each form is compiled as read, as a file's form is (`CompilerHooks.load`, `docs/VM.md` §9.1), never made a value first, so a syntax-quote in the text loads; a form that does not compile throws as `eval`'s does, its `:form` nil when it has no value form |
 | `array-map` | 0+ | `(apply hash-map kvs)`: a map of up to eight entries keeps its insertion order (§5), all that Clojure's array map promises; a larger one is a hash map, as Clojure's becomes one past eight |
 | `bigint`, `biginteger` | 1 | `long`: one integer domain (BIGNUM.md), so a number truncated to an integer of any size |
-| `decimal?`, `inst?` | 1 | false: there are no decimals and no instants (PLAN §4) |
+| `decimal?` | 1 | false: there are no decimals (PLAN §4) |
+| `Inst`, `inst-ms*` | protocol | Clojure's `Inst`: an instant is a value of a type extended to it, whose `inst-ms*` is its epoch milliseconds. `nexis.time`'s `Instant` extends it (§12), and so may any record |
+| `inst?`, `inst-ms` | 1 | `(satisfies? Inst x)`; `(inst-ms* inst)`, `:no-protocol-impl` for anything else (an integer included: `nexis.time/inst-ms` takes one too) |
 | `qualified-ident?`, `simple-ident?` | 1 | Whether `x` is a keyword or symbol with a namespace, without one |
 | `bit-and-not`, `bit-flip` | 2+, 2 | `(bit-and x (bit-not y))` over each further argument; `bit-flip` is `bit-set` or `bit-clear` of the bit, as `bit-test` finds it |
 | `alter-var-root` | 2+ | `(alter-var-root v f & args)`: sets the root of the Var `v` to `(apply f root args)` and returns it; a `binding` in force is left as it is. An unbound Var's root is nil to `f` and bound after (Clojure passes its `Unbound` object). A non-Var is `:kind-mismatch` |
@@ -679,3 +689,166 @@ line (`TOOLING.md` §1).
 
 Clojure's `source` has no counterpart: a Var does not record the
 file and line it came from.
+
+---
+
+### 11. The process: `nexis.sys` and `nexis.shell`
+
+`src/stdlib/sys.nx` holds the process's environment and working
+directory, `src/stdlib/shell.nx` Clojure's `clojure.java.shell`, each
+function a docstring'd `defn` over a native in `internal_natives`.
+`exit` and `*command-line-args*` are `nexis.core`'s (§6): `nexis run`
+and `nexis -e` both bind the arguments after the program. Text the operating system hands over is
+any bytes; each byte that starts no well-formed UTF-8 sequence reads
+as U+FFFD, as Java decodes it.
+
+| Name | Arity | Semantics | Errors |
+|---|---|---|---|
+| `getenv` | 0–1 | `(getenv name)`: the value of the environment variable as a string, nil when it is not set (an empty name, or one holding a NUL byte, is never set); `(getenv)`: every variable as a map of name to value, Clojure's `(System/getenv)`. libc's environment, which nexis never changes | `:kind-mismatch` (a name that is not a string) |
+| `cwd` | 0 | The absolute path of the working directory, Java's `(System/getProperty "user.dir")` | `:io-error` |
+| `sh` | 1+ | `(sh "ls" "-l" :dir "/tmp")`: runs a program and waits for it, returning `{:exit status :out text :err text}`. The leading strings are the program, found on the PATH (`/usr/local/bin:/bin:/usr/bin` when the process has none), and its arguments; keyword options follow. `:in` is text written to the program's stdin, which otherwise reads end of input at once; `:dir` its working directory, else `*sh-dir*`; `:env` a map that is the whole of its environment, each name by `name` and value by `str`, else `*sh-env*`; nil for any of them is the process's own. A signal's status is 128 plus its number, as Java reports it; output that is not UTF-8 reads as U+FFFD | `:invalid-argument` (no program; an option other than these, among them Clojure's `:in-enc` and `:out-enc`; a NUL byte in an argument; a name no variable can have), `:kind-mismatch` (a non-string `:in`, a non-map `:env`), `:arity-mismatch` (an option without its value), `:file-not-found` (no such program, or no such `:dir`), `:io-error` (any other failure to run it; a VM with no `io`) |
+| `*sh-dir*`, `*sh-env*` | Var | Dynamic, nil at the root: the `:dir` and `:env` of a `sh` that gives none | — |
+| `with-sh-dir`, `with-sh-env` | macro | `(with-sh-dir dir body...)`: the body with `*sh-dir*` bound to `dir`; `with-sh-env` the same for `*sh-env*` | — |
+
+One thread runs a program's three streams together: it writes `:in`
+to the stdin pipe and drains stdout and stderr through one `std.Io`
+batch (`std.Io.Batch.awaitConcurrent`, a `poll` on POSIX), each
+write at most the 512 bytes POSIX lets a pipe that polls writable take
+at once, so neither side waits on a full pipe whatever the sizes. A
+program that closes its stdin early leaves the rest of `:in`
+unwritten, as Java's does. The program inherits nothing else: no
+terminal, no open file but the three pipes.
+
+`test/integration/eval_pipeline.zig` pins every row, a variable and
+output holding bytes that are not UTF-8 and a `:in` past any pipe's
+buffer included; `sh` runs there with the test's `std.Io`.
+
+---
+
+### 12. Instants: `nexis.time`
+
+`src/stdlib/time.nx` holds instants, their ISO-8601 text and
+durations, each function a docstring'd `defn`; three natives in
+`internal_natives` read the clock and convert the text.
+
+**The representation.** An instant is the record
+`nexis.time.Instant` of one field, `:ms`, the milliseconds since
+1970-01-01T00:00:00Z on the proleptic Gregorian calendar, UTC, with no
+leap seconds: Java's `Instant` to the millisecond, the precision of
+Clojure's `#inst` and of Nextomic's `:db.type/instant`. A record needs
+no new value kind (PLAN §23): it is `=` and hashes by its `:ms`,
+`(:ms i)` reads it, and it prints as `#nexis.time.Instant{:ms
+1791549015123}`. It is not `compare`-able, as records are not
+(`docs/SORTED.md` §6): sort instants with `(sort-by t/inst-ms xs)`.
+It extends `nexis.core`'s `Inst` protocol, so Clojure's `inst?` and
+`inst-ms` take it (§8). There is no `#inst` literal (PLAN §4;
+`TODO.md` #22 has the design note). The range is
+the fixnum's, ±2^47 ms: -2490-03-17 to 6429-10-17.
+
+**Nextomic.** A `:db.type/instant` value, `:db/txInstant` included, is
+epoch milliseconds, a long (`docs/NEXTOMIC.md` §2), and every function
+here that takes an instant takes such a long as well: `(t/format
+(:db/txInstant tx))` writes one, `(t/instant ms)` makes it an Instant,
+and `(t/inst-ms i)` is what a transaction asserts.
+
+| Name | Arity | Semantics | Errors |
+|---|---|---|---|
+| `now` | 0 | The wall clock (`CLOCK_REALTIME`) as an Instant, to the millisecond | — |
+| `instant` | 1 | An Instant of epoch milliseconds (an integer), of ISO-8601 text as `parse` reads it, or of an Instant (itself) | `:kind-mismatch`, as `parse` |
+| `inst?` | 1 | Whether `x` is an Instant | — |
+| `inst-ms` | 1 | The epoch milliseconds of an instant: an Instant's `:ms`, an integer itself (Clojure's `inst-ms`) | `:kind-mismatch` |
+| `parse` | 1 | The Instant ISO-8601 text names, in the grammar of Clojure's `#inst`, which RFC 3339's is a part of: `YYYY` (with an optional sign), then optionally `-MM`, `-DD`, `THH:MM`, `:SS` and a fraction of 1 to 9 digits, each only after the one before, truncated to the millisecond; then `Z`, an offset `+HH:MM` or `+HHMM`, or nothing, which is UTC. `T` and `Z` may be lower case. A field out of its range (month 13, February 29 of a common year, hour 24, second 60) is not an instant | `:kind-mismatch` (not a string), `:invalid-argument` (any other text; an instant past the range) |
+| `format` | 1 | The instant's ISO-8601 text in UTC as Java's `Instant.toString` writes it: `2026-10-09T12:30:15.123Z`, the fraction left out when it is zero, a year before 1 written with a `-` (`-0001-01-01T00:00:00Z`) | `:kind-mismatch` (not an instant, or past the range) |
+| `seconds`, `minutes`, `hours`, `days` | 1 | A duration of `n` of the unit, in milliseconds: a duration is a number of milliseconds, a day 24 hours | — |
+| `plus`, `minus` | 1+ | `(plus x d ...)`: the Instant each duration later (`minus`: earlier) than the instant `x`, `long` of the sum | `:kind-mismatch` |
+| `between` | 2 | The duration from instant `a` to instant `b`, negative when `b` is earlier | `:kind-mismatch` |
+| `before?`, `after?` | 2 | Whether instant `a` is earlier (later) than instant `b` | `:kind-mismatch` |
+
+There are no time zones but UTC, no local dates, and no calendar
+arithmetic (a month later); a program that needs them builds them on
+`inst-ms`. `src/stdlib.zig` checks the calendar against
+`std.time.epoch` and day by day over the whole range, and that every
+instant's text reads back as the same instant;
+`test/integration/eval_pipeline.zig` pins each row and a Nextomic
+round trip.
+
+---
+
+### 13. JSON: `nexis.json`
+
+`src/stdlib/json.nx` is JSON in the shape of `clojure.data.json`
+(`read-str`, `write-str`, `read`, `write` and their options), each a
+docstring'd `defn` over a native in `internal_natives`. Options are
+keyword arguments or a trailing map (`(read-str s :key-fn keyword)`,
+`(read-str s {:key-fn keyword})`); a key other than the ones a
+function takes is `:invalid-argument`, where `clojure.data.json`
+ignores it.
+
+**Reading.** The text is RFC 8259 JSON, exactly: an object is a map,
+a later duplicate key winning and one of up to eight members keeping
+the text's order (§5); an array a vector; a string a string, every
+escape decoded, a surrogate pair to its character; an integer a
+fixnum, or a bignum past one, with no limit on its digits; a number
+with a fraction or an exponent a double (`1e400` is `##Inf`, as Java
+reads it); `true`, `false` and `null` themselves. Whitespace is space,
+tab, CR and LF. Nothing else is JSON: a trailing comma, a comment,
+`NaN`, a leading zero (`01` is `0` and text after it), a control
+character unescaped in a string, a lone surrogate, text after the
+value. The reader is a loop, not a recursion: each value waits on the
+VM's root stack until the array or object it is in closes and is then
+built into it, so the text nests as deep as memory allows, and every
+value is rooted across the options' calls (GC.md §11.5).
+
+**Writing.** A hash map, sorted map, record or Nextomic entity is an
+object; a vector, list, seq (realized first), set or typed vector an
+array; a string a string; a character a one-character string; a
+keyword or symbol its whole name without the colon (`:person/name` is
+`"person/name"`, where `clojure.data.json` writes `"name"`: a
+Nextomic attribute keeps its namespace; `:key-fn name` gives
+`clojure.data.json`'s keys); a `nexis.time.Instant` its ISO-8601 text
+(§12); an integer its digits; a double Java's `Double.toString`
+(`1.0E10`), a valid JSON number; `true`, `false` and nil `null`. A map
+key is a string as it is, a keyword or symbol by its whole name, an
+integer by its digits. A string is written as UTF-8 with `"`, `\` and
+the control characters escaped (`\b`, `\f`, `\n`, `\r`, `\t`, else
+`\u00XX`); `clojure.data.json` escapes every non-ASCII character and
+`/` by default, this writer only when asked. The walk recurses on the
+data's depth under the stack guard, so data nested past the native
+stack is a catchable `:stack-overflow`.
+
+| Name | Arity | Semantics |
+|---|---|---|
+| `read-str` | 1+ | `(read-str s & opts)`: the value of the JSON text `s`. `:key-fn`: a function of each key's string, its result the map key (`keyword` gives keyword keys, interned without a call: an empty key, which names no keyword, is `:invalid-argument`). `:value-fn`: a function of each object member's key (after `:key-fn`) and value, inner objects first, whose result replaces the value, or drops the member when it is `:value-fn` itself |
+| `write-str` | 1+ | `(write-str x & opts)`: the JSON text of `x`, as above. `:key-fn`: a function of each map key to the string written; `:value-fn`: a function of each map entry's key and value whose result is written, the entry left out when it is `:value-fn` itself; `:indent true`: a newline before each member and element, two spaces a level, `": "` after a key, an empty collection kept as `{}` or `[]` (`clojure.data.json` 2.5's `:indent`); `:escape-unicode true`: every character past ASCII as `\uXXXX`, a pair past the BMP; `:escape-slash true`: `/` as `\/` |
+| `read` | 1+ | `(read path & opts)`: `read-str` of the file's text (`slurp`); stdin is `(read "/dev/stdin")` |
+| `write` | 2+ | `(write x path & opts)`: `write-str` of `x` into the file, replacing it (`spit`); nil |
+
+**Errors.** Malformed text throws the map `{:error :json-error
+:message "JSON: <what> at line L, column C" :line L :column C}` (as
+the multimethod errors are maps, §9.4), the column counted in
+characters, so `(catch :json-error e (ex-message e))` takes it; the
+`<what>`s are `the text ends before its value`, `the text ends inside
+a string` (an `object`, an `array`), `text follows the value`,
+`unexpected 'c'`, `expected a string key`, `expected ':' after a
+key`, `expected ',' or '}'` (`']'`), `a malformed number`, `a control
+character in a string`, `an unknown escape`, `a lone surrogate`.
+Writing what JSON cannot hold throws `{:error :json-error :message
+...}` without a position: `NaN` or an infinity, a nil key, a key of
+another class, a `:key-fn` result that is not a string, a value of any
+other class (a function, an atom). A text that is not a string, or an
+options map that is not a map, is `:kind-mismatch`; a string that is
+not UTF-8 `:utf8-error`; a throw from an option's function passes
+through.
+
+**Speed.** An optimized build (`-Doptimize=fast`, the Apple M5, one
+core under the machine's queue) reads a 10.5 MB document of 42,000
+records (nested objects, arrays, strings with escapes and non-ASCII
+text, doubles, integers to 10^12) in 41–56 ms, 30–43 ms with keyword
+keys, and writes it back in 42–47 ms (5 runs in one process); the
+process peaks at 203 MB. Babashka's cheshire takes 121–175 ms and
+60–161 ms on the same document.
+
+`test/integration/eval_pipeline.zig` pins every value kind both ways,
+the options, each error and its position, a round trip of every kind
+JSON holds, files, and a text 200,000 arrays deep, which reads, and
+writes as `:stack-overflow`.

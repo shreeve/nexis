@@ -1025,9 +1025,8 @@
   "Returns true if x is an integer: with no ratios, the rationals are
   the integers."
   [x] (integer? x))
-; No decimals and no instants either (PLAN §4).
+; No decimals either (PLAN §4).
 (defn decimal? "Returns false: there are no decimals." [_] false)
-(defn inst? "Returns false: there are no instants." [_] false)
 ; One integer domain: a BigInt is an integer, so these truncate as long.
 (defn bigint
   "Returns (long x): one integer kind holds integers of any size."
@@ -1381,6 +1380,27 @@
 (alter-meta! #'Closeable assoc :doc
   "What with-open closes: a db connection, a Nextomic connection, and
   any record or kind extended to it.")
+
+; Clojure's Inst: what inst? and inst-ms take as an instant. nexis.time's
+; Instant extends it (docs/STDLIB.md §12).
+(defprotocol Inst
+  (inst-ms* [inst]
+    "Returns the epoch milliseconds of the instant inst."))
+(alter-meta! #'Inst assoc :doc
+  "An instant: a value with epoch milliseconds, which inst-ms* returns.
+  nexis.time's Instant extends it, and so may any record.")
+
+(defn inst?
+  "Returns true if x is an instant: of a type extended to Inst, as
+  nexis.time's Instant is."
+  [x]
+  (satisfies? Inst x))
+
+(defn inst-ms
+  "Returns the epoch milliseconds of the instant inst; anything else is
+  :no-protocol-impl."
+  [inst]
+  (inst-ms* inst))
 
 (defmacro with-open
   "bindings is [name init ...]. Evaluates body with each name bound,
