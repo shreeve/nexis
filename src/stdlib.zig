@@ -92,8 +92,8 @@ fn table(comptime ns: []const u8, comptime entries: anytype) [entries.len]Native
         };
         inline for (4..e.len) |j| switch (@TypeOf(e[j])) {
             @TypeOf(.enum_literal) => {
-                out[i].leaf = e[j] == .leaf or e[j] == .consuming_leaf;
-                out[i].consumes = e[j] == .consumes or e[j] == .consuming_leaf;
+                out[i].leaf = out[i].leaf or e[j] == .leaf or e[j] == .consuming_leaf;
+                out[i].consumes = out[i].consumes or e[j] == .consumes or e[j] == .consuming_leaf;
             },
             *const fn (*VM, []const Value) VmError!Value => out[i].general = e[j],
             else => {},
@@ -252,6 +252,11 @@ pub const embedded = [_]image_mod.Source{
     .{ .ns = "nexis.json", .info = .{ .path = "json.nx", .text = @embedFile("stdlib/json.nx"), .library = true } },
 };
 
+/// The docstrings two rows share: `deref` and `db/deref` are one
+/// native, and `nextomic/sync` does what `db/sync` does.
+const deref_doc = "Returns the value of ref: an atom's, a Var's, a delay's (forcing\n  it), a reduced's, or a durable ref's stored value (nil when absent,\n  read in one read transaction). Anything else is :not-derefable. @x\n  reads as (deref x).";
+const sync_doc = "Makes every commit to conn's file durable, with one full sync when a\n  commit left it unsynced; returns nil. :db/sync-failed once a sync of\n  the file has failed, until it is reopened.";
+
 const core_rows = .{
     // Sequence primitives.
     .{ "list", 0, null, &fnList, "[& items]", "Returns a new list of the items; (list) is ()." },
@@ -369,7 +374,7 @@ const core_rows = .{
     .{ "val", 1, 1, &fnVal, "[e]", "Returns the val of the map entry e, a [k v] vector." },
     .{ "peek", 1, 1, &fnPeek, "[coll]", "Returns the last item of a vector or the first of a list; nil when\n  coll is nil or empty." },
     .{ "pop", 1, 1, &fnPop, "[coll]", "Returns a vector without its last item or a list without its first;\n  nil for nil. An empty coll is :index-out-of-bounds." },
-    .{ "empty", 1, 1, &fnEmpty, "[coll]", "Returns an empty collection of coll's kind with coll's metadata; {}\n  for a record, nil for anything that is not a collection, a string\n  included." },
+    .{ "empty", 1, 1, &fnEmpty, "[coll]", "Returns an empty collection of coll's kind with coll's metadata; {}\n  for a record, nil for anything that is not a collection, a string\n  included. A typed vector is :kind-mismatch." },
     .{ "not-empty", 1, 1, &fnNotEmpty, "[coll]", "Returns coll, or nil when it has no items." },
     .{ "disj", 1, null, &fnDisj, "[set] [set key] [set key & ks]", "Returns set without the keys; nil for nil." },
     .{ "compare", 2, 2, &fnCompare, "[x y]", "Returns -1, 0 or 1 as x is less than, equal to or greater than y.\n  nil sorts first; numbers compare across kinds, then booleans,\n  strings, keywords, symbols, chars and vectors (shorter first) each\n  among their own. Anything else is :kind-mismatch." },
@@ -492,7 +497,7 @@ const core_rows = .{
     // Atoms: identity-valued in-memory mutable cells (docs/ATOM.md).
     // `deref` is `fnDbDeref`, which takes a var, atom, durable ref
     // or reduced; `db_natives` installs it again as `db/deref`.
-    .{ "deref", 1, 1, &fnDbDeref, "[ref]", "Returns the value of ref: an atom's, a Var's, a delay's (forcing\n  it), a reduced's, or a durable ref's stored value (nil when absent).\n  Anything else is :not-derefable. @x reads as (deref x)." },
+    .{ "deref", 1, 1, &fnDbDeref, "[ref]", deref_doc },
     .{ "atom", 1, null, &fnAtom, "[x] [x & options]", "Returns an atom holding x. The options are :meta m, its metadata,\n  and :validator f, which every new value, x included, must satisfy\n  (else :invalid-reference-state)." },
     .{ "atom?", 1, 1, &fnAtomQ, "[x]", "Returns true if x is an atom." },
     .{ "reset!", 2, 2, &fnResetBang, "[atom newval]", "Sets the value of atom to newval once the validator accepts it,\n  runs the watches and returns newval." },
@@ -538,7 +543,7 @@ const db_rows = .{
     // Connection + ref + auto-ephemeral primitives.
     .{ "open", 1, 2, &fnDbOpen, "[path] [path opts]", "Returns a connection to the emdb store at path, creating the file and\n  its parent directories; a file the process may only read opens\n  read-only. opts takes :durability, :commit or :durable. An empty\n  path or one with a NUL byte is :invalid-path." },
     .{ "close", 1, 1, &fnDbClose, "[conn]", "Closes conn: aborts its open transactions and syncs the file when a\n  commit left it unsynced. Returns nil; closing twice is nil. Any later\n  use of conn or of a ref through it is :db-closed." },
-    .{ "sync", 1, 1, &fnDbSync, "[conn]", "Makes every commit to conn's file durable, with one full sync when a\n  commit left it unsynced; returns nil. :db/sync-failed once a sync of\n  the file has failed, until it is reopened." },
+    .{ "sync", 1, 1, &fnDbSync, "[conn]", sync_doc },
     .{ "ref", 3, 3, &fnDbRef, "[conn tree key]", "Returns the durable ref naming key in tree of conn's store. tree is a\n  keyword, :a/b naming the tree a/b; key is a keyword, symbol or\n  string, equal by name, so :k, 'k and \"k\" name one key." },
     .{ "ref?", 1, 1, &fnDbRefQ, "[x]", "Returns true if x is a durable ref." },
     .{ "put-key!", 2, 2, &fnDbPutKey, "[ref v]", "Stores v at ref in one write transaction, committed as the\n  connection's durability says; returns nil." },
@@ -555,7 +560,7 @@ const db_rows = .{
     .{ "get", 2, 3, &fnDbGet, "[tx ref] [tx ref default]", "Returns the value at ref as the transaction tx sees it, its own\n  writes included, or default (nil) when there is none." },
     .{ "delete!", 2, 2, &fnDbDelete, "[tx ref]", "Deletes ref's key within the write transaction tx; returns true if\n  it existed." },
     // Deref + alter.
-    .{ "deref", 1, 1, &fnDbDeref, "[ref]", "Returns the value of ref: a durable ref's stored value or nil, read\n  in one read transaction, or what deref returns for a Var, atom,\n  delay or reduced. Another kind is :not-derefable." },
+    .{ "deref", 1, 1, &fnDbDeref, "[ref]", deref_doc },
     .{ "alter!", 3, null, &fnDbAlter, "[tx ref f & args]", "Stores and returns (apply f current args) at ref within the write\n  transaction tx, current being the stored value or nil. When f\n  throws, nothing is written." },
     // Tree traversal.
     .{ "scan", 2, 4, &fnDbScan, "[tx tree] [tx tree start] [tx tree start end]", "Returns a vector of [key value] for the entries of tree in key-byte\n  order, each key a string of its bytes, which ref takes back. start\n  is inclusive and end exclusive, each a keyword, symbol or string as\n  a ref's key is. An absent tree is []." },
@@ -2491,10 +2496,8 @@ fn fnGroupBy(vm: *VM, args: []const Value) VmError!Value {
 // Sequence library
 // =============================================================================
 //
-// Eager, list-producing (PLAN §23 #14). Every function takes any
-// seqable receiver through `makeSeqIter` and builds its result
-// with `buildListFromSlice`; vector-producing variants (`mapv`,
-// `filterv`, `vec`) go through `vector_mod.fromSlice`.
+// Lazy producers are seq.zig ops made with `seq.make` (LAZY.md); eager
+// consumers walk any seqable with a `SeqIter`.
 
 /// `(range)` / `(range end)` / `(range start end)` / `(range start
 /// end step)` → the lazy seq start, start+step, ... up to but not
@@ -2832,7 +2835,7 @@ const count_max: usize = @intCast(value_mod.fixnum_max);
 fn floatCount(f: f64) usize {
     if (!(f > 0)) return 0;
     if (f >= @as(f64, @floatFromInt(count_max))) return count_max;
-    return @intFromFloat(f);
+    return @trunc(f);
 }
 
 /// `repeat`'s count, Clojure's `(long n)` of it: a float truncated, NaN
@@ -3793,7 +3796,7 @@ const special_docs = [_]SpecialDoc{
     .{ .name = "letfn*", .forms = "[(letfn* [fnspecs*] exprs*)]", .doc = "The primitive under letfn: mutually recursive local functions.\n  Programs use letfn." },
     .{ .name = "def", .forms = "[(def symbol doc-string? init?)]", .doc = "Interns a Var named symbol in the current namespace and, given init,\n  sets its root to init's value. ^meta on the symbol and the doc-string\n  go into the Var's metadata with :name and :ns. Yields the Var." },
     .{ .name = "set!", .forms = "[(set! var-symbol expr)]", .doc = "Sets the binding in force of a ^:dynamic Var that binding has bound:\n  :no-thread-binding outside a binding, :not-dynamic for a Var that is\n  not dynamic. A local cannot be set!." },
-    .{ .name = "try", .forms = "[(try expr* catch-clause* finally-clause?)]", .doc = "Evaluates the exprs. A value thrown from them is tried against each\n  catch clause in order; the first that matches binds name to it and\n  yields its exprs, and a value none matches is thrown on. A matcher is\n  any or :default, which match every value; a keyword :tag, which\n  matches :tag itself, a map or record whose :error is :tag, and an\n  ex-info map whose data's :error is :tag, so (catch :divide-by-zero e\n  ...) catches the runtime's error of that tag, the map {:error\n  :divide-by-zero :message m :fn f :file p :line l :column c}; or a Java\n  class name:\n  ArithmeticException, ClassCastException and the others that name a\n  nexis error match its tags, and any other (Exception, Throwable)\n  matches every value. The finally exprs run for effect however the\n  try ends." },
+    .{ .name = "try", .forms = "[(try expr* catch-clause* finally-clause?)]", .doc = "Evaluates the exprs. A value thrown from them is tried against each\n  catch clause in order: the first that matches binds name to it and\n  yields its exprs; a value none matches is thrown on. A matcher is any\n  or :default, which match every value; a keyword :tag, which matches\n  :tag, a map or record whose :error is :tag and an ex-info whose\n  data's :error is :tag, as in (catch :divide-by-zero e ...); or a Java\n  class name, which matches the tags it names (ArithmeticException) or\n  every value (Exception, Throwable). The finally exprs run for effect\n  however the try ends." },
     .{ .name = "defmacro", .forms = "[(defmacro name doc-string? attr-map? [params*] body) (defmacro name doc-string? attr-map? ([params*] body) +)]", .doc = "Defines name as a macro: a function called at compile time with the\n  unevaluated argument forms, whose result is compiled in place of the\n  call. Spelled as defn; &form and &env are not available." },
     .{ .name = "ns", .forms = "[(ns name doc-string? attr-map? references*)]", .doc = "Makes name the current namespace, creating it with nexis.core\n  referred. A reference is (:require spec*), as require takes;\n  (:refer-clojure :exclude [names]), which makes those names the\n  namespace's own; or (:gen-class), which is accepted and does nothing.\n  The doc-string and attr-map are accepted and not kept." },
     .{ .name = "require", .forms = "[(require spec*)]", .doc = "Loads each namespace at compile time, once. A spec is ns-name or\n  [ns-name option*], quoted or not; the options are :as alias,\n  :as-alias alias, :refer [names] or :refer :all, and :rename {from to}.\n  my.app-core loads my/app_core.nx from the working directory or the\n  running file's. The library namespaces need no require to be called\n  qualified; requiring clojure.string, clojure.set, clojure.test,\n  clojure.pprint, clojure.walk, clojure.edn or clojure.math names their\n  nexis.* counterpart." },
@@ -3858,7 +3861,7 @@ const nextomic_docs = std.StaticStringMap(Doc).initComptime(.{
     .{ "nextomic/release", nextomicDoc("[conn]", "Syncs conn's file when a commit left it unsynced, then closes conn;\n  returns nil, for a released conn too. Any other later use of conn is\n  :nextomic/closed; :nextomic/busy while an operation on it is in flight.") },
     .{ "nextomic/schema", nextomicDoc("[db]", "Returns a map of each attribute's ident to its definition as db's\n  basis saw it: :db/id, :db/ident, :db/valueType, :db/cardinality,\n  :db/index, :db/isComponent and :db/fulltext, with :db/unique and\n  :db/doc when the attribute has them.") },
     .{ "nextomic/since", nextomicDoc("[db t]", "Returns the view of db holding only what the transactions after t, a\n  t or a transaction entity id, asserted and did not retract: an entity\n  untouched since t is invisible. Of repeated bounds the newer holds.") },
-    .{ "nextomic/sync", nextomicDoc("[conn]", "Makes every commit to conn's file durable, with one full sync when a\n  commit left it unsynced; returns nil. :db/sync-failed once a sync of\n  the file has failed, until it is reopened.") },
+    .{ "nextomic/sync", nextomicDoc("[conn]", sync_doc) },
     .{ "nextomic/touch", nextomicDoc("[ent]", "Returns the map {:db/id e :attr v ...} of every attribute of the\n  entity ent, read in one pass: card-many values as sets, refs as eids.") },
     .{ "nextomic/transact!", nextomicDoc("[conn tx-data] [conn tx-data opts]", "Commits tx-data as one transaction and returns the report {:db-before\n  :db-after :tx :tempids :tx-data}. tx-data holds entity maps and\n  [:db/add e a v], [:db/retract e a v?], [:db/retractEntity e],\n  [:db.fn/call f & args] and [:db.fn/cas e a old new]. opts takes :sync.") },
     .{ "nextomic/tx-range", nextomicDoc("[conn] [conn from] [conn from to]", "Returns a vector of the log's entries {:t t :instant ms :data [datoms]}\n  for from <= t < to, oldest first; a nil or missing bound is open. An\n  entry an excision touched carries :excised [e ...].") },
@@ -6001,7 +6004,7 @@ fn fnStringSplit(vm: *VM, args: []const Value) VmError!Value {
     const rest = if (start == 0) args[0] else string_mod.fromBytes(heap, src[start..]) catch return VmError.OutOfMemory;
     pieces.append(vm.allocator, rest) catch return VmError.OutOfMemory;
     if (limit == 0 and src.len > 0) {
-        while (pieces.items.len > 0 and string_mod.byteLen(pieces.getLast()) == 0) _ = pieces.pop();
+        while (pieces.items.len > 0 and string_mod.byteLen(pieces.last().?) == 0) _ = pieces.pop();
     }
     return vector_mod.fromSlice(heap, pieces.items) catch VmError.OutOfMemory;
 }
@@ -6034,7 +6037,7 @@ fn splitPattern(vm: *VM, s: Value, re: Value, limit: i64) VmError!Value {
     if (index == 0) return vector_mod.fromSlice(heap, &.{s}) catch VmError.OutOfMemory;
     if (!last) pieces.append(vm.allocator, string_mod.fromBytes(heap, src[index..]) catch return VmError.OutOfMemory) catch return VmError.OutOfMemory;
     if (limit == 0) {
-        while (pieces.items.len > 0 and string_mod.byteLen(pieces.getLast()) == 0) _ = pieces.pop();
+        while (pieces.items.len > 0 and string_mod.byteLen(pieces.last().?) == 0) _ = pieces.pop();
     }
     return vector_mod.fromSlice(heap, pieces.items) catch VmError.OutOfMemory;
 }
@@ -6877,9 +6880,12 @@ fn keywordOptions(vm: *VM, opts: Value, comptime who: []const u8, comptime names
     return out;
 }
 
-/// Throw `{:error :json-error :message message}`, with `:json-line`
-/// and `:json-column` when `at` is a position in the text read.
-fn throwJson(vm: *VM, message: []const u8, at: ?struct { line: i64, column: i64 }) VmError {
+/// Throw `{:error :json-error :message "JSON: <fmt>"}`, with
+/// `:json-line` and `:json-column` when `at` is a position in the text
+/// read.
+fn throwJson(vm: *VM, at: ?struct { line: i64, column: i64 }, comptime fmt: []const u8, args: anytype) VmError {
+    const message = vm.allocator.print("JSON: " ++ fmt, args) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(message);
     const pos = at orelse return raise(vm, "json-error", message, &.{});
     return raise(vm, "json-error", message, &.{
         .{ "json-line", try integerValue(vm, pos.line) },
@@ -6897,9 +6903,7 @@ fn jsonSyntaxError(vm: *VM, text: []const u8, at: usize, comptime what: []const 
         line_start = k + 1;
     };
     const column: i64 = @intCast((std.unicode.utf8CountCodepoints(text[line_start..at]) catch at - line_start) + 1);
-    var buf: [160]u8 = undefined;
-    const message = std.fmt.bufPrint(&buf, "JSON: " ++ what ++ " at line {d}, column {d}", args ++ .{ line, column }) catch &buf;
-    return throwJson(vm, message, .{ .line = line, .column = column });
+    return throwJson(vm, .{ .line = line, .column = column }, what ++ " at line {d}, column {d}", args ++ .{ line, column });
 }
 
 /// Whether `f` is `nexis.core/keyword`, which `:key-fn` names to read
@@ -6999,7 +7003,7 @@ const JsonReader = struct {
                 else => return r.unexpected(),
             }
             // A value is whole: end each collection it completes.
-            while (r.open.getLastOrNull()) |o| {
+            while (r.open.last()) |o| {
                 if (o.object) try r.member();
                 r.skipSpace();
                 if (r.peek(',')) {
@@ -7261,8 +7265,8 @@ const JsonWriter = struct {
             .bignum => bignum_mod.formatDecimal(v, jw.w) catch return VmError.OutOfMemory,
             .float => {
                 const f = v.asFloat();
-                if (std.math.isNan(f)) return throwJson(jw.vm, "JSON: cannot write NaN", null);
-                if (std.math.isInf(f)) return throwJson(jw.vm, if (f > 0) "JSON: cannot write Infinity" else "JSON: cannot write -Infinity", null);
+                if (std.math.isNan(f)) return throwJson(jw.vm, null, "cannot write NaN", .{});
+                if (std.math.isInf(f)) return throwJson(jw.vm, null, "cannot write {s}Infinity", .{if (f > 0) "" else "-"});
                 format_mod.formatFloatJava(f, jw.w) catch return VmError.OutOfMemory;
             },
             .string => try jw.string(string_mod.asBytes(v)),
@@ -7286,10 +7290,7 @@ const JsonWriter = struct {
                 try jw.object(m);
             },
             .persistent_vector, .list, .lazy_seq, .persistent_set, .sorted_set, .typed_vector => try jw.array(v),
-            else => |k| {
-                var buf: [80]u8 = undefined;
-                return throwJson(jw.vm, std.fmt.bufPrint(&buf, "JSON: cannot write a value of class {s}", .{className(k)}) catch unreachable, null);
-            },
+            else => |k| return throwJson(jw.vm, null, "cannot write a value of class {s}", .{className(k)}),
         }
     }
 
@@ -7352,10 +7353,9 @@ const JsonWriter = struct {
     /// A member's key: `:key-fn`'s string, else a string as it is, a
     /// keyword or symbol by its whole name and an integer by its digits.
     fn key(jw: *JsonWriter, k: Value) VmError!void {
-        var buf: [80]u8 = undefined;
         if (!jw.key_fn.isNil()) {
             const out = try jw.vm.callValue(jw.key_fn, &.{k});
-            if (out.kind() != .string) return throwJson(jw.vm, std.fmt.bufPrint(&buf, "JSON: :key-fn returned a value of class {s}, not a string", .{className(out.kind())}) catch unreachable, null);
+            if (out.kind() != .string) return throwJson(jw.vm, null, ":key-fn returned a value of class {s}, not a string", .{className(out.kind())});
             return jw.string(string_mod.asBytes(out));
         }
         switch (k.kind()) {
@@ -7365,8 +7365,8 @@ const JsonWriter = struct {
                 try jw.value(k);
                 try jw.put("\"");
             },
-            .nil => return throwJson(jw.vm, "JSON: cannot write a nil key", null),
-            else => |kind| return throwJson(jw.vm, std.fmt.bufPrint(&buf, "JSON: cannot write a key of class {s}", .{className(kind)}) catch unreachable, null),
+            .nil => return throwJson(jw.vm, null, "cannot write a nil key", .{}),
+            else => |kind| return throwJson(jw.vm, null, "cannot write a key of class {s}", .{className(kind)}),
         }
     }
 
