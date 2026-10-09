@@ -174,7 +174,7 @@ string function panics on one.
 | `count` | 1 | Of a string: its code points, an O(n) scan | — |
 | `nth` | 2–3 | Of a string: the char at a code-point index; out of range (negative included) is the default, or `:index-out-of-bounds` without one | `:kind-mismatch` (non-fixnum index) |
 | `get` | 2–3 | Of a string: the char at a fixnum index, else the default (nil); `contains?` answers whether the index is in range | — |
-| `seq` and the sequence library | — | A string is a seq of its chars (`(seq "hé")` is `(\h \u{E9})`, `(seq "")` nil), so `first`, `map`, `into`, `reverse`, `frequencies` and the rest take one. `(empty "abc")` is nil. A string is not callable (`:not-callable`) | — |
+| `seq` and the sequence library | — | A string is a seq of its chars (`(seq "hé")` is `(\h \é)`, `(seq "")` nil), so `first`, `map`, `into`, `reverse`, `frequencies` and the rest take one. `(empty "abc")` is nil. A string is not callable (`:not-callable`) | — |
 | `char` | 1 | The char with a code point; a char is itself | `:kind-mismatch` (non-integer), `:invalid-argument` (not a Unicode scalar: negative, past `0x10FFFF`, a surrogate) |
 | `char?` | 1 | Whether the argument is a char | — |
 | `int`, `short`, `byte`, `long` | 1 | Of a char: its code point (`(int \é)` is 233); of a number, its integer part (SEMANTICS.md §2.2). `long` takes any size (`(long 1e30)` is a bignum); `int`, `short` and `byte` only the range of Java's type, checked on the integer part as Clojure's boxed cast checks it (`(byte 127.5)` is 127), and make NaN 0 | `:kind-mismatch`, `:invalid-argument` (out of range; an infinity) |
@@ -246,7 +246,7 @@ the result and write it once; a `replace` that finds nothing returns
 | `join` | 1–2 | `(join coll)`, `(join sep coll)`: the elements of any seqable, each as `str` makes it (nil empty), separated by `sep`: `(join ", " ["a" nil 1])` is `"a, , 1"`; a map joins its entries (`"[:a 1]"`), a string its chars; nil is `""`. A set joins in its iteration order |
 | `replace-first` | 3 | `(replace-first s match replacement)`: the first match replaced, else `s` itself. A pattern `match` takes what `replace` takes; a string or char `match` is found as it is, an empty one at the start, and `replacement` is a string or char |
 | `re-quote-replacement` | 1 | `s` with a backslash before each `\` and `$`, so a pattern `replace` inserts it literally (`Matcher.quoteReplacement`) |
-| `escape` | 2 | `(escape s cmap)`: `s` with each character that `cmap` maps to a non-nil value replaced by that value's text (`str`), the rest kept: `(escape "a<b" {\< "&lt;"})` is `"a&lt;b"` (`string.nx`) |
+| `escape` | 2 | `(escape s cmap)`: `s` with each character that `cmap` maps to a truthy value replaced by that value's text (`str`), every other character kept, one mapped to `false` too: `(escape "a<b" {\< "&lt;"})` is `"a&lt;b"`, `(escape "ab" {\a false})` `"ab"`. Clojure's code tests truth with `if-let`, though its docstring says non-nil (`string.nx`) |
 | `replace` | 3 | `(replace s match replacement)`: every non-overlapping occurrence of `match`, left to right, replaced; the scan resumes after each match, so `(replace "aaa" "aa" "x")` is `"xa"`. `match` and `replacement` are both strings or both chars (`(replace "a.b" \. \/)`); an empty `match` is found before every code point and at the end (`(replace "ab" "" "-")` is `"-a-b-"`), as Java's `String.replace`, and the replacement is literal. A pattern `match` is Java's `replaceAll`: a string replacement reads `$1` and `${name}` as groups and `\$` as `$` (`(replace "a1b2" #"(\d)" "<$1>")` is `"a<1>b<2>"`; one Java refuses throws `{:error :invalid-replacement :message M}` with Java's sentence, `No group 2`), and a function replacement is called with each match (a string, or the groups vector) and must return a string (`:kind-mismatch`) |
 
 Errors beyond `:kind-mismatch`: `split` and the replaces validate every
@@ -340,7 +340,7 @@ their elements in the same mode. Who uses which:
 | nil, booleans | `nil`, `true`, `false` |
 | fixnum, bignum | Decimal, no suffix |
 | float | SEMANTICS.md §6.3: `1.0`, `-0.0`, `1.0E10`, `1.0E-4`; `##NaN`, `##Inf`, `##-Inf` in both modes (`str` and `%s` of a bare float write Java's `NaN`, `Infinity`, `-Infinity`) |
-| char | display: its UTF-8. readable: `\space`, `\newline`, `\tab`, `\return`, `\formfeed`, `\backspace`, `\\`, printable ASCII as `\x`, anything else `\u{HEX}` (`\u{E9}`) |
+| char | display: its UTF-8. readable: `\space`, `\newline`, `\tab`, `\return`, `\formfeed`, `\backspace`, `\\`, the other ASCII controls and DEL as `\u{HEX}` (`\u{0}`), anything else as `\` and the char itself, as Clojure prints it (`\a`, `\é`) |
 | string | display: its bytes. readable: double-quoted, `\" \\ \n \t \r` escaped, other ASCII controls and DEL as `\u{HEX}`, every other byte as itself (`"é"`) |
 | keyword, symbol | `:ns/name`, `ns/name`; names are not escaped |
 | list, vector, set | `(a b)`, `[a b]`, `#{a b}`, elements separated by one space; a sorted set in its order |

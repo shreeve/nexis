@@ -65,8 +65,14 @@ true.
 
 - An operation with a float operand runs in f64 and yields a float;
   integers stay integral and exact. `(< 1 1.5)` is true, `(+ 1 0.5)`
-  is `1.5`, `(max 1 2.0)` is `2.0`. A bignum operand widens to the
-  nearest f64.
+  is `1.5`. A bignum operand widens to the nearest f64. `max` and
+  `min` compare that way and return the winning argument as it is,
+  as Clojure's `Numbers.max` and `min` do: `(max 2 1.0)` is `2`,
+  `(max 1 2.0)` is `2.0`, a tie is the second argument (`(max 1
+  1.0)` is `1.0`), and a NaN argument is the result.
+- `=`, `==`, `<`, `<=`, `>` and `>=` take one argument or more, as
+  Clojure's do; none is `:arity-mismatch`. `+` and `*` take none:
+  `(+)` is `0`, `(*)` is `1`.
 - `/` on two integers yields an integer when the division is exact
   and otherwise the f64 nearest the true quotient (ties to even),
   whatever the operands' size: `(/ 6 3)` is `2`, `(/ 7 2)` is `3.5`,
@@ -457,10 +463,12 @@ the db and Nextomic handles print as markers for debugging (`#<fn>`,
 #### 6.4 Character print rules
 
 Named: `\newline`, `\space`, `\tab`, `\return`, `\formfeed`,
-`\backspace`, and `\\` for the backslash. Other printable ASCII
-prints as `\a`; everything else as `\u{HEX}`, uppercase, no leading
-zeros (`\u{E9}`, `\u{0}`). The reader accepts the same set, and
-Clojure's `\uXXXX` (PLAN §23 #26).
+`\backspace`, and `\\` for the backslash. The other ASCII controls
+and DEL print as `\u{HEX}`, uppercase, no leading zeros (`\u{0}`,
+`\u{7F}`), as a string escapes them; every other char prints as `\`
+and the char itself, as Clojure prints it (`\a`, `\é`, `\☃`). The
+reader accepts the same set, `\u{HEX}` for any scalar, and Clojure's
+`\uXXXX` (PLAN §23 #26).
 
 #### 6.5 String print rules
 

@@ -281,12 +281,12 @@ const core_rows = .{
     .{ "quot", 2, 2, &fnQuot, "[num div]", "Returns the quotient of num by div, truncated toward zero. A zero\n  div is :divide-by-zero." },
     .{ "rem", 2, 2, &fnRem, "[num div]", "Returns the remainder of num by div under truncated division; it\n  has num's sign. A zero div is :divide-by-zero." },
     .{ "mod", 2, 2, &fnMod, "[num div]", "Returns the modulus of num by div under floored division; it has\n  div's sign. A zero div is :divide-by-zero." },
-    .{ "<", 0, null, &fnLt, .leaf, "[] [x] [x y] [x y & more]", "Returns true if the nums are in strictly increasing order. Exact\n  across integers of any size; false against NaN." },
-    .{ "<=", 0, null, &fnLte, .leaf, "[] [x] [x y] [x y & more]", "Returns true if the nums are in nondecreasing order. Exact across\n  integers of any size; false against NaN." },
-    .{ ">", 0, null, &fnGt, .leaf, "[] [x] [x y] [x y & more]", "Returns true if the nums are in strictly decreasing order. Exact\n  across integers of any size; false against NaN." },
-    .{ ">=", 0, null, &fnGte, .leaf, "[] [x] [x y] [x y & more]", "Returns true if the nums are in nonincreasing order. Exact across\n  integers of any size; false against NaN." },
-    .{ "==", 0, null, &fnNumEq, .leaf, "[] [x] [x y] [x y & more]", "Returns true if the nums are numerically equal, across integers and\n  floats: (== 1 1.0) is true. NaN is == to nothing." },
-    .{ "=", 0, null, &fnEq, "[] [x] [x y] [x y & more]", "Returns true if the args are equal by value. Different kinds are\n  never equal, except a list and a vector, or hash and sorted maps or\n  sets: (= 1 1.0) is false. Unlike Clojure, NaN is = to NaN." },
+    .{ "<", 1, null, &fnLt, .leaf, "[x] [x y] [x y & more]", "Returns true if the nums are in strictly increasing order. Exact\n  across integers of any size; false against NaN." },
+    .{ "<=", 1, null, &fnLte, .leaf, "[x] [x y] [x y & more]", "Returns true if the nums are in nondecreasing order. Exact across\n  integers of any size; false against NaN." },
+    .{ ">", 1, null, &fnGt, .leaf, "[x] [x y] [x y & more]", "Returns true if the nums are in strictly decreasing order. Exact\n  across integers of any size; false against NaN." },
+    .{ ">=", 1, null, &fnGte, .leaf, "[x] [x y] [x y & more]", "Returns true if the nums are in nonincreasing order. Exact across\n  integers of any size; false against NaN." },
+    .{ "==", 1, null, &fnNumEq, .leaf, "[x] [x y] [x y & more]", "Returns true if the nums are numerically equal, across integers and\n  floats: (== 1 1.0) is true. NaN is == to nothing." },
+    .{ "=", 1, null, &fnEq, "[x] [x y] [x y & more]", "Returns true if the args are equal by value. Different kinds are\n  never equal, except a list and a vector, or hash and sorted maps or\n  sets: (= 1 1.0) is false. Unlike Clojure, NaN is = to NaN." },
     .{ "not=", 1, null, &fnNotEq, "[x] [x y] [x y & more]", "Returns (not (= x y & more))." },
     .{ "inc", 1, 1, &fnInc, .leaf, "[x]", "Returns x plus one, a bignum past the fixnum range." },
     .{ "dec", 1, 1, &fnDec, .leaf, "[x]", "Returns x minus one, a bignum past the fixnum range." },
@@ -420,7 +420,7 @@ const core_rows = .{
     .{ "sequential?", 1, 1, kindPredicate(isSequential), .leaf, "[x]", "Returns true if x is a list, a lazy seq or a vector; false of a\n  typed vector." },
     .{ "associative?", 1, 1, kindPredicate(isAssociative), .leaf, "[x]", "Returns true if x is a vector, a hash or sorted map, or a record." },
     .{ "fn?", 1, 1, kindPredicate(isFn), .leaf, "[x]", "Returns true if x is a function: a fn, a native function or a\n  protocol method. A callable keyword or collection is not (ifn?)." },
-    .{ "ifn?", 1, 1, kindPredicate(isIfn), .leaf, "[x]", "Returns true if x can be called as a function: a function, a\n  keyword, a symbol, a vector, a map or set (hash or sorted), or a\n  transient." },
+    .{ "ifn?", 1, 1, kindPredicate(isIfn), .leaf, "[x]", "Returns true if x can be called as a function: a function, a Var,\n  a keyword, a symbol, a vector, a map or set (hash or sorted), or a\n  transient." },
     .{ "counted?", 1, 1, kindPredicate(isCounted), .leaf, "[x]", "Returns true if x is a list, vector, map, set, record, typed vector\n  or transient; false of nil, a string and a lazy seq." },
     .{ "delay?", 1, 1, &fnDelayQ, "[x]", "Returns true if x is a delay." },
     // Lazy seqs (docs/LAZY.md).
@@ -522,7 +522,7 @@ const core_rows = .{
     .{ "pr", 0, null, &fnPr, "[] [x] [x & more]", "Prints the args separated by spaces, readably: strings quoted, chars\n  as literals. Returns nil." },
     .{ "prn", 0, null, &fnPrn, "[& more]", "Prints as pr does, then a newline. Returns nil." },
     .{ "pr-str", 0, null, &fnPrStr, "[& xs]", "Returns the text pr prints of the xs, as a string." },
-    .{ "bound?", 1, null, &fnBoundQ, "[v & vars]", "Returns true if every Var given has a root value; a binding in\n  force does not count." },
+    .{ "bound?", 0, null, &fnBoundQ, "[& vars]", "Returns true if every Var given has a value, its root or a binding\n  in force." },
     .{ "nano-time", 0, 0, &fnNanoTime, "[]", "Returns a monotonic clock reading in nanoseconds, for measuring\n  intervals; it is no time of day." },
     .{ "slurp", 1, 1, &fnSlurp, "[f]", "Returns the whole text of the file at the path f, which must be\n  UTF-8; a missing file is :file-not-found." },
     .{ "spit", 2, null, &fnSpit, "[f content & options]", "Writes (str content) to the file at the path f, replacing it, or\n  after its end with :append true; returns nil. Parent directories\n  are not created." },
@@ -1043,7 +1043,7 @@ fn fnSomeQ(_: *VM, args: []const Value) VmError!Value {
 //   (+)        => 0            (*)        => 1
 //   (+ x)      => x            (- x)      => negation
 //   (+ x y...) => left fold    (/ x)      => reciprocal
-//   (<)        => true         (< x y z)  => chained
+//   (< x)      => true         (< x y z)  => chained
 //
 // `=` is value equality (dispatch.equal, cross-type false);
 // `==` is numeric equality with contagion (`(== 1 1.0)` is true).
@@ -2147,7 +2147,8 @@ fn assocOne(vm: *VM, coll: Value, k: Value, v: Value) VmError!Value {
     };
 }
 
-/// `(dissoc m k & ks)` → persistent remove from a map or record.
+/// `(dissoc m k & ks)` → persistent remove from a map or record; a
+/// record without one of its declared fields is a map.
 fn fnDissoc(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() == .sorted_map) return sortedRemoveAll(vm, args[0], args[1..]);
     const heap = vm.ensureHeap();
@@ -2158,12 +2159,30 @@ fn fnDissoc(vm: *VM, args: []const Value) VmError!Value {
             .nil => coll,
             .record => blk: {
                 const new_fields = champ_mod.mapDissoc(heap, record_mod.fieldsOf(coll), k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch return VmError.OutOfMemory;
+                // Without a declared field it is no longer the type: a
+                // plain map keeping the metadata, as Clojure's record
+                // `without` makes it (PROTOCOLS.md §0).
+                if (isDeclaredField(vm, coll, k)) {
+                    if (heap_mod.Heap.asHeapHeader(coll).getMeta() == null) break :blk new_fields;
+                    break :blk try fnWithMeta(vm, &.{ new_fields, try fnMeta(vm, &.{coll}) });
+                }
                 break :blk record_mod.withFields(heap, coll, new_fields) catch return VmError.OutOfMemory;
             },
             else => return VmError.KindMismatch,
         };
     }
     return coll;
+}
+
+/// Whether `k` is a field the record `rec`'s `defrecord` declared.
+fn isDeclaredField(vm: *VM, rec: Value, k: Value) bool {
+    if (k.kind() != .keyword) return false;
+    const entry = vm.recordType(record_mod.typeId(rec)) orelse return false;
+    const name = vm.ensureInterner().keywordName(k.asKeywordId());
+    for (entry.field_names) |f| {
+        if (std.mem.eql(u8, f, name)) return true;
+    }
+    return false;
 }
 
 /// `(disj s x & xs)` → set without the elements.
@@ -3766,7 +3785,7 @@ const special_docs = [_]SpecialDoc{
     .{ .name = "case", .macro = true, .forms = "([expr & clauses])", .doc = "Evaluates expr and yields the result of the clause whose constant is =\n  to it: clauses are constant result-expr pairs, a list of constants\n  (k1 k2) groups alternatives, and a lone last expr is the default. The\n  constants are not evaluated. With no match and no default, throws\n  {:error :no-matching-clause :message \"No matching clause: v\" :value v}." },
     .{ .name = "condp", .macro = true, .forms = "([pred expr & clauses])", .doc = "Yields the result of the first clause for which (pred test-expr expr)\n  holds; clauses are test-expr result-expr pairs, test-expr :>> f calls\n  f on pred's result, and a lone last expr is the default. With no\n  match and no default, throws :no-matching-clause as case does." },
     .{ .name = "defrecord", .macro = true, .forms = "([name [fields*] & specs])", .doc = "Defines a record type: a map with the fields as keys that is\n  (instance? name x), with the constructors ->name and map->name, the\n  predicate name?, and the protocol methods the specs implement, each\n  (method [this args*] body) after its protocol's name, the fields in\n  scope as locals. name is bound to the record's type symbol, ns.name." },
-    .{ .name = "defprotocol", .macro = true, .forms = "([name doc-string? & sigs])", .doc = "Defines a protocol: each sig, (method [this args*]+ doc-string?),\n  becomes a function that calls the implementation for its first\n  argument's type, which defrecord, extend-type and extend-protocol\n  install. :no-protocol-impl when there is none." },
+    .{ .name = "defprotocol", .macro = true, .forms = "([name doc-string? & sigs])", .doc = "Defines a protocol: each sig, (method [this args*]+ doc-string?),\n  becomes a function that calls the implementation for its first\n  argument's type, which defrecord, extend-type and extend-protocol\n  install. :no-protocol-impl when there is none. A doc-string lands\n  on the protocol's Var; the form's value is the name." },
     .{ .name = "extend-type", .macro = true, .forms = "([type & specs])", .doc = "Implements protocols for type: a kind keyword (:string, :vector,\n  :fixnum, :any), nil, a record name, or a Clojure class name standing\n  for its kinds (String, Long, Object for any). specs are a protocol\n  name followed by its methods, (method [this args*] body)." },
     .{ .name = "extend-protocol", .macro = true, .forms = "([protocol & specs])", .doc = "Implements protocol for several types at once: each type, spelled as\n  extend-type takes it, is followed by its methods, (method [this\n  args*] body)." },
 };
@@ -3996,8 +4015,10 @@ fn isFn(k: Kind) bool {
         else => false,
     };
 }
+/// What `callDirect` calls: a function, a Var (its value in force,
+/// as Clojure's `Var` is an `IFn`) or a lookup target.
 fn isIfn(k: Kind) bool {
-    return isFn(k) or vm_mod.isLookupCallable(k);
+    return isFn(k) or k == .var_ or vm_mod.isLookupCallable(k);
 }
 
 // =============================================================================
@@ -6308,11 +6329,12 @@ fn fnPopOut(vm: *VM, _: []const Value) VmError!Value {
     return string_mod.fromBytes(vm.ensureHeap(), buf.items) catch VmError.OutOfMemory;
 }
 
-/// `(bound? v & vs)` → whether every Var has a root value.
+/// `(bound? & vs)` → whether every Var has a value, its root or a
+/// binding in force, as Clojure's `Var.isBound`.
 fn fnBoundQ(_: *VM, args: []const Value) VmError!Value {
     for (args) |v| {
         if (v.kind() != .var_) return VmError.KindMismatch;
-        if (!VM.asVar(v).bound) return value_mod.fromBool(false);
+        if (VM.asVar(v).current() == null) return value_mod.fromBool(false);
     }
     return value_mod.fromBool(true);
 }

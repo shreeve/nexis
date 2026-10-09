@@ -1739,6 +1739,8 @@ test "integration: core.nx higher-order functions: some-fn, every-pred, memoize,
     try expectOutputProgram("(defn down [n] (if (zero? n) :done #(down (dec n)))) (trampoline down 100000)", ":done");
     try expectOutput("(sort (comparator >) [1 3 2])", "(3 2 1)");
     try expectOutput("(let [a (atom 0)] [(run! #(swap! a + %) [1 2 3]) @a])", "[nil 6]");
+    // A reduced from f ends the walk, as Clojure's reduce-based run!.
+    try expectOutput("(let [a (atom [])] [(run! #(if (= % 3) (reduced :stop) (swap! a conj %)) (range 10)) @a])", "[nil [0 1 2]]");
 }
 
 test "integration: core.nx sequence functions: partition-by, dedupe, take-nth, split-with, distinct?, doall, dorun, rseq, nthnext" {
@@ -3168,13 +3170,13 @@ test "integration: variadic native + / * / - / <" {
     try expectOutput("(* 2 3 4)", "24");
     try expectOutput("(- 10 3)", "7");
     try expectOutput("(- 7)", "-7");
-    try expectOutput("(<)", "true");
+    try expectOutput("[(try (<) (catch :arity-mismatch _ :arity)) (try (<=) (catch :arity-mismatch _ :arity)) (try (==) (catch :arity-mismatch _ :arity))]", "[:arity :arity :arity]");
     try expectOutput("(< 1 2 3)", "true");
     try expectOutput("(< 1 3 2)", "false");
 }
 
 test "integration: value equality `=` (variadic, structural)" {
-    try expectOutput("(=)", "true");
+    try expectOutput("(try (=) (catch :arity-mismatch _ :arity))", ":arity");
     try expectOutput("(= 1)", "true");
     try expectOutput("(= 1 1 1)", "true");
     try expectOutput("(= 1 1 2)", "false");
@@ -5526,14 +5528,16 @@ test "defrecord: map-like get / assoc / dissoc / contains?" {
         \\        c2 (assoc c :n 99)]
         \\    [(Counter? c2) (get c2 :n)]))
     , "[true 99]");
-    // `dissoc` likewise preserves record type.
+    // `dissoc` of a declared field leaves a plain map with the record's
+    // metadata, as Clojure's record `without`; of any other key, a record.
     try expectOutputProgram(
         \\(do
         \\  (defrecord Counter [n])
-        \\  (let [c (->Counter 5)
-        \\        c2 (dissoc c :n)]
-        \\    [(Counter? c2) (get c2 :n)]))
-    , "[true nil]");
+        \\  (let [c (with-meta (->Counter 5) {:m 1})
+        \\        c2 (dissoc c :n)
+        \\        c3 (dissoc (assoc c :x 1) :x)]
+        \\    [(Counter? c2) (record? c2) c2 (meta c2) (Counter? c3) c3 (record? (dissoc c :x :n)) (Counter? (dissoc c :x)) (Counter? (dissoc c :user/n))]))
+    , "[false false {} {:m 1} true #user.Counter{:n 5} false true true]");
     try expectOutputProgram(
         \\(do
         \\  (defrecord Counter [n])
@@ -5598,6 +5602,10 @@ test "defprotocol: a docstring and options before the methods" {
         \\(extend-type :string Named (nm [s] (str "s:" s)))
         \\(nm "a")
     , "s:a");
+    // The protocol's docstring lands on its Var, and the form's value
+    // is the protocol's name, as Clojure's defprotocol returns it.
+    try expectOutputProgram("(defprotocol Named \"Things with names.\" (nm [x]))", "Named");
+    try expectOutputProgram("(defprotocol Named \"Things with names.\" (nm [x])) [(:doc (meta #'Named)) (:doc (meta #'nm)) (symbol? (defprotocol Q (q [x])))]", "[Things with names. nil true]");
     // A method's arities and docstring land on its Var.
     try expectOutputProgram("(defprotocol Sh (ar [s] [s x] \"Area.\")) (select-keys (meta #'ar) [:doc :arglists :name])", "{:doc Area., :arglists ([s] [s x]), :name ar}");
 }
@@ -6359,6 +6367,11 @@ test "numbers: the promoting and unchecked operators, num, float, ratio? and rat
     try expectOutput("[(ratio? 1) (ratio? 0.5) (ratio? nil) (rational? 1) (rational? 99999999999999999999) (rational? 1.0) (rational? nil)]", "[false false false true true false false]");
 }
 
+test "printing: a char past ASCII prints as itself, as Clojure's, and reads back" {
+    try expectOutput("(pr-str [\\é \\u{1F980} \\☃ \\a \\u{7F} \\u{0}])", "[\\é \\🦀 \\☃ \\a \\u{7F} \\u{0}]");
+    try expectOutput("(let [cs (map char [233 0x80 0xA0 0x2028 0xFEFF 0x10FFFF])] (= cs (read-string (pr-str cs))))", "true");
+}
+
 test "numbers: ##Inf, ##-Inf and ##NaN read, print readable and round-trip" {
     try expectOutput("[(= ##Inf (* 2 1e308)) (= ##-Inf (* -2 1e308)) (NaN? ##NaN) (float? ##Inf) (infinite? ##-Inf)]", "[true true true true true]");
     try expectOutput("(pr-str ##Inf ##-Inf ##NaN [1.5 ##Inf] (f64-vector [##-Inf]))", "##Inf ##-Inf ##NaN [1.5 ##Inf] #f64[##-Inf]");
@@ -6430,7 +6443,7 @@ test "numbers: comparison across kinds" {
     try expectOutput("(> 3 2 1)", "true");
     try expectOutput("(> 3 1 2)", "false");
     try expectOutput("(<= 1 1 2)", "true");
-    try expectOutput("(>)", "true");
+    try expectOutput("[(try (>) (catch :arity-mismatch _ :arity)) (try (>=) (catch :arity-mismatch _ :arity))]", "[:arity :arity]");
     try expectOutput("(>= 5)", "true");
     try expectOutput("(= 1 1.0)", "false");
     try expectOutput("(== 1 1.0)", "true");
@@ -6590,6 +6603,7 @@ test "integration: a Var calls, and derefs to, the value in force" {
     try expectOutput("(def ^:dynamic *x* 1) (binding [*x* 2] [@#'*x* (deref (var *x*))])", "[2 2]");
     try expectOutput("(declare later) (try (#'later 1) (catch any e e))", "{:error :unbound-var, :message unbound var, :fn test-form}");
     try expectOutput("(def n 5) (try (#'n 1) (catch any e e))", "{:error :not-callable, :message an integer is not callable, :fn test-form}");
+    try expectOutput("(def ^:dynamic *u*) [(binding [*u* 3] @#'*u*) (try @#'*u* (catch :unbound-var _ :unbound))]", "[3 :unbound]");
 }
 
 // =============================================================================
@@ -6857,6 +6871,8 @@ test "core: predicates, names and conversions" {
         .{ .src = "[(coll? []) (coll? {}) (coll? \"s\") (coll? nil)]", .expected = "[true true false false]" },
         .{ .src = "[(sequential? []) (sequential? '()) (sequential? #{}) (associative? {}) (associative? []) (associative? #{})]", .expected = "[true true false true true false]" },
         .{ .src = "[(fn? inc) (fn? (fn [] 1)) (fn? :a) (ifn? :a) (ifn? {}) (ifn? 1)]", .expected = "[true true false true true false]" },
+        .{ .src = "[(list? (seq [1 2])) (list? (rest [1 2 3])) (list? (cons 1 ())) (list? (keys {:a 1})) (list? (map inc [1])) (list? (range 3))]", .expected = "[true true true true false false]" },
+        .{ .src = "(do (defrecord R [a]) [(ifn? #'inc) (ifn? (var +)) (fn? #'inc) (ifn? (->R 1)) (ifn? (transient []))])", .expected = "[true true false false true]" },
         .{ .src = "(do (defrecord R [a]) [(map? (->R 1)) (coll? (->R 1))])", .expected = "[true true]" },
         .{ .src = "[(true? true) (true? 1) (false? false) (false? nil)]", .expected = "[true false true false]" },
         .{ .src = "(name :abc)", .expected = "abc" },
@@ -7691,6 +7707,8 @@ test "binding: nesting, restoration, and a closure seeing the binding in force a
     try expectOutputProgram("(def ^:dynamic *x* 1) (let [f (fn [] *x*)] [(f) (binding [*x* 5] (f)) (f)])", "[1 5 1]");
     try expectOutputProgram("(def ^:dynamic *x* 1) (binding [*x* (+ *x* 10)] (binding [*x* (+ *x* 100)] *x*))", "111");
     try expectOutputProgram("(def ^:dynamic *x* 1) [(thread-bound? (var *x*)) (binding [*x* 0] (thread-bound? (var *x*)))]", "[false true]");
+    // bound? counts a binding in force, as Clojure's Var.isBound; with no Vars it is true.
+    try expectOutputProgram("(def ^:dynamic *u*) [(bound? #'*u*) (binding [*u* 1] (bound? #'*u*)) (binding [*u* 1] (bound? #'*u* #'inc)) (bound?)]", "[false true true true]");
     try expectOutputProgram("(def ^:dynamic *x* 1) (def ^:dynamic *y* 2) (binding [*x* *y* *y* *x*] [*x* *y*])", "[2 1]");
 }
 

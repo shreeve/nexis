@@ -508,6 +508,7 @@ replaced, and `vm.dyn_frames` the index each frame starts at.
 | `pop-thread-bindings` | `VM.popBindings` | Restore the innermost frame's Vars in reverse order |
 | `var-set` (`set!`) | | Write `thread_value` of a dynamic Var with a binding in force; `:not-dynamic` / `:no-thread-binding` otherwise. Only `def` writes the root |
 | `thread-bound?` | | Whether a binding of the Var is in force |
+| `bound?` | | Whether every Var given has a value, its root or a binding in force, as Clojure's `Var.isBound`; true of none |
 
 `binding` (`src/stdlib/core.nx`) evaluates its values outside the
 form, calls `push-thread-bindings` once and runs the body inside

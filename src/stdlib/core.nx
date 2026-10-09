@@ -814,9 +814,11 @@
   (fn [a b] (cond (pred a b) -1 (pred b a) 1 true 0)))
 
 (defn run!
-  "Calls f on each element of coll, for effect. Returns nil."
+  "Calls f on each element of coll, for effect, through reduce: a
+  reduced value from f ends the walk. Returns nil."
   [f coll]
-  (reduce (fn [_ x] (f x) nil) nil coll))
+  (reduce (fn [_ x] (f x)) nil coll)
+  nil)
 
 
 (defn split-with
@@ -1372,18 +1374,16 @@
             (throw e)))))
     x))
 
-; Java's Closeable. defprotocol keeps no docstring (MACROEXPAND.md
-; §10), so the Var takes its own below.
+; Java's Closeable.
 (defprotocol Closeable
+  "What with-open closes: a db connection, a Nextomic connection, and
+  any record or kind extended to it."
   (close [this]
     "Closes this: db/close of a db connection, nextomic/release of a
   Nextomic connection."))
 (extend-protocol Closeable
   :db_connection (close [c] (db/close c))
   :nextomic_conn (close [c] (nextomic/release c)))
-(alter-meta! #'Closeable assoc :doc
-  "What with-open closes: a db connection, a Nextomic connection, and
-  any record or kind extended to it.")
 
 ; Clojure's Inst: what inst? and inst-ms take as an instant. nexis.time's
 ; Instant extends it (docs/STDLIB.md §12).

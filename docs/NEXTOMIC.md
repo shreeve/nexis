@@ -1044,7 +1044,7 @@ predicate's is only tested (§5). Nextomic returns no lazy seq: `q`,
 | `(d/entity db e)` | a lazy entity (§6.1); nil when `e` has no datoms in this view; `:nextomic/history-view` on a history db |
 | `(d/touch ent)` | the map `{:db/id e :attr v ...}` of every attribute read in one pass, card-many as sets, refs as eids; `{:db/id e}` alone when the view holds no datom of `e` (a ref to an excised entity) |
 | `(d/entity-db ent)` | the db-value the entity reads through |
-| `(d/entid db x)` / `(d/ident db x)` | lookup ref or ident → eid; eid → ident |
+| `(d/entid db x)` / `(d/ident db x)` | lookup ref or ident → eid; `entid` of an eid is the eid, whether or not it was ever allocated, as Datomic's ("or the id itself if passed"); eid → ident, nil for an eid with no ident |
 | `(d/datoms db index c1 ... tx added)` | vector of `[e a v t added]` after the fold. `index` is `:eavt`, `:aevt`, `:avet` or `:vaet` (another keyword is `:invalid-argument`); its components follow in index order, then `tx` (a t or a transaction entity id) and `added` (a boolean); nil leaves one unbound, later ones filter |
 | `(d/index-range db attr start end)` | the AVET datoms of an indexed or unique attribute with `start <= v < end` in value order; a nil bound is open; another attribute is `:nextomic/tx-data` naming it, a bound of the wrong type `:nextomic/value-type`. The cursor seeks to `start` and stops at `end`; the range test compares decoded values, so long strings and byte arrays (§2.2) are placed by value: a bound of 64 bytes or more seeks at its 64-byte prefix class, which is scanned whole |
 | `(d/q query & inputs)` / `(d/q {:query query :args [inputs...]})` | §5, inputs positional to `:in`; the arg-map is the same call; Datomic's `:timeout` and `:io-context` keys are accepted and ignored (a query is one read in the caller's thread, with no timer to arm and no I/O to attribute), and any other key is `:nextomic/query-syntax`. `:find` takes `.`, `[...]`, `[[...]]`, aggregates and pull expressions, with `:keys`/`:strs`/`:syms` and `:with`; `:where` takes patterns, predicates, function bindings, `not`/`not-join`/`or`/`or-join`/`and` and rule calls. A relation query returns a persistent set of vectors, or a vector of maps under `:keys` |
@@ -1315,6 +1315,11 @@ damaged page is `:db/corrupted` (§7), never a short scan.
 - **`:db/index true` and `:db/unique` are never retracted** (§3 step
   5), and `:db/unique` does not switch between identity and value.
   Datomic can drop an index or a uniqueness constraint.
+- **`pull` always includes `:db/id`** (§6.2): every entity it pulls,
+  a nested one included, carries its eid whether or not the pattern
+  names it, so `(d/pull db [:person/name] e)` is `{:db/id e
+  :person/name "Ann"}`. Datomic's includes `:db/id` only where the
+  pattern names it or holds `*`, and in a ref with no sub-pattern.
 - **`with` takes a connection and a function.** `(d/with conn tx-data
   f)` calls `f` with `db-after` and the report inside a held write
   transaction that is aborted when `f` returns, and returns `f`'s

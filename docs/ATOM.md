@@ -204,10 +204,11 @@ atom is a reference and not a value that carries metadata.
 
 `deref` is one native, `fnDbDeref`, installed as `nexis.core/deref` and
 as `db/deref`. On an atom it returns the contained value; on a durable
-ref it reads the stored value (`docs/DB.md`), on a Var its root
-(`:unbound-var` when unbound), on a `reduced` wrapper its value, on a
-delay its forced value (`force`, `docs/STDLIB.md` §8), and on anything
-else it is `:not-derefable`. The reader's `@x` expands to
+ref it reads the stored value (`docs/DB.md`), on a Var the value in
+force, a `binding`'s when one is, else the root, as Clojure's
+`Var.deref` (`:unbound-var` when there is neither), on a `reduced`
+wrapper its value, on a delay its forced value (`force`,
+`docs/STDLIB.md` §8), and on anything else it is `:not-derefable`. The reader's `@x` expands to
 `(nexis.core/deref x)`, qualified so that no local or Var named `deref`
 captures it (`src/expand.zig`).
 
