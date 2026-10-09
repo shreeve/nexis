@@ -154,7 +154,8 @@ the names the namespace's own (`MACROEXPAND.md` §2b).
 - A helper no caller outside the file names is `defn-`, so `(require
   '[ns :refer :all])` skips it; a function a macro's expansion calls
   stays public, since the expansion names it from the caller's
-  namespace.
+  namespace, unless the expansion calls it through its Var, as `doc`
+  calls `(#'nexis.core/doc-of ...)`.
 
 ---
 
