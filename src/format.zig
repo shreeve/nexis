@@ -1,47 +1,25 @@
-//! format.zig — Value → text presentation.
+//! format.zig — Value → text, the one printer: `.display` (print,
+//! println, str of a string or char) and `.readable` (pr, prn,
+//! pr-str, the REPL, error reports). The contract, every kind's
+//! spelling and who uses which mode, is `docs/STDLIB.md` §5; which
+//! kinds read back is SEMANTICS.md §6. The codec (`src/codec.zig`) is
+//! the serialization layer; this is presentation.
 //!
-//! Two modes:
-//!   - `.display`  strings UNQUOTED; chars as their UTF-8 bytes;
-//!                 nil → `"nil"`. Used by `print`, `println`, and
-//!                 `str` for a string or char.
-//!   - `.readable` strings DOUBLE-QUOTED with `\ " \n \t \r` plus
-//!                 `\u{HEX}` for other ASCII controls and DEL;
-//!                 chars as `\space` / `\newline` / `\tab` / `\return`
-//!                 / `\formfeed` / `\backspace` / `\\` / `\x` for
-//!                 printable ASCII / `\u{HEX}` for the rest;
-//!                 nil → `"nil"`. Used by `pr`, `prn`, `pr-str`,
-//!                 the REPL and `-e` results, and error reports.
-//!
-//! The single formatter: `src/cli.zig` (REPL + run output),
-//! `test/integration/eval_pipeline.zig` and `src/stdlib.zig` all
-//! delegate here.
-//!
-//! Authoritative contract: `docs/STDLIB.md` §5 (and the readable
-//! escape table). Identity-valued and process-local kinds (atom,
-//! function, native fn, transient, protocols, db handles, durable
-//! refs) format OPAQUELY in both modes, as `#<...>`: they have no
-//! source form, and the readable output does not read back. A Var
-//! prints as `#'ns/name`, a Nextomic handle as `#nextomic/...`, and a
-//! record as Clojure prints one, `#ns.Type{:k v, ...}`; the reader
-//! reads none of them back. The codec (`src/codec.zig`) is the
-//! serialization layer; format.zig is presentation.
-//!
-//! Frozen invariants:
+//! Invariants:
 //!   §F1. `format(.display, nil)` writes `"nil"`. `str`/`join`/`spit`
-//!        each layer their OWN nil → empty wrapping ON TOP of
-//!        format; format itself never special-cases nil.
-//!   §F2. Readable strings always quote + escape; passing a string
-//!        Value containing malformed UTF-8 surfaces `error.Utf8Error`
-//!        in readable mode (display mode preserves raw bytes
-//!        unmodified, since storage is byte-blob per STRING.md §2).
+//!        each layer their own nil → empty wrapping on top of format;
+//!        format itself never special-cases nil.
+//!   §F2. Readable strings always quote and escape; a string holding
+//!        malformed UTF-8 is `error.Utf8Error` in readable mode
+//!        (display writes the bytes unchanged, STRING.md §2).
 //!   §F3. Recursion is bounded by the native stack, not by a depth
-//!        cap. Persistent collections can't self-cycle without an
-//!        atom in the way, and atoms format opaquely, so recursion is
-//!        finite. A realized lazy seq can be a cycle (`(repeat x)`);
-//!        its walk stops with `...` when it meets a cell again, so
-//!        every print ends. A collection nested past the stack guard prints as
-//!        `#<too deep>` and counts an overflow, which the VM raises as
-//!        `:stack-overflow` (SEMANTICS §2.7).
+//!        cap. Persistent collections cannot cycle without an atom in
+//!        the way, and atoms print opaquely; a realized lazy seq can be
+//!        a cycle (`(repeat x)`), and its walk stops with `...` when it
+//!        meets a cell again, so every print ends. A collection nested
+//!        past the stack guard prints `#<too deep>` and counts an
+//!        overflow, which the VM raises as `:stack-overflow`
+//!        (SEMANTICS §2.7).
 
 const std = @import("std");
 const value_mod = @import("value.zig");
@@ -125,12 +103,28 @@ pub fn format(
                 return writer.writeAll("#<too deep>");
             };
             switch (v.kind()) {
-                .list => try formatList(v, mode, writer, interner),
+                .list => {
+                    var it = list_mod.Cursor.init(v);
+                    try formatItems(&it, "(", ")", .item, mode, writer, interner);
+                },
                 .lazy_seq => try formatLazy(v, mode, writer, interner),
-                .persistent_vector => try formatVector(v, mode, writer, interner),
+                .persistent_vector => {
+                    var it = vector_mod.Cursor.init(v);
+                    try formatItems(&it, "[", "]", .item, mode, writer, interner);
+                },
                 .persistent_map => try formatMap(v, mode, writer, interner),
-                .persistent_set => try formatSet(v, mode, writer, interner),
-                .sorted_map, .sorted_set => try formatSorted(v, mode, writer, interner),
+                .persistent_set => {
+                    var it = champ_mod.setIter(v);
+                    try formatItems(&it, "#{", "}", .item, mode, writer, interner);
+                },
+                .sorted_map => {
+                    var it = sorted_mod.Iter.init(v, true);
+                    try formatItems(&it, "{", "}", .entry, mode, writer, interner);
+                },
+                .sorted_set => {
+                    var it = sorted_mod.Iter.init(v, true);
+                    try formatItems(&it, "#{", "}", .key, mode, writer, interner);
+                },
                 else => try formatRecord(v, mode, writer, interner),
             }
         },
@@ -157,7 +151,7 @@ pub fn format(
                 protocol_mod.protocolFnMethodNameId(v),
             },
         ),
-        .durable_ref => try formatDurableRef(v, writer, interner),
+        .durable_ref => try formatDurableRef(v, writer),
         .db_connection => try writer.writeAll("#<db-connection>"),
         // The path as a string literal, escaped, in both modes.
         .nextomic_conn => {
@@ -267,24 +261,25 @@ fn formatString(bytes: []const u8, mode: FormatMode, writer: *std.Io.Writer) Err
     // could; refusing to emit invalid source is the safer policy.
     if (!std.unicode.utf8ValidateSlice(bytes)) return error.Utf8Error;
     try writer.writeByte('"');
-    var i: usize = 0;
-    while (i < bytes.len) : (i += 1) {
-        const b = bytes[i];
-        switch (b) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\t' => try writer.writeAll("\\t"),
-            '\r' => try writer.writeAll("\\r"),
-            // ASCII controls 0x00..0x1F (minus the named four above)
-            // + DEL (0x7F): hex-escape so the output is valid nexis
-            // source per the `\u{HEX}` escape (PLAN §23 #26).
-            0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F, 0x7F => {
-                try writer.print("\\u{{{X}}}", .{b});
-            },
-            else => try writer.writeByte(b),
-        }
+    // Each run of bytes that need no escape goes out in one write.
+    var run: usize = 0;
+    for (bytes, 0..) |b, i| {
+        const named: ?[]const u8 = switch (b) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\t' => "\\t",
+            '\r' => "\\r",
+            else => null,
+        };
+        if (named == null and b >= 0x20 and b != 0x7F) continue;
+        try writer.writeAll(bytes[run..i]);
+        run = i + 1;
+        // The other ASCII controls and DEL as the reader's `\u{HEX}`
+        // escape (PLAN §23 #26).
+        if (named) |e| try writer.writeAll(e) else try writer.print("\\u{{{X}}}", .{b});
     }
+    try writer.writeAll(bytes[run..]);
     try writer.writeByte('"');
 }
 
@@ -323,21 +318,38 @@ fn formatChar(scalar: u21, mode: FormatMode, writer: *std.Io.Writer) Error!void 
     }
 }
 
-fn formatList(
-    v: Value,
+/// The items of `it` between `open` and `close`: each value
+/// (`.item`), each entry as `k v` with entries separated by `, `
+/// (`.entry`), or each entry's key (`.key`, a sorted set's).
+fn formatItems(
+    it: anytype,
+    open: []const u8,
+    close: []const u8,
+    comptime shape: enum { item, entry, key },
     mode: FormatMode,
     writer: *std.Io.Writer,
     interner: ?*const intern_mod.Interner,
 ) Error!void {
-    try writer.writeByte('(');
-    var it = list_mod.Cursor.init(v);
+    try writer.writeAll(open);
     var first = true;
-    while (it.next()) |x| {
-        if (!first) try writer.writeByte(' ');
-        first = false;
-        try format(x, mode, writer, interner);
+    while (it.next()) |x| : (first = false) {
+        if (!first) try writer.writeAll(if (shape == .entry) ", " else " ");
+        switch (shape) {
+            .item => try format(x, mode, writer, interner),
+            .key => try format(x.key, mode, writer, interner),
+            .entry => {
+                try format(x.key, mode, writer, interner);
+                try writer.writeByte(' ');
+                try format(x.value, mode, writer, interner);
+            },
+        }
     }
-    try writer.writeByte(')');
+    try writer.writeAll(close);
+}
+
+fn formatMap(v: Value, mode: FormatMode, writer: *std.Io.Writer, interner: ?*const intern_mod.Interner) Error!void {
+    var it = champ_mod.mapIter(v);
+    try formatItems(&it, "{", "}", .entry, mode, writer, interner);
 }
 
 /// A lazy seq prints as a list of its elements. Up to a block whose
@@ -386,41 +398,6 @@ fn formatLazy(
     try writer.writeByte(')');
 }
 
-fn formatVector(
-    v: Value,
-    mode: FormatMode,
-    writer: *std.Io.Writer,
-    interner: ?*const intern_mod.Interner,
-) Error!void {
-    try writer.writeByte('[');
-    var it = vector_mod.Cursor.init(v);
-    var first = true;
-    while (it.next()) |x| : (first = false) {
-        if (!first) try writer.writeByte(' ');
-        try format(x, mode, writer, interner);
-    }
-    try writer.writeByte(']');
-}
-
-fn formatMap(
-    v: Value,
-    mode: FormatMode,
-    writer: *std.Io.Writer,
-    interner: ?*const intern_mod.Interner,
-) Error!void {
-    try writer.writeByte('{');
-    var it = champ_mod.mapIter(v);
-    var first = true;
-    while (it.next()) |entry| {
-        if (!first) try writer.writeAll(", ");
-        first = false;
-        try format(entry.key, mode, writer, interner);
-        try writer.writeByte(' ');
-        try format(entry.value, mode, writer, interner);
-    }
-    try writer.writeByte('}');
-}
-
 /// `#ns.Type{:k v, ...}`, as Clojure prints a record, when the
 /// interner names the type (`Interner.nameRecordType`); the opaque
 /// `#<record type-id=N>` otherwise.
@@ -438,52 +415,7 @@ fn formatRecord(
     } else try writer.print("#<record type-id={d}>", .{type_id});
 }
 
-fn formatSet(
-    v: Value,
-    mode: FormatMode,
-    writer: *std.Io.Writer,
-    interner: ?*const intern_mod.Interner,
-) Error!void {
-    try writer.writeAll("#{");
-    var it = champ_mod.setIter(v);
-    var first = true;
-    while (it.next()) |elem| {
-        if (!first) try writer.writeByte(' ');
-        first = false;
-        try format(elem, mode, writer, interner);
-    }
-    try writer.writeByte('}');
-}
-
-/// A sorted map as `{k v, k v}` and a sorted set as `#{a b}`, in
-/// order.
-fn formatSorted(
-    v: Value,
-    mode: FormatMode,
-    writer: *std.Io.Writer,
-    interner: ?*const intern_mod.Interner,
-) Error!void {
-    const is_map = v.kind() == .sorted_map;
-    try writer.writeAll(if (is_map) "{" else "#{");
-    var it = sorted_mod.Iter.init(v, true);
-    var first = true;
-    while (it.next()) |e| {
-        if (!first) try writer.writeAll(if (is_map) ", " else " ");
-        first = false;
-        try format(e.key, mode, writer, interner);
-        if (is_map) {
-            try writer.writeByte(' ');
-            try format(e.value, mode, writer, interner);
-        }
-    }
-    try writer.writeByte('}');
-}
-
-fn formatDurableRef(
-    v: Value,
-    writer: *std.Io.Writer,
-    _: ?*const intern_mod.Interner,
-) Error!void {
+fn formatDurableRef(v: Value, writer: *std.Io.Writer) Error!void {
     // The tree name and the key bytes may hold any byte, so neither
     // is printed raw: a control character, a space, `>` or invalid
     // UTF-8 would break the one-line opaque token. The key is hex;
@@ -503,14 +435,18 @@ fn formatDurableRef(
 // Inline tests
 // =============================================================================
 
-/// Test-only convenience: drive `format` into a fresh
-/// `Writer.Allocating` and return the bytes for direct comparison.
-/// Caller owns the slice (free via `testing.allocator`).
+/// `v` printed in `mode`, as an owned slice of `testing.allocator`.
 fn formatForTest(v: Value, mode: FormatMode, interner: ?*const intern_mod.Interner) ![]u8 {
     var w = std.Io.Writer.Allocating.init(testing.allocator);
     errdefer w.deinit();
     try format(v, mode, &w.writer, interner);
     return try w.toOwnedSlice();
+}
+
+fn expectFormat(v: Value, mode: FormatMode, interner: ?*const intern_mod.Interner, want: []const u8) !void {
+    const got = try formatForTest(v, mode, interner);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings(want, got);
 }
 
 /// A realized block whose seq is `items`, as cons cells or one chunk,
@@ -531,14 +467,13 @@ fn cycleForTest(heap: *heap_mod.Heap, items: []const Value, chunked: bool) !Valu
     return head;
 }
 
+fn fx(n: i64) Value {
+    return value_mod.fromFixnum(n).?;
+}
+
 test "a chunked cons prints its offset onward; an unrealized block, or a cell met again, prints as ..." {
     var heap = heap_mod.Heap.init(std.testing.allocator);
     defer heap.deinit();
-    const fx = struct {
-        fn f(n: i64) Value {
-            return value_mod.fromFixnum(n).?;
-        }
-    }.f;
     const cc = try lazy_mod.chunkedOf(&heap, &.{ fx(1), fx(2), fx(3) }, try list_mod.fromSlice(&heap, &.{fx(4)}));
     const pending = try lazy_mod.unrealized(&heap, 0, &.{value_mod.nilValue()});
     const cases = [_]struct { v: Value, expect: []const u8 }{
@@ -552,38 +487,21 @@ test "a chunked cons prints its offset onward; an unrealized block, or a cell me
         .{ .v = try cycleForTest(&heap, &.{ fx(1), fx(2), fx(3) }, true), .expect = "(1 2 3 ...)" },
         .{ .v = try lazy_mod.cons(&heap, fx(0), try cycleForTest(&heap, &.{ fx(1), fx(2), fx(3) }, false)), .expect = "(0 1 2 3 1 2 ...)" },
     };
-    for (cases) |c| {
-        const got = try formatForTest(c.v, .readable, null);
-        defer testing.allocator.free(got);
-        try testing.expectEqualStrings(c.expect, got);
-    }
+    for (cases) |c| try expectFormat(c.v, .readable, null, c.expect);
 }
 
-test "display: scalar Values" {
+test "scalars and bignums print the same in both modes" {
+    var heap = heap_mod.Heap.init(testing.allocator);
+    defer heap.deinit();
     const cases = [_]struct { v: Value, expect: []const u8 }{
         .{ .v = value_mod.nilValue(), .expect = "nil" },
         .{ .v = value_mod.fromBool(true), .expect = "true" },
         .{ .v = value_mod.fromBool(false), .expect = "false" },
-        .{ .v = value_mod.fromFixnum(42).?, .expect = "42" },
-        .{ .v = value_mod.fromFixnum(-7).?, .expect = "-7" },
+        .{ .v = fx(42), .expect = "42" },
+        .{ .v = fx(-7), .expect = "-7" },
+        .{ .v = (try bignum_mod.parseDecimal(&heap, "-340282366920938463463374607431768211456")).?, .expect = "-340282366920938463463374607431768211456" },
     };
-    for (cases) |c| {
-        const got = try formatForTest(c.v, .display, null);
-        defer testing.allocator.free(got);
-        try testing.expectEqualStrings(c.expect, got);
-    }
-}
-
-test "display and readable: a bignum prints its decimal value with no suffix" {
-    var heap = heap_mod.Heap.init(std.testing.allocator);
-    defer heap.deinit();
-    const v = (try bignum_mod.parseDecimal(&heap, "-340282366920938463463374607431768211456")).?;
-    try std.testing.expect(v.kind() == .bignum);
-    for ([_]FormatMode{ .display, .readable }) |mode| {
-        const got = try formatForTest(v, mode, null);
-        defer testing.allocator.free(got);
-        try testing.expectEqualStrings("-340282366920938463463374607431768211456", got);
-    }
+    for (cases) |c| for ([_]FormatMode{ .display, .readable }) |mode| try expectFormat(c.v, mode, null, c.expect);
 }
 
 test "floats: NaN and the infinities print as the reader reads them in either mode; formatFloatJava is Java's spelling" {
@@ -600,11 +518,7 @@ test "floats: NaN and the infinities print as the reader reads them in either mo
         .{ .f = 1.7976931348623157e308, .printed = "1.7976931348623157E308", .java = "1.7976931348623157E308" },
     };
     for (cases) |c| {
-        for ([_]FormatMode{ .display, .readable }) |mode| {
-            const got = try formatForTest(value_mod.fromFloat(c.f), mode, null);
-            defer testing.allocator.free(got);
-            try testing.expectEqualStrings(c.printed, got);
-        }
+        for ([_]FormatMode{ .display, .readable }) |mode| try expectFormat(value_mod.fromFloat(c.f), mode, null, c.printed);
         var buf: [32]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
         try formatFloatJava(c.f, &w);
@@ -612,124 +526,59 @@ test "floats: NaN and the infinities print as the reader reads them in either mo
     }
 }
 
-test "display: keyword + symbol via interner" {
+test "strings: display writes the bytes; readable quotes, escapes, hex-escapes the other controls and refuses malformed UTF-8" {
+    var heap = heap_mod.Heap.init(testing.allocator);
+    defer heap.deinit();
     var it = intern_mod.Interner.init(testing.allocator);
     defer it.deinit();
-    const kw = try it.internKeywordValue("hello");
-    const sym = try it.internSymbolValue("world");
-
-    const got_kw = try formatForTest(kw, .display, &it);
-    defer testing.allocator.free(got_kw);
-    try testing.expectEqualStrings(":hello", got_kw);
-
-    const got_sym = try formatForTest(sym, .display, &it);
-    defer testing.allocator.free(got_sym);
-    try testing.expectEqualStrings("world", got_sym);
-}
-
-test "display: strings unquoted; readable: strings quoted + escaped" {
-    var heap = heap_mod.Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const s = try string_mod.fromBytes(&heap, "a\"b\nc\\d");
-
-    const got_d = try formatForTest(s, .display, null);
-    defer testing.allocator.free(got_d);
-    try testing.expectEqualStrings("a\"b\nc\\d", got_d);
-
-    const got_r = try formatForTest(s, .readable, null);
-    defer testing.allocator.free(got_r);
-    try testing.expectEqualStrings("\"a\\\"b\\nc\\\\d\"", got_r);
-}
-
-test "readable: control characters hex-escape; DEL hex-escapes" {
-    var heap = heap_mod.Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    // 0x01 (control-A), 0x7F (DEL), and 0x1F (unit separator).
-    const s = try string_mod.fromBytes(&heap, &[_]u8{ 0x01, 0x7F, 0x1F });
-
-    const got = try formatForTest(s, .readable, null);
-    defer testing.allocator.free(got);
-    try testing.expectEqualStrings("\"\\u{1}\\u{7F}\\u{1F}\"", got);
-}
-
-test "readable: malformed UTF-8 string surfaces Utf8Error" {
-    var heap = heap_mod.Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    // 0xC3 is a UTF-8 leading byte for a 2-byte sequence; alone
-    // it's invalid.
-    const s = try string_mod.fromBytes(&heap, &[_]u8{0xC3});
-
+    const s = try string_mod.fromBytes(&heap, "a\"b\nc\\d\té");
+    try expectFormat(s, .display, null, "a\"b\nc\\d\té");
+    try expectFormat(s, .readable, null, "\"a\\\"b\\nc\\\\d\\té\"");
+    try expectFormat(try string_mod.fromBytes(&heap, &.{ 0x01, 0x7F, 0x1F, '\r' }), .readable, null, "\"\\u{1}\\u{7F}\\u{1F}\\r\"");
+    try expectFormat(try string_mod.fromBytes(&heap, ""), .readable, null, "\"\"");
+    try expectFormat(try it.internKeywordValue("hello"), .display, &it, ":hello");
+    try expectFormat(try it.internSymbolValue("world"), .readable, &it, "world");
     var w = std.Io.Writer.Allocating.init(testing.allocator);
     defer w.deinit();
-    try testing.expectError(error.Utf8Error, format(s, .readable, &w.writer, null));
+    try testing.expectError(error.Utf8Error, format(try string_mod.fromBytes(&heap, &.{0xC3}), .readable, &w.writer, null));
 }
 
-test "display: char as UTF-8 bytes; readable: named token or \\x or hex" {
-    const a_d = try formatForTest(value_mod.fromChar('a').?, .display, null);
-    defer testing.allocator.free(a_d);
-    try testing.expectEqualStrings("a", a_d);
-
-    const a_r = try formatForTest(value_mod.fromChar('a').?, .readable, null);
-    defer testing.allocator.free(a_r);
-    try testing.expectEqualStrings("\\a", a_r);
-
-    const sp_d = try formatForTest(value_mod.fromChar(' ').?, .display, null);
-    defer testing.allocator.free(sp_d);
-    try testing.expectEqualStrings(" ", sp_d);
-
-    const sp_r = try formatForTest(value_mod.fromChar(' ').?, .readable, null);
-    defer testing.allocator.free(sp_r);
-    try testing.expectEqualStrings("\\space", sp_r);
-
-    const nl_r = try formatForTest(value_mod.fromChar('\n').?, .readable, null);
-    defer testing.allocator.free(nl_r);
-    try testing.expectEqualStrings("\\newline", nl_r);
-
-    const nul_r = try formatForTest(value_mod.fromChar(0).?, .readable, null);
-    defer testing.allocator.free(nul_r);
-    try testing.expectEqualStrings("\\u{0}", nul_r);
-
-    const e_d = try formatForTest(value_mod.fromChar(0xE9).?, .display, null);
-    defer testing.allocator.free(e_d);
-    try testing.expectEqualStrings("é", e_d);
-
-    // Past ASCII a char prints as itself, as Clojure's `\é`.
-    const e_r = try formatForTest(value_mod.fromChar(0xE9).?, .readable, null);
-    defer testing.allocator.free(e_r);
-    try testing.expectEqualStrings("\\é", e_r);
-
-    const crab_r = try formatForTest(value_mod.fromChar(0x1F980).?, .readable, null);
-    defer testing.allocator.free(crab_r);
-    try testing.expectEqualStrings("\\\u{1F980}", crab_r);
-
-    const del_r = try formatForTest(value_mod.fromChar(0x7F).?, .readable, null);
-    defer testing.allocator.free(del_r);
-    try testing.expectEqualStrings("\\u{7F}", del_r);
+test "chars: display writes the UTF-8; readable a named token, \\x, or a hex escape" {
+    const cases = [_]struct { c: u21, display: []const u8, readable: []const u8 }{
+        .{ .c = 'a', .display = "a", .readable = "\\a" },
+        .{ .c = ' ', .display = " ", .readable = "\\space" },
+        .{ .c = '\n', .display = "\n", .readable = "\\newline" },
+        .{ .c = 0, .display = "\x00", .readable = "\\u{0}" },
+        .{ .c = 0x7F, .display = "\x7F", .readable = "\\u{7F}" },
+        .{ .c = 0xE9, .display = "é", .readable = "\\é" },
+        .{ .c = 0x1F980, .display = "\u{1F980}", .readable = "\\\u{1F980}" },
+    };
+    for (cases) |c| {
+        try expectFormat(value_mod.fromChar(c.c).?, .display, null, c.display);
+        try expectFormat(value_mod.fromChar(c.c).?, .readable, null, c.readable);
+    }
 }
 
-test "collections: list / vector display + readable round-trip" {
+test "collections: a list, vector, set and map in both modes" {
     var heap = heap_mod.Heap.init(testing.allocator);
     defer heap.deinit();
     var it = intern_mod.Interner.init(testing.allocator);
     defer it.deinit();
-
-    // [1 :a "x"] in both modes.
-    const a = value_mod.fromFixnum(1).?;
-    const b = try it.internKeywordValue("a");
-    const c = try string_mod.fromBytes(&heap, "x");
-    const elems = [_]Value{ a, b, c };
+    const elems = [_]Value{ fx(1), try it.internKeywordValue("a"), try string_mod.fromBytes(&heap, "x") };
     const vec = try vector_mod.fromSlice(&heap, &elems);
-
-    const got_d = try formatForTest(vec, .display, &it);
-    defer testing.allocator.free(got_d);
-    try testing.expectEqualStrings("[1 :a x]", got_d);
-
-    const got_r = try formatForTest(vec, .readable, &it);
-    defer testing.allocator.free(got_r);
-    try testing.expectEqualStrings("[1 :a \"x\"]", got_r);
+    try expectFormat(vec, .display, &it, "[1 :a x]");
+    try expectFormat(vec, .readable, &it, "[1 :a \"x\"]");
+    try expectFormat(try list_mod.fromSlice(&heap, &elems), .readable, &it, "(1 :a \"x\")");
+    try expectFormat(try list_mod.fromSlice(&heap, &.{}), .readable, &it, "()");
+    var set = try champ_mod.setEmpty(&heap);
+    set = try champ_mod.setConj(&heap, set, fx(1), &dispatch.hashValue, &dispatch.equal);
+    set = try champ_mod.setConj(&heap, set, fx(2), &dispatch.hashValue, &dispatch.equal);
+    try expectFormat(set, .readable, &it, "#{1 2}");
+    var map = try champ_mod.mapEmpty(&heap);
+    map = try champ_mod.mapAssoc(&heap, map, elems[1], elems[2], &dispatch.hashValue, &dispatch.equal);
+    map = try champ_mod.mapAssoc(&heap, map, fx(1), vec, &dispatch.hashValue, &dispatch.equal);
+    try expectFormat(map, .readable, &it, "{:a \"x\", 1 [1 :a \"x\"]}");
+    try expectFormat(map, .display, &it, "{:a x, 1 [1 :a x]}");
 }
 
 test "records: #ns.Type{...} in both modes once the interner names the type; opaque otherwise" {
@@ -738,37 +587,20 @@ test "records: #ns.Type{...} in both modes once the interner names the type; opa
     var it = intern_mod.Interner.init(testing.allocator);
     defer it.deinit();
     var fields = try champ_mod.mapEmpty(&heap);
-    fields = try champ_mod.mapAssoc(&heap, fields, try it.internKeywordValue("x"), value_mod.fromFixnum(1).?, &dispatch.hashValue, &dispatch.equal);
+    fields = try champ_mod.mapAssoc(&heap, fields, try it.internKeywordValue("x"), fx(1), &dispatch.hashValue, &dispatch.equal);
     fields = try champ_mod.mapAssoc(&heap, fields, try it.internKeywordValue("y"), try string_mod.fromBytes(&heap, "a"), &dispatch.hashValue, &dispatch.equal);
     const r = try record_mod.make(&heap, 0, fields);
-
-    const opaque_form = try formatForTest(r, .readable, &it);
-    defer testing.allocator.free(opaque_form);
-    try testing.expectEqualStrings("#<record type-id=0>", opaque_form);
-
+    try expectFormat(r, .readable, &it, "#<record type-id=0>");
     try it.nameRecordType(0, "user", "P");
-    const readable = try formatForTest(r, .readable, &it);
-    defer testing.allocator.free(readable);
-    try testing.expectEqualStrings("#user.P{:x 1, :y \"a\"}", readable);
-    const display = try formatForTest(r, .display, &it);
-    defer testing.allocator.free(display);
-    try testing.expectEqualStrings("#user.P{:x 1, :y a}", display);
+    try expectFormat(r, .readable, &it, "#user.P{:x 1, :y \"a\"}");
+    try expectFormat(r, .display, &it, "#user.P{:x 1, :y a}");
 }
 
 test "a durable ref prints its tree's odd bytes escaped and its key in hex" {
     var heap = heap_mod.Heap.init(testing.allocator);
     defer heap.deinit();
-    const plain = try db_mod.refFromBytes(&heap, 1, "users", "k1");
-    const odd = try db_mod.refFromBytes(&heap, 1, "a b>\\\n\u{e9}", "\x00>");
-    const cases = [_]struct { v: Value, expect: []const u8 }{
-        .{ .v = plain, .expect = "#<durable-ref :users hex:6B31>" },
-        .{ .v = odd, .expect = "#<durable-ref :a\\x20b\\x3E\\x5C\\x0A\\xC3\\xA9 hex:003E>" },
-    };
-    for (cases) |c| {
-        const got = try formatForTest(c.v, .readable, null);
-        defer testing.allocator.free(got);
-        try testing.expectEqualStrings(c.expect, got);
-    }
+    try expectFormat(try db_mod.refFromBytes(&heap, 1, "users", "k1"), .readable, null, "#<durable-ref :users hex:6B31>");
+    try expectFormat(try db_mod.refFromBytes(&heap, 1, "a b>\\\n\u{e9}", "\x00>"), .readable, null, "#<durable-ref :a\\x20b\\x3E\\x5C\\x0A\\xC3\\xA9 hex:003E>");
 }
 
 test "a pattern prints as #\"...\" with Clojure's escaping in both modes; a matcher as #<matcher ...>" {
@@ -783,17 +615,10 @@ test "a pattern prints as #\"...\" with Clojure's escaping in both modes; a matc
     };
     for (cases) |c| {
         const v = (try regex_mod.make(&heap, testing.allocator, c.source)).ok;
-        for ([_]FormatMode{ .display, .readable }) |mode| {
-            const got = try formatForTest(v, mode, null);
-            defer testing.allocator.free(got);
-            try testing.expectEqualStrings(c.expect, got);
-        }
+        for ([_]FormatMode{ .display, .readable }) |mode| try expectFormat(v, mode, null, c.expect);
     }
     const p = (try regex_mod.make(&heap, testing.allocator, "x\"")).ok;
-    const m = try regex_mod.makeMatcher(&heap, p, try string_mod.fromBytes(&heap, "x"));
-    const got = try formatForTest(m, .readable, null);
-    defer testing.allocator.free(got);
-    try testing.expectEqualStrings("#<matcher #\"x\\\"\">", got);
+    try expectFormat(try regex_mod.makeMatcher(&heap, p, try string_mod.fromBytes(&heap, "x")), .readable, null, "#<matcher #\"x\\\"\">");
 }
 
 test "a collection nested past the stack guard prints #<too deep> and counts an overflow" {
