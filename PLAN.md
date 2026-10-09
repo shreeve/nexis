@@ -947,3 +947,22 @@ entry stating the decision and its rationale.
   and on ad-hoc hierarchies, which protocols cannot express, and the
   owner's goal is Clojure semantics. `docs/STDLIB.md` §9 is the
   authority; `CLOJURE-REVIEW.md` and `docs/MACROEXPAND.md` carry it.
+
+- **2026-10-08 — Nextomic store format 3 (§15.11 NX-4; supersedes
+  the value and history clauses of the 2026-09-18 index-layout
+  entry).** The four current indexes keep every current fact; the four
+  history indexes (`nx/*-h`) hold only rows that are no longer
+  current, a retired assertion beside the retraction that retired it,
+  and every time view (`as-of`, `since`, `history`) reads the current
+  and history trees merged in fact order. A current value is its `t`
+  as a LEB128 followed by any out-of-line payload, stored once. Keys
+  carry entity ids in a class-and-length header form and attribute and
+  keyword ids as ordered varints, both prefix-free and order-keeping;
+  `nx/txlog` entries are a compact binary encoding keyed by an ordered
+  varint `t`. A store records its format in `nx/sys`, and `connect`
+  refuses any format but 3 as `:db/corrupted`, naming both; a store is
+  recreated or re-imported, never migrated (`docs/DB.md` §1). Reason:
+  the history trees repeated every current fact, and fixed-width ids
+  padded every key; the §3.11 load goes from 144 MB to 51 MB with
+  identical query results (`docs/PERF.md` §3.36). `docs/NEXTOMIC.md`
+  §1–§2 are the authority.
