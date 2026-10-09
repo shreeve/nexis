@@ -181,7 +181,10 @@ nexis: test/golden/cli/divide-by-zero.nx:5:3: runtime error: DivideByZero
   argument, got 0`). An uncaught throw is `UncaughtThrow` followed by
   the thrown value as `pr-str` prints it (`runtime error:
   UncaughtThrow {:error :negative, :value -3}`, `uncaught-throw.err`,
-  whose `throw` spans two lines and is underlined on its first). An
+  whose `throw` spans two lines and is underlined on its first); an
+  error map a handler rethrew is printed without the place keys it
+  carries (`:fn`, `:file`, `:line`, `:column`; VM.md §13), which the
+  header and the trace show (`VM.withoutPlace`). An
   error or a thrown value that leaves through a `finally`, a `catch`
   no clause of which matches, or a `catch` that throws it again is
   reported where it was raised, with its detail and the frames it left,

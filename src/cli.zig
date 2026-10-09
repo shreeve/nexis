@@ -497,8 +497,10 @@ const Runtime = struct {
         try label.writer.print("runtime error: {s}", .{@errorName(err)});
         if (rt.v.error_detail.len > 0) try label.writer.print(": {s}", .{rt.v.error_detail});
         if (err == vm.VmError.UncaughtThrow) if (rt.v.unhandled_throw) |payload| {
+            // An error map a handler rethrew carries the place the
+            // caret and the trace show.
             try label.writer.writeAll(" ");
-            format_mod.format(payload, .readable, &label.writer, rt.v.ensureInterner()) catch try label.writer.writeAll("#<unprintable>");
+            format_mod.format(rt.v.withoutPlace(payload), .readable, &label.writer, rt.v.ensureInterner()) catch try label.writer.writeAll("#<unprintable>");
         };
 
         const trace = rt.v.error_trace.items;

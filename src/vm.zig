@@ -4404,6 +4404,24 @@ pub const VM = struct {
         return self.putKey(m, "column", value_mod.fromFixnum(place.col).?);
     }
 
+    /// `v` without the place keys `addPlace` gives an error map, for
+    /// a report that shows the place itself; `v` as it is when it is
+    /// not such a map (one with `:error`, `:fn` and `:file`) or memory
+    /// is exhausted.
+    pub fn withoutPlace(self: *VM, v: Value) Value {
+        if (v.kind() != .persistent_map) return v;
+        for ([_][]const u8{ "error", "fn", "file" }) |key| {
+            const k = self.ensureInterner().internKeywordValue(key) catch return v;
+            if (champ_mod.mapGet(v, k, &dispatch_mod.hashValue, &dispatch_mod.equal) == .absent) return v;
+        }
+        var m = v;
+        for ([_][]const u8{ "fn", "file", "line", "column" }) |key| {
+            const k = self.ensureInterner().internKeywordValue(key) catch return v;
+            m = champ_mod.mapDissoc(self.ensureHeap(), m, k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch return v;
+        }
+        return m;
+    }
+
     /// `m` with the keyword named `key` mapped to `v`.
     fn putKey(self: *VM, m: Value, key: []const u8, v: Value) !Value {
         const k = try self.ensureInterner().internKeywordValue(key);
@@ -7997,6 +8015,24 @@ test "VM error value: a map of tag, message and place; the bare keyword when mem
     try testing.expectEqualStrings("index-out-of-bounds", try caughtTag(&vm, m));
     const message = try lookup(m, try vm.ensureInterner().internKeywordValue("message"), value_mod.nilValue());
     try testing.expectEqualStrings("index out of bounds", string_mod.asBytes(message));
+}
+
+test "VM error value: a report drops the place a rethrown error map carries, and nothing else" {
+    var vm = try VM.init(testing.allocator, &VM.idle_routine);
+    defer vm.deinit();
+    const info = SourceInfo{ .path = "t.nx", .text = "(f)" };
+    const routine = Routine{ .code = &.{}, .consts = &.{}, .slot_count = 1, .name = "f", .source = &info, .spans = &.{.{ .pc = 0, .span = .{ .pos = 0, .len = 3 } }} };
+    const tag = try vm.ensureInterner().internKeywordValue("kind-mismatch");
+    const placed = vm.errorValue(tag, "", .{ .name = "f", .pc = 0, .span = routine.spanAt(0), .source = &info });
+    try testing.expectEqual(@as(usize, 6), champ_mod.mapCount(placed));
+    const bare = vm.withoutPlace(placed);
+    try testing.expectEqual(@as(usize, 2), champ_mod.mapCount(bare));
+    try testing.expectEqualStrings("kind-mismatch", try caughtTag(&vm, bare));
+    // A map of the program's own with a :line of its own keeps it.
+    const line_key = try vm.ensureInterner().internKeywordValue("line");
+    const own = try vm.putKey(try vm.putKey(try champ_mod.mapEmpty(vm.ensureHeap()), "error", tag), "line", fx(3));
+    try testing.expect(vm.withoutPlace(own).identicalTo(own));
+    try testing.expectEqual(@as(i64, 3), (try lookup(own, line_key, value_mod.nilValue())).asFixnum());
 }
 
 test "VM ctrl: a try's finally body runs after its catch; try-enter names a try of the routine" {
