@@ -1,36 +1,12 @@
-//! coll/champ.zig — persistent map + set heap kinds.
+//! coll/champ.zig — the persistent hash map and hash set heap kinds.
 //!
-//! Authoritative spec: `docs/CHAMP.md`. Semantic framing:
-//! `docs/SEMANTICS.md` §2.6 (maps and sets: the own-kind structural rule)
-//! and §3.2–§3.3 (map entry-hash formula; the hash domains are the
-//! kind numbers 18 and 19). Physical storage: `docs/HEAP.md`. Representation
-//! choices: `docs/VALUE.md` §2.2.
-//!
-//! One trie implementation, `Trie(P, kind)`, serves both kinds: a map's
-//! payload is an `Entry` (key + value, 32 bytes), a set's a bare key
-//! `Value` (16 bytes). The public `map*` / `set*` names are the
-//! operations of `MapTrie` and `SetTrie`.
-//!
-//! ## Representation (CHAMP.md §3-§4)
-//!
-//!   - subkind 0 = array-map / array-set: up to 8 payloads inline,
-//!     in association order.
-//!   - subkind 1 = CHAMP root: count + pointer to the root interior.
-//!
-//! Interior and collision nodes are internal: no Value ever points at
-//! one, and no header records which one a node is. Every walk derives
-//! it from the shift it reached the node at (a node reached past
-//! `MAX_TRIE_SHIFT` is a collision node).
-//!
-//! ## Dispatch plumbing (one-way terminal)
-//!
-//! This module does not import `dispatch.zig` (CHAMP.md §9). Every
-//! operation that hashes or compares arbitrary Values takes callbacks
-//! (`elementHash: *const fn (Value) u64`, `elementEq: *const fn
-//! (Value, Value) bool`); the dispatcher passes `&dispatch.hashValue`
-//! and `&dispatch.equal`.
-//!
-//! Transients are the separate `src/coll/transient.zig` module.
+//! Authoritative spec: `docs/CHAMP.md` (§3-§4 the representation, §9
+//! the callbacks). One trie, `Trie(P, kind)`, serves both kinds: a
+//! map's payload is an `Entry`, a set's a bare key `Value`; the public
+//! `map*` / `set*` names are the operations of `MapTrie` and `SetTrie`.
+//! No header records whether an internal node is an interior or a
+//! collision node: a walk derives it from the shift it reached it at.
+//! Never imports dispatch: hash and equality arrive as callbacks.
 
 const std = @import("std");
 const builtin = @import("builtin");

@@ -1,29 +1,10 @@
-//! coll/list.zig — immutable list heap kind: cons cells and vector views.
+//! coll/list.zig — the immutable list heap kind: cons cells and
+//! vector views.
 //!
-//! Authoritative spec: `docs/LIST.md`. Physical storage: `src/heap.zig`.
-//! Semantics: `docs/SEMANTICS.md` §2.6 (sequential equality category)
-//! and §3.2 (sequential-domain hash mixing; the domain mixer is chosen
-//! by equality category).
-//!
-//! Subkinds (LIST.md §1):
-//!   - 0 = cons  — body is `{ head: Value, tail: Value }` = 32 bytes;
-//!         tail is always kind .list (proper lists only).
-//!   - 1 = empty — body size 0; the Value alone encodes emptiness.
-//!   - 2 = view  — body is one vector Value = 16 bytes; the Value's
-//!         tag bits 32..63 hold the offset of its first element. The
-//!         elements of a vector from an offset on, so `seq`, `rest`
-//!         and `next` of a vector are O(1): `tail` of a view is the
-//!         same block at the next offset and allocates nothing. A
-//!         view carrying metadata holds, instead of the vector, a
-//!         view Value of the metadata-free block its rests share.
-//!
-//! Every reader goes through `isEmpty` / `head` / `tail` / `count` /
-//! `drop` / `Cursor`; only this file knows the bodies.
-//!
-//! Dispatch plumbing: `hashSeq` and `equalSeq` take function-pointer
-//! callbacks (`elementHash`, `elementEq`) for the inner operations so
-//! list.zig never imports `dispatch`. The dispatcher passes
-//! `&dispatch.hashValue` and `&dispatch.equal` at the kind switch.
+//! Authoritative spec: `docs/LIST.md` (§1 the subkinds). Only this file
+//! knows the bodies: every reader goes through `isEmpty`, `head`,
+//! `tail`, `count`, `drop` and `Cursor`. Never imports dispatch: hash
+//! and equality arrive as callbacks.
 
 const std = @import("std");
 const builtin = @import("builtin");
