@@ -436,6 +436,26 @@ pub const Cursor = struct {
     }
 };
 
+/// The entries of a hash map or a sorted map, in its order.
+pub const MapEntries = union(enum) {
+    hash: champ.MapIter,
+    sorted: Iter,
+
+    pub fn init(m: Value) MapEntries {
+        return if (m.kind() == .sorted_map) .{ .sorted = .init(m, true) } else .{ .hash = champ.mapIter(m) };
+    }
+
+    pub fn next(self: *MapEntries) ?Entry {
+        switch (self.*) {
+            .hash => |*it| {
+                const e = it.next() orelse return null;
+                return .{ .key = e.key, .value = e.value };
+            },
+            .sorted => |*it| return it.next(),
+        }
+    }
+};
+
 // =============================================================================
 // The natural order (SORTED.md §6): Clojure's `compare`
 // =============================================================================
