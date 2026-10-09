@@ -434,10 +434,17 @@ fn dispatchList(ctx: *ExpandContext, list_form: *const Form, items: []const *For
 }
 
 /// The namespace name `ns_prefix` stands for: the target of an
-/// alias registered in the current namespace, else itself.
+/// alias registered in the current namespace, else itself, either
+/// one through `canonicalNs`.
 fn aliasTarget(ctx: *ExpandContext, ns_prefix: []const u8) []const u8 {
-    const cur = ctx.namespace orelse return ns_prefix;
-    return cur.lookupAlias(ns_prefix) orelse ns_prefix;
+    const cur = ctx.namespace orelse return canonicalNs(ns_prefix);
+    return canonicalNs(cur.lookupAlias(ns_prefix) orelse ns_prefix);
+}
+
+/// The namespace `name` names: `clojure.core` is a permanent name for
+/// `nexis.core` (STDLIB.md §1), any other name is itself.
+pub fn canonicalNs(name: []const u8) []const u8 {
+    return if (std.mem.eql(u8, name, "clojure.core")) "nexis.core" else name;
 }
 
 // =============================================================================
@@ -1032,7 +1039,7 @@ fn requireSpec(ctx: *ExpandContext, quoted: *const Form, step: Step) ExpandError
     };
     const name_form = if (spec.datum == .vector) spec.datum.vector[0] else spec;
     if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) return ctx.fail(name_form.origin, "require: the namespace must be an unqualified symbol, not {s}", .{describeForm(name_form)});
-    const ns_name = name_form.datum.symbol.name;
+    const ns_name = canonicalNs(name_form.datum.symbol.name);
     if (opts.len % 2 != 0) return ctx.fail(spec.origin, "require: options come in pairs", .{});
     var as_alias: ?[]const u8 = null;
     var load = true;

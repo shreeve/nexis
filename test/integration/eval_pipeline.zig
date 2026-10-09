@@ -8677,3 +8677,16 @@ test "loader: an unresolved symbol whose namespace ends in a period is reported,
     try expectLoadFailure("a./b", "compile error: unable to resolve symbol: a./b", "a./b");
     try expectLoadFailure("(./x 1)", "compile error: unable to resolve symbol: ./x", "./x");
 }
+
+test "clojure.core is a permanent name for nexis.core" {
+    try expectOutputProgram("(clojure.core/inc 1)", "2");
+    try expectOutputProgram("(clojure.core/when true (clojure.core/let [[a] [3]] a))", "3");
+    try expectOutputProgram("`clojure.core/inc", "nexis.core/inc");
+    try expectOutputProgram(
+        \\(ns my.app (:refer-clojure :exclude [get]))
+        \\(defn get [m k] :mine)
+        \\[(get {} 1) (clojure.core/get {:a 1} :a)]
+    , "[:mine 1]");
+    try expectOutputWithFiles(&.{}, "(require '[clojure.core :as c]) [(c/inc 1) (c/when true 2)]", "[2 2]");
+    try expectOutputWithFiles(&.{}, "(require '[clojure.core :refer [inc]]) (inc 1)", "2");
+}

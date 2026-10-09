@@ -139,9 +139,15 @@ Requiring one creates a namespace of that name holding the nexis
 namespace's Vars (the same Var objects), so `(require
 '[clojure.string :as str])` and, after it, `clojure.string/join`
 both reach `nexis.string/join`. Before a `require` a
-`clojure.string/...` symbol does not resolve. No other `clojure.*`
-namespace exists; `(:refer-clojure :exclude [...])` in `ns` makes
-the names the namespace's own (`MACROEXPAND.md` §2b).
+`clojure.string/...` symbol does not resolve. `clojure.core` is a
+permanent name for `nexis.core` in compiled code (`expand.canonicalNs`):
+`clojure.core/get` resolves, a `clojure.core/let` expands, a
+syntax-quote qualifies `clojure.core/x` to `nexis.core/x`, and
+`(require '[clojure.core :as c])` aliases `nexis.core`, with no
+require needed for the first three. No other `clojure.*` namespace
+exists; `(:refer-clojure :exclude [...])` in `ns` makes the names the
+namespace's own (`MACROEXPAND.md` §2b), and `clojure.core/name` then
+still reaches `nexis.core`'s.
 
 **Rules for the embedded sources.**
 

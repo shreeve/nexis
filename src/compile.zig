@@ -1813,12 +1813,11 @@ fn symbolResolves(ctx: LowerCtx, declared: *const DeclaredNames, name: []const u
 
 /// The namespace a qualified symbol's prefix names from `ns`: an
 /// alias registered there resolves to its target, any other
-/// prefix is a namespace name. Null when nothing is registered
-/// under it.
+/// prefix is a namespace name (`expand.canonicalNs`). Null when
+/// nothing is registered under it.
 fn qualifiedTarget(ns: *const vm.Namespace, ns_prefix: []const u8) ?*vm.Namespace {
     const registry = ns.registry orelse return null;
-    const effective = ns.lookupAlias(ns_prefix) orelse ns_prefix;
-    return registry.lookupNs(effective);
+    return registry.lookupNs(expand_mod.canonicalNs(ns.lookupAlias(ns_prefix) orelse ns_prefix));
 }
 
 /// Whether a bare operator `name` means `nexis.core`'s Var of that
@@ -2008,7 +2007,7 @@ fn lowerList(
             if (namesCore(ctx, name)) return try lowerPrim(allocator, in, items[1..], ctx);
         }
         if (items.len == 2 and std.mem.eql(u8, name, "not") and namesCore(ctx, name)) return try lowerNot(allocator, items[1], ctx);
-    } else if (items[0].datum == .symbol and std.mem.eql(u8, items[0].datum.symbol.ns.?, "nexis.core")) {
+    } else if (items[0].datum == .symbol and std.mem.eql(u8, expand_mod.canonicalNs(items[0].datum.symbol.ns.?), "nexis.core")) {
         // A qualified head is never a lexical local, so `nexis.core/+`
         // inlines unconditionally. Host macros emit these
         // (MACROEXPAND.md §5).
