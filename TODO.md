@@ -50,17 +50,17 @@ up. Every fix starts with its failing test (`AGENTS.md`).
     cell write `docs/VM.md` §6 rules out, and its own design. `sort`
     and `sort-by` do not consume their seq either: they gather every
     element before they sort (`docs/LAZY.md` §9).
-18. **A native's result waits on a load it cannot forward on x86-64.**
-    A native whose returns merge assembles its `VmError!Value` in a
-    temporary of narrow stores and copies it to its caller with wider
-    loads, which wait for the cache: `fnCount` (one blocked load an
-    iteration of the micro kit's `leaf1`), `fnNth`, `fnNthrest` and
-    `fnForce`, about 2 of the destructuring loop's 5.4 blocked loads an
-    iteration on the Linux host; `champ.mapFromEntries` reads its
-    hashed-entry array 8 bytes at a time where it wrote 4-byte fields,
-    about 2 more (`docs/PERF.md` §3.40, §6 "A native's result
-    assembled in a temporary"). The call boundary itself agrees
-    (`docs/VM.md` §8); what is left is in the natives' bodies.
+18. **Loads that wait on stores they cannot forward on x86-64.** The
+    native boundary agrees (`docs/VM.md` §8), and `count`, `nth` and
+    `nthnext` return in place, which leaves the destructuring loop
+    0.03 M blocked loads (`docs/PERF.md` §3.40, §3.41). Other rows
+    still block: a map literal's entries sorted by
+    `std.mem.sortUnstable` in `champ` (6.7 blocked loads a three-entry
+    literal, the pipeline's setup), `assoc` into a map (`assocOne`,
+    `champ.mapAssoc`: the map build's 2.9 M) and `vector.conj` (the
+    vectors' 2.2 M). Two ways around the sort cost more than they saved
+    (`docs/PERF.md` §6 "A native's result assembled in a temporary",
+    "A map literal's sort").
 19. **A leaf native called through a Var pays a whole call.** `(nth v
     i)` or `(even? x)` is `var:load-var`, the argument moves and
     `call:call` into `callLeaf`, about 240 instructions above a
@@ -69,12 +69,14 @@ up. Every fix starts with its failing test (`AGENTS.md`).
     and calling in place without the moves removed 3–6% and 7–21% of
     that, short of the bars they had to meet, and were not kept
     (`docs/PERF.md` §6). An instruction trace of one `leaf1` iteration
-    puts the native's own body (`count` of a vector through
-    `fnCountLeaf` and `fnCount`) at 61 instructions beside the call's
-    107, most of those the out-of-line part's frame, tests and safe
-    point: the levers left are the natives' leaf bodies and that part, and a cache at the call site must still see the Var's
-    latest root (PLAN §23 #20; `docs/PERF.md` §6 "Inline caches at
-    call sites").
+    puts the call at 107 instructions beside the native's own body,
+    most of those the out-of-line part's frame, tests and safe point;
+    the body, `count` of a vector, is 61 as a leaf that calls the
+    general native and 38 fewer on the M5 as a body of its own
+    (`docs/PERF.md` §3.37, §3.41). The levers left are the other
+    natives' leaf bodies and that part, and a cache at the call site
+    must still see the Var's latest root (PLAN §23 #20;
+    `docs/PERF.md` §6 "Inline caches at call sites").
 
 ## Store size
 

@@ -2671,9 +2671,10 @@ What the rows say:
 - The destructuring loop blocks 5.4 loads an iteration where it
   blocked 17.4, and runs 7.3% fewer cycles: 186.5 ms, 0.44 of
   babashka's time, from 0.48.
-- What still blocks is inside natives: a `VmError!Value` a native
-  assembles in a temporary of narrow stores (two words and the 2-byte
-  error) and copies to its caller with an 8-byte and a 16-byte load,
+- What blocks at `277a3b4` is inside natives (§3.41 removes it): a
+  `VmError!Value` a native assembles in a temporary of narrow stores
+  (two words and the 2-byte error) and copies to its caller with an
+  8-byte and a 16-byte load,
   where its returns merge (`fnCount`, `fnNth`, `fnNthrest`, `fnForce`;
   `leaf1`'s remaining block is `fnCount`'s), and `champ.mapFromEntries`'
   hashed-entry array, written in 4-byte fields and read 8 bytes at a
@@ -2683,6 +2684,110 @@ What the rows say:
   1.6%: its calls are of closures from natives, whose windows stay
   word stores; it retires 32 M more instructions, the copies a value
   at a time of its non-leaf natives' arguments.
+
+### 3.41 Natives that return in place, Linux x86-64 and Apple M5
+
+A native returns its `VmError!Value` through memory. Compiled Zig
+stores a `return` of a value it holds, or of an error, where the
+caller reads it: two 8-byte words or one 16-byte store, and the 2-byte
+error. A result merged from an `if`, a `switch`, an `orelse` or a
+labeled block, or returned from a call of another function's body, it
+assembles in a temporary of those stores and copies on with an 8-byte
+load of the error's word and a 16-byte load of the value, neither of
+which the x86-64 store buffer forwards: each waits for the stores to
+reach the cache (§3.40). So `count`, `nth` and `nthnext`, the leaves a
+destructuring form calls, return each result by a statement of its
+own; the leaf and the general native of `count` and of `nthnext` are
+one body each, generated for both, not a leaf that calls the general
+native and copies its result on; and `nthnext` of nil, a list or a
+vector returns the rest itself rather than `seq` of `nthrest`
+(`docs/VM.md` §8). A map literal's bulk build sorts its entries by one
+64-bit key, the bit-reversed hash above the input position, stored
+and compared whole, where it stored two 4-byte fields and read them
+as one word (`docs/CHAMP.md` §8.1). Before is `1957422`, after
+`1957422` with the stdlib and champ commits of this section; one
+ReleaseFast build of each on each host. Provenance: §11.
+
+Linux x86-64, the micro kit (`docs/BENCH.md` §13) with `--counter perf
+--pin 2`, two runs of ten interleaved rounds, each in its own hold of
+the host's benchmark lease (load 0.7 → 1.4); per unit, the median of
+the twenty rounds, cycles with their range:
+
+| Program | instructions | cycles | cycles change | blocked loads |
+|---|---:|---:|---:|---:|
+| `count` | 63.0 → 63.0 | 10.3 [10.0–10.5] → 10.3 [10.2–10.5] | 0.0% | 0 → 0 |
+| `fib`, a call | 203.5 → 203.5 | 42.8 [42.4–43.3] → 42.6 [42.4–42.9] | −0.4% | 0 → 0 |
+| `gcall` | 251.0 → 251.0 | 49.7 [49.4–50.2] → 49.6 [49.4–50.2] | −0.1% | 0 → 0 |
+| `leaf` | 337.0 → 337.0 | 64.7 [64.3–65.0] → 64.6 [63.7–65.7] | −0.1% | 0 → 0 |
+| `getnl` | 402.0 → 402.0 | 86.3 [85.5–86.9] → 85.7 [85.3–86.3] | −0.7% | 0 → 0 |
+| `vnth` | 341.0 → 340.0 | 68.6 [68.1–70.9] → 65.6 [65.0–66.0] | −4.4% | 0 → 0 |
+| `leaf1` | 309.0 → 270.0 | 73.8 [73.6–74.1] → 53.8 [53.5–54.1] | −27.2% | 1.006 → 0 |
+| `vdestr` | 1317.9 → 1198.9 | 345.5 [343.7–347.5] → 255.2 [253.3–258.0] | −26.2% | 1.913 → 0.001 |
+| `cbsum` − `cbbase` | 71.5 → 71.5 | 16.1 [14.2–19.3] → 16.3 [14.7–19.9] | +1.6% | 0 → 0 |
+| `cb` − `cbbase` | 82.8 → 82.8 | 22.4 [4.5–26.8] → 22.4 [11.9–24.1] | 0.0% | 0 → 0 |
+| `lazy` − `cbbase` | 176.0 → 176.0 | 52.7 [51.0–54.2] → 53.1 [42.1–65.5] | +0.7% | 0.234 → 0.237 |
+
+The `bench/compare` language programs (`prelude.nx` with the body),
+`taskset -c 2`, `perf stat -e
+cpu_core/instructions/u,cpu_core/cycles/u,cpu_core/ld_blocks.store_forward/u`,
+the builds interleaved, ten rounds (load 0.9 → 1.7), medians, cycles
+with their range:
+
+| Row | phase | instructions | cycles | blocked loads |
+|---|---:|---:|---:|---:|
+| destructuring loop | 199.7 → 176.1 ms | 3,481.7 → 3,364.7 M | 936.2 [929.0–950.3] → 820.5 [808.3–841.9] M (−12.4%) | 5.21 → 0.03 M |
+| vector `conj` and `nth` | 57.3 → 56.9 ms | 768.5 → 767.5 M | 245.2 [242.0–252.4] → 243.7 [240.6–279.0] M (−0.6%) | 2.18 → 2.16 M |
+| pipeline | 43.8 → 43.3 ms | 2,167.5 → 2,172.5 M | 634.9 [628.7–638.2] → 631.6 [625.0–638.7] M (−0.5%) | 8.78 → 6.96 M |
+| map build and read | 879.1 → 882.5 ms | 3,471.3 → 3,470.3 M | 4,160.7 [4,071.3–4,266.5] → 4,157.7 [4,049.7–4,208.0] M (−0.1%) | 2.90 → 2.93 M |
+| `fib` 30 | 24.3 → 24.3 ms | 551.5 → 551.5 M | 118.2 [117.1–118.8] → 117.6 [117.3–120.3] M | 0.02 → 0.02 M |
+
+The natives alone, without the sort key (four rounds of the
+destructuring loop): 942 → 848 M cycles, 5.21 → 3.99 M blocked loads;
+the sort key takes it to 819 M and 0.03 M.
+
+`bench/compare/run.clj --only lang --impls nexis,bb --workloads
+destructure,vector-conj-nth,pipeline,map-build-read --n 10 --max-load 4
+--pin 0-11` on the Linux host, two passes, after and before alternating
+(load 1.3 → 1.7):
+
+| Row | Build | nexis | babashka | ÷ bb | wall: nexis / bb | RSS: nexis / bb |
+|---|---|---:|---:|---:|---:|---:|
+| destructuring loop | before | 201, 201 ms | 430, 429 ms | 0.47, 0.47 | 209, 210 ms / 446, 445 ms | 24 / 86 MB |
+| | after | 177, 177 ms | 429, 431 ms | 0.41, 0.41 | 186, 186 ms / 445, 445 ms | 24 / 86 MB |
+| vectors | before | 59.8, 57.8 ms | 121, 120 ms | 0.50, 0.48 | 68.7, 68.7 ms / 140, 139 ms | 36 / 127–129 MB |
+| | after | 58.2, 57.9 ms | 121, 122 ms | 0.48, 0.48 | 68.1, 68.1 ms / 142, 143 ms | 36 / 127–129 MB |
+| pipeline | before | 42.5, 42.7 ms | 49.6, 45.8 ms | 0.86, 0.93 | 193, 191 ms / 567, 570 ms | 189 / 214 MB |
+| | after | 43.3, 43.4 ms | 46.3, 49.8 ms | 0.93, 0.87 | 190, 191 ms / 565, 572 ms | 189 / 214 MB |
+| map build and read | before | 870, 876 ms | 1.42, 1.42 s | 0.61, 0.62 | 882, 890 ms / 1.44, 1.44 s | 97 / 195 MB |
+| | after | 884, 881 ms | 1.44, 1.43 s | 0.61, 0.61 | 898, 895 ms / 1.46, 1.46 s | 97 / 195 MB |
+
+Apple M5, the micro kit, two runs of five interleaved rounds under
+`tools/heavy` (1 core; load 17.5 → 6.8, so its cycles spread): `leaf1`
+retires 300.0 → 262.0 instructions a unit, `vdestr` 1,281.3 → 1,164.3
+and `vnth` 332.0 → 328.0; every other program the same within 0.1,
+its cycles within their ranges (`leaf1` 37.8, 47.8 → 32.1, 40.5;
+`vdestr` 165.9, 204.2 → 147.0, 169.0).
+
+What the rows say:
+
+- A leaf that returns in place runs no blocked load: `leaf1` (a
+  `count` of a vector) runs 27% fewer cycles and `vdestr` (two `nth`,
+  an `nthnext` and a `count`) 26%. The generated leaf of `count` drops
+  what only the general native does, its frame and the entity and
+  lazy cases, so it also retires 39 fewer instructions on x86-64 and
+  38 on arm64.
+- The destructuring loop runs 12.4% fewer cycles: 176–177 ms, 0.41 of
+  babashka's time from 0.47, its blocked loads 5.2 M → 0.03 M.
+- What still blocks in these rows is elsewhere: the pipeline's 7 M
+  are in its setup, the sort of a three-entry map literal's entries
+  (`std.mem.sortUnstable` moves a 40-byte entry in pieces its next
+  comparison reads whole); the map build's 2.9 M in `assoc`
+  (`assocOne`, `champ.mapAssoc`); the vectors' 2.2 M in
+  `vector.conj` and the heap's allocation (§6 "A native's result
+  assembled in a temporary").
+- The pipeline's and the map build's run.clj phases are within 1 ms
+  and 2% of before, inside their ranges, while their cycles under
+  `perf stat` are level.
 
 ## 6. Levers and dead ends
 
@@ -2788,19 +2893,17 @@ Each lever is a measured change: a before/after from `zig build bench`
   whose returns merge builds its `VmError!Value` in a temporary of
   narrow stores (two 8-byte words and the 2-byte error) and copies it
   to its caller's with an 8-byte load of the error's word and a
-  16-byte load of the value, both of which wait for the cache: one
-  `count` (`fnCount`, `leaf1`'s one blocked load an iteration), `nth`'s
-  `fnNth`, `fnNthrest` and `fnForce` under `nthnext`, about 2 of the
-  destructuring loop's 5.4 blocked loads an iteration (§3.40). The
-  boundary cannot reach them: a leaf entry that inlined the leaf body
-  into a function storing its result through a pointer (no union in
-  memory) removed `fnNth`'s and `fnMax`'s but not those a body reaches
-  through a call (`fnCountLeaf` → `fnCount`), and cost instructions
-  (below). A native written so that each return builds its value from
-  registers, as `numExtremum` reads its winner a word at a time,
-  removes its own. `champ.mapFromEntries`' hashed-entry array, written
-  in 4-byte fields and read 8 bytes at a time, blocks about 2 loads a
-  map literal.
+  16-byte load of the value, both of which wait for the cache; so does
+  a function that returns another's result. `count`, `nth` and
+  `nthnext` return in place (§3.41), which leaves the destructuring
+  loop 0.03 M blocked loads. What blocks in the other rows: a sort of
+  a map literal's entries by `std.mem.sortUnstable`, which moves a
+  40-byte entry in pieces its next comparison reads whole (6.7
+  blocked loads a three-entry literal; the pipeline's setup, 7 M);
+  `assoc` into a map (`assocOne`, `champ.mapAssoc`; the map build's
+  2.9 M); `vector.conj` and the heap's allocation (vectors, 2.2 M).
+  The two ways around the sort measured so far cost more than they
+  saved (below, *A map literal's sort*).
 - **A compare-and-branch instruction**: an `if` on `(< i n)` is
   `cmp:lt` into a slot and `jump:if-false` on it, which the dispatch
   runs as one (`docs/VM.md` §8, §3.12). One encoded instruction would
@@ -2810,6 +2913,14 @@ Each lever is a measured change: a before/after from `zig build bench`
 
 **Levers pulled.**
 
+- *Natives that return in place* (§3.41, `docs/VM.md` §8): `count`,
+  `nth` and `nthnext` return each result by a statement of its own,
+  the leaf and the general native of `count` and `nthnext` one body
+  each, and a map literal's bulk build sorts on one 64-bit key. On the
+  Linux host `leaf1` 73.8 → 53.8 cycles, `vdestr` 345.5 → 255.2, the
+  destructuring loop 936.2 → 820.5 M cycles (−12.4%) and its blocked
+  loads 5.2 → 0.03 M; on the M5 `leaf1` 300 → 262 instructions and
+  `vdestr` 1,281 → 1,164.
 - *A width-consistent native boundary* (§3.40, `docs/VM.md` §8): on
   x86-64 the values a native may read whole are stored as one 16-byte
   store, a native's result is read a word at a time, argument runs are
@@ -3008,6 +3119,17 @@ Each lever is a measured change: a before/after from `zig build bench`
 
 **Dead ends, measured and reverted** (hosts of §3.7 and §3.8):
 
+- *A map literal's sort* (§3.41's Linux host, `perf stat` per unit,
+  three rounds, against §3.41's after build). Sorting a word per entry,
+  its key, and gathering the entries once in the keys' order: a
+  three-entry literal 6.7 → 16.7 blocked loads and 335 → 374 cycles,
+  the destructuring loop 815 → 862 M cycles. An insertion sort that
+  moves each entry whole for a literal's at most 16: the literal 6.7
+  → 0 blocked loads and 332 → 315 cycles, and the pipeline's setup 7.0
+  → 0.4 M, but the destructuring loop, a two-entry literal an
+  iteration, 822 → 865 M cycles on 83 M fewer instructions, with its
+  memory-ordering machine clears 0.25 → 0.46 M, as a load issued
+  ahead of the store of an entry at an index the loop computes makes.
 - *The boundary's other widths* (§3.40's Linux host, `perf stat` per
   unit, three rounds each). Reading `callLeaf`'s result a word at a
   time alone: `leaf` 75.3 → 67.7 cycles, but the destructuring loop's
@@ -3208,4 +3330,5 @@ is one invocation's 30-sample median.
 | §3.38, §6 "x86-64 handlers without register saves" | Intel Core Ultra 9 185H, 30 GiB, Ubuntu 26.04.1 LTS, Linux 7.0.0-34-generic, governor `powersave`, as §3.15; babashka v1.13.224; and Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434); Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `b3370fb` (a source snapshot on the Linux host); both hosts shared with other sessions | 2026-10-08 19:24–22:52 MDT, x86: `bin/nexis` built by `zig build install -Doptimize=fast` from source snapshots of `8cd7499` (before, `e115f57`'s source) and of `3065544` (after) on the Linux host, and with `--prefix DIR` at `8cd7499`, `13df08b` (the status word alone) and `3065544` on the M5, whose `13df08b` and `3065544` builds disassemble to the same instructions. Static sizes from `zig build codegen` at `8cd7499`, `13df08b` and `3065544`. Linux: `micro.sh`, `bb bench/micro/run.clj --counter perf --pin 2 --rounds 10 --programs count,fib,gcall,leaf,getnl,cbbase,cbsum,cb,lazy BEFORE AFTER`, twice, each in its own exclusive hold of the host's benchmark lease (load 0.9 → 1.2); `perfpairs.sh`, each run `taskset -c 2 /usr/bin/time -f %M perf stat -x, -e cpu_core/instructions/u,cpu_core/cycles/u,cpu_core/br_misp_retired.indirect/u,cpu_core/ld_blocks.store_forward/u bin/nexis run P` over `prelude.nx` with each body, the builds interleaved, ten rounds (load 1.1 → 1.4); `run.clj --n 10 --max-load 4 --pin 0-11 --no-build --only lang --impls nexis,bb --workloads fib,destructure,vector-conj-nth,pipeline` from each snapshot, after, before, after, before (load 0.9 → 1.6; its report names the `zig` on the path, not the one that built). The `callLeaf` stall and the one-line trial of §6 from the Stage 0 profile at `fd5ef10` (`perf record -e cpu_core/cycles/upp` and `cpu_core/ld_blocks.store_forward/u`, five rounds). M5: `bb bench/micro/run.clj --rounds 5` over every program but those of other trees, and `--rounds 9` over the callback programs, under `tools/heavy` (1 core). Raw output: `.git/revamp/r3/x86/` (`pup-micro-*.txt`/`.json`, `pup-pairs-1.txt`, `runclj/`, `m5-micro-*`, `codegen-*.log`) and `.git/revamp/r3/x86spike.md` |
 | §3 "Durable commits", §6 "Fewer pages per durable commit", §3.15's durable note | Intel Core Ultra 9 185H, 30 GiB, Ubuntu 26.04.1 LTS, Linux 7.0.0-34-generic, ext4 on NVMe, governor `powersave`, as §3.15; Datalevin 1.1.0; and Apple M5, 10 cores, 32 GiB, macOS 27.0.1, APFS; Zig 0.17.0, ReleaseFast (`-Doptimize=fast`), emdb `b3370fb` | 2026-10-08 23:56 – 2026-10-09 00:25 MDT, durable: `bin/nexis` of `bd2cf5c`; on Linux under the `pup-bench` lease, processes pinned to CPUs 0–11, a probe of 300 durable commits per shape (`.nx` for Nextomic and `db/*`, a `dtlv exec` twin) over a copy of the `bench/compare` load, five runs of rounds with the shapes and systems alternating, the rounds whose `db/*` commit ran under 1.9 ms kept; `strace -f -c`, `strace -f -T` and `perf stat -e task-clock,page-faults` over 100 and 400 commits outside the lease; pages from a ReleaseFast build printing emdb's dirty-page count, not committed; Datalevin's writes from `strace -e pwrite64,writev,fdatasync` over 200 commits; the program table's Linux load from `bb bench/compare/run.clj --only db --impls nexis,datalevin --n 10 --max-load 4 --pin 0-11 --no-build`, its M5 rows from runs on one core at load 8–69 |
 | §3.40, §6 "A width-consistent native boundary", "A native's result assembled in a temporary" and "The boundary's other widths" | Intel Core Ultra 9 185H, 30 GiB, Ubuntu 26.04.1 LTS, Linux 7.0.0-34-generic, governor `powersave`, as §3.15; babashka v1.13.224; and Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434); Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `b3370fb` (a source snapshot on the Linux host); both hosts shared with other sessions | 2026-10-09 00:00–01:50 MDT. x86: `bin/nexis` built by `zig build install -Doptimize=fast` from `git archive` snapshots of `bd2cf5c` (before) and `4cd8e90` (after) on the Linux host; `277a3b4`'s build there has the same `.text`, byte for byte. Linux: `micro.sh`, `bb bench/micro/run.clj --counter perf --pin 2 --rounds 10 --programs count,fib,gcall,leaf,getnl,vnth,leaf1,vdestr,cbbase,cbsum,cb,lazy BEFORE AFTER`, twice, each in its own hold of the host's benchmark lease (load 0.9 → 1.2); `pairs.sh`, each run `taskset -c 2 /usr/bin/time -f %M perf stat -x, -e cpu_core/instructions/u,cpu_core/cycles/u,cpu_core/ld_blocks.store_forward/u bin/nexis run P` over `prelude.nx` with each body, the builds interleaved, ten rounds (load 1.0 → 1.3); `run.clj --n 10 --max-load 4 --pin 0-11 --no-build --only lang --impls nexis,bb --workloads destructure,vector-conj-nth,pipeline` from each snapshot, after, before, after, before (load 1.0 → 1.1). The blocked loads located with `perf mem record -t load --ldlat 4` (each sample's data source marks a load blocked on a store's data) and `perf record -e cpu_core/ld_blocks.store_forward/upp`; the dead ends from trial builds of the worktree, `perf stat` at two sizes per unit, three rounds. M5: `bb bench/micro/run.clj --rounds 5` over the same programs, twice, under `tools/heavy` (1 core; load 21.8 → 13.0), the builds `zig build install -Doptimize=fast --prefix DIR` at `bd2cf5c` and `277a3b4`. Raw output: `.git/revamp/r3/boundary/` (`pup-micro-*.txt`, `pup-pairs-1.txt`, `pup-runclj-*.txt`, `runclj/`, `m5-micro-*`) |
+| §3.41, §6 "A native's result assembled in a temporary" and "A map literal's sort" | Intel Core Ultra 9 185H, 30 GiB, Ubuntu 26.04.1 LTS, Linux 7.0.0-34-generic, governor `powersave`, as §3.15; babashka v1.13.224; and Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434); Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `8463a21` (a source snapshot on the Linux host); both hosts shared with other sessions | 2026-10-09 04:40–05:50 MDT. x86: `bin/nexis` built by `zig build install -Doptimize=fast` on the Linux host from `git archive` snapshots of `1957422` (before) and of `1957422` with the stdlib and champ commits (after; a snapshot of the two commits themselves builds the same `.text` there, byte for byte). Linux: `micro.sh`, `bb bench/micro/run.clj --counter perf --pin 2 --rounds 10 --programs count,fib,gcall,leaf,getnl,vnth,leaf1,vdestr,cbbase,cbsum,cb,lazy BEFORE AFTER`, twice, each in its own hold of the host's benchmark lease (load 0.7 → 1.4); `pairs.sh`, each run `taskset -c 2 /usr/bin/time -f %M perf stat -x, -e cpu_core/instructions/u,cpu_core/cycles/u,cpu_core/ld_blocks.store_forward/u bin/nexis run P` over `prelude.nx` with each body, the builds interleaved, ten rounds (load 0.9 → 1.7); `run.clj --n 10 --max-load 4 --pin 0-11 --no-build --only lang --impls nexis,bb --workloads destructure,vector-conj-nth,pipeline,map-build-read` from each snapshot, after, before, after, before (load 1.3 → 1.7). The natives-alone build and the dead ends from snapshots of the worktree, `perf stat` at two sizes per unit, three rounds, and the destructuring program three or four rounds; the blocked loads located with `perf record -e cpu_core/ld_blocks.store_forward/upp`. M5: `bb bench/micro/run.clj --rounds 5` over the same programs, twice, under `tools/heavy` (1 core; load 17.5 → 14.9, then 6.2 → 6.8), the builds `zig build install -Doptimize=fast --prefix DIR` of the same two trees. Raw output: `.git/revamp/r3/boundary2/` (`pup-micro-*`, `pup-pairs-w1.txt`, `pup-runclj-*.txt`, `runclj/`, `pup-probe-*.txt`, `pup-sites-w1.txt`, `m5-micro-*`) |
 | §6 "Levers pulled", the `cc935cc` figures of §3.11 | as §3.11 language and database rows, shared with concurrent builds (1-minute load average 5–15) | 2026-09-26: `bb bench/compare/run.clj --only db --n 10 --max-load 6 --no-build` over ReleaseFast binaries of the ws-durability branch (after) and of `cc935cc` (before), run one after the other; each run's third attempt, the first two having seen the load pass 6; ten rounds after a warm-up. The `bin/nexis` read figures: a probe program timing 10,000 of each operation over 10,000 entities with `nano-time`, three runs of each binary, alternating. `db_put_commit_scalar`: `zig build bench -Doptimize=ReleaseFast -- --filter db-integrated,nextomic`, three invocations at the branch head and two at `cc935cc`, alternating, the best median; §3.6's durable M5 figure is the `cc935cc` run's, and the branch head measured 7.2–8.9 ms under `NEXIS_DURABILITY=durable` at load 7 |
