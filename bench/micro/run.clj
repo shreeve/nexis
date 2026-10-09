@@ -85,7 +85,8 @@
 (defn load-avg []
   (str/trim (if (= os "time")
               (:out (p/sh "sysctl" "-n" "vm.loadavg"))
-              (str/join " " (take 3 (str/split (slurp "/proc/loadavg") #" "))))))
+              ;; slurp reads nothing from /proc.
+              (str/join " " (take 3 (str/split (:out (p/sh "cat" "/proc/loadavg")) #" "))))))
 
 (defn counter [err label]
   (some-> (re-find (re-pattern (str "(\\d+)\\s+" label)) err) second parse-long))
