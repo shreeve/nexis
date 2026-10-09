@@ -1843,13 +1843,15 @@ fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
             var acc: ?Value = init;
             while (true) {
                 var it = try makeSeqIter(vm, all);
+                // The walk's first pass realizes the source, which runs
+                // code: the accumulator waits in the root slot.
                 while (try it.next()) |x| {
                     if (acc) |a| {
-                        vm.roots.items[scope.base] = a;
                         const r = try cb.call2(a, x);
                         if (isReduced(vm, r)) return reducedValue(r);
                         acc = r;
                     } else acc = x;
+                    vm.roots.items[scope.base] = acc.?;
                 }
             }
         },
@@ -2417,10 +2419,14 @@ const conj_in_place_min = 4;
 
 /// `coll` with every `xs` conj'd in place on a transient over it,
 /// carrying `coll`'s metadata as the persistent path does (SEMANTICS
-/// §7). No collection runs while it builds.
+/// §7). Realizing a lazy key runs code before its edit (LAZY.md §6),
+/// so the transient waits in a root slot; `xs` must be rooted.
 fn conjInPlace(vm: *VM, coll: Value, xs: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
     const t = transient_mod.transientFrom(heap, coll) catch |err| return transientFailure(vm, err);
+    const scope = vm.rootScope();
+    defer scope.release();
+    try scope.push(t);
     for (xs) |x| try conjBang(vm, coll.kind(), t, x);
     const result = transient_mod.persistentBang(t) catch |err| return transientFailure(vm, err);
     heap_mod.Heap.asHeapHeader(result).setMeta(heap_mod.Heap.asHeapHeader(coll).getMeta());
@@ -2557,13 +2563,13 @@ fn fnInto(vm: *VM, args: []const Value) VmError!Value {
     if (fresh) {
         return vector_mod.fromSlice(vm.ensureHeap(), items.items) catch VmError.OutOfMemory;
     }
-    // A sorted target's comparator, or the realizing of a lazy target,
-    // can collect while `conj` runs; a map source's entries were built
-    // by the walk and reach from nothing else, and `from` is consumed
-    // (GC.md §11.5, class 4).
+    // A sorted target's comparator, a lazy target's realizing or a lazy
+    // key's can collect while `conj` runs; a map source's entries were
+    // built by the walk and reach from nothing else, and `from` is
+    // consumed (GC.md §11.5, class 4).
     const scope = vm.rootScope();
     defer scope.release();
-    if (sorted_mod.isSortedKind(args[0].kind()) or args[0].kind() == .lazy_seq) try scope.pushAll(items.items);
+    try scope.pushAll(items.items);
     const conj_args = vm.allocator.alloc(Value, items.items.len + 1) catch return VmError.OutOfMemory;
     defer vm.allocator.free(conj_args);
     conj_args[0] = args[0];
@@ -5107,11 +5113,7 @@ fn conjBangMap(vm: *VM, t: Value, x: Value) VmError!void {
             var it = MapEntries.of(x).?;
             while (it.next()) |e| try assocBang(vm, t, e.key, e.value);
         },
-        .persistent_vector => {
-            // The entry is the argument; its key is realized through it.
-            try seq_mod.realizeAll(vm, x);
-            try assocBang(vm, t, vector_mod.nth(x, 0), vector_mod.nth(x, 1));
-        },
+        .persistent_vector => try assocBang(vm, t, vector_mod.nth(x, 0), vector_mod.nth(x, 1)),
         else => {},
     }
 }
@@ -6143,10 +6145,15 @@ fn fnStringJoin(vm: *VM, args: []const Value) VmError!Value {
     const scope = vm.rootScope();
     defer scope.release();
     var it = try consumingSeqIter(vm, coll, scope);
+    // An element the walk built (a map's entry) waits in a slot of its
+    // own while its text is made.
+    try scope.push(value_mod.nilValue());
+    const held = vm.roots.items.len - 1;
     var first = true;
     while (try it.next()) |x| {
         if (!first) w.writer.writeAll(sep) catch return VmError.OutOfMemory;
         first = false;
+        vm.roots.items[held] = x;
         if (x.kind() == .string) {
             w.writer.writeAll(string_mod.asBytes(x)) catch return VmError.OutOfMemory;
         } else try appendStrValue(vm, &w, x);

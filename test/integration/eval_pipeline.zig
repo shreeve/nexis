@@ -8672,3 +8672,31 @@ test "a user macro named like a core macro is the namespace's own" {
         \\[(when-let [x 1] x) (nexis.core/when-let [x 1] x)]
     , "[:mine 1]");
 }
+
+// =============================================================================
+// Natives' rooting under the collector (GC.md §11.5)
+// =============================================================================
+
+const mk_lazy = "(defn mk [n] (map (fn [i] [i i]) (range n))) ";
+
+test "gc: reduce over a cycle keeps the accumulator while the source realizes" {
+    try expectOutputUnderGc(
+        \\(def src (take 50 (map (fn [i] (vec (range i (+ i 40)))) (iterate inc 0))))
+        \\(def r (reduce (fn [acc x] (if (= (count acc) 120) (reduced acc) (conj acc [(first x) (str "v" (first x))]))) [] (cycle src)))
+        \\[(count r) (first r) (nth r 49) (nth r 50) (nth r 119)]
+    , "[120 [0 v0] [49 v49] [0 v0] [19 v19]]");
+}
+
+test "gc: nexis.string/join keeps a map entry while its lazy value realizes" {
+    try expectOutputUnderGc(mk_lazy ++ "(let [s (nexis.string/join \"|\" {:a (mk 3000) :b (mk 3000)})] [(count s) (subs s 0 12)])", "[67573 [:a ([0 0] []");
+}
+
+test "gc: conj in place keeps its transient while a lazy key realizes" {
+    try expectOutputUnderGc(mk_lazy ++ "(sort (map #(if (number? %) % (count %)) (conj #{1 2 3} (mk 1500) (mk 1501) (mk 1502) (mk 1503) (mk 1504))))", "(1 2 3 1500 1501 1502 1503 1504)");
+    try expectOutputUnderGc(mk_lazy ++ "(sort (map #(if (number? %) % (count %)) (keys (conj {0 0} [(mk 1500) 1] [(mk 1501) 2] [(mk 1502) 3] [(mk 1503) 4]))))", "(0 1500 1501 1502 1503)");
+}
+
+test "gc: into a hash target keeps the entries a map walk built" {
+    try expectOutputUnderGc(mk_lazy ++ "(sort (map count (vals (into {} (hash-map :a (mk 300) :b (mk 301) :c (mk 302) :d (mk 303))))))", "(300 301 302 303)");
+    try expectOutputUnderGc(mk_lazy ++ "(count (into #{} {(mk 1500) 1 (mk 1600) 2 (mk 1700) 3 (mk 1800) 4}))", "4");
+}

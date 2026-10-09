@@ -389,8 +389,9 @@ make sure a root reaches it. What is rooted already:
   ring; `reverse`, `butlast` and `apply` put each in a `Results` too,
   `mapv` and `filterv` each result or kept element, `select-keys`
   conj's what it finds onto a result kept in a slot, and
-  `nexis.string/join` writes each element's text before the next
-  step); an `iterate`'s function or a `cycle`'s source,
+  `nexis.string/join` keeps the element whose text it makes in a slot,
+  since a map's entry is built by the walk and making its text
+  realizes its lazy values); an `iterate`'s function or a `cycle`'s source,
   reached from the argument, stays rooted through it. `into` with a
   transducer passes its argument to a closure, whose parameter holds
   it until its last move (`docs/COMPILER.md` §4.9). Reached by
@@ -464,9 +465,12 @@ The rule each native follows, by what it holds across a further
    in the block that heads it, so the elements already walked reach
    from the argument the walk started at, but a callback result
    (`reduce`'s accumulator, which goes into a root slot before each
-   step that may run code, `SeqIter.nextChunk`),
+   step that may run code, `SeqIter.nextChunk`, and after each call
+   over a `cycle`, whose first pass realizes its source),
    a value the native built (`frequencies`' transient, `select-keys`'
-   result) and a value another iterator built (the entries of a map
+   result, the transient `conj` and `into` edit in place while a lazy
+   key realizes before its edit, and the entries `into` gathers from a
+   map) and a value another iterator built (the entries of a map
    walked beside a lazy seq by `concat`, `interleave`, `zipmap`,
    `partition`'s pad, which walk with `rootedSeqIter`) are not.
 
