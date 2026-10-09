@@ -161,6 +161,20 @@ const Run = struct {
     }
 };
 
+/// The eid of an entity argument, an eid, a lookup ref or an ident, in
+/// `read` (the `marshal` contract): null for a reference that names
+/// nothing; a failure leaves what it names in `diag`.
+pub fn entityOf(read: *Read, arena: Allocator, e: Value, diag: *Diag) Failure!?u64 {
+    var fault: db_mod.Fault = .{};
+    return marshal.entity(read, arena, e, &fault) catch |err| {
+        diag.* = switch (err) {
+            error.ValueType => .{ .attr = fault.attr, .given = fault.given, .value_type = fault.value_type },
+            else => .{ .message = fault.message orelse "unknown attribute", .attr = fault.attr },
+        };
+        return err;
+    };
+}
+
 // =============================================================================
 // Resolved patterns
 // =============================================================================
@@ -422,19 +436,10 @@ const Puller = struct {
         };
     }
 
-    /// The eid of an entity argument: an eid, a lookup ref or an ident.
-    /// The entity to pull: the `marshal` contract, where a reference
-    /// that names nothing is `NoEntity`.
+    /// The entity to pull, where a reference that names nothing is
+    /// `NoEntity`.
     fn resolveEntity(self: *Puller, e: Value) Failure!u64 {
-        var fault: db_mod.Fault = .{};
-        const eid = marshal.entity(self.read, self.arena, e, &fault) catch |err| {
-            self.diag.* = switch (err) {
-                error.ValueType => .{ .attr = fault.attr, .given = fault.given, .value_type = fault.value_type },
-                else => .{ .message = fault.message orelse "unknown attribute", .attr = fault.attr },
-            };
-            return err;
-        };
-        return eid orelse error.NoEntity;
+        return (try entityOf(self.read, self.arena, e, self.diag)) orelse error.NoEntity;
     }
 
     fn root(self: *Puller, pat: *const Pattern, e: u64) Failure!?Value {

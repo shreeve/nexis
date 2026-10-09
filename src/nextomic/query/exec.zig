@@ -112,8 +112,8 @@ pub const Exec = struct {
     heap: *Heap,
     interner: *Interner,
     hook: ?CallHook,
-    /// Where an `UnknownAttribute` in an input leaves its name.
-    diag: ?*Diag = null,
+    /// Where a failure leaves what it names.
+    diag: *Diag,
     /// The inputs, positional to `:in`: where a pull pattern bound by
     /// `:in` is found.
     args: []const Value = &.{},
@@ -126,7 +126,7 @@ pub const Exec = struct {
     scans: std.ArrayList(Scanned) = .empty,
     /// The pull find elements' resolved patterns, by find position
     /// (`preparePulls`).
-    pulls: ?[]?pull_mod.Prepared = null,
+    pulls: []?pull_mod.Prepared = &.{},
     /// The value each function symbol names (`resolveFns`).
     fns: std.AutoHashMapUnmanaged(u32, Value) = .empty,
 
@@ -177,17 +177,11 @@ pub const Exec = struct {
         };
     }
 
-    /// The cell of a datom value read from `read`: ids as `int`,
-    /// keywords as VM keyword ids, uuids as text.
-    pub fn valCell(self: *Exec, read: *Read, v: key.Val) !Cell {
-        return marshal.cellOf(read, self.arena, v);
-    }
-
     fn datomCells(self: *Exec, read: *Read, d: datom_mod.Datom) ![5]Cell {
         return .{
             .{ .int = @intCast(d.e) },
             .{ .int = d.a },
-            try self.valCell(read, d.v),
+            try marshal.cellOf(read, self.arena, d.v),
             .{ .int = @intCast(key.txEntity(d.t)) },
             .{ .boolean = d.added },
         };
@@ -535,7 +529,7 @@ pub const Exec = struct {
         switch (b) {
             .lt, .le, .gt, .ge => {
                 for (args[0 .. args.len - 1], args[1..]) |x, y| {
-                    const o = x.compare(y, self.interner) orelse return self.wrongType("{s} compares values of one kind, not {s} and {s}", .{ predName(b), cellPhrase(x), cellPhrase(y) });
+                    const o = x.compare(y, self.interner) orelse return self.wrongType("{s} compares values of one kind, not {s} and {s}", .{ b.name(), cellPhrase(x), cellPhrase(y) });
                     const ok = switch (b) {
                         .lt => o == .lt,
                         .le => o != .gt,
@@ -572,7 +566,7 @@ pub const Exec = struct {
         const at = try self.attrNamed(.fulltext, read, attr);
         const a = at.id;
         if (!at.fulltext) {
-            if (self.diag) |d| d.* = .{ .message = "attribute is not :db/fulltext", .attr = self.interner.keywordValue(attr.keyword) };
+            self.diag.* = .{ .message = "attribute is not :db/fulltext", .attr = self.interner.keywordValue(attr.keyword) };
             return error.TxData;
         }
         const tokens = try fulltext.tokens(self.arena, needle.str);
@@ -608,11 +602,11 @@ pub const Exec = struct {
     }
 
     fn pair(self: *Exec, read: *Read, d: datom_mod.Datom) ![]const Cell {
-        return self.arena.dupe(Cell, &.{ .{ .int = @intCast(d.e) }, try self.valCell(read, d.v) });
+        return self.arena.dupe(Cell, &.{ .{ .int = @intCast(d.e) }, try marshal.cellOf(read, self.arena, d.v) });
     }
 
     fn unknownAttribute(self: *Exec, kw: u32) anyerror {
-        if (self.diag) |d| d.* = .{ .message = "unknown attribute", .attr = self.interner.keywordValue(kw) };
+        self.diag.* = .{ .message = "unknown attribute", .attr = self.interner.keywordValue(kw) };
         return error.UnknownAttribute;
     }
 
@@ -632,7 +626,7 @@ pub const Exec = struct {
         const eid = e.asEid() orelse return null;
         var it = try read.scan(self.arena, .eavt, .{ .e = eid, .a = at.id });
         const d = (try it.next()) orelse return null;
-        return try self.valCell(read, d.v);
+        return try marshal.cellOf(read, self.arena, d.v);
     }
 
     /// `get-else`: the attribute's value on the entity, else the
@@ -645,7 +639,7 @@ pub const Exec = struct {
     }
 
     fn syntax(self: *Exec, message: []const u8) error{QuerySyntax} {
-        if (self.diag) |d| d.* = .{ .message = message };
+        self.diag.* = .{ .message = message };
         return error.QuerySyntax;
     }
 
@@ -1116,22 +1110,15 @@ pub const Exec = struct {
     }
 
     /// The entity an ident or lookup-ref input names in `read` (the
-    /// `marshal` contract), or null when there is none; the diagnostic
-    /// carries what a failing lookup ref named.
+    /// `marshal` contract), or null when there is none or `c` is
+    /// another cell.
     fn inputEntity(self: *Exec, read: *Read, c: Cell) anyerror!?u64 {
         const v: Value = switch (c) {
             .keyword => |kw| self.interner.keywordValue(kw),
             .vm => |v| v,
             else => return null,
         };
-        var fault: db_mod.Fault = .{};
-        return marshal.entity(read, self.arena, v, &fault) catch |err| {
-            if (self.diag) |d| d.* = switch (err) {
-                error.ValueType => .{ .attr = fault.attr, .given = fault.given, .value_type = fault.value_type },
-                else => .{ .message = fault.message orelse "unknown attribute", .attr = fault.attr },
-            };
-            return err;
-        };
+        return pull_mod.entityOf(read, self.arena, v, self.diag);
     }
 
     // ── find ──────────────────────────────────────────────────────
@@ -1207,52 +1194,46 @@ pub const Exec = struct {
     /// each a vector; a custom aggregate receives the vector of values.
     fn aggregate(self: *Exec, agg: ir.Agg, basis: *const Relation, col: usize, members: []const usize) anyerror!Cell {
         const op = agg.op;
+        if (op == .count) return .{ .int = @intCast(members.len) };
+        const cells = try self.arena.alloc(Cell, members.len);
+        for (members, cells) |m, *c| c.* = basis.cell(m, col);
         switch (op) {
-            .count => return .{ .int = @intCast(members.len) },
+            .count => unreachable,
             .count_distinct, .distinct, .sample => {
                 var seen = try Relation.init(self.arena, &.{0});
-                for (members) |m| try seen.append(&.{basis.cell(m, col)});
+                for (cells) |c| try seen.append(&.{c});
                 const d = try seen.dedup();
                 if (op == .count_distinct) return .{ .int = @intCast(d.rows) };
+                const distinct = try self.arena.alloc(Cell, d.rows);
+                for (distinct, 0..) |*c, i| c.* = d.cell(i, 0);
                 if (op == .sample) {
-                    const cells = try self.arena.alloc(Cell, d.rows);
-                    for (cells, 0..) |*c, i| c.* = d.cell(i, 0);
-                    self.random().shuffle(Cell, cells);
-                    return self.cellVector(cells[0..@min(cells.len, agg.n.?)]);
+                    self.random().shuffle(Cell, distinct);
+                    return self.cellVector(distinct[0..@min(distinct.len, agg.n.?)]);
                 }
                 var set = try champ.setEmpty(self.heap);
-                var i: usize = 0;
-                while (i < d.rows) : (i += 1) set = try champ.setConj(self.heap, set, try self.cellValue(d.cell(i, 0)), &dispatch.hashValue, &dispatch.equal);
+                for (distinct) |c| set = try champ.setConj(self.heap, set, try self.cellValue(c), &dispatch.hashValue, &dispatch.equal);
                 return .{ .vm = try self.kept(set) };
             },
             .rand => {
                 const n = std.math.cast(usize, agg.n.?) orelse return error.OutOfMemory;
-                const cells = try self.arena.alloc(Cell, if (members.len == 0) 0 else n);
-                for (cells) |*c| c.* = basis.cell(members[self.random().uintLessThan(usize, members.len)], col);
-                return self.cellVector(cells);
+                const picked = try self.arena.alloc(Cell, if (cells.len == 0) 0 else n);
+                for (picked) |*c| c.* = cells[self.random().uintLessThan(usize, cells.len)];
+                return self.cellVector(picked);
             },
             .min, .max => {
                 if (agg.n) |n| {
-                    const cells = try self.arena.alloc(Cell, members.len);
-                    for (members, cells) |m, *c| c.* = basis.cell(m, col);
                     std.mem.sort(Cell, cells, CellOrder{ .names = self.interner, .descending = op == .max }, CellOrder.less);
                     return self.cellVector(cells[0..@min(cells.len, n)]);
                 }
-                var best: ?Cell = null;
-                for (members) |m| {
-                    const c = basis.cell(m, col);
-                    if (best == null) {
-                        best = c;
-                        continue;
-                    }
-                    const o = c.orderBy(best.?, self.interner);
+                if (cells.len == 0) return .nil;
+                var best = cells[0];
+                for (cells[1..]) |c| {
+                    const o = c.orderBy(best, self.interner);
                     if ((op == .min and o == .lt) or (op == .max and o == .gt)) best = c;
                 }
-                return best orelse .nil;
+                return best;
             },
             .median => {
-                const cells = try self.arena.alloc(Cell, members.len);
-                for (members, cells) |m, *c| c.* = basis.cell(m, col);
                 std.mem.sort(Cell, cells, CellOrder{ .names = self.interner, .descending = false }, CellOrder.less);
                 if (cells.len == 0) return .nil;
                 if (cells.len % 2 == 1) return cells[cells.len / 2];
@@ -1261,22 +1242,22 @@ pub const Exec = struct {
                 return .{ .double = (lo + hi) / 2 };
             },
             .variance, .stddev => {
-                if (members.len == 0) return .nil;
+                if (cells.len == 0) return .nil;
                 var mean: f64 = 0;
-                for (members) |m| mean += try self.numberOf(op, basis.cell(m, col));
-                mean /= @floatFromInt(members.len);
+                for (cells) |c| mean += try self.numberOf(op, c);
+                mean /= @floatFromInt(cells.len);
                 var acc: f64 = 0;
-                for (members) |m| {
-                    const d = (try self.numberOf(op, basis.cell(m, col))) - mean;
+                for (cells) |c| {
+                    const d = (try self.numberOf(op, c)) - mean;
                     acc += d * d;
                 }
-                const variance = acc / @as(f64, @floatFromInt(members.len));
+                const variance = acc / @as(f64, @floatFromInt(cells.len));
                 return .{ .double = if (op == .variance) variance else @sqrt(variance) };
             },
             .custom => {
                 const hook = self.hook orelse return error.NoHook;
-                const vals = try self.arena.alloc(Value, members.len);
-                for (members, vals) |m, *v| v.* = try self.cellValue(basis.cell(m, col));
+                const vals = try self.arena.alloc(Value, cells.len);
+                for (cells, vals) |c, *v| v.* = try self.cellValue(c);
                 const result = try hook.apply(hook.ctx, try self.fnOf(agg.sym), &.{try vector_mod.fromSlice(self.heap, vals)});
                 return Cell.fromValue(try self.keptResult(result));
             },
@@ -1286,7 +1267,7 @@ pub const Exec = struct {
                 var is_float = false;
                 // Integers past i64 (inputs, function results), summed exactly.
                 var big: ?Value = null;
-                for (members) |m| switch (basis.cell(m, col)) {
+                for (cells) |c| switch (c) {
                     .int => |n| isum += n,
                     .double => |d| {
                         is_float = true;
@@ -1296,10 +1277,10 @@ pub const Exec = struct {
                         if (v.kind() != .bignum) return self.wrongType("{s} takes numbers, not {s}", .{ op.name(), cellPhrase(.{ .vm = v }) });
                         big = if (big) |acc| try bignum.add(self.heap, acc, v) else v;
                     },
-                    else => |c| return self.wrongType("{s} takes numbers, not {s}", .{ op.name(), cellPhrase(c) }),
+                    else => return self.wrongType("{s} takes numbers, not {s}", .{ op.name(), cellPhrase(c) }),
                 };
                 const total = fsum + @as(f64, @floatFromInt(isum)) + if (big) |v| bignum.toF64(v) else 0;
-                if (op == .avg) return .{ .double = total / @as(f64, @floatFromInt(members.len)) };
+                if (op == .avg) return .{ .double = total / @as(f64, @floatFromInt(cells.len)) };
                 if (is_float) return .{ .double = total };
                 var exact = try bignum.fromI128(self.heap, isum);
                 if (big) |v| exact = try bignum.add(self.heap, exact, v);
@@ -1320,19 +1301,8 @@ pub const Exec = struct {
 
     /// `ValueType`, with the reason in the diagnostic.
     fn wrongType(self: *Exec, comptime fmt: []const u8, args: anytype) error{ValueType} {
-        if (self.diag) |d| d.set(null, fmt, args);
+        self.diag.set(null, fmt, args);
         return error.ValueType;
-    }
-
-    /// A comparison predicate as a query writes it.
-    fn predName(b: ir.Builtin) []const u8 {
-        return switch (b) {
-            .lt => "<",
-            .le => "<=",
-            .gt => ">",
-            .ge => ">=",
-            else => @tagName(b),
-        };
     }
 
     /// A cell's kind with its article, for a message: "a string".
@@ -1379,7 +1349,7 @@ pub const Exec = struct {
             .scalar, .tuple => rows_in.len > 1,
             .relation, .collection => false,
         };
-        const rows = try self.pullColumns(query, if (first) rows_in[0..1] else rows_in);
+        const rows = try self.pullColumns(if (first) rows_in[0..1] else rows_in);
         if (query.keys) |keys| return self.rowMaps(keys, rows);
         switch (query.find_spec) {
             .relation => {
@@ -1414,8 +1384,6 @@ pub const Exec = struct {
     /// before any user function has run; a syntax error leaves its
     /// reason in the diagnostic.
     pub fn preparePulls(self: *Exec, query: *const Ir) anyerror!void {
-        var scratch: Diag = .{};
-        const diag = self.diag orelse &scratch;
         const prepared = try self.arena.alloc(?pull_mod.Prepared, query.find.len);
         for (query.find, prepared) |f, *p| {
             if (f != .pull) {
@@ -1426,7 +1394,7 @@ pub const Exec = struct {
                 .value => |v| v,
                 .input => |v| inputOf(query, self.args, v),
             };
-            p.* = try pull_mod.Prepared.prepare(self.arena, try self.readOf(f.pull.src), self.heap, self.interner, pattern, diag);
+            p.* = try pull_mod.Prepared.prepare(self.arena, try self.readOf(f.pull.src), self.heap, self.interner, pattern, self.diag);
         }
         self.pulls = prepared;
     }
@@ -1436,16 +1404,14 @@ pub const Exec = struct {
     /// lookup ref, resolved in the pull's source (nil for an entity
     /// with no datoms, or a reference that names nothing); any other
     /// cell is `ValueType`.
-    fn pullColumns(self: *Exec, query: *const Ir, rows: []const []const Cell) anyerror![]const []const Cell {
-        if (self.pulls == null) try self.preparePulls(query);
-        const prepared = self.pulls.?;
-        for (prepared) |p| {
+    fn pullColumns(self: *Exec, rows: []const []const Cell) anyerror![]const []const Cell {
+        for (self.pulls) |p| {
             if (p != null) break;
         } else return rows;
         const out = try self.arena.alloc([]const Cell, rows.len);
         for (rows, out) |row, *o| {
             const cells = try self.arena.dupe(Cell, row);
-            for (prepared, cells) |*p, *c| {
+            for (self.pulls, cells) |*p, *c| {
                 const pr = &(p.* orelse continue);
                 const e = c.asEid() orelse switch (c.*) {
                     .keyword, .vm => try self.inputEntity(pr.puller.read, c.*),
