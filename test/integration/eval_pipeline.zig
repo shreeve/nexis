@@ -8706,3 +8706,11 @@ test "nexis.test: thrown-with-msg? passes when the matcher takes the throw and t
         \\[2 3 1 [FAIL in user/msgs: (nexis.test/thrown-with-msg? :x #"zz" (throw {:error :x, :message "caab"})) expected: #"zz" actual: "caab" ; m FAIL in user/msgs: (nexis.test/thrown-with-msg? :x #"a" (throw :x)) expected: #"a" actual: nil FAIL in user/msgs: (nexis.test/thrown-with-msg? any #"a" 1) expected: any actual: 1 ERROR in user/other-tag: :x a Ran 2 tests containing 5 assertions. 3 failures, 1 errors.]]
     );
 }
+
+test "nexis.test: run-tests takes any number of namespaces" {
+    try expectOutputProgram(
+        \\(reset! nexis.test/out (fn [line] nil))
+        \\(nexis.test/deftest one (nexis.test/is true))
+        \\[(nexis.test/run-tests 'user 'user) (nexis.test/run-tests)]
+    , "[{:test 2, :pass 2, :fail 0, :error 0} {:test 1, :pass 1, :fail 0, :error 0}]");
+}

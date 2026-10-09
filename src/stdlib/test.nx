@@ -168,13 +168,11 @@
   (do (is (= 1 1)) (is (= 2 2))). A count of args that is not a
   multiple of argv's fails the expansion."
   [argv expr & args]
-  (cond
-    (empty? args) (if (empty? argv) nil (throw (ex-info "The number of args doesn't match are's argv." {})))
-    (or (empty? argv) (not (zero? (mod (count args) (count argv)))))
-    (throw (ex-info "The number of args doesn't match are's argv." {}))
-    :else
+  (if (or (and (empty? argv) (empty? args))
+          (and (seq argv) (seq args) (zero? (mod (count args) (count argv)))))
     `(do ~@(map (fn [vals] `(is ~(nexis.walk/postwalk-replace (zipmap argv vals) expr)))
-                (partition (count argv) args)))))
+                (when (seq argv) (partition (count argv) args))))
+    (throw (ex-info "The number of args doesn't match are's argv." {}))))
 
 (defmacro testing
   "Evaluates body with desc added to the descriptions report lines
@@ -247,12 +245,12 @@
       (reset! contexts []))))
 
 (defn run-tests
-  "Runs the tests of the current namespace, or of the namespace ns
-  names, in definition order, and reports. Returns {:test n :pass n
-  :fail n :error n}: tests run, assertions passed and failed, and tests
-  that threw."
-  ([] (run-namespaces [(nexis.internal/#%current-ns)]))
-  ([ns] (run-namespaces [(name ns)])))
+  "Runs the tests of the current namespace, or of the namespaces the
+  symbols nss name, in definition order, and reports. Returns {:test n
+  :pass n :fail n :error n}: tests run, assertions passed and failed,
+  and tests that threw."
+  [& nss]
+  (run-namespaces (if nss (map name nss) [(nexis.internal/#%current-ns)])))
 
 (defn successful?
   "Returns true if the run summary has no failure and no error."

@@ -377,9 +377,9 @@ the private helpers.
   (`join-fixtures`, `compose-fixtures`). A fixture's throw is not a
   test's and propagates out of the run, as in Clojure.
 - `(run-tests)` runs the current namespace's tests in definition
-  order, `(run-tests 'my.ns)` a named namespace's, `(run-all-tests)`
-  every namespace that registered a test, in first-registration
-  order. Each returns `{:test n :pass n :fail n :error n}`: tests
+  order, `(run-tests 'my.ns 'other.ns)` the named namespaces',
+  `(run-all-tests)` every namespace that registered a test, in
+  first-registration order. Each returns `{:test n :pass n :fail n :error n}`: tests
   run, assertions passed, assertions failed, tests that threw. A
   test's throw is caught by `any` and counted as an error; the next
   test still runs. `(successful? summary)` is whether a summary has
