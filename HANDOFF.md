@@ -481,8 +481,9 @@ after numbers in the commit message.
    `map`/`filter`/`reduce` pipeline among them since the batched
    callbacks of `docs/PERF.md` §3.33 (0.94, from 1.30), and is level on
    string splitting.
-   Warm JVM Clojure is faster on seven of ten: `fib` 6.0×, the
-   destructuring loop 5.5×, string splitting 2.4×, the map build 2.1×,
+   Warm JVM Clojure is faster on seven of ten: `fib` 5.6×
+   (`docs/PERF.md` §3.38; 6.0× in §3.15), the destructuring loop 5.3×
+   (5.5×), string splitting 2.4×, the map build 2.1×,
    the pipeline and vectors 2.1× (§3.33), the transient map 1.2×; nexis
    leads on the counting loop (0.71), on `frequencies`/`group-by`
    (0.92) and on `sort` (54–56 ms against 147 ms, `docs/PERF.md`
@@ -500,14 +501,20 @@ after numbers in the commit message.
      warm JVM Clojure's 147 ms, and peaks at 56 MB against babashka's
      116 MB. `(vec sorted)` gathering the list again (`docs/PERF.md`
      §6 "`vec` of a vector's view") is the lever left.
-   - Calls (`fib`, the destructuring loop): on x86-64 `fastCall` saves
-     six callee-saved registers, `fastCallSelf` four, the comparisons
-     three (`docs/PERF.md` §6 "Frameless fast handlers on x86-64"). em's
-     runtime is the reference: its handlers take six System V argument
-     registers (the instruction, the pc and three operand words a fast
-     handler hands the next), and its jumps fuse the compare and the
-     branch (`ifLt`; `docs/PERF.md` §6 "A compare-and-branch
-     instruction").
+   - Calls (`fib`, the destructuring loop): on x86-64 every handler
+     takes the `preserve_none` convention and saves no register
+     (`docs/PERF.md` §3.38), so a `fib` call is 203.5 instructions and
+     42.6 cycles on the Linux host (from 211.5 and 45.6), `fib` 26 ms
+     (5.6× warm JVM Clojure) and the destructuring loop 205 ms (5.3×).
+     What remains on x86-64 is a leaf call's load of the native's
+     result, which the CPU cannot forward (`docs/PERF.md` §6 "A
+     width-consistent native boundary on x86-64"), and on both hosts
+     the dependent chain of each fetch (frame → routine → code →
+     instruction → table). em's runtime is the reference: its handlers
+     take six argument registers (the instruction, the pc and three
+     operand words a fast handler hands the next), and its jumps fuse
+     the compare and the branch (`ifLt`; `docs/PERF.md` §6 "A
+     compare-and-branch instruction").
    - The pipeline and vectors (`docs/PERF.md` §3.33): a closure
      called from a native takes its arguments and gives its result as
      words, and `reduce`, `mapv`, `filterv` and the lazy `map`,

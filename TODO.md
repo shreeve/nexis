@@ -48,15 +48,17 @@ up. Every fix starts with its failing test (`AGENTS.md`).
     cell write `docs/VM.md` §6 rules out, and its own design. `sort`
     and `sort-by` do not consume their seq either: they gather every
     element before they sort (`docs/LAZY.md` §9).
-18. **Calls on x86-64 save callee-saved registers.** `fastCall` saves
-    six, `fastCallSelf` four and the comparisons three (`zig build
-    codegen`; `docs/PERF.md` §6 "Frameless fast handlers on x86-64"),
-    and `fib` runs 6.0× behind warm JVM Clojure on the Linux host
-    (`docs/PERF.md` §3.15; `HANDOFF.md` §8 item 1). The `preserve_none`
-    calling convention for every handler, or handlers that take their
-    operands in System V's argument registers as em's runtime does,
-    would remove the saves; either needs the x86-64 host to run the
-    gate and to measure.
+18. **A leaf call on x86-64 waits on a load it cannot forward.**
+    `callLeaf` reads the native's `VmError!Value` with one 16-byte load
+    of what the native stored in narrower writes, about 12 of the 75
+    cycles of an iteration of the micro kit's `leaf` on the Linux
+    host, and the destructuring loop's blocked loads, 15 M in its 1 M
+    iterations, are what keep its cycles from falling with its
+    instructions (`docs/PERF.md` §3.38).
+    Reading the result as words alone moves the stall into
+    `numExtremum` (`docs/PERF.md` §6 "A width-consistent native
+    boundary on x86-64"): the copies along the whole boundary must
+    agree, which needs its own trial on the x86-64 host.
 19. **A leaf native called through a Var pays a whole call.** `(nth v
     i)` or `(even? x)` is `var:load-var`, the argument moves and
     `call:call` into `callLeaf`, about 240 instructions above a

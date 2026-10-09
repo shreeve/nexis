@@ -2356,6 +2356,129 @@ second read of the callee 55, and the safe point and the next fetch
 the rest. `callLeaf` behind `call:call` costs about the same; what
 the calls in place remove is the moves, not the call.
 
+### 3.38 x86-64 handlers without register saves, Linux x86-64 and Apple M5
+
+Every dispatch handler and out-of-line part returns a status word,
+`VM.Status`, where it returned `VmError!void`, and on x86-64 takes the
+`x86_64_preserve_none` calling convention (`docs/VM.md` §8), under
+which no general register but rsp and rbp is the callee's to save.
+Under System V's, whose nine scratch registers include the handler's
+four arguments, a handler that kept more live values saved callee-saved
+registers with `push` at its entry and `pop` before its tail call;
+under `preserve_none` it saves nothing for the handler before it, and
+an out-of-line part keeps its values across a native's call in the
+registers System V has the native save. Zig allows an error union as
+the return type of no calling convention but `.auto`, hence the status
+word. Before is `e115f57`, after `3065544`; one ReleaseFast build of
+each on each host. Provenance: §11.
+
+The x86-64 release build's static sizes (`zig build codegen`),
+instructions and registers saved:
+
+| Function | before | after |
+|---|---:|---:|
+| `fastCall` | 142, 6 | 110, 0 |
+| `fastCallSelf` | 106, 4 | 94, 0 |
+| `fastCmp`, any operand kind | 150, 3 | 141, 0 |
+| `fastMath`, any operand kind | 127–150, 1–2 | 124–142, 0 |
+| `fastMathQuick`, `idiv` and `mod` | 54–70, 0–2 | 52–62, 0 |
+| `fastStep`, a slot limit | 72, 1 | 69, 0 |
+| `callLeaf`, out of line | 111, 4 | 77, 0 |
+| `callLookup`, out of line | 111, 5 | 88, 0 |
+| `lookupPart`, out of line | 156, 5 | 135, 0 |
+| `callBuffered`, out of line | 195, 6 | 187, 1 |
+
+Every other fast handler saved nothing and is the same size. No
+handler saves rbp, the one register the convention leaves the callee
+to save: `fastCall`, the largest, fits in the other fourteen. On arm64,
+whose handlers keep `.auto`, every fast handler and out-of-line part is
+the same size instruction for instruction; the status word moves only
+the general handlers' register allocation (`opCtrl` 185 → 197
+instructions, the others within 3). The micro kit on the M5 retires
+the same instructions: `count`, `acc`, `fib`, `gcall`, `lc`, `lv`,
+`mv`, `mvc`, `kw`, `leaf` and `getnl` within 0.1 and `lazyl` and
+`lazyf` within 0.2 (five rounds, load 6.7 → 7.3), the callback
+programs, whose own rounds spread by 2–5, within 0.8 (nine rounds,
+load 6.6 → 6.7).
+
+Linux x86-64, the micro kit (`docs/BENCH.md` §13) with `--counter perf
+--pin 2`, two runs of ten interleaved rounds, holding the host's
+benchmark lease alone (load 0.9 → 1.2); per unit, the median of the
+twenty rounds, cycles with their range:
+
+| Program | instructions | cycles | cycles change | blocked loads |
+|---|---:|---:|---:|---:|
+| `count` | 65.0 → 63.0 | 10.5 [9.2–12.7] → 10.4 [10.3–10.6] | −1.6% | 0 → 0 |
+| `fib`, a call | 211.5 → 203.5 | 45.6 [45.4–46.6] → 42.6 [42.5–43.6] | −6.4% | 0 → 0 |
+| `gcall` | 263.0 → 251.0 | 52.2 [51.5–53.6] → 49.6 [49.4–50.1] | −4.9% | 0 → 0 |
+| `leaf` | 357.0 → 325.0 | 76.4 [75.7–77.7] → 74.8 [74.0–75.7] | −2.0% | 1.141 → 1.032 |
+| `getnl` | 426.0 → 396.0 | 95.7 [94.7–96.4] → 96.7 [95.9–97.5] | +1.1% | 2.000 → 1.996 |
+| `cbsum` | 106.6 → 106.6 | 36.6 [32.3–39.0] → 35.4 [34.1–39.8] | −3.2% | 0 → 0 |
+| `cb` | 117.5 → 117.7 | 43.1 [40.2–44.9] → 42.1 [39.8–44.2] | −2.2% | 0 → 0 |
+| `lazy` | 210.8 → 211.2 | 74.1 [70.7–85.3] → 72.7 [71.7–74.2] | −1.9% | 0.225 → 0.241 |
+
+`fib` and `gcall` ran at least 3% fewer cycles in every one of the
+twenty rounds' pairs. The indirect-branch mispredicts are the same:
+0.028 a `fib` call, none on the others.
+
+The `bench/compare` language programs (`prelude.nx` with the body),
+`taskset -c 2`, `perf stat -e
+cpu_core/instructions/u,cpu_core/cycles/u,cpu_core/ld_blocks.store_forward/u`,
+the builds interleaved, ten rounds (load 1.1 → 1.4), medians:
+
+| Row | phase | instructions | cycles | blocked loads |
+|---|---:|---:|---:|---:|
+| `fib` 30 | 26.4 → 24.4 ms | 572.7 → 551.1 M | 127.6 → 117.8 M | 21.1 → 21.1 K |
+| destructuring loop | 208.1 → 202.4 ms | 3,625.0 → 3,401.0 M | 975.8 → 947.6 M | 14.21 → 15.24 M |
+| pipeline | 55.0 → 45.4 ms | 2,207.4 → 2,134.9 M | 707.5 → 649.2 M | 15.02 → 14.91 M |
+| vector `conj` and `nth` | 60.9 → 60.7 ms | 792.1 → 762.1 M | 261.9 → 262.4 M | 3.16 → 3.18 M |
+
+`bench/compare/run.clj --only lang --impls nexis,bb --workloads
+fib,destructure,vector-conj-nth,pipeline --n 10 --max-load 4 --pin
+0-11` on the Linux host, two passes, after and before alternating
+(load 0.9 → 1.6):
+
+| Row | Build | nexis | babashka | ÷ bb | wall: nexis / bb | RSS: nexis / bb |
+|---|---|---:|---:|---:|---:|---:|
+| `fib` | before | 28.3, 28.6 ms | 160, 161 ms | 0.18, 0.18 | 35.5, 35.4 ms / 176, 175 ms | 5 / 79 MB |
+| | after | 25.8, 26.3 ms | 161, 159 ms | 0.16, 0.17 | 33.0, 35.1 ms / 177, 177 ms | 5 / 79 MB |
+| destructuring loop | before | 210, 208 ms | 432, 431 ms | 0.49, 0.48 | 219, 218 ms / 450, 446 ms | 23 / 86 MB |
+| | after | 205, 204 ms | 432, 429 ms | 0.48, 0.48 | 215, 214 ms / 446, 445 ms | 23 / 86 MB |
+| pipeline | before | 53.8, 53.9 ms | 45.8, 49.5 ms | 1.17, 1.09 | 206, 206 ms / 562, 562 ms | 188 / 214 MB |
+| | after | 44.9, 45.2 ms | 49.0, 45.9 ms | 0.92, 0.99 | 193, 194 ms / 565, 565 ms | 188 / 214 MB |
+| vectors | before | 63.5, 63.5 ms | 121, 122 ms | 0.52, 0.52 | 73.8, 73.5 ms / 141, 142 ms | 35 / 126 MB |
+| | after | 61.2, 62.8 ms | 120, 121 ms | 0.51, 0.52 | 71.5, 73.2 ms / 141, 139 ms | 36 / 126 MB |
+
+What the rows say:
+
+- The instructions fall by exactly the saves: 8 a `fib` call
+  (`fastCallSelf`'s four pairs), 12 a closure call (`fastCall`'s six;
+  rbp is not among them, so the whole 12 goes), 2 an iteration of the
+  counting loop (`fastStep`'s pair), 32 a leaf call and 30 a native
+  call (`fastCall`'s pairs on its way out of line, `callLeaf`'s or
+  `callBuffered`'s, and the moves that copied the arguments into
+  callee-saved registers before the native's call).
+- The cycles fall less than the instructions on the native paths:
+  each leaf call still waits on a load the store before it cannot
+  forward (`callLeaf`'s 16-byte read of the native's result, about 12
+  cycles; §6 "A width-consistent native boundary on x86-64"), and
+  `getnl` blocks twice an iteration, so its 7% fewer instructions run
+  in 1% more cycles. The destructuring loop, five leaf calls and a
+  closure call an iteration, retires 6.2% fewer instructions and runs
+  2.6% faster, its blocked loads up 7%.
+- `fib` runs in 26 ms, 5.6× warm JVM Clojure's 4.68 ms (§3.15), from
+  6.0×; the destructuring loop 5.3×, from 5.5×.
+- The pipeline's before build runs 707.5 M cycles for the instructions
+  §3.33's build ran in 674.7 M (46.8 ms), the same code placed
+  differently; the after build's 649.2 M are 3.8% under §3.33's, its
+  phase 45.4 ms (0.92–0.99 of babashka's).
+- The chain's entries, `drive` and a `Callback`'s call, save what they
+  keep across the chain once a pass, under any convention: `cbsum`,
+  `cb` and `lazy` run the same instructions and no more cycles.
+- Debug x86-64 builds tail-call through LLVM's `musttail` under the
+  convention: the gate, its `deep-calls` and `deep-recursion` CLI
+  goldens among it, passes on the Linux host.
+
 ## 6. Levers and dead ends
 
 Each lever is a measured change: a before/after from `zig build bench`
@@ -2441,13 +2564,17 @@ Each lever is a measured change: a before/after from `zig build bench`
   (f)] (g x))` computes `x` into its slot and moves it into `g`'s
   block; computing it into the block directly saves the move for each
   binding used once, as an argument, by the body's call.
-- **Frameless fast handlers on x86-64**: the comparisons, the
-  arithmetic and `call:call` save one to six callee-saved registers there
-  (`zig build codegen`), where System V leaves nine scratch registers
-  and the handler's arguments take four. The `preserve_none` calling
-  convention (`x86_64_preserve_none`, every register scratch) for
-  every handler would remove the saves; it needs an x86-64 host to
-  run the gate and to measure.
+- **A width-consistent native boundary on x86-64**: `callLeaf` reads
+  a native's `VmError!Value` result with one 16-byte load of what the
+  native stored as two 8-byte words and a 2-byte error, which the CPU
+  cannot forward, about 12 of the 75 cycles of an iteration of
+  §3.38's `leaf` (`perf annotate` of `vm.VM.callLeaf`). Reading the
+  result as words alone moves the stall into `numExtremum`, whose
+  operands `fnMax` passes through memory at mixed widths: `leaf` 77.3
+  → 78.5 cycles an iteration in a trial build (five rounds on the
+  Linux host, not in the tree). The copies along the whole boundary (`callLeaf`'s
+  result, `foldNumbers`' and `numExtremum`'s operands, the window's
+  `copyWords` that natives read back) would need to agree.
 - **A compare-and-branch instruction**: an `if` on `(< i n)` is
   `cmp:lt` into a slot and `jump:if-false` on it, which the dispatch
   runs as one (`docs/VM.md` §8, §3.12). One encoded instruction would
@@ -2463,6 +2590,16 @@ Each lever is a measured change: a before/after from `zig build bench`
   gathered the elements and built a second vector: the `bench/compare`
   `sort` row 1,045 → 959 M instructions and 136.5 → 120.1 MB on the
   M5.
+- *x86-64 handlers without register saves* (§3.38, `docs/VM.md` §8):
+  every handler returns a status word and, on x86-64, takes the
+  `preserve_none` convention, so no fast handler saves a register
+  (`fastCall` saved six, `fastCallSelf` four) and the out-of-line
+  parts keep their values across a native's call in the registers the
+  native saves. On the Linux host a `fib` call 211.5 → 203.5
+  instructions and 45.6 → 42.6 cycles, a closure call 12 instructions
+  and 4.9% of its cycles fewer, a leaf call 32 instructions fewer;
+  `fib` 28.4 → 26.0 ms, the destructuring loop 209 → 205 ms. arm64's
+  code is the same.
 - *`sort`'s buffers* (§3.34): `sort` and `sort-by` sort the elements
   in the list they gather them into, the values alone without a key
   function, each merge through a scratch array of half the elements;
@@ -2816,4 +2953,5 @@ is one invocation's 30-sample median.
 | §3.35 | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); shared with concurrent sessions | 2026-10-08 16:13–16:44 MDT, seqfix: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at `ced34dc` (before: `0c7d082` before its rebase onto `e115f57`, which brings §3.34's `sort`) and at the commit that adds §3.35 over the same base (after; the `zipmap` rows with its values consumed as well, `zipmap` alone differing). Programs (`rev`, `butl`, `mapv`, `filtv`, `apply`, `zipm`, `selk`, `join`, `joini`, the vector controls and the loops of small calls) kept with the raw output: `harness.py OUT 3` at 3 M and 30 M (`mem5.*`, load 14.5 → 15.4); `join`, `joini` and `string-split` by `cmds.py OUT 5` (`cmp3.*`, load 30). Micro kit: `bb bench/micro/run.clj --rounds 5 BEFORE AFTER` under `tools/heavy` (1 core), load 31.5 → 25.9. The `bench/compare` language programs (`prelude.nx` and body) by `cmds.py OUT 5`, load 29.4 → 31.1. The `vec` of a view runs: `cmds.py OUT 5`, the build of the consuming commit against the one after it (`vec.*`, load 5.3 → 5.2). Raw output: `.git/revamp/r3/seqfix/` (`mem*.txt`, `mem*.json`, `mem*.load`, `micro.*`, `cmp*.*`, `vec.*`, `programs/`) |
 | §3.36, §3.11's and §3.15's store rows, §6 "Store size" | Apple M5, 10 cores, 32 GiB, macOS 27.0.1, Zig 0.17.0, ReleaseFast (`-Doptimize=fast`), emdb `b3370fb` (`8e1ed1e` for the v0.1.0 stage, a source snapshot), shared with concurrent sessions (load 6–45); and the Linux host of §3.15, Zig 0.17.0 (`tools/zig-0.17`; `run.clj` reports the host's default `zig`), emdb `b3370fb` (a source snapshot) | 2026-10-08, store. Sizes: `zig build bench -Doptimize=fast -- --filter nextomic-store` at each stage's commit (snapshots of `0d5f691` under both emdbs, `f4b2072`, `4dd916a`, `05ed7a1`). Reads on the M5: `q.nx STORE MODE N` (a probe over the `nexis-load.nx` store, its churn variant after two rounds of 20,000 salary changes) under `tools/heavy /usr/bin/time -l`, N1 and N2 per mode, three interleaved rounds, `78f0f3b` against `b2c4eaa`. Transactions on the M5: `tx.nx STORE N MODE` (§3.27's probe plus a `retract` shape), 2,000 and 10,000, three interleaved rounds, `78f0f3b` against `b2c4eaa`, pages from copies of both printing each commit's dirty-page count. Linux: `perf stat -x, -e instructions:u,cycles:u,branch-misses:u` of the read probe pinned to one core (`taskset -c 2`), three rounds, `fd5ef10`, `b2c4eaa` and `04ccab3`; `run.clj --no-build --only db --impls nexis --n 10 --max-load 4 --pin 0-11` from snapshots of `fd5ef10` and `04ccab3`, base, head, base, head (load 0.5–1.4), and once from `05ed7a1` with `--impls nexis,datalevin`; all under the host's benchmark lease. Raw output: `.git/revamp/r3/store/` |
 | §3.37, §6 "A Var's load run with its call", "Calls of one or two arguments in place", "Inline caches at call sites" | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); shared with concurrent sessions | 2026-10-08, varcalls: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at `19eb7cd` (before), with the load run with its call over `f277127`, and with the calls in place and the load run with `call2` over `a9a7cec` (five commits, not kept); `-Dopcodes=true` twins of each. Micro kit: `bb bench/micro/run.clj --rounds 5 --programs count,acc,fib,gcall,lc,lv,mv,mvc,kw,leaf,getnl,vnth,leaf1,vdestr,cbbase,cbsum,cbred,cb,lazy,lazyl,lazyf BEFORE AFTER` under `tools/heavy` (1 core), the loads in the text. Whole process: the `bench/compare` programs (prelude and body) under `/usr/bin/time -l`, three interleaved rounds; the §3.31 shapes at 3 M once each. The trace: `lldb` stepping one iteration of `leaf1.nx` from one `fnCountLeaf` entry to the next. Raw output: `.git/revamp/r3/varcalls/` |
+| §3.38, §6 "x86-64 handlers without register saves" and "A width-consistent native boundary on x86-64" | Intel Core Ultra 9 185H, 30 GiB, Ubuntu 26.04.1 LTS, Linux 7.0.0-34-generic, governor `powersave`, as §3.15; babashka v1.13.224; and Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434); Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `b3370fb` (a source snapshot on the Linux host); both hosts shared with other sessions | 2026-10-08 19:24–22:52 MDT, x86: `bin/nexis` built by `zig build install -Doptimize=fast` from source snapshots of `8cd7499` (before, `e115f57`'s source) and of `3065544` (after) on the Linux host, and with `--prefix DIR` at `8cd7499`, `13df08b` (the status word alone) and `3065544` on the M5, whose `13df08b` and `3065544` builds disassemble to the same instructions. Static sizes from `zig build codegen` at `8cd7499`, `13df08b` and `3065544`. Linux: `micro.sh`, `bb bench/micro/run.clj --counter perf --pin 2 --rounds 10 --programs count,fib,gcall,leaf,getnl,cbbase,cbsum,cb,lazy BEFORE AFTER`, twice, each in its own exclusive hold of the host's benchmark lease (load 0.9 → 1.2); `perfpairs.sh`, each run `taskset -c 2 /usr/bin/time -f %M perf stat -x, -e cpu_core/instructions/u,cpu_core/cycles/u,cpu_core/br_misp_retired.indirect/u,cpu_core/ld_blocks.store_forward/u bin/nexis run P` over `prelude.nx` with each body, the builds interleaved, ten rounds (load 1.1 → 1.4); `run.clj --n 10 --max-load 4 --pin 0-11 --no-build --only lang --impls nexis,bb --workloads fib,destructure,vector-conj-nth,pipeline` from each snapshot, after, before, after, before (load 0.9 → 1.6; its report names the `zig` on the path, not the one that built). The `callLeaf` stall and the one-line trial of §6 from the Stage 0 profile at `fd5ef10` (`perf record -e cpu_core/cycles/upp` and `cpu_core/ld_blocks.store_forward/u`, five rounds). M5: `bb bench/micro/run.clj --rounds 5` over every program but those of other trees, and `--rounds 9` over the callback programs, under `tools/heavy` (1 core). Raw output: `.git/revamp/r3/x86/` (`pup-micro-*.txt`/`.json`, `pup-pairs-1.txt`, `runclj/`, `m5-micro-*`, `codegen-*.log`) and `.git/revamp/r3/x86spike.md` |
 | §6 "Levers pulled", the `cc935cc` figures of §3.11 | as §3.11 language and database rows, shared with concurrent builds (1-minute load average 5–15) | 2026-09-26: `bb bench/compare/run.clj --only db --n 10 --max-load 6 --no-build` over ReleaseFast binaries of the ws-durability branch (after) and of `cc935cc` (before), run one after the other; each run's third attempt, the first two having seen the load pass 6; ten rounds after a warm-up. The `bin/nexis` read figures: a probe program timing 10,000 of each operation over 10,000 entities with `nano-time`, three runs of each binary, alternating. `db_put_commit_scalar`: `zig build bench -Doptimize=ReleaseFast -- --filter db-integrated,nextomic`, three invocations at the branch head and two at `cc935cc`, alternating, the best median; §3.6's durable M5 figure is the `cc935cc` run's, and the branch head measured 7.2–8.9 ms under `NEXIS_DURABILITY=durable` at load 7 |
