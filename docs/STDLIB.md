@@ -27,7 +27,7 @@ registry; the CLI (`cli.zig` `Runtime.init`) and the test harness
    the sources themselves are evaluated, each with its namespace
    current: `core.nx`, `nextomic.nx`, `walk.nx`, `edn.nx`, `test.nx`,
    `pprint.nx`, `math.nx`, `string.nx`, `set.nx`, `sys.nx`,
-   `shell.nx`.
+   `shell.nx`, `time.nx`.
 4. Every namespace in the registry is marked loaded, so a `require`
    of one only makes the alias.
 
@@ -109,10 +109,11 @@ Var inside a `binding`.
 | `nexis.math` | `math_natives` | `math.nx` (`PI`, `E`, `floor-div`, `floor-mod`) | TOOLING.md §4 |
 | `nexis.sys` | (`#%getenv`, `#%cwd` in `internal_natives`) | `sys.nx` | §11 |
 | `nexis.shell` | (`#%sh` in `internal_natives`) | `shell.nx` | §11 |
+| `nexis.time` | (`#%now-ms`, `#%format-instant`, `#%parse-instant` in `internal_natives`) | `time.nx` | §12 |
 | `nexis.test` | — | `test.nx` | TOOLING.md §3 |
 | `nexis.pprint` | — | `pprint.nx` | TOOLING.md §4 |
 | `nexis.simd` | `simd_natives` | — | TYPED_VECTOR.md §7.2 |
-| `nexis.internal` | `internal_natives` | — | the `#%` helpers macros emit: records and protocols (PROTOCOLS.md §7), `#%catch-matches?` (`try`), `#%kwargs` (`& {:keys ...}`), `#%current-ns` (TOOLING.md §3), `#%delay` (`delay`, §8), `#%sorted-map` / `#%sorted-set` (a sorted collection a macro returns, MACROEXPAND.md §5), `#%push-out` / `#%pop-out` (`with-out-str`, §6), `#%mm-lookup` (a multimethod's call, §9.3), and the natives the namespaces of §11 call |
+| `nexis.internal` | `internal_natives` | — | the `#%` helpers macros emit: records and protocols (PROTOCOLS.md §7), `#%catch-matches?` (`try`), `#%kwargs` (`& {:keys ...}`), `#%current-ns` (TOOLING.md §3), `#%delay` (`delay`, §8), `#%sorted-map` / `#%sorted-set` (a sorted collection a macro returns, MACROEXPAND.md §5), `#%push-out` / `#%pop-out` (`with-out-str`, §6), `#%mm-lookup` (a multimethod's call, §9.3), and the natives the namespaces of §11 and §12 call |
 
 **Resolution.** Every other namespace has `nexis.core` as its parent,
 so an unqualified symbol a namespace does not define resolves in
@@ -715,3 +716,51 @@ terminal, no open file but the three pipes.
 `test/integration/eval_pipeline.zig` pins every row, a variable and
 output holding bytes that are not UTF-8 and a `:in` past any pipe's
 buffer included; `sh` runs there with the test's `std.Io`.
+
+---
+
+### 12. Instants: `nexis.time`
+
+`src/stdlib/time.nx` holds instants, their ISO-8601 text and
+durations, each function a docstring'd `defn`; three natives in
+`internal_natives` read the clock and convert the text.
+
+**The representation.** An instant is the record
+`nexis.time.Instant` of one field, `:ms`, the milliseconds since
+1970-01-01T00:00:00Z on the proleptic Gregorian calendar, UTC, with no
+leap seconds: Java's `Instant` to the millisecond, the precision of
+Clojure's `#inst` and of Nextomic's `:db.type/instant`. A record needs
+no new value kind (PLAN §23): it is `=` and hashes by its `:ms`,
+`(:ms i)` reads it, and it prints as `#nexis.time.Instant{:ms
+1791549015123}`. It is not `compare`-able, as records are not
+(`docs/SORTED.md` §6): sort instants with `(sort-by inst-ms xs)`.
+`nexis.core`'s `inst?` is false of everything (§8) and there is no
+`#inst` literal (PLAN §4; `TODO.md` has the design note). The range is
+the fixnum's, ±2^47 ms: -2490-03-17 to 6429-10-17.
+
+**Nextomic.** A `:db.type/instant` value, `:db/txInstant` included, is
+epoch milliseconds, a long (`docs/NEXTOMIC.md` §2), and every function
+here that takes an instant takes such a long as well: `(t/format
+(:db/txInstant tx))` writes one, `(t/instant ms)` makes it an Instant,
+and `(t/inst-ms i)` is what a transaction asserts.
+
+| Name | Arity | Semantics | Errors |
+|---|---|---|---|
+| `now` | 0 | The wall clock (`CLOCK_REALTIME`) as an Instant, to the millisecond | — |
+| `instant` | 1 | An Instant of epoch milliseconds (an integer), of ISO-8601 text as `parse` reads it, or of an Instant (itself) | `:kind-mismatch`, as `parse` |
+| `inst?` | 1 | Whether `x` is an Instant | — |
+| `inst-ms` | 1 | The epoch milliseconds of an instant: an Instant's `:ms`, an integer itself (Clojure's `inst-ms`) | `:kind-mismatch` |
+| `parse` | 1 | The Instant ISO-8601 text names, in the grammar of Clojure's `#inst`, which RFC 3339's is a part of: `YYYY` (with an optional sign), then optionally `-MM`, `-DD`, `THH:MM`, `:SS` and a fraction of 1 to 9 digits, each only after the one before, truncated to the millisecond; then `Z`, an offset `+HH:MM` or `+HHMM`, or nothing, which is UTC. `T` and `Z` may be lower case. A field out of its range (month 13, February 29 of a common year, hour 24, second 60) is not an instant | `:kind-mismatch` (not a string), `:invalid-argument` (any other text; an instant past the range) |
+| `format` | 1 | The instant's ISO-8601 text in UTC as Java's `Instant.toString` writes it: `2026-10-09T12:30:15.123Z`, the fraction left out when it is zero, a year before 1 written with a `-` (`-0001-01-01T00:00:00Z`) | `:kind-mismatch` (not an instant, or past the range) |
+| `seconds`, `minutes`, `hours`, `days` | 1 | A duration of `n` of the unit, in milliseconds: a duration is a number of milliseconds, a day 24 hours | — |
+| `plus`, `minus` | 1+ | `(plus x d ...)`: the Instant each duration later (`minus`: earlier) than the instant `x`, `long` of the sum | `:kind-mismatch` |
+| `between` | 2 | The duration from instant `a` to instant `b`, negative when `b` is earlier | `:kind-mismatch` |
+| `before?`, `after?` | 2 | Whether instant `a` is earlier (later) than instant `b` | `:kind-mismatch` |
+
+There are no time zones but UTC, no local dates, and no calendar
+arithmetic (a month later); a program that needs them builds them on
+`inst-ms`. `src/stdlib.zig` checks the calendar against
+`std.time.epoch` and day by day over the whole range, and that every
+instant's text reads back as the same instant;
+`test/integration/eval_pipeline.zig` pins each row and a Nextomic
+round trip.

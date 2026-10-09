@@ -1,0 +1,86 @@
+; src/stdlib/time.nx — the `nexis.time` namespace: instants, ISO-8601
+; text and durations (docs/STDLIB.md §12), over the natives in
+; src/stdlib.zig internal_natives. Embedded via @embedFile and
+; bootstrapped with nexis.time as the current namespace.
+
+(defrecord Instant [ms])
+
+; defrecord's Vars, documented as the defns below are.
+(doseq [[v doc] [[#'Instant "The record type of an instant, whose one field :ms is its epoch\n  milliseconds."]
+                 [#'->Instant "Returns the Instant of the epoch milliseconds ms; instant also takes\n  text or an Instant."]
+                 [#'map->Instant "Returns the Instant of the map m's :ms."]
+                 [#'Instant? "Returns true if x is an Instant, as inst? does."]
+                 [#'Instant-type-id "The record type id of Instant."]]]
+  (alter-meta! v assoc :doc doc))
+
+(defn inst?
+  "Whether x is an Instant."
+  [x]
+  (instance? Instant x))
+
+(defn inst-ms
+  "The epoch milliseconds of the instant x: an Instant's :ms, or an
+  integer itself, the form Nextomic's :db.type/instant values take."
+  [x]
+  (cond (instance? Instant x) (:ms x)
+        (integer? x) x
+        :else (throw :kind-mismatch)))
+
+(defn parse
+  "The Instant the ISO-8601 text s names: 2026-10-09, 2026-10-09T12:30Z,
+  2026-10-09T12:30:15.123+02:00 and the like, a missing offset UTC, a
+  fraction truncated to the millisecond. Other text is :invalid-argument."
+  [s]
+  (->Instant (nexis.internal/#%parse-instant s)))
+
+(defn instant
+  "An Instant of x: epoch milliseconds (an integer), ISO-8601 text as
+  `parse` reads it, or an Instant, itself."
+  [x]
+  (cond (instance? Instant x) x
+        (integer? x) (->Instant x)
+        (string? x) (parse x)
+        :else (throw :kind-mismatch)))
+
+(defn now
+  "The wall clock as an Instant, to the millisecond."
+  []
+  (->Instant (nexis.internal/#%now-ms)))
+
+(defn format
+  "The ISO-8601 text of the instant x (an Instant or epoch
+  milliseconds), in UTC as Java's Instant.toString writes it:
+  2026-10-09T12:30:15.123Z, the fraction left out when it is zero."
+  [x]
+  (nexis.internal/#%format-instant (inst-ms x)))
+
+(defn seconds "n seconds, as a duration in milliseconds." [n] (* n 1000))
+(defn minutes "n minutes, as a duration in milliseconds." [n] (* n 60000))
+(defn hours "n hours, as a duration in milliseconds." [n] (* n 3600000))
+(defn days "n days of 24 hours, as a duration in milliseconds." [n] (* n 86400000))
+
+(defn plus
+  "The Instant each duration (milliseconds) later than the instant x."
+  [x & durations]
+  (->Instant (long (apply + (inst-ms x) durations))))
+
+(defn minus
+  "The Instant each duration (milliseconds) earlier than the instant x."
+  [x & durations]
+  (->Instant (long (apply - (inst-ms x) durations))))
+
+(defn between
+  "The duration from the instant a to the instant b in milliseconds,
+  negative when b is earlier."
+  [a b]
+  (- (inst-ms b) (inst-ms a)))
+
+(defn before?
+  "Whether the instant a is earlier than the instant b."
+  [a b]
+  (< (inst-ms a) (inst-ms b)))
+
+(defn after?
+  "Whether the instant a is later than the instant b."
+  [a b]
+  (> (inst-ms a) (inst-ms b)))

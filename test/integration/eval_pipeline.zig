@@ -314,7 +314,7 @@ test "doc, find-doc, apropos and dir read the documentation of Vars, natives, sp
     try expectOutput("[(doc no-such-thing) (with-out-str (doc no-such-thing))]", "[nil ]");
     // apropos: sorted qualified symbols, host macros included.
     try expectOutput("(apropos \"cond-\")", "(nexis.core/cond-> nexis.core/cond->>)");
-    try expectOutput("(apropos #\"^->\")", "(nexis.core/-> nexis.core/->>)");
+    try expectOutput("(apropos #\"^->\")", "(nexis.core/-> nexis.core/->> nexis.time/->Instant)");
     try expectOutput("(some #{'nexis.string/split-lines} (apropos \"split\"))", "nexis.string/split-lines");
     // dir: a namespace or an alias; nexis.core with its host macros.
     try expectOutput("(dir-fn 'nexis.set)", "(difference intersection map-invert rename-keys select subset? superset? union)");
@@ -4997,6 +4997,65 @@ test "shell: sh refuses what it cannot run" {
     try expectOutputWithIo("(try (nexis.shell/sh \"ls\" :dir) (catch any e e))", ":arity-mismatch");
     // A VM with no I/O spawns nothing.
     try expectOutput("(try (nexis.shell/sh \"true\") (catch any e e))", ":io-error");
+}
+
+test "time: format writes an instant as Java's Instant.toString does" {
+    try expectOutput("(nexis.time/format 0)", "1970-01-01T00:00:00Z");
+    try expectOutput("(nexis.time/format 1791549015123)", "2026-10-09T12:30:15.123Z");
+    try expectOutput("(nexis.time/format (nexis.time/instant 951868799999))", "2000-02-29T23:59:59.999Z");
+    try expectOutput("(nexis.time/format -1)", "1969-12-31T23:59:59.999Z");
+    try expectOutput("(nexis.time/format -62167219200000)", "0000-01-01T00:00:00Z");
+    try expectOutput("(nexis.time/format -62198755200000)", "-0001-01-01T00:00:00Z");
+    try expectOutput("(nexis.time/format 1791549015120)", "2026-10-09T12:30:15.120Z");
+    try expectOutput("(try (nexis.time/format \"2026\") (catch any e e))", ":kind-mismatch");
+}
+
+test "time: parse reads ISO-8601 instants, a missing offset UTC" {
+    try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"2026-10-09\"))", "1791504000000");
+    try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"2026-10-09T12:30Z\"))", "1791549000000");
+    try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"2026-10-09T12:30:15.5+02:00\"))", "1791541815500");
+    try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"2026-10-09t12:30:15.123456789z\"))", "1791549015123");
+    try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"2026-10-09T12:30:00-0530\"))", "1791568800000");
+    try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"2026-10-09T12:30\"))", "1791549000000");
+    try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"2026\"))", "1767225600000");
+    try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"2026-10\"))", "1790812800000");
+    try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"-0001-01-01T00:00:00Z\"))", "-62198755200000");
+    try expectOutput("(= (nexis.time/instant \"2026-10-09\") (nexis.time/parse \"2026-10-09T00:00:00.000Z\"))", "true");
+    for ([_][]const u8{ "", "x", "2026-13-01", "2026-02-29", "2026-10-09T24:00Z", "2026-10-09T12:60Z", "2026-10-09T12:30:61Z", "2026-10-09T12Z", "2026-10-09T12:30:15.Z", "2026-10-09T12:30+25:00", "2026-10-09T12:30Zx", "26-10-09", "2026-1-09", "99999-01-01" }) |text| {
+        const src = try std.fmt.allocPrint(testing.allocator, "(try (nexis.time/parse \"{s}\") (catch any e e))", .{text});
+        defer testing.allocator.free(src);
+        try expectOutput(src, ":invalid-argument");
+    }
+    try expectOutput("(try (nexis.time/parse 5) (catch any e e))", ":kind-mismatch");
+}
+
+test "time: instants, the clock, durations and order" {
+    try expectOutput("(nexis.time/inst? (nexis.time/now))", "true");
+    try expectOutput("[(nexis.time/inst? 5) (nexis.time/inst? {:ms 5})]", "[false false]");
+    try expectOutput("(< 1767225600000 (nexis.time/inst-ms (nexis.time/now)))", "true");
+    try expectOutput("(nexis.time/instant 5)", "#nexis.time.Instant{:ms 5}");
+    try expectOutput("(let [i (nexis.time/instant 5)] (identical? i (nexis.time/instant i)))", "true");
+    try expectOutput("(try (nexis.time/instant :x) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (nexis.time/inst-ms \"x\") (catch any e e))", ":kind-mismatch");
+    try expectOutput(
+        \\(nexis.time/format (nexis.time/plus (nexis.time/parse "2026-10-09") (nexis.time/days 1) (nexis.time/hours 1) (nexis.time/minutes 30) (nexis.time/seconds 15) 7))
+    , "2026-10-10T01:30:15.007Z");
+    try expectOutput("(nexis.time/format (nexis.time/minus 1000 (nexis.time/seconds 2)))", "1969-12-31T23:59:59Z");
+    try expectOutput("(nexis.time/between (nexis.time/parse \"2026-10-09\") (nexis.time/parse \"2026-10-08\"))", "-86400000");
+    try expectOutput("[(nexis.time/before? 1 (nexis.time/instant 2)) (nexis.time/after? 1 2) (nexis.time/before? 2 2)]", "[true false false]");
+    try expectOutput("(map nexis.time/format (sort-by nexis.time/inst-ms [(nexis.time/instant 2000) 1000]))", "(1970-01-01T00:00:01Z 1970-01-01T00:00:02Z)");
+}
+
+test "time: Nextomic's instants are epoch milliseconds, which every time function takes" {
+    try expectOutputProgramWithStore("time-nextomic",
+        \\(def c (nextomic/connect "@STORE@"))
+        \\(nextomic/transact! c [{:db/ident :ev/at :db/valueType :db.type/instant :db/cardinality :db.cardinality/one}])
+        \\(nextomic/transact! c [{:ev/at (nexis.time/inst-ms (nexis.time/parse "2026-10-09T12:30:15.123Z"))}])
+        \\(def at (nextomic/q '[:find ?at . :where [_ :ev/at ?at]] (nextomic/db c)))
+        \\(def tx (nextomic/q '[:find (max ?i) . :where [_ :db/txInstant ?i]] (nextomic/db c)))
+        \\(nextomic/release c)
+        \\[(nexis.time/format at) (nexis.time/inst? (nexis.time/instant tx)) (not (nexis.time/after? tx (nexis.time/now)))]
+    , "[2026-10-09T12:30:15.123Z true true]");
 }
 
 // =============================================================================

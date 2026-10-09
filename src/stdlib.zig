@@ -244,6 +244,8 @@ pub const embedded = [_]image_mod.Source{
     .{ .ns = "nexis.sys", .info = .{ .path = "sys.nx", .text = @embedFile("stdlib/sys.nx") } },
     // Clojure's clojure.java.shell.
     .{ .ns = "nexis.shell", .info = .{ .path = "shell.nx", .text = @embedFile("stdlib/shell.nx") } },
+    // Instants, ISO-8601 text and durations.
+    .{ .ns = "nexis.time", .info = .{ .path = "time.nx", .text = @embedFile("stdlib/time.nx") } },
 };
 
 const core_rows = .{
@@ -661,6 +663,10 @@ const internal_rows = .{
     .{ "#%cwd", 0, 0, &fnCwd },
     // nexis.shell/sh (shell.nx, STDLIB.md §11).
     .{ "#%sh", 2, 2, &fnSh },
+    // The natives under nexis.time (time.nx, STDLIB.md §12).
+    .{ "#%now-ms", 0, 0, &fnNowMs },
+    .{ "#%format-instant", 1, 1, &fnFormatInstant },
+    .{ "#%parse-instant", 1, 1, &fnParseInstant },
 };
 const internal_natives = table("nexis.internal", internal_rows);
 
@@ -3765,6 +3771,7 @@ const namespace_docs = std.StaticStringMap([]const u8).initComptime(.{
     .{ "nexis.pprint", "Clojure's clojure.pprint, which names it: pprint and pprint-str." },
     .{ "nexis.sys", "The process's environment and working directory: getenv and cwd.\n  exit and *command-line-args* are nexis.core's." },
     .{ "nexis.shell", "Clojure's clojure.java.shell: sh runs a program and returns\n  {:exit :out :err}; with-sh-dir and with-sh-env set its defaults." },
+    .{ "nexis.time", "Instants, the record Instant of epoch milliseconds: now, parse and\n  format (ISO-8601), durations in milliseconds, plus, minus, between.\n  Each takes Nextomic's epoch-millisecond longs as well." },
     .{ "nexis.simd", "Kernels over typed vectors (i64-vector, f64-vector): sum, dot,\n  scale and map." },
     .{ "nexis.internal", "The helpers macro expansions call. Not for programs." },
 });
@@ -6629,6 +6636,167 @@ fn shExchange(vm: *VM, io: std.Io, child: *std.process.Child, input: []const u8,
 }
 
 // =============================================================================
+// Instants (nexis.time, STDLIB.md §12)
+// =============================================================================
+//
+// An instant is a count of milliseconds since 1970-01-01T00:00:00Z on
+// the proleptic Gregorian calendar, as Nextomic's `:db.type/instant`
+// values are; these natives turn one into ISO-8601 text and back.
+
+const ms_per_day = 86_400_000;
+
+/// The days from 1970-01-01 to the date `year-month-day` (Hinnant's
+/// `days_from_civil`, exact for every year).
+fn daysFromCivil(year: i64, month: u32, day: u32) i64 {
+    const y = if (month <= 2) year - 1 else year;
+    const era = @divFloor(y, 400);
+    const yoe = y - era * 400;
+    const mp: i64 = if (month > 2) month - 3 else month + 9;
+    const doy = @divFloor(153 * mp + 2, 5) + day - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146_097 + doe - 719_468;
+}
+
+const Civil = struct { year: i64, month: u32, day: u32 };
+
+/// The date `days` after 1970-01-01 (`civil_from_days`).
+fn civilFromDays(days: i64) Civil {
+    const z = days + 719_468;
+    const era = @divFloor(z, 146_097);
+    const doe = z - era * 146_097;
+    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36_524) - @divFloor(doe, 146_096), 365);
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp = @divFloor(5 * doy + 2, 153);
+    const month = if (mp < 10) mp + 3 else mp - 9;
+    return .{
+        .year = yoe + era * 400 + @intFromBool(month <= 2),
+        .month = @intCast(month),
+        .day = @intCast(doy - @divFloor(153 * mp + 2, 5) + 1),
+    };
+}
+
+fn daysInMonth(year: i64, month: u32) u32 {
+    return switch (month) {
+        2 => if (@mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0)) 29 else 28,
+        4, 6, 9, 11 => 30,
+        else => 31,
+    };
+}
+
+/// The instant `ms` as Java's `Instant.toString` writes it, to the
+/// millisecond: `2026-10-09T12:30:15.123Z`, the fraction left out when
+/// it is zero, a year before 1 with a `-` and one past 9999 with a `+`.
+fn writeInstant(w: *std.Io.Writer, ms: i64) std.Io.Writer.Error!void {
+    const in_day: u64 = @intCast(@mod(ms, ms_per_day));
+    const date = civilFromDays(@divFloor(ms, ms_per_day));
+    if (date.year < 0) try w.writeByte('-') else if (date.year > 9999) try w.writeByte('+');
+    try w.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}", .{ @abs(date.year), date.month, date.day, in_day / 3_600_000, in_day / 60_000 % 60, in_day / 1000 % 60 });
+    if (in_day % 1000 != 0) try w.print(".{d:0>3}", .{in_day % 1000});
+    try w.writeByte('Z');
+}
+
+/// The instant the ISO-8601 text `s` names, in epoch milliseconds, or
+/// null when `s` is not one. The grammar is Clojure's `#inst`, which
+/// RFC 3339 is a part of: `[+-]YYYY`, then optionally `-MM`, `-DD`,
+/// `THH:MM`, `:SS` and a fraction of 1 to 9 digits (truncated to the
+/// millisecond), each only after the one before; then `Z`, an offset
+/// `+HH:MM` (or `+HHMM`), or nothing, which is UTC. `T` and `Z` may be
+/// lower case.
+fn parseInstant(s: []const u8) ?i64 {
+    const Scan = struct {
+        s: []const u8,
+        i: usize = 0,
+
+        fn eat(p: *@This(), set: []const u8) bool {
+            if (p.i >= p.s.len or std.mem.findScalar(u8, set, p.s[p.i]) == null) return false;
+            p.i += 1;
+            return true;
+        }
+
+        fn digits(p: *@This(), n: usize) ?u32 {
+            if (p.s.len - p.i < n) return null;
+            var v: u32 = 0;
+            for (p.s[p.i..][0..n]) |c| {
+                if (!std.ascii.isDigit(c)) return null;
+                v = v * 10 + (c - '0');
+            }
+            p.i += n;
+            return v;
+        }
+    };
+    var p: Scan = .{ .s = s };
+    const negative = p.eat("-");
+    if (!negative) _ = p.eat("+");
+    const year: i64 = @as(i64, p.digits(4) orelse return null) * @as(i64, if (negative) -1 else 1);
+    var month: u32 = 1;
+    var day: u32 = 1;
+    var hour: u32 = 0;
+    var minute: u32 = 0;
+    var second: u32 = 0;
+    var milli: u32 = 0;
+    if (p.eat("-")) {
+        month = p.digits(2) orelse return null;
+        if (p.eat("-")) {
+            day = p.digits(2) orelse return null;
+            if (p.eat("Tt")) {
+                hour = p.digits(2) orelse return null;
+                if (!p.eat(":")) return null;
+                minute = p.digits(2) orelse return null;
+                if (p.eat(":")) {
+                    second = p.digits(2) orelse return null;
+                    if (p.eat(".")) {
+                        const start = p.i;
+                        while (p.i < s.len and std.ascii.isDigit(s[p.i])) p.i += 1;
+                        const n = p.i - start;
+                        if (n == 0 or n > 9) return null;
+                        for (0..3) |k| milli = milli * 10 + if (k < n) s[start + k] - '0' else 0;
+                    }
+                }
+            }
+        }
+    }
+    var offset: i64 = 0;
+    if (!p.eat("Zz") and p.i < s.len and (s[p.i] == '+' or s[p.i] == '-')) {
+        const sign: i64 = if (s[p.i] == '-') -1 else 1;
+        p.i += 1;
+        const oh = p.digits(2) orelse return null;
+        _ = p.eat(":");
+        const om = p.digits(2) orelse return null;
+        if (oh > 23 or om > 59) return null;
+        offset = sign * (oh * 60 + om);
+    }
+    if (p.i != s.len) return null;
+    if (month < 1 or month > 12 or day < 1 or day > daysInMonth(year, month)) return null;
+    if (hour > 23 or minute > 59 or second > 59) return null;
+    const seconds = (@as(i64, hour) * 60 + minute - offset) * 60 + second;
+    return daysFromCivil(year, month, day) * ms_per_day + seconds * 1000 + milli;
+}
+
+/// `(#%now-ms)` → the wall clock in epoch milliseconds.
+fn fnNowMs(vm: *VM, _: []const Value) VmError!Value {
+    const now = std.Io.Clock.real.now(ioOf(vm));
+    return value_mod.fromFixnum(@intCast(@divFloor(now.nanoseconds, std.time.ns_per_ms))) orelse VmError.ArithmeticOverflow;
+}
+
+/// `(#%format-instant ms)` → the ISO-8601 text of the instant `ms`.
+fn fnFormatInstant(vm: *VM, args: []const Value) VmError!Value {
+    var buf: [40]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    writeInstant(&w, try requireFixnum(args[0])) catch unreachable;
+    return string_mod.fromBytes(vm.ensureHeap(), w.buffered()) catch VmError.OutOfMemory;
+}
+
+/// `(#%parse-instant s)` → the instant the ISO-8601 text `s` names, in
+/// epoch milliseconds; `:invalid-argument` for any other text, or an
+/// instant past the fixnum range (-2490-03-17 to 6429-10-17).
+fn fnParseInstant(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .string) return VmError.KindMismatch;
+    const s = string_mod.asBytes(args[0]);
+    const ms = parseInstant(s) orelse return vm.fail(VmError.InvalidArgument, "not an ISO-8601 instant: \"{s}\"", .{s});
+    return value_mod.fromFixnum(ms) orelse vm.fail(VmError.InvalidArgument, "an instant past the fixnum range: \"{s}\"", .{s});
+}
+
+// =============================================================================
 // Record internals (PROTOCOLS.md §7)
 // =============================================================================
 //
@@ -8117,5 +8285,44 @@ test "stdlib: reduce over an infinite range past the fixnum range keeps its elem
         defer w.deinit();
         try format_mod.format(got, .readable, &w.writer, vm.ensureInterner());
         try testing.expectEqualStrings(case.want, w.written());
+    }
+}
+
+test "stdlib: the civil calendar agrees with std.time.epoch and walks day by day" {
+    var day: i64 = 0;
+    while (day < 60_000) : (day += 1) {
+        const yd = (std.time.epoch.EpochDay{ .day = @intCast(day) }).calculateYearDay();
+        const md = yd.calculateMonthDay();
+        const c = civilFromDays(day);
+        try testing.expectEqual(@as(i64, yd.year), c.year);
+        try testing.expectEqual(@as(u32, @backingInt(md.month)), c.month);
+        try testing.expectEqual(@as(u32, md.day_index) + 1, c.day);
+    }
+    // Every day of years -2500 to 6500 follows the one before it.
+    var prev = civilFromDays(-1_633_000);
+    day = -1_632_999;
+    while (day < 1_660_000) : (day += 1) {
+        const c = civilFromDays(day);
+        try testing.expectEqual(day, daysFromCivil(c.year, c.month, c.day));
+        if (c.day == 1) {
+            try testing.expectEqual(daysInMonth(prev.year, prev.month), prev.day);
+            try testing.expectEqual(if (c.month == 1) prev.year + 1 else prev.year, c.year);
+        } else try testing.expectEqual(prev.day + 1, c.day);
+        prev = c;
+    }
+}
+
+test "stdlib: an instant's text reads back as the same instant" {
+    var buf: [40]u8 = undefined;
+    var rng = std.Random.DefaultPrng.init(0x1505);
+    for (0..20_000) |i| {
+        const ms: i64 = switch (i) {
+            0 => value_mod.fixnum_min,
+            1 => value_mod.fixnum_max,
+            else => rng.random().intRangeAtMost(i64, value_mod.fixnum_min, value_mod.fixnum_max),
+        };
+        var w: std.Io.Writer = .fixed(&buf);
+        try writeInstant(&w, ms);
+        try testing.expectEqual(ms, parseInstant(w.buffered()).?);
     }
 }
