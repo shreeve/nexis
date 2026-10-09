@@ -112,10 +112,15 @@ pub const OpenOptions = struct {
     refused_format: ?*u16 = null,
 };
 
+/// The keywords tx-data's forms are read by (transact.zig).
+pub const FormKeyword = enum { @"db/id", @"db/add", @"db/retract", @"db/retractEntity", @"db.fn/call", @"db.fn/cas" };
+
 pub const Conn = struct {
     gpa: Allocator,
     store: *Store,
     interner: *Interner,
+    /// The interner's id of each form keyword, interned once.
+    form_keywords: std.EnumArray(FormKeyword, u32) = .initFill(0),
     idents: Idents,
     schema_cache: ?*Schema = null,
     sync_mode: SyncMode,
@@ -179,10 +184,13 @@ pub const Conn = struct {
         const gpa = self.gpa;
         const interner = self.interner;
         const view = self.view;
+        var form_keywords: std.EnumArray(FormKeyword, u32) = undefined;
+        for (std.enums.values(FormKeyword)) |f| form_keywords.set(f, try interner.internKeyword(@tagName(f)));
         self.* = .{
             .gpa = gpa,
             .store = store,
             .interner = interner,
+            .form_keywords = form_keywords,
             .idents = Idents.init(gpa, store, interner),
             .sync_mode = sync_mode,
             .is_open = true,

@@ -240,8 +240,8 @@ fn lowerOps(conn: *Conn, heap: *Heap, ops: []const Op) !Value {
         heap: *Heap,
         txn: *Txn,
 
-        fn kw(l: @This(), name: []const u8) !Value {
-            return l.conn.interner.internKeywordValue(name);
+        fn kw(l: @This(), f: db_mod.FormKeyword) Value {
+            return l.conn.interner.keywordValue(l.conn.form_keywords.get(f));
         }
 
         fn id(n: u64) !Value {
@@ -279,10 +279,10 @@ fn lowerOps(conn: *Conn, heap: *Heap, ops: []const Op) !Value {
 
         fn form(l: @This(), op: Op) !Value {
             return switch (op) {
-                .add => |o| vector_mod.fromSlice(l.heap, &.{ try l.kw("db/add"), try l.entity(o.e), try l.attr(o.a), try l.val(o.v) }),
-                .retract => |o| vector_mod.fromSlice(l.heap, &.{ try l.kw("db/retract"), try l.entity(o.e), try l.attr(o.a), try l.val(o.v) }),
-                .retract_attr => |o| vector_mod.fromSlice(l.heap, &.{ try l.kw("db/retract"), try l.entity(o.e), try l.attr(o.a) }),
-                .retract_entity => |e| vector_mod.fromSlice(l.heap, &.{ try l.kw("db/retractEntity"), try l.entity(e) }),
+                .add => |o| vector_mod.fromSlice(l.heap, &.{ l.kw(.@"db/add"), try l.entity(o.e), try l.attr(o.a), try l.val(o.v) }),
+                .retract => |o| vector_mod.fromSlice(l.heap, &.{ l.kw(.@"db/retract"), try l.entity(o.e), try l.attr(o.a), try l.val(o.v) }),
+                .retract_attr => |o| vector_mod.fromSlice(l.heap, &.{ l.kw(.@"db/retract"), try l.entity(o.e), try l.attr(o.a) }),
+                .retract_entity => |e| vector_mod.fromSlice(l.heap, &.{ l.kw(.@"db/retractEntity"), try l.entity(e) }),
             };
         }
     };
@@ -379,6 +379,7 @@ pub const With = struct {
             .gpa = conn.gpa,
             .store = conn.store,
             .interner = conn.interner,
+            .form_keywords = conn.form_keywords,
             .idents = idents,
             .sync_mode = self.ctx.sync_mode,
             .is_open = true,
@@ -837,8 +838,13 @@ const Ctx = struct {
 
     // ── normalisation from VM values ──────────────────────────────
 
-    fn kwIs(self: *Ctx, v: Value, name: []const u8) bool {
-        return v.kind() == .keyword and std.mem.eql(u8, self.conn.interner.keywordName(v.asKeywordId()), name);
+    /// The form keyword `v` is, if any.
+    fn formKeyword(self: *Ctx, v: Value) ?db_mod.FormKeyword {
+        if (v.kind() != .keyword) return null;
+        for (std.enums.values(db_mod.FormKeyword)) |f| {
+            if (self.conn.form_keywords.get(f) == v.asKeywordId()) return f;
+        }
+        return null;
     }
 
     fn normaliseValue(self: *Ctx, tx_data: Value) anyerror!void {
@@ -865,34 +871,40 @@ const Ctx = struct {
         const f = (try self.listForm(form)) orelse return self.malformed("a form is a vector, a list or a map", .{ .given = form });
         if (f.len < 2) return self.malformed("a list form is [op e ...]", .{ .given = form });
         const op = f[0];
-        if (self.kwIs(op, "db.fn/call")) {
-            try self.normaliseCall(f);
-        } else if (self.kwIs(op, "db.fn/cas")) {
-            if (f.len != 5) return self.malformed(":db.fn/cas is [:db.fn/cas e a old new]", .{ .given = form });
-            const attr = try self.attrFromVm(f[2]);
-            if (attr.id == boot.ident) return self.malformed(":db.fn/cas never renames; assert the new :db/ident", .{ .attr = attr.id });
-            const e = try self.entityFromVm(f[1]);
-            const op_cas = try self.arena.create(CasOp);
-            op_cas.* = .{ .e = e, .attr = attr, .old = if (f[3].isNil()) null else try self.valueFromVm(attr, f[3], .match), .written = f[3], .new = try self.valueFromVm(attr, f[4], .assert) };
-            try self.ops.append(self.arena, .{ .cas = op_cas });
-        } else if (self.kwIs(op, "db/add")) {
-            if (f.len != 4) return self.malformed(":db/add is [:db/add e a v]", .{ .given = form });
-            const attr = try self.attrFromVm(f[2]);
-            const e = try self.entityFromVm(f[1]);
-            try self.ops.append(self.arena, .{ .add = .{ .e = e, .attr = attr, .v = try self.valueFromVm(attr, f[3], .assert) } });
-        } else if (self.kwIs(op, "db/retract")) {
-            if (f.len != 3 and f.len != 4) return self.malformed(":db/retract is [:db/retract e a] or [:db/retract e a v]", .{ .given = form });
-            const attr = try self.attrFromVm(f[2]);
-            const e = try self.entityFromVm(f[1]);
-            if (f.len == 3) {
-                try self.ops.append(self.arena, .{ .retract_attr = .{ .e = e, .attr = attr } });
-            } else {
-                try self.ops.append(self.arena, .{ .retract = .{ .e = e, .attr = attr, .v = try self.valueFromVm(attr, f[3], .match) } });
-            }
-        } else if (self.kwIs(op, "db/retractEntity")) {
-            if (f.len != 2) return self.malformed(":db/retractEntity is [:db/retractEntity e]", .{ .given = form });
-            try self.ops.append(self.arena, .{ .retract_entity = try self.entityFromVm(f[1]) });
-        } else return self.malformed("unknown op; one of :db/add, :db/retract, :db/retractEntity, :db.fn/call, :db.fn/cas", .{ .given = op });
+        const unknown = "unknown op; one of :db/add, :db/retract, :db/retractEntity, :db.fn/call, :db.fn/cas";
+        switch (self.formKeyword(op) orelse return self.malformed(unknown, .{ .given = op })) {
+            .@"db/id" => return self.malformed(unknown, .{ .given = op }),
+            .@"db.fn/call" => try self.normaliseCall(f),
+            .@"db.fn/cas" => {
+                if (f.len != 5) return self.malformed(":db.fn/cas is [:db.fn/cas e a old new]", .{ .given = form });
+                const attr = try self.attrFromVm(f[2]);
+                if (attr.id == boot.ident) return self.malformed(":db.fn/cas never renames; assert the new :db/ident", .{ .attr = attr.id });
+                const e = try self.entityFromVm(f[1]);
+                const op_cas = try self.arena.create(CasOp);
+                op_cas.* = .{ .e = e, .attr = attr, .old = if (f[3].isNil()) null else try self.valueFromVm(attr, f[3], .match), .written = f[3], .new = try self.valueFromVm(attr, f[4], .assert) };
+                try self.ops.append(self.arena, .{ .cas = op_cas });
+            },
+            .@"db/add" => {
+                if (f.len != 4) return self.malformed(":db/add is [:db/add e a v]", .{ .given = form });
+                const attr = try self.attrFromVm(f[2]);
+                const e = try self.entityFromVm(f[1]);
+                try self.ops.append(self.arena, .{ .add = .{ .e = e, .attr = attr, .v = try self.valueFromVm(attr, f[3], .assert) } });
+            },
+            .@"db/retract" => {
+                if (f.len != 3 and f.len != 4) return self.malformed(":db/retract is [:db/retract e a] or [:db/retract e a v]", .{ .given = form });
+                const attr = try self.attrFromVm(f[2]);
+                const e = try self.entityFromVm(f[1]);
+                if (f.len == 3) {
+                    try self.ops.append(self.arena, .{ .retract_attr = .{ .e = e, .attr = attr } });
+                } else {
+                    try self.ops.append(self.arena, .{ .retract = .{ .e = e, .attr = attr, .v = try self.valueFromVm(attr, f[3], .match) } });
+                }
+            },
+            .@"db/retractEntity" => {
+                if (f.len != 2) return self.malformed(":db/retractEntity is [:db/retractEntity e]", .{ .given = form });
+                try self.ops.append(self.arena, .{ .retract_entity = try self.entityFromVm(f[1]) });
+            },
+        }
     }
 
     /// The elements of a list form `[op e ...]`, which, as in Datomic,
@@ -947,7 +959,7 @@ const Ctx = struct {
         var ent: ?Ent = null;
         var it = MapEntries.of(m);
         while (it.next()) |entry| {
-            if (self.kwIs(entry.key, "db/id")) {
+            if (self.formKeyword(entry.key) == .@"db/id") {
                 ent = try self.entityFromVm(entry.value);
                 break;
             }
@@ -957,7 +969,7 @@ const Ctx = struct {
 
         var it2 = MapEntries.of(m);
         while (it2.next()) |entry| {
-            if (self.kwIs(entry.key, "db/id")) continue;
+            if (self.formKeyword(entry.key) == .@"db/id") continue;
             const v = entry.value;
             if (try self.reverseAttr(entry.key)) |attr| {
                 if (try self.elementsOf(v, true)) |els| {
