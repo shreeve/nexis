@@ -84,11 +84,11 @@ it; `db_write_txn` (32) and `db_read_txn` (33) point at a transaction
 handle (§3.2).
 
 **Pinned geometry.** `StoreFile.acquire`, which every `open` and
-Nextomic `connect` passes through, overrides the caller's `pageSize`
-with `db.page_size` (16 KiB), `maxNamedTrees` with
-`db.max_named_trees` (128), `maxReaders` with `db.reader_slots`
-(§3.2), `mapSize` with `db.initial_map_size` (1 MiB) and `growStep`
-with `db.map_grow_step` (8 MiB). emdb's default page size is the OS page size, and the page
+Nextomic `connect` passes through, takes only an allocator and opens
+every file with `db.page_size` (16 KiB) pages, `db.max_named_trees`
+(128) trees, `db.reader_slots` reader slots (§3.2), a map of
+`db.initial_map_size` (1 MiB) and a growth step of `db.map_grow_step`
+(8 MiB). emdb's default page size is the OS page size, and the page
 size fixes the key bound and overflow threshold for the life of the
 file, so every store carries the same geometry wherever it is
 created. An existing file keeps the page size it was created with.
@@ -413,8 +413,8 @@ emdb, codec, intern and allocator errors propagate unchanged.
 
 | Function | Contract |
 |---|---|
-| `open(allocator, heap, interner, path, options) !Connection` | §2, §3. |
-| `StoreFile.acquire(path, options) !*StoreFile` / `release(*StoreFile)` / `beginWrite(*StoreFile, options) !*emdb.Txn` | §3.1; the last `release` syncs (§3.3). |
+| `open(allocator, heap, interner, path) !Connection` | §2, §3. |
+| `StoreFile.acquire(path, allocator) !*StoreFile` / `release(*StoreFile)` / `beginWrite(*StoreFile, options) !*emdb.Txn` | §3.1; the last `release` syncs (§3.3). |
 | `StoreFile.commit(*StoreFile, txn) !void` / `sync(*StoreFile) !void` / `closingSync(*StoreFile) !void` / `syncFailed(*const StoreFile) bool` / `StoreFile.syncAll() void` | Commit the file's write transaction, noting whether it synced; one full sync when a commit left the file unsynced, `SyncFailed` once a sync of the file has failed; a close's sync, nothing once one has; whether one has; the closing sync of every open file (§3.3). |
 | `Durability.parse(text) ?Durability` / `Durability.process() Durability` | `commit` or `durable`; the process's, from `NEXIS_DURABILITY` (§3.3). |
 | `close(*Connection) !void` / `shutdown(*Connection) void` / `sync(*Connection) !void` | §3, §3.3. |

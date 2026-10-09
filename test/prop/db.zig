@@ -114,13 +114,7 @@ test "D1: 10000 random Values across 5 trees read back equal after commit" {
     var ctx = TestCtx.init();
     defer ctx.deinit();
 
-    var conn = try db.open(
-        std.testing.allocator,
-        &ctx.heap,
-        &ctx.interner,
-        path.ptr,
-        .{ .allocator = std.testing.allocator, .mapSize = 64 * 1024 * 1024 },
-    );
+    var conn = try db.open(std.testing.allocator, &ctx.heap, &ctx.interner, path.ptr);
     defer db.shutdown(&conn);
 
     var prng = std.Random.DefaultPrng.init(prng_seed +% 1);
@@ -219,13 +213,7 @@ test "D2: reopen-connection readback (2000 Values, close+reopen between)" {
         var ctx = TestCtx.init();
         defer ctx.deinit();
 
-        var conn = try db.open(
-            std.testing.allocator,
-            &ctx.heap,
-            &ctx.interner,
-            path.ptr,
-            .{ .allocator = std.testing.allocator, .mapSize = 64 * 1024 * 1024 },
-        );
+        var conn = try db.open(std.testing.allocator, &ctx.heap, &ctx.interner, path.ptr);
         defer db.shutdown(&conn);
 
         var prng = std.Random.DefaultPrng.init(prng_seed +% 0x42);
@@ -273,13 +261,7 @@ test "D2: reopen-connection readback (2000 Values, close+reopen between)" {
         var ctx = TestCtx.init();
         defer ctx.deinit();
 
-        var conn = try db.open(
-            std.testing.allocator,
-            &ctx.heap,
-            &ctx.interner,
-            path.ptr,
-            .{ .allocator = std.testing.allocator, .mapSize = 64 * 1024 * 1024 },
-        );
+        var conn = try db.open(std.testing.allocator, &ctx.heap, &ctx.interner, path.ptr);
         defer db.shutdown(&conn);
 
         var rtxn = try db.beginRead(&conn);
@@ -373,13 +355,7 @@ test "D4: same key in every tree returns its own value (no cross-contamination)"
     var ctx = TestCtx.init();
     defer ctx.deinit();
 
-    var conn = try db.open(
-        std.testing.allocator,
-        &ctx.heap,
-        &ctx.interner,
-        path.ptr,
-        .{ .allocator = std.testing.allocator },
-    );
+    var conn = try db.open(std.testing.allocator, &ctx.heap, &ctx.interner, path.ptr);
     defer db.shutdown(&conn);
 
     var wtxn = try db.beginWrite(&conn);

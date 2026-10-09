@@ -722,7 +722,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (include(filter, "db-integrated")) {
         var store = try TmpStore.init(alloc, "db");
         defer store.deinit(alloc);
-        var conn = try db.open(alloc, &heap, &interner, store.path.ptr, .{ .allocator = alloc });
+        var conn = try db.open(alloc, &heap, &interner, store.path.ptr);
         defer db.close(&conn) catch {};
 
         // Seed the key we'll be overwriting.
