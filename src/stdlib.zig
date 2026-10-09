@@ -639,6 +639,7 @@ const internal_rows = .{
     .{ "#%extend-default-impl", 3, 3, &fnExtendDefaultImpl },
     // try: the keyword-matcher test the expander emits.
     .{ "#%catch-matches?", 2, 2, &fnCatchMatches },
+    .{ "#%raise", 2, 3, &fnRaise },
     // `& {:keys ...}`: the rest seq as a map.
     .{ "#%kwargs", 1, 1, &fnKwargs },
     .{ "#%load-next", 2, 2, &fnLoadNext },
@@ -7674,6 +7675,24 @@ fn fnKwargs(vm: *VM, args: []const Value) VmError!Value {
         m = try mapPut(heap, m, items.items[i], items.items[i + 1]);
     }
     return m;
+}
+
+/// `(#%raise tag message x?)` → throws the library's own error `tag`
+/// as the runtime throws one of its own (docs/VM.md §13): the map
+/// `{:error tag :message m}`, `m` being `message` followed by the kind
+/// of `x` when given ("num takes a number or nil, got a string"), and
+/// the place of the program's call when a handler is in force.
+fn fnRaise(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .keyword or args[1].kind() != .string) return VmError.KindMismatch;
+    var buf: [256]u8 = undefined;
+    const text = string_mod.asBytes(args[1]);
+    const message = if (args.len == 3)
+        std.mem.print(&buf, "{s} {s}", .{ text, vm_mod.kindPhrase(args[2].kind()) }) catch text
+    else
+        text;
+    const m = vm.errorValue(args[0], message, null);
+    if (m.kind() != .persistent_map) return vm.throwValue(m);
+    return vm.throwErrorMap(m);
 }
 
 /// `(#%catch-matches? v tag)` → whether `(catch tag e ...)` takes the

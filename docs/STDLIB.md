@@ -117,7 +117,7 @@ Var inside a `binding`.
 | `nexis.test` | — | `test.nx` | TOOLING.md §3 |
 | `nexis.pprint` | — | `pprint.nx` | TOOLING.md §4 |
 | `nexis.simd` | `simd_natives` | — | TYPED_VECTOR.md §7.2 |
-| `nexis.internal` | `internal_natives` | — | the `#%` helpers macros emit: records and protocols (PROTOCOLS.md §7), `#%catch-matches?` (`try`), `#%kwargs` (`& {:keys ...}`), `#%current-ns` (TOOLING.md §3), `#%delay` (`delay`, §8), `#%sorted-map` / `#%sorted-set` (a sorted collection a macro returns, MACROEXPAND.md §5), `#%push-out` / `#%pop-out` (`with-out-str`, §6), `#%mm-lookup` (a multimethod's call, §9.3), and the natives the namespaces of §11–§13 call |
+| `nexis.internal` | `internal_natives` | — | the `#%` helpers macros emit: records and protocols (PROTOCOLS.md §7), `#%catch-matches?` (`try`), `#%raise` (the library's own error, `(#%raise :tag "sentence, got" x)`: the error map of `docs/VM.md` §13, its message naming the kind of `x`), `#%kwargs` (`& {:keys ...}`), `#%current-ns` (TOOLING.md §3), `#%delay` (`delay`, §8), `#%sorted-map` / `#%sorted-set` (a sorted collection a macro returns, MACROEXPAND.md §5), `#%push-out` / `#%pop-out` (`with-out-str`, §6), `#%mm-lookup` (a multimethod's call, §9.3), and the natives the namespaces of §11–§13 call |
 
 **Resolution.** Every other namespace has `nexis.core` as its parent,
 so an unqualified symbol a namespace does not define resolves in

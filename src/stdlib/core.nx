@@ -1018,7 +1018,7 @@
 (defn num
   "Returns x, a number or nil; there are no boxed kinds to convert.
   Anything else is :kind-mismatch."
-  [x] (if (or (nil? x) (number? x)) x (throw :kind-mismatch)))
+  [x] (if (or (nil? x) (number? x)) x (nexis.internal/#%raise :kind-mismatch "num takes a number or nil, got" x)))
 ; No rationals (PLAN §23 #10): the rationals are the integers.
 (defn ratio? "Returns false: there are no ratios." [_] false)
 (defn rational?
@@ -1049,7 +1049,8 @@
   "Returns true for \"true\", false for \"false\", nil for any other
   string. A non-string is :kind-mismatch."
   [s]
-  (cond (= s "true") true (= s "false") false (string? s) nil true (throw :kind-mismatch)))
+  (cond (= s "true") true (= s "false") false (string? s) nil
+        true (nexis.internal/#%raise :kind-mismatch "parse-boolean takes a string, got" s)))
 
 (defn ex-cause
   "Returns the cause an ex-info value e carries, nil for anything else,
@@ -1287,7 +1288,9 @@
   record's symbol. There is no hierarchy of kinds. A t that is not a
   keyword or symbol is :kind-mismatch."
   [t x]
-  (if (or (keyword? t) (symbol? t)) (= t (class x)) (throw :kind-mismatch)))
+  (if (or (keyword? t) (symbol? t))
+    (= t (class x))
+    (nexis.internal/#%raise :kind-mismatch "instance? takes a kind keyword or a record symbol, got" t)))
 
 (defn special-symbol?
   "Returns true if s names a special form of the compiler."
@@ -1298,7 +1301,7 @@
 (defn the-ns
   "Returns x, a namespace's name symbol, when that namespace exists,
   else throws :no-such-namespace. A namespace is its name symbol."
-  [x] (or (find-ns x) (throw :no-such-namespace)))
+  [x] (or (find-ns x) (nexis.internal/#%raise :no-such-namespace (str "no namespace named " x))))
 (defn ns-name
   "Returns the name symbol of the namespace x names, which is x itself;
   :no-such-namespace when there is none."
@@ -1306,7 +1309,7 @@
 
 (defn var-get
   "Returns the value of the Var v. A non-Var is :kind-mismatch."
-  [v] (if (var? v) (deref v) (throw :kind-mismatch)))
+  [v] (if (var? v) (deref v) (nexis.internal/#%raise :kind-mismatch "var-get takes a Var, got" v)))
 (defn find-var
   "Returns the Var the qualified symbol sym names, nil when its
   namespace has none; :no-such-namespace when the namespace does not
@@ -1565,7 +1568,8 @@
   "Returns true if x is a multimethod."
   [x] (contains? @multifns x))
 
-(defn- multifn-entry [mf] (or (get @multifns mf) (throw :kind-mismatch)))
+(defn- multifn-entry [mf]
+  (or (get @multifns mf) (nexis.internal/#%raise :kind-mismatch "expected a multimethod, got" mf)))
 
 ; MultiFn.resetCache: the cache is the method table, so an exact key
 ; is found before any isa? search.
@@ -1634,7 +1638,8 @@
   href the Var or atom its hierarchy is read through. What defmulti
   expands to, nexis's name for Clojure's new MultiFn."
   [mname dispatch-fn default href]
-  (when-not (or (var? href) (atom? href)) (throw :kind-mismatch))
+  (when-not (or (var? href) (atom? href))
+    (nexis.internal/#%raise :kind-mismatch "make-multifn reads its hierarchy through a Var or an atom, got" href))
   (let [state (atom {:name mname :default default :href href :table {} :prefers {}})
         cache (atom [@href {}])
         mf (fn

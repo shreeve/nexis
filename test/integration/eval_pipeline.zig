@@ -1799,7 +1799,7 @@ test "core: var-get, find-var, load-string" {
         \\(def x 4)
         \\[(var-get #'x) (find-var 'user/x) (find-var 'nexis.core/inc) (find-var 'user/nope) (try (find-var 'nope/x) (catch any e e))
         \\ (try (var-get 1) (catch any e e)) (load-string "(def zz 2) (+ zz x) ; c") zz (load-string "")]
-    , "[4 #'user/x #'nexis.core/inc nil :no-such-namespace :kind-mismatch 6 2 nil]");
+    , "[4 #'user/x #'nexis.core/inc nil {:error :no-such-namespace, :message no namespace named nope, :fn test-form} {:error :kind-mismatch, :message var-get takes a Var, got an integer, :fn test-form} 6 2 nil]");
 }
 
 test "core: load-string reads and evaluates a form at a time, and leaves the namespace as it found it" {
@@ -2033,7 +2033,7 @@ test "integration: class, type, instance?, var?, special-symbol?" {
     try expectOutput("(map class [nil true false \\a 1 99999999999999999999 1.5 :k 'x \"s\" '(1) [1] {:a 1} #{1} (i64-vector [1]) (fn [] 1) first (atom 1) (transient []) #'inc])", "(nil :boolean :boolean :char :fixnum :bignum :float :keyword :symbol :string :list :vector :map :set :typed_vector :function :native_fn :atom :transient :var_)");
     // A record's type is the symbol it prints with; :type metadata is type's.
     try expectOutput("(defrecord P [x]) [(class (->P 1)) (type (->P 1)) (symbol? (type (->P 1))) (type (with-meta [1] {:type :point})) (class (with-meta [1] {:type :point})) (type (with-meta (->P 1) {:type :q}))]", "[user.P user.P true :point :vector :q]");
-    try expectOutput("(defrecord P [x]) [(instance? :vector [1]) (instance? :map [1]) (instance? 'user.P (->P 1)) (instance? (type (->P 1)) (->P 2)) (instance? :map (->P 1)) (instance? :vector (with-meta [] {:type :t})) (try (instance? nil 1) (catch any e e))]", "[true false true true false true :kind-mismatch]");
+    try expectOutput("(defrecord P [x]) [(instance? :vector [1]) (instance? :map [1]) (instance? 'user.P (->P 1)) (instance? (type (->P 1)) (->P 2)) (instance? :map (->P 1)) (instance? :vector (with-meta [] {:type :t})) (try (instance? nil 1) (catch any e e))]", "[true false true true false true {:error :kind-mismatch, :message instance? takes a kind keyword or a record symbol, got nil, :fn test-form}]");
     try expectOutput("(def x 1) [(var? #'x) (var? x) (var? 'x) (var? (resolve 'inc))]", "[true false false true]");
     try expectOutput("(map special-symbol? '[if def let* fn* loop* letfn* quote var recur try catch finally throw do set! & let fn nexis.core/if])", "(true true true true true true true true true true true true true true true true false false false)");
     try expectOutput("[(special-symbol? \"if\") (special-symbol? :if)]", "[false false]");
@@ -2247,7 +2247,7 @@ test "multimethods: methods, get-method, prefers, remove-all-methods and what ea
         \\ (multifn? rv) (multifn? inc) (fn? rv) (ifn? rv) (= rv rv) (get {rv 1} rv) (meta rv)
         \\ (try (with-meta rv {:a 1}) (catch any e e)) (try (methods {}) (catch ClassCastException e e))
         \\ (try (defmethod {} :a [] 1) (catch any e e))]
-    , "[true true {:a #{:b}} true true {} {} true false true true true 1 nil {:error :kind-mismatch, :message kind mismatch, :fn test-form} :kind-mismatch :kind-mismatch]");
+    , "[true true {:a #{:b}} true true {} {} true false true true true 1 nil {:error :kind-mismatch, :message kind mismatch, :fn test-form} {:error :kind-mismatch, :message expected a multimethod, got a map, :fn test-form} {:error :kind-mismatch, :message expected a multimethod, got a map, :fn test-form}]");
     // get-method: an ambiguity throws as a call does; no match and no default is nil.
     try expectOutputProgram(
         \\(derive :user/a :user/c) (derive :user/b :user/c) (derive :user/ab :user/a) (derive :user/ab :user/b)
@@ -2286,7 +2286,7 @@ test "multimethods: :default and :hierarchy options; the cache follows the hiera
         \\(defmethod p :user/parent [_] :p)
         \\(swap! ah derive :user/kid :user/parent)
         \\[(p :user/kid) (try (defmulti bad identity :hierarchy {}) (catch ClassCastException e e))]
-    , "[:p :kind-mismatch]");
+    , "[:p {:error :kind-mismatch, :message make-multifn reads its hierarchy through a Var or an atom, got a map, :fn test-form}]");
 }
 
 test "multimethods: defmulti defines once; its docstring and attr-map reach the Var" {
@@ -2349,7 +2349,7 @@ test "integration: namespaces as their name symbols: the-ns, find-ns, ns-name, a
         \\[(the-ns 'app.util) (find-ns 'app.util) (find-ns 'nope) (ns-name 'user) (try (the-ns 'nope) (catch any e e))
         \\ (ns-publics 'app.util) (ns-interns 'app.util) (contains? (ns-publics 'user) 'x) (get (ns-publics 'nexis.core) 'inc)
         \\ (every? symbol? (all-ns)) (boolean (some #{'app.util} (all-ns))) (try (find-ns "user") (catch any e e))]
-    , "[app.util app.util nil user :no-such-namespace {x #'app.util/x} {x #'app.util/x, y #'app.util/y} false #'nexis.core/inc true true {:error :kind-mismatch, :message kind mismatch, :fn test-form}]");
+    , "[app.util app.util nil user {:error :no-such-namespace, :message no namespace named nope, :fn test-form} {x #'app.util/x} {x #'app.util/x, y #'app.util/y} false #'nexis.core/inc true true {:error :kind-mismatch, :message kind mismatch, :fn test-form}]");
 }
 
 test "integration: resolve and ns-resolve name a Var through the namespace's names" {
@@ -6353,7 +6353,7 @@ test "numbers: the promoting and unchecked operators, num, float, ratio? and rat
     try expectOutput("[(unchecked-add 9223372036854775807 1) (unchecked-subtract -9223372036854775808 1) (unchecked-multiply 9223372036854775807 2) (unchecked-inc 9223372036854775807) (unchecked-dec -9223372036854775808) (unchecked-negate -9223372036854775808)]", "[-9223372036854775808 9223372036854775807 -2 -9223372036854775808 9223372036854775807 -9223372036854775808]");
     try expectOutput("[(unchecked-add 1 2) (unchecked-add 1 2.5) (unchecked-add 99999999999999999999 1) (unchecked-multiply 3 -4)]", "[3 3.5 100000000000000000000 -12]");
     try expectOutput("(try (unchecked-add nil 1) (catch any e e))", "{:error :kind-mismatch, :message + expects numbers, got nil, :fn test-form}");
-    try expectOutput("[(num 1) (num 1.5) (num nil) (try (num \"a\") (catch any e e))]", "[1 1.5 nil :kind-mismatch]");
+    try expectOutput("[(num 1) (num 1.5) (num nil) (try (num \"a\") (catch any e e))]", "[1 1.5 nil {:error :kind-mismatch, :message num takes a number or nil, got a string, :fn test-form}]");
     try expectOutput("[(float 1) (float 0.5) (NaN? (float ##NaN)) (float -3.4028234663852886E38)]", "[1.0 0.5 true -3.4028234663852886E38]");
     try expectOutput("(map #(try (float %) (catch any e e)) [1e39 -1e39 ##Inf nil \\a \"1\"])", "({:error :invalid-argument, :message invalid argument, :fn fn} {:error :invalid-argument, :message invalid argument, :fn fn} {:error :invalid-argument, :message invalid argument, :fn fn} {:error :kind-mismatch, :message kind mismatch, :fn fn} {:error :kind-mismatch, :message kind mismatch, :fn fn} {:error :kind-mismatch, :message kind mismatch, :fn fn})");
     try expectOutput("[(ratio? 1) (ratio? 0.5) (ratio? nil) (rational? 1) (rational? 99999999999999999999) (rational? 1.0) (rational? nil)]", "[false false false true true false false]");
@@ -7832,6 +7832,24 @@ test "runtime errors: a form a user macro was given keeps its own place in the e
     );
 }
 
+test "runtime errors: the library's own refusals are error maps with a sentence" {
+    try expectLocatedOutput("(try (num \"1\") (catch any e e))",
+        \\{:error :kind-mismatch, :message "num takes a number or nil, got a string", :fn "<top>", :file "t.nx", :line 1, :column 6}
+    );
+    try expectLocatedOutput(
+        \\(defmulti m identity)
+        \\[(ex-message (try (parse-boolean 1) (catch :kind-mismatch e e)))
+        \\ (ex-message (try (instance? "x" 1) (catch :kind-mismatch e e)))
+        \\ (ex-message (try (the-ns 'nope) (catch :no-such-namespace e e)))
+        \\ (ex-message (try (var-get 1) (catch :kind-mismatch e e)))
+        \\ (ex-message (try (methods {}) (catch :kind-mismatch e e)))
+        \\ (ex-message (try (make-multifn "m" identity :default {}) (catch :kind-mismatch e e)))
+        \\ (ex-message (try (nexis.test/use-fixtures :always identity) (catch :invalid-argument e e)))]
+    ,
+        \\["parse-boolean takes a string, got an integer" "instance? takes a kind keyword or a record symbol, got a string" "no namespace named nope" "var-get takes a Var, got an integer" "expected a multimethod, got a map" "make-multifn reads its hierarchy through a Var or an atom, got a map" "use-fixtures takes :once or :each, not :always"]
+    );
+}
+
 test "runtime errors: an error inside a library function is placed at the program's call" {
     try expectLocatedOutput("(defn g [m]\n  (update m :a inc))\n(try (g {:a \"x\"}) (catch any e [(:fn e) (:file e) (:line e) (:column e)]))",
         \\["g" "t.nx" 2 3]
@@ -8526,7 +8544,7 @@ test "nexis.test: use-fixtures wraps a namespace's run (:once) and each test (:e
         \\(def r (nexis.test/run-all-tests))
         \\[@user/log (:test r) (nexis.test/successful? r) (nexis.test/successful? {:fail 1 :error 0})
         \\ (try (nexis.test/use-fixtures :always identity) (catch any e e))]
-    , "[[:once :outer :inner :a :done :outer :inner :b :done :once-end :c] 3 true false :invalid-argument]");
+    , "[[:once :outer :inner :a :done :outer :inner :b :done :once-end :c] 3 true false {:error :invalid-argument, :message use-fixtures takes :once or :each, not :always, :fn test-form}]");
 }
 
 test "nexis.test, nexis.pprint: :refer :all brings the API, not the private helpers" {

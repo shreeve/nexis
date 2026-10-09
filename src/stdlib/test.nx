@@ -209,7 +209,8 @@
   later call replaces the kind's fixtures; another kind is
   :invalid-argument."
   [kind & fs]
-  (when-not (contains? #{:once :each} kind) (throw :invalid-argument))
+  (when-not (contains? #{:once :each} kind)
+    (nexis.internal/#%raise :invalid-argument (str "use-fixtures takes :once or :each, not " (pr-str kind))))
   (swap! fixtures assoc-in [(nexis.internal/#%current-ns) kind] (join-fixtures fs))
   nil)
 
