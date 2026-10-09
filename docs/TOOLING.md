@@ -301,8 +301,8 @@ clears its slot (COMPILER.md §4.9).
   space within 60 bytes and followed by ` ...` and, for a collection,
   its item count when longer (`c0=[0 1 2 ... 22 ...(5000 items)`); a
   var its namespace-qualified name (`v0=nexis.core/println`). Operand B of `call:call`,
-  `call:tailcall`, `call:self` and every `coll:*` is a raw immediate
-  (VM.md §4.5) and prints as `#n`. The wide field prints as what it names: a jump
+  `call:self` and every `coll:*` is a raw immediate (VM.md §4.5) and
+  prints as `#n`. The wide field prints as what it names: a jump
   or `try-exit` target as its pc (`j0009`), `mov:load-const`'s
   constant and a `var:*` Var as a `c` or `v` operand would,
   `try-enter`'s try as `#n<catch j0012 finally j0015>`, and
@@ -319,8 +319,10 @@ clears its slot (COMPILER.md §4.9).
 Macro expansion, `(ns ...)` and `(require ...)` take effect while the
 file compiles, but no form runs, so a macro that calls a function the
 same file defines cannot expand under `disasm`. The opcode names are
-tables in `src/disasm.zig`; a test walks every variant enum
-`src/vm.zig` defines and fails when one lacks a name.
+the tags of the group and variant enums in `src/vm.zig`, `_` spelled
+`-` and a trailing `_` dropped, and what each operand is, an immediate
+or a wide field, is what verification proves (`Routine.shapeOf`, VM.md
+§5).
 
 ### 3. Test runner (`src/stdlib/test.nx`, the `nexis.test` namespace)
 
