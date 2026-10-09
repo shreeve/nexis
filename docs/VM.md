@@ -597,6 +597,17 @@ call stores it (`call:call`, the buffered and the general call,
 or general call and a collection's construction copy off the stack are
 copied a value at a time, a map's key and value as one 32-byte entry,
 the width its constructor reads (`VM.copyRun`, `VM.copyEntries`).
+A native returns its result through memory by a `return` of a value
+it holds, or of an error, which stores it in place: a result merged
+from an `if`, a `switch`, an `orelse` or a labeled block, or returned
+from a call of another native's body, is assembled in a temporary of
+narrow stores and copied on with an 8-byte load of the error's word
+and a 16-byte load of the value, which wait for those stores. So
+`count`, `nth` and `nthnext`, the leaves a destructuring form calls,
+return each result by a statement of its own, and the leaf and the
+general native of `count` and of `nthnext` are one body each, not a
+leaf that calls the general native (`docs/PERF.md` "Natives that
+return in place").
 arm64 stores every value as two words and copies results and argument
 runs whole. On both, `max` and `min` read their winner a word at a
 time (`docs/PERF.md` "A width-consistent native boundary").

@@ -264,7 +264,7 @@ const core_rows = .{
     .{ "drop", 1, 2, &fnDrop, "[n] [n coll]", "Returns a lazy seq of all but the first n items of coll. With no\n  coll, returns a transducer." },
     .{ "some", 2, 2, &fnSome, .consumes, "[pred coll]", "Returns the first truthy (pred x) for x in coll, else nil; stops at\n  the first one." },
     .{ "every?", 2, 2, &fnEveryQ, .consumes, "[pred coll]", "Returns true if (pred x) is truthy for every x in coll, true for an\n  empty coll; stops at the first falsy one." },
-    .{ "count", 1, 1, &fnCountLeaf, .consuming_leaf, &fnCount, "[coll]", "Returns the number of items in coll; 0 for nil. A string counts code\n  points, not bytes; a lazy seq is realized to its end." },
+    .{ "count", 1, 1, fnCountLeaf, .consuming_leaf, fnCount, "[coll]", "Returns the number of items in coll; 0 for nil. A string counts code\n  points, not bytes; a lazy seq is realized to its end." },
     .{ "nth", 2, 3, &fnNth, .leaf, &fnNthGeneral, "[coll index] [coll index not-found]", "Returns the item at index of coll, a string's char by code point. Out\n  of range, returns not-found, or without one is\n  :index-out-of-bounds; nil coll gives not-found (nil). A lazy seq is\n  realized as far as index." },
     .{ "empty?", 1, 1, &fnEmptyQ, "[coll]", "Returns true if coll has no items; true for nil." },
     .{ "identity", 1, 1, &fnIdentity, .leaf, "[x]", "Returns x." },
@@ -355,7 +355,7 @@ const core_rows = .{
     .{ "last", 1, 1, &fnLast, .consumes, "[coll]", "Returns the last item of coll, nil when it is empty. O(1) for a\n  vector, a walk of anything else." },
     .{ "reverse", 1, 1, &fnReverse, .consumes, "[coll]", "Returns a seq of the items of coll in reverse order; () when there\n  are none." },
     .{ "nthrest", 2, 2, &fnNthrest, "[coll n]", "Returns coll without its first n items; coll itself when n is not\n  positive." },
-    .{ "nthnext", 2, 2, &fnNthnextLeaf, .leaf, &fnNthnext, "[coll n]", "Returns (seq (nthrest coll n)): the items after the first n, nil\n  when there are none." },
+    .{ "nthnext", 2, 2, fnNthnextLeaf, .leaf, fnNthnext, "[coll n]", "Returns (seq (nthrest coll n)): the items after the first n, nil\n  when there are none." },
     .{ "take-last", 2, 2, &fnTakeLast, .consumes, "[n coll]", "Returns a seq of the last n items of coll, nil when there are none." },
     .{ "repeat", 1, 2, &fnRepeat, "[x] [n x]", "Returns a lazy seq of x, infinite, or n times; () when n is at most\n  0. n is truncated as long does." },
     .{ "repeatedly", 1, 2, &fnRepeatedly, "[f] [n f]", "Returns a lazy seq of calls to the no-argument f, infinite, or n of\n  them; each call made when its item is first needed." },
@@ -851,24 +851,39 @@ fn fnSeq(vm: *VM, args: []const Value) VmError!Value {
 /// `(count coll)` → element count. nil → 0. Lists, vectors,
 /// maps, records, sets and strings; a string counts Unicode
 /// scalars, not bytes.
-fn fnCount(vm: *VM, args: []const Value) VmError!Value {
-    const c = args[0];
-    const n: i64 = switch (c.kind()) {
-        .nil => 0,
-        .list => @intCast(list_mod.count(c)),
-        .persistent_vector => @intCast(vector_mod.count(c)),
-        .typed_vector => @intCast(typed_vector_mod.count(c)),
-        .persistent_map => @intCast(champ_mod.mapCount(c)),
-        .record => @intCast(champ_mod.mapCount(record_mod.fieldsOf(c))),
-        .nextomic_entity => @intCast(champ_mod.mapCount(try nextomic_mod.natives.entityMap(vm, c))),
-        .persistent_set => @intCast(champ_mod.setCount(c)),
-        .sorted_map, .sorted_set => @intCast(sorted_mod.count(c)),
-        .string => @intCast(string_mod.codepointCount(c) catch return VmError.Utf8Error),
-        .transient => @intCast(try transientCount(vm, c)),
-        .lazy_seq => @intCast(try countConsumed(vm, c)),
-        else => return VmError.KindMismatch,
-    };
-    return value_mod.fromFixnum(n) orelse VmError.ArithmeticOverflow;
+const fnCount = countNative(false);
+
+/// `count` as a leaf (VM.md §6): a lazy seq (realized to its end) and
+/// an entity (read from the store) go the general way, which consumes
+/// the argument.
+const fnCountLeaf = countNative(true);
+
+/// `count`, the leaf's or the general native: one body, not a leaf
+/// that calls the general one, so the count is returned where the
+/// caller reads it, not copied on (`docs/VM.md` §8).
+fn countNative(comptime leaf: bool) *const fn (*VM, []const Value) VmError!Value {
+    return struct {
+        fn call(vm: *VM, args: []const Value) VmError!Value {
+            const c = args[0];
+            const n: i64 = switch (c.kind()) {
+                .nil => 0,
+                .list => @intCast(list_mod.count(c)),
+                .persistent_vector => @intCast(vector_mod.count(c)),
+                .typed_vector => @intCast(typed_vector_mod.count(c)),
+                .persistent_map => @intCast(champ_mod.mapCount(c)),
+                .record => @intCast(champ_mod.mapCount(record_mod.fieldsOf(c))),
+                .nextomic_entity => if (leaf) return VmError.NeedsReentry else @intCast(champ_mod.mapCount(try nextomic_mod.natives.entityMap(vm, c))),
+                .persistent_set => @intCast(champ_mod.setCount(c)),
+                .sorted_map, .sorted_set => @intCast(sorted_mod.count(c)),
+                .string => @intCast(string_mod.codepointCount(c) catch return VmError.Utf8Error),
+                .transient => @intCast(try transientCount(vm, c)),
+                .lazy_seq => if (leaf) return VmError.NeedsReentry else @intCast(try countConsumed(vm, c)),
+                else => return VmError.KindMismatch,
+            };
+            const v = value_mod.fromFixnum(n) orelse return VmError.ArithmeticOverflow;
+            return v;
+        }
+    }.call;
 }
 
 /// How many elements a lazy seq `count` consumes has: an unrealized
@@ -885,16 +900,6 @@ fn countConsumed(vm: *VM, s: Value) VmError!usize {
     var n: usize = 0;
     while (try it.next()) |_| n += 1;
     return n;
-}
-
-/// `count` as a leaf (VM.md §6): a lazy seq (realized to its end) and
-/// an entity (read from the store) go the general way, which consumes
-/// the argument.
-fn fnCountLeaf(vm: *VM, args: []const Value) VmError!Value {
-    return switch (args[0].kind()) {
-        .lazy_seq, .nextomic_entity => VmError.NeedsReentry,
-        else => fnCount(vm, args),
-    };
 }
 
 /// `(nth coll n)` → element at index `n`. Throws on out-of-
@@ -926,56 +931,42 @@ fn fnNth(vm: *VM, args: []const Value) VmError!Value {
         else => return VmError.KindMismatch,
     }
     const idx = idx_v.asFixnum();
-    if (idx < 0) {
-        if (has_default) return default;
-        return VmError.IndexOutOfBounds;
-    }
-    const u_idx: usize = @intCast(idx);
-    return switch (coll.kind()) {
-        .nil => default,
-        .list => blk: {
-            const at = list_mod.drop(coll, u_idx);
-            if (list_mod.isEmpty(at)) {
-                if (has_default) break :blk default;
-                return VmError.IndexOutOfBounds;
-            }
-            break :blk list_mod.head(at);
-        },
-        .persistent_vector => blk: {
-            if (u_idx >= vector_mod.count(coll)) {
-                if (has_default) break :blk default;
-                return VmError.IndexOutOfBounds;
-            }
-            break :blk vector_mod.nth(coll, u_idx);
-        },
-        .transient => blk: {
-            if (u_idx >= try transientCount(vm, coll)) {
-                if (has_default) break :blk default;
-                return VmError.IndexOutOfBounds;
-            }
-            break :blk transient_mod.vectorNthBang(coll, u_idx) catch |err| return transientFailure(vm, err);
-        },
-        .typed_vector => typed_vector_mod.nth(vm.ensureHeap(), coll, u_idx) catch |err| switch (err) {
-            error.IndexOutOfBounds => if (has_default) default else VmError.IndexOutOfBounds,
-            error.OutOfMemory => VmError.OutOfMemory,
-        },
-        // `(nth s i)` returns a
-        // Kind.char at codepoint index `i`. Indexing is by
-        // Unicode scalar to match `(count s)`. Out-of-bounds
-        // surfaces `:index-out-of-bounds`; malformed UTF-8
-        // surfaces `:utf8-error`.
-        .string => blk: {
-            const scalar = string_mod.codepointAt(coll, u_idx) catch |err| switch (err) {
-                error.OutOfBounds => {
-                    if (has_default) break :blk default;
-                    return VmError.IndexOutOfBounds;
-                },
+    if (idx >= 0) {
+        const u_idx: usize = @intCast(idx);
+        // Each element is returned by a statement of its own, so it is
+        // stored where the caller reads it, not merged in a temporary
+        // and copied on (docs/VM.md §8).
+        switch (coll.kind()) {
+            .nil => return default,
+            .list => {
+                const at = list_mod.drop(coll, u_idx);
+                if (!list_mod.isEmpty(at)) return list_mod.head(at);
+            },
+            .persistent_vector => if (u_idx < vector_mod.count(coll)) return vector_mod.nth(coll, u_idx),
+            .transient => if (u_idx < try transientCount(vm, coll)) {
+                return transient_mod.vectorNthBang(coll, u_idx) catch |err| return transientFailure(vm, err);
+            },
+            .typed_vector => if (typed_vector_mod.nth(vm.ensureHeap(), coll, u_idx)) |x| {
+                return x;
+            } else |err| switch (err) {
+                error.IndexOutOfBounds => {},
+                error.OutOfMemory => return VmError.OutOfMemory,
+            },
+            // A string's char at code point `i`, indexed by Unicode
+            // scalar to match `(count s)`; malformed UTF-8 is
+            // `:utf8-error`.
+            .string => if (string_mod.codepointAt(coll, u_idx)) |scalar| {
+                const c = value_mod.fromChar(scalar) orelse return VmError.Utf8Error;
+                return c;
+            } else |err| switch (err) {
+                error.OutOfBounds => {},
                 error.InvalidUtf8 => return VmError.Utf8Error,
-            };
-            break :blk value_mod.fromChar(scalar) orelse return VmError.Utf8Error;
-        },
-        else => return VmError.KindMismatch,
-    };
+            },
+            else => return VmError.KindMismatch,
+        }
+    }
+    if (has_default) return default;
+    return VmError.IndexOutOfBounds;
 }
 
 /// `nth` called other than as a leaf: a lazy seq is walked, realizing
@@ -2859,7 +2850,7 @@ fn fnNthrest(vm: *VM, args: []const Value) VmError!Value {
         .list => return list_mod.drop(args[0], count),
         .persistent_vector => {
             const v = args[0];
-            return list_mod.ofVector(vm.ensureHeap(), v, @min(count, vector_mod.count(v))) catch VmError.OutOfMemory;
+            return list_mod.ofVector(vm.ensureHeap(), v, @min(count, vector_mod.count(v))) catch return VmError.OutOfMemory;
         },
         // Clojure's loop: `rest` while the seq is not empty, so what
         // is left is not realized.
@@ -2897,17 +2888,41 @@ fn fnNthrest(vm: *VM, args: []const Value) VmError!Value {
 /// `(nthnext coll n)` → `(seq (nthrest coll n))`: the elements after
 /// the first n, nil when none; a vector's is its view, so a
 /// destructuring rest (`[a b & more]`) costs one block.
-fn fnNthnext(vm: *VM, args: []const Value) VmError!Value {
-    return fnSeq(vm, &.{try fnNthrest(vm, args)});
-}
+const fnNthnext = nthnextNative(false);
 
 /// `nthnext` as a leaf (VM.md §6): of nil, a list or a vector; any
 /// other seqable goes the general way.
-fn fnNthnextLeaf(vm: *VM, args: []const Value) VmError!Value {
-    return switch (args[0].kind()) {
-        .nil, .list, .persistent_vector => fnNthnext(vm, args),
-        else => VmError.NeedsReentry,
-    };
+const fnNthnextLeaf = nthnextNative(true);
+
+/// `nthnext`, the leaf's or the general native. Of nil, a list or a
+/// vector it is one body that returns the rest itself, so the rest is
+/// stored where the caller reads it rather than copied on from
+/// `nthrest` and `seq` (`docs/VM.md` §8).
+fn nthnextNative(comptime leaf: bool) *const fn (*VM, []const Value) VmError!Value {
+    return struct {
+        fn call(vm: *VM, args: []const Value) VmError!Value {
+            const coll = args[0];
+            switch (coll.kind()) {
+                .nil, .list, .persistent_vector => {},
+                else => {
+                    if (leaf) return VmError.NeedsReentry;
+                    return fnSeq(vm, &.{try fnNthrest(vm, args)});
+                },
+            }
+            const n = try requireCount(args[1]);
+            switch (coll.kind()) {
+                .list => {
+                    const rest = list_mod.drop(coll, n);
+                    if (!list_mod.isEmpty(rest)) return rest;
+                },
+                .persistent_vector => if (n < vector_mod.count(coll)) {
+                    return list_mod.ofVector(vm.ensureHeap(), coll, n) catch return VmError.OutOfMemory;
+                },
+                else => {},
+            }
+            return value_mod.nilValue();
+        }
+    }.call;
 }
 
 /// `(take-last n coll)`; of nothing it is nil, as Clojure's. A lazy
