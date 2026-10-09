@@ -12,21 +12,11 @@
 //! `big.int.Const`, so every operation reads the operands in place and
 //! only the result is copied onto the heap.
 //!
-//! The central invariant (BIGNUM.md §1): for integers, the runtime
-//! guarantees that two mathematically-equal integers are always
-//! represented by exactly one runtime kind/value form. This is what
-//! makes the `(= x y) ⇒ hash(x) = hash(y)` law hold across the
-//! fixnum↔bignum boundary without a cross-kind equality rule. Every
-//! code path that could produce a bignum funnels through exactly one
-//! canonicalization function (`canonicalizeToValue`) that enforces:
-//!   - trim trailing zero limbs,
-//!   - zero magnitude → `fixnum(0)` regardless of sign,
-//!   - fixnum-range magnitude → fixnum,
-//!   - otherwise: allocate a heap bignum whose canonical constraints
-//!     (BIGNUM.md §2) are all satisfied.
+//! Every integer has one form (BIGNUM.md §1): every result goes
+//! through `fromLimbs`, the canonicalizer (§3), so a magnitude that
+//! fits i48 is always a fixnum.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const value = @import("value.zig");
 const heap_mod = @import("heap.zig");
 const hash_mod = @import("hash.zig");
@@ -44,17 +34,12 @@ const testing = std.testing;
 
 pub const subkind_limbs: u16 = 0;
 
-/// Body prefix. 8 bytes; followed by a variable-length `[N]u64` limb
-/// array. `_pad` is layout-only — it is NEVER fed into hashing or
-/// equality. Semantic bytes are only the
-/// `negative` field and the limb bytes.
+/// The body's prefix: the sign, 1 negative and 0 not, and padding never
+/// hashed or compared; the limbs, least significant first, follow
+/// (BIGNUM.md §2).
 const BignumBody = extern struct {
-    /// 0 = non-negative, 1 = negative. Any other value is a runtime
-    /// bug caught by safe-build asserts in `isNegative` / accessors.
     negative: u8,
     _pad: [7]u8,
-    // limbs: [limb_count]u64 follow immediately after this struct;
-    // limb_count = (body.len - 8) / 8. limb[0] is LSW.
 
     comptime {
         std.debug.assert(@sizeOf(BignumBody) == 8);
@@ -69,39 +54,11 @@ const limb_bytes: usize = @sizeOf(u64);
 // Public API — construction
 // =============================================================================
 
-/// Integer-tower-aware constructor from an `i64`. Returns `fixnum(n)`
-/// when `n` is in fixnum range, otherwise a bignum Value. Handles
-/// `i64.min` correctly via two's-complement negation in u64 space
-/// (BIGNUM.md §7).
+/// The canonical integer `n`; `i64.min`'s magnitude, 2^63, comes from
+/// negating in `u64` (BIGNUM.md §7).
 pub fn fromI64(heap: *Heap, n: i64) !Value {
-    // Fast path: already fits as a fixnum.
-    if (value.isFixnumRange(n)) return value.fromFixnum(n).?;
-
-    // Out of fixnum range: materialize sign + single-limb magnitude.
-    // For `n == i64.min`, |n| = 2^63 which exactly fits in a u64 limb
-    // but NOT in `-n` as i64. Use two's-complement negation on the
-    // bit pattern to avoid the overflow.
-    const negative = n < 0;
-    const magnitude: u64 = if (!negative)
-        @intCast(n)
-    else
-        (~@as(u64, @bitCast(n))) +% 1;
-
-    // Single-limb allocation path; canonicalize still runs the
-    // fixnum-range check which will reject (we're here because we
-    // failed that check above, but canonicalize re-runs with the
-    // sign-aware bound).
-    const limbs_arr = [_]u64{magnitude};
-    return canonicalizeToValue(heap, negative, &limbs_arr);
-}
-
-/// Construct from a signed-magnitude little-endian `u64` limb sequence.
-/// Canonicalizes before returning: trims trailing zeros, collapses zero
-/// magnitude to `fixnum(0)`, folds fixnum-range magnitudes to `fixnum`.
-/// An empty `limbs` slice is treated as magnitude zero (returns
-/// `fixnum(0)` regardless of `negative`).
-pub fn fromLimbs(heap: *Heap, negative: bool, input_limbs: []const u64) !Value {
-    return canonicalizeToValue(heap, negative, input_limbs);
+    if (value.fromFixnum(n)) |v| return v;
+    return fromLimbs(heap, n < 0, &.{@abs(n)});
 }
 
 // =============================================================================
@@ -129,38 +86,20 @@ pub fn limbCount(v: Value) usize {
 // Per-kind hash / equality — called by dispatch
 // =============================================================================
 
-/// The sign (1 negative, 0 not) and xxHash3 of the limb bytes through
-/// `hash.combineOrdered`, truncated to u32.
-/// Cached in `HeapHeader.hash` using the cache-if-nonzero pattern
-/// (HEAP.md §1). Padding bytes inside the body are deliberately
-/// excluded — the hash is over semantic content only.
+/// The sign and xxHash3 of the limb bytes, ordered-combined and cached
+/// (BIGNUM.md §5); the padding is never hashed.
 pub fn hashHeader(h: *HeapHeader) u32 {
-    if (builtin.optimize.runtimeSafety()) {
-        std.debug.assert(h.kind == @backingInt(Kind.bignum));
-    }
+    std.debug.assert(h.kind == @backingInt(Kind.bignum));
     if (h.cachedHash()) |cached| return cached;
-
     const limb_hash = hash_mod.hashBytes(std.mem.sliceAsBytes(headerLimbs(h)));
-    const raw: u32 = @truncate(hash_mod.combineOrdered(@intFromBool(headerNegative(h)), limb_hash));
-    if (raw != 0) h.setCachedHash(raw);
-    return raw;
+    return h.cacheHash(hash_mod.combineOrdered(@intFromBool(headerNegative(h)), limb_hash));
 }
 
-/// Semantic equality: same sign, same limb count, same limb bytes.
-/// Padding is not compared. Canonical form (no trailing zeros) is
-/// maintained by the canonicalizer, so equal limb-byte-streams iff
-/// equal magnitudes.
+/// The same sign and limbs: in canonical form, the same integer
+/// (BIGNUM.md §6).
 pub fn limbsEqual(a: *HeapHeader, b: *HeapHeader) bool {
-    if (builtin.optimize.runtimeSafety()) {
-        std.debug.assert(a.kind == @backingInt(Kind.bignum));
-        std.debug.assert(b.kind == @backingInt(Kind.bignum));
-    }
-    if (a == b) return true;
-    if (headerNegative(a) != headerNegative(b)) return false;
-    const al = headerLimbs(a);
-    const bl = headerLimbs(b);
-    if (al.len != bl.len) return false;
-    return std.mem.eql(u64, al, bl);
+    std.debug.assert(a.kind == @backingInt(Kind.bignum) and b.kind == @backingInt(Kind.bignum));
+    return a == b or (headerNegative(a) == headerNegative(b) and std.mem.eql(u64, headerLimbs(a), headerLimbs(b)));
 }
 
 // =============================================================================
@@ -214,9 +153,19 @@ pub fn isInteger(v: Value) bool {
 
 /// A finished `big.int.Mutable` onto the heap in canonical form.
 fn fromMutable(heap: *Heap, m: bigint.Mutable) !Value {
-    const limbs_u64: []const u64 = @ptrCast(m.limbs[0..m.len]);
-    return canonicalizeToValue(heap, !m.positive, limbs_u64);
+    return fromLimbs(heap, !m.positive, @ptrCast(m.limbs[0..m.len]));
 }
+
+/// Scratch limbs on the stack, then from the heap's backing allocator.
+const Scratch = struct {
+    stack: [scratch_limbs]Limb,
+    bfa: std.heap.BufferFirstAllocator,
+
+    fn allocator(s: *Scratch, heap: *Heap) std.mem.Allocator {
+        s.bfa = .init(@ptrCast(&s.stack), heap.backing);
+        return s.bfa.allocator();
+    }
+};
 
 fn mutable(buf: []Limb) bigint.Mutable {
     return .{ .limbs = buf, .len = 1, .positive = true };
@@ -226,52 +175,36 @@ fn mutable(buf: []Limb) bigint.Mutable {
 pub fn fromI128(heap: *Heap, n: i128) !Value {
     if (n >= std.math.minInt(i64) and n <= std.math.maxInt(i64)) return fromI64(heap, @intCast(n));
     const mag: u128 = @abs(n);
-    const limbs_arr = [_]u64{ @truncate(mag), @truncate(mag >> 64) };
-    return canonicalizeToValue(heap, n < 0, &limbs_arr);
+    return fromLimbs(heap, n < 0, &.{ @truncate(mag), @truncate(mag >> 64) });
 }
 
 pub fn add(heap: *Heap, a: Value, b: Value) !Value {
-    var sa: [1]Limb = undefined;
-    var sb: [1]Limb = undefined;
-    const x = view(a, &sa);
-    const y = view(b, &sb);
-    var stack: [scratch_limbs]Limb = undefined;
-    var bfa: std.heap.BufferFirstAllocator = .init(@ptrCast(&stack), heap.backing);
-    const alloc = bfa.allocator();
-    const buf = try alloc.alloc(Limb, @max(x.limbs.len, y.limbs.len) + 1);
-    defer alloc.free(buf);
-    var r = mutable(buf);
-    r.add(x, y);
-    return fromMutable(heap, r);
+    return binary(heap, a, b, .add);
 }
 
 pub fn sub(heap: *Heap, a: Value, b: Value) !Value {
-    var sa: [1]Limb = undefined;
-    var sb: [1]Limb = undefined;
-    const x = view(a, &sa);
-    const y = view(b, &sb);
-    var stack: [scratch_limbs]Limb = undefined;
-    var bfa: std.heap.BufferFirstAllocator = .init(@ptrCast(&stack), heap.backing);
-    const alloc = bfa.allocator();
-    const buf = try alloc.alloc(Limb, @max(x.limbs.len, y.limbs.len) + 1);
-    defer alloc.free(buf);
-    var r = mutable(buf);
-    r.sub(x, y);
-    return fromMutable(heap, r);
+    return binary(heap, a, b, .sub);
 }
 
 pub fn mul(heap: *Heap, a: Value, b: Value) !Value {
+    return binary(heap, a, b, .mul);
+}
+
+fn binary(heap: *Heap, a: Value, b: Value, comptime op: enum { add, sub, mul }) !Value {
     var sa: [1]Limb = undefined;
     var sb: [1]Limb = undefined;
     const x = view(a, &sa);
     const y = view(b, &sb);
-    var stack: [scratch_limbs]Limb = undefined;
-    var bfa: std.heap.BufferFirstAllocator = .init(@ptrCast(&stack), heap.backing);
-    const alloc = bfa.allocator();
-    const buf = try alloc.alloc(Limb, x.limbs.len + y.limbs.len);
+    var scratch: Scratch = undefined;
+    const alloc = scratch.allocator(heap);
+    const buf = try alloc.alloc(Limb, if (op == .mul) x.limbs.len + y.limbs.len else @max(x.limbs.len, y.limbs.len) + 1);
     defer alloc.free(buf);
     var r = mutable(buf);
-    r.mulNoAlias(x, y, alloc);
+    switch (op) {
+        .add => r.add(x, y),
+        .sub => r.sub(x, y),
+        .mul => r.mulNoAlias(x, y, alloc),
+    }
     return fromMutable(heap, r);
 }
 
@@ -321,9 +254,8 @@ fn divide(heap: *Heap, a: Value, b: Value, rounding: Rounding, part: DivPart) !?
     const x = view(a, &sa);
     const y = view(b, &sb);
     std.debug.assert(!y.eqlZero());
-    var stack: [scratch_limbs]Limb = undefined;
-    var bfa: std.heap.BufferFirstAllocator = .init(@ptrCast(&stack), heap.backing);
-    const alloc = bfa.allocator();
+    var scratch: Scratch = undefined;
+    const alloc = scratch.allocator(heap);
     const qbuf = try alloc.alloc(Limb, x.limbs.len + 1);
     defer alloc.free(qbuf);
     const rbuf = try alloc.alloc(Limb, y.limbs.len + 1);
@@ -366,13 +298,13 @@ pub fn mod(heap: *Heap, a: Value, b: Value) !Value {
 pub fn neg(heap: *Heap, a: Value) !Value {
     var sa: [1]Limb = undefined;
     const x = view(a, &sa);
-    return canonicalizeToValue(heap, x.positive, @ptrCast(x.limbs));
+    return fromLimbs(heap, x.positive, @ptrCast(x.limbs));
 }
 
 pub fn abs(heap: *Heap, a: Value) !Value {
     var sa: [1]Limb = undefined;
     const x = view(a, &sa);
-    return canonicalizeToValue(heap, false, @ptrCast(x.limbs));
+    return fromLimbs(heap, false, @ptrCast(x.limbs));
 }
 
 /// Exact ordering of two integers of any size.
@@ -412,9 +344,8 @@ pub fn quotientF64(heap: *Heap, a: Value, b: Value) !f64 {
     if (k > 1134) return sign * 0.0;
     const up: usize = @intCast(@max(k, 0));
     const down: usize = @intCast(@max(-k, 0));
-    var stack: [scratch_limbs]Limb = undefined;
-    var bfa: std.heap.BufferFirstAllocator = .init(@ptrCast(&stack), heap.backing);
-    const alloc = bfa.allocator();
+    var scratch: Scratch = undefined;
+    const alloc = scratch.allocator(heap);
     const xs_buf = try alloc.alloc(Limb, x.limbs.len + up / @bitSizeOf(Limb) + 1);
     defer alloc.free(xs_buf);
     const ys_buf = try alloc.alloc(Limb, y.limbs.len + down / @bitSizeOf(Limb) + 1);
@@ -452,9 +383,8 @@ pub fn fromF64(heap: *Heap, f: f64) !?Value {
     if (!std.math.isFinite(f)) return null;
     const t = @trunc(f);
     if (@abs(t) < @as(f64, @floatFromInt(@as(u64, 1) << 47))) return value.fromFixnum(@trunc(t)).?;
-    var stack: [scratch_limbs]Limb = undefined;
-    var bfa: std.heap.BufferFirstAllocator = .init(@ptrCast(&stack), heap.backing);
-    const alloc = bfa.allocator();
+    var scratch: Scratch = undefined;
+    const alloc = scratch.allocator(heap);
     const buf = try alloc.alloc(Limb, bigint.calcLimbLen(t) + 1);
     defer alloc.free(buf);
     var m = mutable(buf);
@@ -558,9 +488,8 @@ pub fn parseDecimal(heap: *Heap, text: []const u8) !?Value {
     for (digits) |c| if (c < '0' or c > '9') return null;
     if (digits.len <= 18) return try fromI64(heap, std.fmt.parseInt(i64, text, 10) catch unreachable);
     if (digits.len <= split_digits) {
-        var stack: [scratch_limbs]Limb = undefined;
-        var bfa: std.heap.BufferFirstAllocator = .init(@ptrCast(&stack), heap.backing);
-        const alloc = bfa.allocator();
+        var scratch: Scratch = undefined;
+        const alloc = scratch.allocator(heap);
         const buf = try alloc.alloc(Limb, bigint.calcSetStringLimbCount(10, digits.len));
         defer alloc.free(buf);
         var m = mutable(buf);
@@ -573,7 +502,7 @@ pub fn parseDecimal(heap: *Heap, text: []const u8) !?Value {
     defer arena.deinit();
     var split: DecimalSplit = .{ .arena = arena.allocator() };
     const magnitude = try split.read(digits);
-    return try canonicalizeToValue(heap, negative, @ptrCast(magnitude.limbs));
+    return try fromLimbs(heap, negative, @ptrCast(magnitude.limbs));
 }
 
 /// At or under this many digits, `std`'s conversion (one multiply-add
@@ -625,426 +554,82 @@ const DecimalSplit = struct {
 // Private helpers
 // =============================================================================
 
-/// The single canonicalization funnel. Every public constructor
-/// returns here. Steps in order (BIGNUM.md §3):
-///   1. Trim trailing zero limbs.
-///   2. Zero magnitude → `fixnum(0)`.
-///   3. Fixnum-range magnitude → fixnum.
-///   4. Otherwise allocate a heap bignum with trimmed limbs.
-fn canonicalizeToValue(heap: *Heap, negative: bool, input_limbs: []const u64) !Value {
-    // 1. Trim trailing zeros.
-    var trimmed_len: usize = input_limbs.len;
-    while (trimmed_len > 0 and input_limbs[trimmed_len - 1] == 0) : (trimmed_len -= 1) {}
-    const trimmed = input_limbs[0..trimmed_len];
-
-    // 2. Zero magnitude → fixnum(0). Ignores `negative`.
-    if (trimmed.len == 0) return value.fromFixnum(0).?;
-
-    // 3. Fixnum-range magnitude → fixnum. Only a single-limb
-    // magnitude can possibly fit; multi-limb is automatically out of
-    // i48 range.
-    if (trimmed.len == 1) {
-        const mag = trimmed[0];
-        if (!negative) {
-            // Non-negative: representable iff mag <= fixnum_max = 2^47 - 1.
-            if (mag <= @as(u64, @intCast(value.fixnum_max))) {
-                return value.fromFixnum(@intCast(mag)).?;
-            }
-        } else {
-            // Negative: representable iff mag <= |fixnum_min| = 2^47.
-            // The magnitude exactly 2^47 maps to fixnum(-2^47), which
-            // IS representable (i48 is asymmetric).
-            const neg_bound: u64 = @as(u64, 1) << 47; // 2^47 = |fixnum_min|
-            if (mag <= neg_bound) {
-                // Reconstruct the signed value. For mag == 2^47, this
-                // is fixnum_min. For mag < 2^47, it's `-@as(i64, mag)`.
-                const n: i64 = if (mag == neg_bound)
-                    value.fixnum_min
-                else
-                    -@as(i64, @intCast(mag));
-                return value.fromFixnum(n).?;
-            }
-        }
+/// The canonical integer of a sign and a little-endian magnitude, which
+/// may be empty or carry trailing zero limbs (BIGNUM.md §3): zero is
+/// `fixnum(0)` whatever the sign, a magnitude in i48 a fixnum, anything
+/// else a bignum of the trimmed limbs. Every result passes through here.
+pub fn fromLimbs(heap: *Heap, negative: bool, input_limbs: []const u64) !Value {
+    var n: usize = input_limbs.len;
+    while (n > 0 and input_limbs[n - 1] == 0) n -= 1;
+    const trimmed = input_limbs[0..n];
+    if (n == 0) return value.fromFixnum(0).?;
+    if (n == 1 and trimmed[0] <= 1 << 47) {
+        const m: i64 = @intCast(trimmed[0]);
+        if (value.fromFixnum(if (negative) -m else m)) |v| return v;
     }
-
-    // 4. Allocate a heap bignum with the trimmed limbs.
-    // Overflow-safe: `trimmed.len * limb_bytes` could wrap in non-
-    // safe release builds. `std.math.mul` + `std.math.add` reject
-    // pathological inputs with `error.Overflow`.
-    const limbs_size = try std.math.mul(usize, trimmed.len, limb_bytes);
-    const body_size = try std.math.add(usize, prefix_bytes, limbs_size);
-    const h = try heap.alloc(.bignum, body_size);
+    const h = try heap.alloc(.bignum, prefix_bytes + n * limb_bytes);
     const body = Heap.bodyBytes(h);
-    std.debug.assert(body.len == body_size);
-
-    const prefix: *BignumBody = @ptrCast(@alignCast(body.ptr));
-    prefix.negative = if (negative) 1 else 0;
-    // _pad bytes are already zero from heap.alloc's zero-init.
-
-    const dst_limbs: []u64 = @as([*]u64, @ptrCast(@alignCast(body.ptr + prefix_bytes)))[0..trimmed.len];
-    @memcpy(dst_limbs, trimmed);
-
-    // Canonicality self-check — catches canonicalizer bugs at
-    // construction time rather than later at hash/eq.
-    if (builtin.optimize.runtimeSafety()) {
-        std.debug.assert(dst_limbs.len >= 1); // not empty
-        std.debug.assert(dst_limbs[dst_limbs.len - 1] != 0); // no trailing zero
-    }
-
-    return valueFrom(h);
+    @as(*BignumBody, @ptrCast(@alignCast(body.ptr))).negative = @intFromBool(negative);
+    @memcpy(@as([*]u64, @ptrCast(@alignCast(body.ptr + prefix_bytes)))[0..n], trimmed);
+    return .{ .tag = @as(u64, @backingInt(Kind.bignum)) | (@as(u64, subkind_limbs) << 16), .payload = @intFromPtr(h) };
 }
 
-/// Private accessor for the body prefix. Centralizes the
-/// `body.len >= prefix_bytes` invariant check so every caller
-/// doesn't have to re-assert (read-side invariants are enforced,
-/// not assumed).
-fn headerPrefix(h: *HeapHeader) *const BignumBody {
-    const body = Heap.bodyBytes(h);
-    std.debug.assert(body.len >= prefix_bytes);
-    return @ptrCast(@alignCast(body.ptr));
-}
-
-/// Private accessor for the sign bit, centralized so every read
-/// path enforces the 0-or-1 invariant on the stored byte.
 fn headerNegative(h: *HeapHeader) bool {
-    const prefix = headerPrefix(h);
+    const prefix: *const BignumBody = @ptrCast(@alignCast(Heap.bodyBytes(h).ptr));
     std.debug.assert(prefix.negative <= 1);
     return prefix.negative == 1;
 }
 
-/// Low-level accessor: limbs slice from a `*HeapHeader`. Panics in
-/// safe builds if structural constraints aren't met (shape invariants
-/// from BIGNUM.md §2: body ≥ prefix, multiple-of-8 tail, ≥ 1 limb,
-/// top limb nonzero).
+/// The limbs, asserted canonical: at least one, the top one nonzero.
 fn headerLimbs(h: *HeapHeader) []const u64 {
     const body = Heap.bodyBytes(h);
-    std.debug.assert(body.len >= prefix_bytes);
-    const limb_region_bytes = body.len - prefix_bytes;
-    std.debug.assert(limb_region_bytes % limb_bytes == 0);
-    const limb_count = limb_region_bytes / limb_bytes;
-    std.debug.assert(limb_count >= 1); // canonical: non-empty
+    std.debug.assert(body.len > prefix_bytes and (body.len - prefix_bytes) % limb_bytes == 0);
     const ptr: [*]const u64 = @ptrCast(@alignCast(body.ptr + prefix_bytes));
-    const slice = ptr[0..limb_count];
-    std.debug.assert(slice[slice.len - 1] != 0); // canonical: no trailing zero
+    const slice = ptr[0 .. (body.len - prefix_bytes) / limb_bytes];
+    std.debug.assert(slice[slice.len - 1] != 0);
     return slice;
 }
 
-/// Pack a heap-bignum Value. Private — the outside world reaches this
-/// through `canonicalizeToValue` only.
-fn valueFrom(h: *HeapHeader) Value {
-    return .{
-        .tag = @as(u64, @backingInt(Kind.bignum)) |
-            (@as(u64, subkind_limbs) << 16),
-        .payload = @intFromPtr(h),
-    };
-}
-
 // =============================================================================
-// Inline tests — structural / canonicalization invariants.
-// Full Value ↔ dispatch round-trips live in dispatch.zig + test/prop/bignum.zig.
+// Tests. The randomized laws are test/prop/bignum.zig's.
 // =============================================================================
 
-test "fromI64: values in fixnum range canonicalize to fixnum" {
+test "fromI64 and fromLimbs: one form per integer at the i48 and i64 edges" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-
-    const cases = [_]i64{ 0, 1, -1, 42, -42, 1000, -1000, value.fixnum_min, value.fixnum_max };
-    for (cases) |n| {
-        const v = try fromI64(&heap, n);
+    const two47: u64 = 1 << 47;
+    // Fixnums, never allocated: either edge of i48, zero of either
+    // sign, trailing zero limbs.
+    for ([_]Value{
+        try fromI64(&heap, value.fixnum_min),
+        try fromI64(&heap, value.fixnum_max),
+        try fromLimbs(&heap, true, &.{two47}),
+        try fromLimbs(&heap, true, &.{}),
+        try fromLimbs(&heap, true, &.{ 0, 0, 0 }),
+        try fromLimbs(&heap, false, &.{ 42, 0, 0 }),
+    }, [_]i64{ value.fixnum_min, value.fixnum_max, value.fixnum_min, 0, 0, 42 }) |v, n| {
         try testing.expect(v.kind() == .fixnum);
         try testing.expectEqual(n, v.asFixnum());
     }
-    // Nothing was allocated on the heap.
     try testing.expectEqual(@as(usize, 0), heap.liveCount());
-}
-
-test "fromI64: values just outside fixnum range become single-limb bignums" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    // fixnum_max + 1 = 2^47, first positive out-of-range value.
-    const pos_oor: i64 = value.fixnum_max + 1;
-    const v_pos = try fromI64(&heap, pos_oor);
-    try testing.expect(v_pos.kind() == .bignum);
-    try testing.expect(!isNegative(v_pos));
-    try testing.expectEqual(@as(usize, 1), limbCount(v_pos));
-    try testing.expectEqual(@as(u64, @intCast(pos_oor)), limbs(v_pos)[0]);
-}
-
-test "fromI64: fixnum_min is NOT out of range (asymmetric i48)" {
-    // Critical boundary case: -2^47 is exactly fixnum_min and must
-    // canonicalize to fixnum, not bignum.
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const v = try fromI64(&heap, value.fixnum_min);
-    try testing.expect(v.kind() == .fixnum);
-    try testing.expectEqual(value.fixnum_min, v.asFixnum());
-}
-
-test "fromI64: i64.min produces a bignum with magnitude 2^63" {
-    // Hardest case: |i64.min| = 2^63, which overflows signed negation
-    // but fits in a u64 limb. Tests the two's-complement negation path.
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const v = try fromI64(&heap, std.math.minInt(i64));
-    try testing.expect(v.kind() == .bignum);
-    try testing.expect(isNegative(v));
-    try testing.expectEqual(@as(usize, 1), limbCount(v));
-    const expected: u64 = @as(u64, 1) << 63;
-    try testing.expectEqual(expected, limbs(v)[0]);
-}
-
-test "fromLimbs: empty slice returns fixnum(0) regardless of sign" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const a = try fromLimbs(&heap, false, &.{});
-    const b = try fromLimbs(&heap, true, &.{});
-    try testing.expect(a.kind() == .fixnum and a.asFixnum() == 0);
-    try testing.expect(b.kind() == .fixnum and b.asFixnum() == 0);
-    try testing.expectEqual(@as(usize, 0), heap.liveCount());
-}
-
-test "fromLimbs: all-zero limbs collapse to fixnum(0) regardless of sign" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const v = try fromLimbs(&heap, true, &[_]u64{ 0, 0, 0 });
-    try testing.expect(v.kind() == .fixnum);
-    try testing.expectEqual(@as(i64, 0), v.asFixnum());
-    try testing.expectEqual(@as(usize, 0), heap.liveCount());
-}
-
-test "fromLimbs: trailing zeros are trimmed" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    // Single real limb with trailing zeros. The real limb is huge
-    // (above fixnum range) so this should produce a 1-limb bignum.
-    const big: u64 = (@as(u64, 1) << 50); // 2^50, out of i48 range
-    const v = try fromLimbs(&heap, false, &[_]u64{ big, 0, 0 });
-    try testing.expect(v.kind() == .bignum);
-    try testing.expectEqual(@as(usize, 1), limbCount(v));
-    try testing.expectEqual(big, limbs(v)[0]);
-}
-
-test "fromLimbs: fixnum-range single-limb magnitude canonicalizes to fixnum" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const v_pos = try fromLimbs(&heap, false, &[_]u64{42});
-    try testing.expect(v_pos.kind() == .fixnum);
-    try testing.expectEqual(@as(i64, 42), v_pos.asFixnum());
-
-    const v_neg = try fromLimbs(&heap, true, &[_]u64{42});
-    try testing.expect(v_neg.kind() == .fixnum);
-    try testing.expectEqual(@as(i64, -42), v_neg.asFixnum());
-
-    try testing.expectEqual(@as(usize, 0), heap.liveCount());
-}
-
-test "fromLimbs: negative 2^47 canonicalizes to fixnum_min (asymmetric i48 boundary)" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const mag: u64 = @as(u64, 1) << 47; // 2^47 = |fixnum_min|
-    const v = try fromLimbs(&heap, true, &[_]u64{mag});
-    try testing.expect(v.kind() == .fixnum);
-    try testing.expectEqual(value.fixnum_min, v.asFixnum());
-    try testing.expectEqual(@as(usize, 0), heap.liveCount());
-}
-
-test "fromLimbs: positive 2^47 does NOT fit in fixnum (asymmetric i48 boundary)" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const mag: u64 = @as(u64, 1) << 47; // 2^47, one above fixnum_max
-    const v = try fromLimbs(&heap, false, &[_]u64{mag});
-    try testing.expect(v.kind() == .bignum);
-    try testing.expect(!isNegative(v));
-    try testing.expectEqual(@as(usize, 1), limbCount(v));
-    try testing.expectEqual(mag, limbs(v)[0]);
-}
-
-test "fromLimbs: multi-limb magnitude always allocates a bignum" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const v = try fromLimbs(&heap, false, &[_]u64{ 0xDEAD_BEEF, 0xCAFE_BABE });
-    try testing.expect(v.kind() == .bignum);
-    try testing.expectEqual(@as(usize, 2), limbCount(v));
-    try testing.expectEqual(@as(u64, 0xDEAD_BEEF), limbs(v)[0]);
-    try testing.expectEqual(@as(u64, 0xCAFE_BABE), limbs(v)[1]);
-}
-
-test "limbsEqual: reflexive and symmetric on distinct allocations" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const big: u64 = @as(u64, 1) << 60;
-    const a = try fromLimbs(&heap, false, &[_]u64{ big, 1 });
-    const b = try fromLimbs(&heap, false, &[_]u64{ big, 1 });
-    const ah = Heap.asHeapHeader(a);
-    const bh = Heap.asHeapHeader(b);
-    try testing.expect(ah != bh); // distinct allocations
-    try testing.expect(limbsEqual(ah, bh));
-    try testing.expect(limbsEqual(bh, ah));
-    try testing.expect(limbsEqual(ah, ah)); // reflexive
-}
-
-test "limbsEqual: sign mismatch breaks equality" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const big: u64 = @as(u64, 1) << 60;
-    const a = try fromLimbs(&heap, false, &[_]u64{ big, 1 });
-    const b = try fromLimbs(&heap, true, &[_]u64{ big, 1 });
-    try testing.expect(!limbsEqual(Heap.asHeapHeader(a), Heap.asHeapHeader(b)));
-}
-
-test "limbsEqual: magnitude mismatch breaks equality" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const big: u64 = @as(u64, 1) << 60;
-    const a = try fromLimbs(&heap, false, &[_]u64{ big, 1 });
-    const b = try fromLimbs(&heap, false, &[_]u64{ big, 2 });
-    try testing.expect(!limbsEqual(Heap.asHeapHeader(a), Heap.asHeapHeader(b)));
-}
-
-test "limbsEqual: different limb counts break equality" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const a = try fromLimbs(&heap, false, &[_]u64{ 1, 2, 3 });
-    const b = try fromLimbs(&heap, false, &[_]u64{ 1, 2 });
-    try testing.expect(!limbsEqual(Heap.asHeapHeader(a), Heap.asHeapHeader(b)));
-}
-
-test "hashHeader: deterministic, caches nonzero, matches xxHash3 over sign+limbs" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const big: u64 = @as(u64, 1) << 62;
-    const v = try fromLimbs(&heap, true, &[_]u64{ big, 7 });
-    const h = Heap.asHeapHeader(v);
-
-    // Pre-hash: cache is clear.
-    try testing.expectEqual(@as(u32, 0), h.hash);
-
-    // The expected hash by hand: the sign, then xxHash3 over the
-    // limb bytes, through the ordered combine.
-    const limb_arr = [_]u64{ big, 7 };
-    const expected: u32 = @truncate(hash_mod.combineOrdered(1, hash_mod.hashBytes(std.mem.sliceAsBytes(&limb_arr))));
-
-    try testing.expectEqual(expected, hashHeader(h));
-    try testing.expectEqual(expected, hashHeader(h)); // deterministic, re-reads cache
-
-    if (expected != 0) {
-        try testing.expectEqual(expected, h.hash); // cached
-    }
-}
-
-test "hashHeader: equal bignums across allocations have equal hashes" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const big: u64 = @as(u64, 1) << 55;
-    const a = try fromLimbs(&heap, false, &[_]u64{ big, big, big });
-    const b = try fromLimbs(&heap, false, &[_]u64{ big, big, big });
-    try testing.expectEqual(
-        hashHeader(Heap.asHeapHeader(a)),
-        hashHeader(Heap.asHeapHeader(b)),
-    );
-}
-
-test "hashHeader: sign flip changes the hash" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const big: u64 = @as(u64, 1) << 55;
-    const positive = try fromLimbs(&heap, false, &[_]u64{big});
-    const negative = try fromLimbs(&heap, true, &[_]u64{big});
-    try testing.expect(hashHeader(Heap.asHeapHeader(positive)) !=
-        hashHeader(Heap.asHeapHeader(negative)));
-}
-
-test "body layout: canonical bignum has no trailing zero limbs" {
-    // Direct invariant check: for every bignum we construct, the
-    // top limb is nonzero.
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const big: u64 = @as(u64, 1) << 60;
-    const cases = [_][]const u64{
-        &[_]u64{big},
-        &[_]u64{ big, 1 },
-        &[_]u64{ big, 1, 2, 3 },
-    };
-    for (cases) |input| {
-        const v = try fromLimbs(&heap, false, input);
+    // Bignums, trimmed: one past either edge, i64.min, and 2^47 with
+    // trailing zeros.
+    for ([_]Value{
+        try fromI64(&heap, value.fixnum_max + 1),
+        try fromI64(&heap, value.fixnum_min - 1),
+        try fromI64(&heap, std.math.minInt(i64)),
+        try fromLimbs(&heap, false, &.{ two47, 0 }),
+    }, [_]bool{ false, true, true, false }, [_]u64{ two47, two47 + 1, 1 << 63, two47 }) |v, negative, magnitude| {
         try testing.expect(v.kind() == .bignum);
-        const l = limbs(v);
-        try testing.expect(l[l.len - 1] != 0);
+        try testing.expectEqual(negative, isNegative(v));
+        try testing.expectEqualSlices(u64, &.{magnitude}, limbs(v));
+        try testing.expectEqual(subkind_limbs, v.subkind());
     }
+    const a = try fromI64(&heap, std.math.minInt(i64));
+    const b = try fromLimbs(&heap, true, &.{1 << 63});
+    try testing.expect(limbsEqual(Heap.asHeapHeader(a), Heap.asHeapHeader(b)));
+    try testing.expectEqual(hashHeader(Heap.asHeapHeader(a)), hashHeader(Heap.asHeapHeader(b)));
 }
-
-test "body layout: pad bytes are zero (heap.alloc zero-init) and never semantic" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const big: u64 = @as(u64, 1) << 50;
-    const v = try fromLimbs(&heap, false, &[_]u64{big});
-    const h = Heap.asHeapHeader(v);
-    const body = Heap.bodyBytes(h);
-    // Pad bytes are offsets 1..8 in the body; must be zero from
-    // heap.alloc's memset. Hashing + equality never inspect them;
-    // this is a layout-integrity check only.
-    for (body[1..8]) |b| {
-        try testing.expectEqual(@as(u8, 0), b);
-    }
-}
-
-test "valueFrom: tag encodes kind + subkind, payload = *HeapHeader" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const big: u64 = @as(u64, 1) << 50;
-    const v = try fromLimbs(&heap, false, &[_]u64{big});
-    try testing.expect(v.kind() == .bignum);
-    try testing.expectEqual(subkind_limbs, v.subkind());
-    try testing.expectEqual(@intFromPtr(Heap.asHeapHeader(v)), v.payload);
-}
-
-test "cross-constructor canonical coherence: fromI64(n) ≡ fromLimbs(false, &{n, 0, 0})" {
-    // Per BIGNUM.md §1: semantically-equal
-    // integers produced through different constructor paths must be
-    // byte-identical `Value`s (same kind, same payload when fixnum;
-    // or equal-by-structure bignums that share hashValue).
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const via_i64 = try fromI64(&heap, 123);
-    const via_tight = try fromLimbs(&heap, false, &[_]u64{123});
-    const via_padded = try fromLimbs(&heap, false, &[_]u64{ 123, 0, 0 });
-    // All three canonicalize to fixnum(123); every invariant follows.
-    try testing.expect(via_i64.kind() == .fixnum);
-    try testing.expect(via_tight.kind() == .fixnum);
-    try testing.expect(via_padded.kind() == .fixnum);
-    try testing.expectEqual(@as(i64, 123), via_i64.asFixnum());
-    try testing.expectEqual(via_i64.tag, via_tight.tag);
-    try testing.expectEqual(via_i64.payload, via_tight.payload);
-    try testing.expectEqual(via_i64.tag, via_padded.tag);
-    try testing.expectEqual(via_i64.payload, via_padded.payload);
-    // No heap allocations because every input canonicalized away.
-    try testing.expectEqual(@as(usize, 0), heap.liveCount());
-}
-
-test "cross-constructor canonical coherence: i64.min ≡ fromLimbs(true, &{1<<63})" {
-    // Two paths to the same out-of-fixnum-range magnitude: fromI64
-    // via two's-complement negation, and fromLimbs via explicit
-    // sign+magnitude. Both must produce bignums that compare equal
-    // by `limbsEqual` and share `hashHeader`.
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const via_i64 = try fromI64(&heap, std.math.minInt(i64));
-    const via_limbs = try fromLimbs(&heap, true, &[_]u64{@as(u64, 1) << 63});
-    try testing.expect(via_i64.kind() == .bignum);
-    try testing.expect(via_limbs.kind() == .bignum);
-    const ah = Heap.asHeapHeader(via_i64);
-    const bh = Heap.asHeapHeader(via_limbs);
-    try testing.expect(ah != bh); // distinct allocations
-    try testing.expect(limbsEqual(ah, bh));
-    try testing.expectEqual(hashHeader(ah), hashHeader(bh));
-}
-
-// =============================================================================
-// Inline tests — arithmetic, ordering and conversion
-// =============================================================================
 
 fn fx(n: i64) Value {
     return value.fromFixnum(n).?;

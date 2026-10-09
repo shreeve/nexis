@@ -44,8 +44,8 @@ Frozen invariants (a change is a PLAN amendment):
 2. `@sizeOf(HeapHeader) == 16`, `@alignOf(HeapHeader) == 16`, with the
    field offsets above (asserted at compile time).
 3. `hash == 0` means "not computed". A kind's hasher caches its `u32`
-   hash only when it is nonzero (`cachedHash` / `setCachedHash`); a
-   genuine zero is recomputed on each use, which is cheaper than a
+   hash (`cachedHash` / `cacheHash`); a genuine zero stays "not
+   computed" and is recomputed on each use, which is cheaper than a
    validity bit per object.
 4. A fresh block is zero-filled except `kind`: `mark`, `flags`, `hash`
    are 0, `meta` is null and every body byte is 0, so a body of
@@ -142,6 +142,7 @@ at the db layer.
 | `isMarked`, `setMarked`, `clearMarked` | The `marked` bit |
 | `hasMeta`, `getMeta`, `setMeta` | `setMeta` keeps `flags.has_meta` equal to `meta != null`; `getMeta` asserts it in safe builds. Raw writes to `meta` are not made |
 | `cachedHash() ?u32`, `setCachedHash(u32)` | Null when `hash == 0` (§1 invariant 3) |
+| `cacheHash(u64) u32` | Stores the hash truncated to `u32` and returns it |
 
 ---
 

@@ -107,9 +107,7 @@ pub fn withFields(heap: *Heap, v: Value, new_fields: Value) !Value {
 pub fn hashHeader(h: *HeapHeader, fieldHash: *const fn (v: Value) u64) u32 {
     if (h.cachedHash()) |cached| return cached;
     const body = Heap.bodyOf(RecordBody, h);
-    const truncated: u32 = @truncate(hash_mod.combineOrdered(hash_mod.hashU64(body.type_id), fieldHash(body.fields)));
-    if (truncated != 0) h.setCachedHash(truncated);
-    return truncated;
+    return h.cacheHash(hash_mod.combineOrdered(hash_mod.hashU64(body.type_id), fieldHash(body.fields)));
 }
 
 /// Structural equality: same type_id AND equal field maps.

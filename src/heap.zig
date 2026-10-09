@@ -111,21 +111,20 @@ pub const HeapHeader = extern struct {
         }
     }
 
-    // ---- Cached hash ----
-    //
-    // HEAP.md §1 accepts the "hash == 0 means uncomputed" sentinel:
-    // a genuine computed-zero hash recomputes on next access. This
-    // saves one flag bit per heap object. If a per-
-    // kind hasher produces output with a non-trivial 0-collision rate
-    // (e.g. identity hashes over small domains), that kind's hasher
-    // should remap 0 to 1 in its own finalizer before calling
-    // `setCachedHash`.
+    // ---- Cached hash: 0 is "not yet computed" (HEAP.md §1) ----
 
     pub inline fn cachedHash(self: *const HeapHeader) ?u32 {
         return if (self.hash == 0) null else self.hash;
     }
     pub inline fn setCachedHash(self: *HeapHeader, h: u32) void {
         self.hash = h;
+    }
+
+    /// `h` truncated to the cached hash, stored and returned; a hash
+    /// of 0 stays "not yet computed" and is computed again.
+    pub inline fn cacheHash(self: *HeapHeader, h: u64) u32 {
+        self.hash = @truncate(h);
+        return self.hash;
     }
 };
 

@@ -57,9 +57,10 @@ in safe builds, and `headerLimbs` re-asserts it on every read.
 
 ### 3. Canonicalization
 
-`canonicalizeToValue(heap, negative, limbs)` (private) takes a sign and
-a possibly non-canonical little-endian magnitude and is the only place
-that decides the kind of the result. Its steps, each short-circuiting:
+`fromLimbs(heap, negative, limbs)` takes a sign and a possibly
+non-canonical little-endian magnitude and is the only place that
+decides the kind of a result: every constructor and every operation
+ends in it. Its steps, each short-circuiting:
 
 1. Trim trailing zero limbs.
 2. An empty magnitude is `fixnum(0)`, whatever `negative` says (no
@@ -70,9 +71,9 @@ that decides the kind of the result. Its steps, each short-circuiting:
 4. Otherwise one allocation of `8 + n·8` bytes, sign and trimmed limbs
    copied in.
 
-Steps 1 to 3 never allocate; only step 4 can fail, with
-`error.OutOfMemory` or `error.Overflow` (the size computation and
-`heap.alloc`). There is no bignum-specific error.
+Steps 1 to 3 never allocate; only step 4 can fail, with `heap.alloc`'s
+`error.OutOfMemory` or `error.Overflow`. There is no bignum-specific
+error.
 
 ---
 
@@ -177,7 +178,10 @@ The semantics match Clojure's `Numbers` for BigInt:
   exceeds it, and writes the quotient and the zero-padded remainder the
   same way, so the whole conversion costs about one division of the
   value by its square root instead of one pass per nine digits; a
-  million digits print in about a second (`-Doptimize=fast`).
+  million digits print in about a second (`-Doptimize=fast`). Its
+  scratch comes from the page allocator, since a printer holds no heap:
+  `NEXIS_MAX_ALLOC` does not bound it, and running out of it is the
+  writer's `WriteFailed`.
 
 The VM's tower (`src/vm.zig` `numAdd` through `numCompare`) keeps the
 fixnum-by-fixnum fast path in `i64` and calls this module only when a
