@@ -110,18 +110,13 @@ pub const ExpandContext = struct {
     /// Null = `(require ...)` raises MalformedMacroCall (useful
     /// for tests that compile in-memory only).
     load_callback: ?LoadCallback = null,
-    /// Lazy-init heap for arg Value construction when no
-    /// `value_heap` is given. Macro args that are vectors/maps/sets
-    /// need a heap for their backing nodes; this one lives on
-    /// ExpandContext.allocator (the compile arena) and is reused
-    /// across macro invocations.
-    _arg_heap: ?heap_mod.Heap = null,
-    /// A heap to build values on instead of `_arg_heap`: the
-    /// calling VM's heap, which the compiler passes whenever a
-    /// namespace registry carries one and the run-time hooks
-    /// (`macroexpand-1`, `read-string`) always pass. Macro
-    /// arguments, the macro sub-VM's allocations and the values
-    /// it returns then live where the VM's Vars can hold them.
+    /// The heap macro arguments and quoted data are built on: the
+    /// calling VM's, which the compiler passes whenever a namespace
+    /// registry carries one and the run-time hooks (`macroexpand-1`,
+    /// `read-string`) always pass, so the macro sub-VM's allocations
+    /// and the values it returns live where the VM's Vars can hold
+    /// them. Null only in a test that expands no user macro and
+    /// converts no form to data.
     value_heap: ?*heap_mod.Heap = null,
     /// The calling VM's `io`, given to a user macro's sub-VM so the
     /// macro body can print; null leaves the sub-VM without one.
@@ -160,15 +155,9 @@ pub const ExpandContext = struct {
         return self.failWith(ExpandError.MalformedMacroCall, span, fmt, args);
     }
 
-    /// The heap for arg Value construction: `value_heap` when set,
-    /// else the lazily created `_arg_heap`, good for the lifetime
-    /// of the ExpandContext.
-    pub fn heapForArgs(self: *ExpandContext) ExpandError!*heap_mod.Heap {
-        if (self.value_heap) |h| return h;
-        if (self._arg_heap == null) {
-            self._arg_heap = heap_mod.Heap.init(self.allocator);
-        }
-        return &self._arg_heap.?;
+    /// `value_heap`; a form cannot become data without one.
+    fn heapForArgs(self: *ExpandContext) ExpandError!*heap_mod.Heap {
+        return self.value_heap orelse ExpandError.MalformedMacroCall;
     }
 
     /// A fresh name `<base>__<N>__auto__` (MACROEXPAND.md §4) in
