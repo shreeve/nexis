@@ -6205,44 +6205,12 @@ pub const VM = struct {
     }
 };
 
-/// Stable taxonomy mapping recoverable VmError
-/// variants to user-visible keyword names. Per VM.md §13's
-/// catchable table.
-///
-/// Returns null for unrecoverable errors — bytecode
-/// corruption, OOM, handler-state malformation, etc. Those
-/// propagate to the caller unchanged.
+/// The keyword name of a catchable error (VM.md §13): its tag in
+/// kebab case, `KindMismatch` as `kind-mismatch`. Null for the rest,
+/// compiler bugs, corrupt bytecode, memory and the control signals,
+/// which leave a run as they are.
 pub fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
     return switch (err) {
-        // Recoverable per VM.md §13.
-        VmError.KindMismatch => "kind-mismatch",
-        VmError.ArityMismatch => "arity-mismatch",
-        VmError.NotCallable => "not-callable",
-        VmError.UnboundVar => "unbound-var",
-        VmError.NotDynamic => "not-dynamic",
-        VmError.NoThreadBinding => "no-thread-binding",
-        VmError.ArithmeticOverflow => "arithmetic-overflow",
-        VmError.DivideByZero => "divide-by-zero",
-        VmError.IndexOutOfBounds => "index-out-of-bounds",
-        VmError.DbError => "db-error",
-        VmError.DbClosed => "db-closed",
-        VmError.InvalidDurableRef => "invalid-durable-ref",
-        VmError.CodecFailed => "codec-failed",
-        VmError.TxClosed => "tx-closed",
-        VmError.NotDerefable => "not-derefable",
-        VmError.AtomReEntry => "atom-re-entry",
-        VmError.TransientUsedAfterPersistent => "transient-used-after-persistent",
-        VmError.Utf8Error => "utf8-error",
-        VmError.InvalidArgument => "invalid-argument",
-        VmError.IoError => "io-error",
-        VmError.FileNotFound => "file-not-found",
-        VmError.InvalidPath => "invalid-path",
-        VmError.NotARecord => "not-a-record",
-        VmError.NoProtocolImpl => "no-protocol-impl",
-        VmError.NoProtocolMethod => "no-protocol-method",
-        VmError.StackOverflow => "stack-overflow",
-        // Unrecoverable: bytecode corruption / VM-internal /
-        // OOM / already-a-user-throw / unimplemented.
         VmError.UncaughtThrow,
         VmError.BytecodeCorruption,
         VmError.BytecodeExhausted,
@@ -6260,7 +6228,20 @@ pub fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
         VmError.ControlTransferred,
         VmError.NeedsReentry,
         => null,
+        inline else => |e| comptime kebab(@errorName(e)),
     };
+}
+
+/// `name` in kebab case: a `-` before each upper-case letter but the
+/// first, every letter lower case.
+fn kebab(comptime name: []const u8) []const u8 {
+    @setEvalBranchQuota(10_000);
+    var out: []const u8 = "";
+    for (name, 0..) |c, i| {
+        if (i > 0 and std.ascii.isUpper(c)) out = out ++ "-";
+        out = out ++ .{std.ascii.toLower(c)};
+    }
+    return out;
 }
 
 // =============================================================================
@@ -6414,7 +6395,6 @@ pub fn kindPhrase(k: value_mod.Kind) []const u8 {
         .persistent_vector => "a vector",
         .function, .native_fn, .protocol_fn => "a function",
         .var_ => "a var",
-        .error_ => "an error",
         .atom => "an atom",
         .db_write_txn => "a db write transaction",
         .db_read_txn => "a db read transaction",
@@ -7434,6 +7414,15 @@ test "VM dispatch: fixnum arithmetic that leaves i48 promotes" {
         .{ .name = "a zero divisor", .code = &.{ mod(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ fx(7), fx(0) }, .want = .{ .err = VmError.DivideByZero } },
         .{ .name = "a zero quotient divisor", .code = &.{ quot(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ fx(7), fx(0) }, .want = .{ .err = VmError.DivideByZero } },
     });
+}
+
+test "vmErrorToKeywordName: a catchable error's tag in kebab case, null for the rest" {
+    try testing.expectEqualStrings("kind-mismatch", vmErrorToKeywordName(VmError.KindMismatch).?);
+    try testing.expectEqualStrings("utf8-error", vmErrorToKeywordName(VmError.Utf8Error).?);
+    try testing.expectEqualStrings("atom-re-entry", vmErrorToKeywordName(VmError.AtomReEntry).?);
+    try testing.expectEqualStrings("not-a-record", vmErrorToKeywordName(VmError.NotARecord).?);
+    try testing.expectEqualStrings("transient-used-after-persistent", vmErrorToKeywordName(VmError.TransientUsedAfterPersistent).?);
+    try testing.expect(vmErrorToKeywordName(VmError.OutOfMemory) == null);
 }
 
 test "VM dispatch: a handler's status carries every VmError and back" {
