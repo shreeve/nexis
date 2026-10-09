@@ -355,7 +355,7 @@ their elements in the same mode. Who uses which:
 | atom, transient | `#<atom>`, `#<transient>` |
 | regex | `#"source"`, with Clojure's escaping of `"` (`docs/REGEX.md` §8); `str` and `%s` of a bare pattern write its source, as `Pattern.toString` does |
 | matcher | `#<matcher #"source">` |
-| protocol, protocol fn | `#<protocol id=N>`, `#<protocol-fn proto=N method=M>` |
+| protocol, protocol fn | `#<protocol id=N>`, `#<protocol-fn NAME>` (`NAME` the method's: `(defprotocol P (area [x]))` makes `#<protocol-fn area>`) |
 | durable ref | `#<durable-ref :tree hex:KEY>`, the key bytes in upper-case hex |
 | db connection, transactions | `#<db-connection>`, `#<db-write-txn>`, `#<db-read-txn>` |
 | Nextomic handles | `#nextomic/conn "path"`, `#nextomic/db {:basis-t N :mode :current}` (`:as-of N` / `:since N` when set), `#nextomic/entity {:db/id N}` |
