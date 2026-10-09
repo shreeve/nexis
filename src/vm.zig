@@ -1094,53 +1094,31 @@ pub const ArityPhrase = struct {
 /// the instruction.
 pub const VerifyFailure = struct { routine: *const Routine, pc: u32 };
 
-/// A Var holds a mutable cell of a Value with stable identity
-/// across rebinds (matches Clojure's `def` semantics: `(def x 5)`
-/// then `(def x 10)` does NOT create a new Var; the same Var
-/// object's root is updated). Per VM.md §10.7.
-///
-/// Allocation: a Var lives in VM.runtime_arena for the VM's
-/// life and the Value payload is the raw `*Var`, not a
-/// `HeapHeader`-prefixed heap object. Vars are immortal by
-/// design (a namespace never removes one), so the collector
-/// does not sweep them; it reaches their `root`, `meta` and
-/// `thread_value` through the namespace walk (GC.md §3).
-///
-/// `bound`: false until the first `(def name val)` runs. Loads
-/// via `var:load-var` trap `:unbound-var` in that case. This
-/// is what makes forward references work — `(defn f [] (g))`
-/// compiles when g doesn't exist yet (g's Var is interned
-/// unbound), and only traps if f is called before g is bound.
+/// A namespace's mutable binding of a name (VM.md §10.7): `def` of
+/// the name again updates the same Var, so code compiled against it
+/// sees the new root, and a forward reference compiles against a Var
+/// still unbound, which traps `:unbound-var` only if read before its
+/// `def`. A Var lives in `VM.runtime_arena` for the VM's life and the
+/// Value is the raw `*Var`: Vars are immortal, and the collector reaches
+/// their values through the namespaces (GC.md §3).
 pub const Var = struct {
-    /// Symbol name (the Var's identity). The Namespace that
-    /// owns this Var owns the name's backing storage.
+    /// The name, owned by the Var's namespace.
     name: []const u8,
-    /// The owning Namespace's name, for printing `#'ns/name`; empty
-    /// for a Var of a bare Namespace.
+    /// The namespace's name, for `#'ns/name`; empty for a bare
+    /// `Namespace`.
     ns: []const u8 = "",
-    /// Current root value. Read by `var:load-var` / V-operand
-    /// resolve. Written by `var:store-var`.
     root: Value = value_mod.nilValue(),
-    /// True once `def` has set the root. Distinguishes
-    /// "intentionally nil" from "never bound".
+    /// Set once `def` has set the root: a nil root may be bound.
     bound: bool = false,
-    /// True when this Var was created by `(defmacro ...)`.
-    /// The expander dispatches
-    /// macro Vars (compile-time evaluation of the macro fn)
-    /// instead of compiling `(my-macro ...)` as an ordinary
-    /// call. Set ONLY by the expander's defmacro handler;
-    /// regular `def` never sets it.
+    /// Set by `defmacro` alone: the expander calls the Var's value at
+    /// compile time (MACROEXPAND.md §1.2).
     macro: bool = false,
-    /// The metadata map, or nil: `^meta` on the name, a docstring
-    /// and an attribute map land here through `reset-meta!`.
+    /// The metadata map, or nil.
     meta: Value = value_mod.nilValue(),
-    /// True once the Var's metadata has carried `:dynamic true`
-    /// (`(def ^:dynamic *x* ...)`); only a dynamic Var can be
-    /// rebound by `binding`. Never cleared.
+    /// Set once the metadata has carried `:dynamic true`, never cleared
+    /// (VM.md §6.5).
     dynamic: bool = false,
-    /// The binding in force when `thread_bound` is true: what a
-    /// load returns instead of `root`. Pushed by `binding`
-    /// (`VM.pushBindings`), written by `set!`, restored by the pop.
+    /// The binding in force when `thread_bound` (VM.md §6.5).
     thread_value: Value = value_mod.nilValue(),
     thread_bound: bool = false,
 
@@ -1153,115 +1131,66 @@ pub const Var = struct {
     }
 };
 
-/// A namespace mapping symbol names to `*Var`. A VM holds one
-/// or more namespaces through `NamespaceRegistry`; a bare
-/// `Namespace` without a registry is the single-namespace form
-/// the tests use.
-///
-/// Lifetime: Var structs themselves live in VM.runtime_arena
-/// and are freed wholesale at `VM.deinit`. The HashMap's
-/// internal storage uses the same allocator the VM uses for
-/// its other ArrayLists (VM.allocator); freed in
-/// `Namespace.deinit`.
+/// Names to Vars (STDLIB.md §8). A VM's namespaces live in its
+/// `NamespaceRegistry`; a bare `Namespace` with no registry is the one
+/// namespace of a VM built by hand. The Vars and names live in
+/// `var_allocator` (the VM's runtime arena), the maps in
+/// `map_allocator`.
 pub const Namespace = struct {
-    /// Namespace name. Empty for ad-hoc single-ns usage (tests
-    /// that construct a Namespace directly without going through
-    /// `NamespaceRegistry`). When non-empty, this is the
-    /// canonical name (e.g., "nexis.core", "user", "my.app").
+    /// Empty for a bare namespace.
     name: []const u8 = "",
-    /// Auto-refer fallback. When `lookup` doesn't
-    /// find a Var by name in this namespace, it walks the
-    /// parent chain. Used to thread `nexis.core` into every
-    /// user-defined namespace (`nexis.core` is auto-referred
-    /// from every new namespace).
-    /// `intern` does NOT walk parent — forward references
-    /// always land in the current namespace, never silently
-    /// shadowing parent Vars.
+    /// Where `lookup` goes for a name this namespace does not hold:
+    /// `nexis.core`, referred into every namespace. `intern` never
+    /// goes there, so a forward reference lands here.
     parent: ?*Namespace = null,
-    /// Back-link to the owning registry. Lets
-    /// arbitrary cross-namespace qualified lookups (`other/x`
-    /// where `other` is not an ancestor) resolve directly via
-    /// `registry.lookupNs(name)`. Null for ad-hoc namespaces
-    /// constructed without going through `NamespaceRegistry`.
+    /// The registry, which resolves `other/x` for any namespace;
+    /// null for a bare one.
     registry: ?*NamespaceRegistry = null,
-    /// Per-namespace alias table. Maps alias name
-    /// (e.g., "m") to the canonical namespace name (e.g.,
-    /// "my.app"). Populated by `(require '[my.app :as m])` in
-    /// the CURRENT namespace. Qualified symbol resolution
-    /// (`compileQualifiedSymbol`) checks aliases BEFORE
-    /// treating the prefix as a literal namespace name. Aliases
-    /// are namespace-local (not inherited via auto-refer).
+    /// `(require '[my.app :as m])`'s aliases, this namespace's own:
+    /// alias name to namespace name.
     aliases: std.StringHashMapUnmanaged([]const u8) = .empty,
-    /// Backs the hash maps' internal storage.
     map_allocator: std.mem.Allocator,
-    /// Backs the Var struct allocations. Lifetime = VM lifetime.
     var_allocator: std.mem.Allocator,
     vars: std.StringHashMapUnmanaged(*Var) = .empty,
 
-    pub fn init(
-        map_allocator: std.mem.Allocator,
-        var_allocator: std.mem.Allocator,
-    ) Namespace {
-        return .{
-            .map_allocator = map_allocator,
-            .var_allocator = var_allocator,
-        };
+    pub fn init(map_allocator: std.mem.Allocator, var_allocator: std.mem.Allocator) Namespace {
+        return .{ .map_allocator = map_allocator, .var_allocator = var_allocator };
     }
 
     pub fn deinit(self: *Namespace) void {
-        // Var structs are arena-owned; freed wholesale at
-        // VM.deinit. Only the hash map's internal storage
-        // belongs to us here.
         self.vars.deinit(self.map_allocator);
         self.aliases.deinit(self.map_allocator);
         self.* = undefined;
     }
 
-    /// Register an alias `alias_name → target_ns_name`
-    /// in this namespace's alias table. Used by
-    /// `(require '[my.ns :as alias])`. Replaces any existing
-    /// binding for `alias_name`. Both strings are duped into
-    /// var_allocator (stable for the namespace's lifetime)
-    /// since the caller's slices may live in a per-form arena
-    /// that dies before the next lookup.
+    /// Map `alias_name` to `target_ns_name`, replacing any earlier
+    /// alias of the name; both are copied, since a caller's may live
+    /// in a per-form arena.
     pub fn putAlias(self: *Namespace, alias_name: []const u8, target_ns_name: []const u8) !void {
         const owned_alias = try self.var_allocator.dupe(u8, alias_name);
         const owned_target = try self.var_allocator.dupe(u8, target_ns_name);
         try self.aliases.put(self.map_allocator, owned_alias, owned_target);
     }
 
-    /// Resolve an alias name. Returns the target
-    /// namespace name if `name` is registered as an alias in
-    /// this namespace, else null.
+    /// The namespace name `name` is an alias of here, if it is one.
     pub fn lookupAlias(self: *const Namespace, name: []const u8) ?[]const u8 {
         return self.aliases.get(name);
     }
 
-    /// Look up an existing Var. Returns null if no Var was
-    /// ever interned under `name` in this namespace OR in any
-    /// auto-referred parent.
+    /// The Var of `name` here or, failing that, in `parent`.
     pub fn lookup(self: *const Namespace, name: []const u8) ?*Var {
         if (self.vars.get(name)) |v| return v;
         if (self.parent) |p| return p.lookup(name);
         return null;
     }
 
-    /// Local-only lookup. Does NOT walk parent.
-    /// Used by interner-style fall-through where a forward-
-    /// reference Var should ONLY land in the current
-    /// namespace, never in a referred-in parent.
+    /// The Var of `name` here alone.
     pub fn lookupLocal(self: *const Namespace, name: []const u8) ?*Var {
         return self.vars.get(name);
     }
 
-    /// Get or create a Var for `name`. Newly-created Vars are
-    /// unbound (root = nil, bound = false). The compiler uses
-    /// this for forward references.
-    ///
-    /// The name is duped into `var_allocator` so callers can
-    /// pass slices from transient arenas (e.g., a per-form
-    /// reader arena that dies after `(require ...)` loads a
-    /// file); loader-driven interning depends on this dupe.
+    /// The Var of `name` here, made unbound when there is none; the
+    /// name is copied, since a caller's may live in a per-form arena.
     pub fn intern(self: *Namespace, name: []const u8) !*Var {
         if (self.vars.get(name)) |v| return v;
         const owned_name = try self.var_allocator.dupe(u8, name);
@@ -1272,111 +1201,57 @@ pub const Namespace = struct {
     }
 };
 
-/// Multi-namespace registry. Owns
-/// a map from canonical namespace name to `*Namespace`, plus
-/// pointers to the conventional `nexis.core` (auto-referred by
-/// every new namespace) and the `current` namespace (where
-/// `def`/`defn`/`defmacro` install).
-///
-/// Lifetime: Namespaces are arena-allocated (typically into
-/// `VM.runtime_arena`); the registry's HashMap uses
-/// `map_allocator` for its own internal storage and is
-/// `deinit`-ed by the registry's owner.
+/// A VM's namespaces by name, with `nexis.core`, referred into every
+/// namespace, and the current one, where `def` installs (STDLIB.md §8).
+/// The namespaces live in `var_allocator`, the map in `map_allocator`.
 pub const NamespaceRegistry = struct {
     map_allocator: std.mem.Allocator,
-    /// Allocator for Namespace structs + their Var children.
-    /// Typically `VM.runtime_arena.allocator()`.
     var_allocator: std.mem.Allocator,
-    /// Map of canonical ns name → namespace pointer.
-    map: std.StringHashMap(*Namespace) = undefined,
-    /// Auto-referred fallback for every new namespace.
+    map: std.StringHashMapUnmanaged(*Namespace) = .empty,
     core: *Namespace = undefined,
-    /// Where `def`/`defn`/`defmacro` install.
     current: *Namespace = undefined,
-    /// Heap reachable from the compile.zig Form-lowering path
-    /// via `namespace.registry.heap`. Used by `LowerCtx.heap` to
-    /// allocate string-literal Values (Tiny.literal carriers).
-    /// `VM.ensureRegistry` populates this from `VM.ensureHeap()`.
-    /// Ad-hoc test harnesses that init a registry without a VM
-    /// can leave it null; `.string` Forms then raise
-    /// `UnsupportedFeature`. The registry is the channel that
-    /// carries the heap to the compiler; there is no bundled
-    /// compile-context struct.
+    /// The heap the compiler lowers string and bignum literals onto
+    /// (`VM.ensureRegistry` sets it); with none, a `.string` form is
+    /// `UnsupportedFeature`.
     heap: ?*heap_mod.Heap = null,
     /// The VM that owns this registry (`VM.ensureRegistry` sets it):
     /// the expander reaches it through a namespace to give a macro's
     /// sub-VM the registries of the VM it compiles for (§9.1).
     vm: ?*VM = null,
 
-    /// Two-phase init: caller stores the empty registry FIRST,
-    /// then calls `setupDefaults` on the stable pointer.
-    /// Single-phase init would be unsafe: `ns.registry = self`
-    /// would capture a local `self` pointer that dangles once
-    /// the registry is copied into its final home.
-    pub fn initEmpty(
-        map_allocator: std.mem.Allocator,
-        var_allocator: std.mem.Allocator,
-    ) NamespaceRegistry {
-        return .{
-            .map_allocator = map_allocator,
-            .var_allocator = var_allocator,
-            .map = std.StringHashMap(*Namespace).init(map_allocator),
-            .core = undefined,
-            .current = undefined,
-            .heap = null,
-            .vm = null,
-        };
+    /// An empty registry; `setupDefaults` fills it once it is where it
+    /// stays, since each namespace points back at it.
+    pub fn initEmpty(map_allocator: std.mem.Allocator, var_allocator: std.mem.Allocator) NamespaceRegistry {
+        return .{ .map_allocator = map_allocator, .var_allocator = var_allocator };
     }
 
-    /// Populate the conventional `nexis.core` (auto-referred)
-    /// and `user` (default current) namespaces. Must be called
-    /// on a STABLE pointer (i.e., after the registry has been
-    /// stored in its final location) because each namespace
-    /// captures `self` as its back-pointer.
+    /// `nexis.core` and `user`, the current namespace.
     pub fn setupDefaults(self: *NamespaceRegistry) !void {
         self.core = try self.makeNamespace("nexis.core", null);
         self.current = try self.makeNamespace("user", self.core);
     }
 
     pub fn deinit(self: *NamespaceRegistry) void {
-        // Namespace structs + their Vars live in `var_allocator`
-        // (typically an arena); freed wholesale by the arena's
-        // owner. We only own the outer HashMap + the per-
-        // namespace `vars` HashMap storage (which uses
-        // `map_allocator`).
-        var it = self.map.iterator();
-        while (it.next()) |entry| {
-            entry.value_ptr.*.deinit();
-        }
-        self.map.deinit();
+        var it = self.map.valueIterator();
+        while (it.next()) |ns| ns.*.deinit();
+        self.map.deinit(self.map_allocator);
         self.* = undefined;
     }
 
-    /// Get an existing namespace by name, or create + register
-    /// a new one (with `parent` as its auto-referred fallback).
-    /// `name` must be a stable slice (typically a string literal
-    /// or arena-owned; the registry holds the slice by reference).
-    pub fn getOrCreate(
-        self: *NamespaceRegistry,
-        name: []const u8,
-        parent: ?*Namespace,
-    ) !*Namespace {
+    /// The namespace `name`, made with `parent` when there is none.
+    pub fn getOrCreate(self: *NamespaceRegistry, name: []const u8, parent: ?*Namespace) !*Namespace {
         if (self.map.get(name)) |existing| return existing;
         return try self.makeNamespace(name, parent);
     }
 
-    /// Look up a namespace by name. Returns null if missing.
     pub fn lookupNs(self: *const NamespaceRegistry, name: []const u8) ?*Namespace {
         return self.map.get(name);
     }
 
-    /// Switch the current namespace pointer. If the named ns
-    /// doesn't exist yet, create it with `core` as its parent
-    /// (matches Clojure's `(ns NAME)` semantics for first-time
-    /// declarations).
+    /// Make `name` current, as Clojure's `(ns NAME)`: a new one refers
+    /// `nexis.core`.
     pub fn switchTo(self: *NamespaceRegistry, name: []const u8) !void {
-        const ns = try self.getOrCreate(name, self.core);
-        self.current = ns;
+        self.current = try self.getOrCreate(name, self.core);
     }
 
     /// Set the root of `nexis.core/*ns*`, once `core.nx` defines it,
@@ -1390,23 +1265,16 @@ pub const NamespaceRegistry = struct {
         v.root = try interner.internSymbolValue(self.current.name);
     }
 
-    fn makeNamespace(
-        self: *NamespaceRegistry,
-        name: []const u8,
-        parent: ?*Namespace,
-    ) !*Namespace {
-        // Dupe the name into stable storage
-        // (var_allocator, typically vm.runtime_arena). The caller's
-        // `name` slice may be in a per-form reader arena that
-        // dies after the load completes; the registry map key
-        // + Namespace.name field must outlive that.
+    /// The name is copied, since a caller's may live in a per-form
+    /// arena.
+    fn makeNamespace(self: *NamespaceRegistry, name: []const u8, parent: ?*Namespace) !*Namespace {
         const owned_name = try self.var_allocator.dupe(u8, name);
         const ns = try self.var_allocator.create(Namespace);
         ns.* = Namespace.init(self.map_allocator, self.var_allocator);
         ns.name = owned_name;
         ns.parent = parent;
         ns.registry = self;
-        try self.map.put(owned_name, ns);
+        try self.map.put(self.map_allocator, owned_name, ns);
         return ns;
     }
 };
