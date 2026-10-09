@@ -49,5 +49,8 @@ ok pull-many over nothing
 {:error :nextomic/unknown-attribute, :message :person/nope names no attribute, :attr :person/nope}
 {:error :kind-mismatch, :message kind mismatch}
 ok a caught error leaves the db usable
+ok * cuts a card-many attribute at 1000
+ok a bare spec cuts at 1000
+ok :limit nil reads every value
 {:error :nextomic/closed, :message the connection is released, or the with scope of this db-value has ended}
 :pull-done

@@ -498,20 +498,22 @@ const Puller = struct {
                 vals.clearRetainingCapacity();
             }
             cur = d.a;
-            try vals.append(self.arena, d.v);
+            // `*` keeps what the default limit lets through, of a
+            // card-many attribute; a card-one has one value.
+            if (vals.items.len < default_limit) try vals.append(self.arena, d.v);
         }
         if (cur) |a| m = try self.wildAttr(m, a, vals.items, &covered);
         return if (any) m else null;
     }
 
-    /// One attribute of a `*` pull, as a bare spec.
+    /// One attribute of a `*` pull, as a bare spec: `vals` are its
+    /// values, at most the default limit of them.
     fn wildAttr(self: *Puller, m: Value, a: u32, vals: []const Val, covered: *const std.AutoHashMapUnmanaged(u32, void)) Failure!Value {
         if (covered.contains(a)) return m;
         const attr = (try self.read.attr(a)) orelse return error.Corrupted;
         const k = (try self.read.db.conn.idents.internOf(self.read.txn, a)) orelse return error.Corrupted;
         const spec: Spec = .{ .attr = attr, .reverse = false, .key = self.interner.keywordValue(k), .limit = default_limit, .default = null, .sub = .none };
-        const cut: usize = if (spec.many()) @intCast(@min(vals.len, default_limit)) else 1;
-        const v = try self.render(&wildcard_pattern, &spec, 0, &.{}, vals[0..cut]);
+        const v = try self.render(&wildcard_pattern, &spec, 0, &.{}, vals);
         return self.assoc(m, self.interner.keywordValue(k), v);
     }
 
