@@ -69,21 +69,18 @@ so a nexis release may refuse a store another release wrote
 data. The `sys` format number (§2.3) orders Nextomic's own layouts
 within one emdb format.
 
-Connect opens all twelve trees, reads the `sys` header and finds
-`:db/fulltext` in one read transaction, and caches the `TreeId`s for
-the connection's life (tree registration is the engine's one call that
-is not thread-safe, and it happens only here). A transaction then
-opens each tree on its first use of the handle (emdb INV-SUB03), so it
-reads the records of the trees it touches and no others. Only a store
-missing one of them takes a write transaction at connect: a new file is
-bootstrapped, a tree the file lacks is created, and `:db/fulltext` is
-minted (§2.4). One more write can follow the open: when the
-`nx/fulltext` rows are stale (§2.3 `"ft"`) and some attribute is
-full-text, `Conn.open` rebuilds them in a write transaction of its own
-that writes no datom, and skips the rebuild on a file it may only read
-or whose writer this process holds. So opening a complete store with
-current rows writes nothing, waits on no writer, and succeeds on a file
-the process may only read, where every `transact!` is `:db/read-only`.
+Connect opens all twelve trees and reads the `sys` header in one read
+transaction, and caches the `TreeId`s for the connection's life (tree
+registration is the engine's one call that is not thread-safe, and it
+happens only here). A transaction then opens each tree on its first use
+of the handle (emdb INV-SUB03), so it reads the records of the trees it
+touches and no others. Only a file holding none of the twelve takes a
+write transaction at connect, which creates them and bootstraps the
+store (§2.4) in one commit; a file holding some of them, or all twelve
+without the `"format"` header, is `:db/corrupted`, never bootstrapped
+again. So opening a store writes nothing, waits on no writer, and
+succeeds on a file the process may only read, where every `transact!`
+is `:db/read-only`.
 
 emdb's writer lock is per file and makes a second writer wait for the
 first to end. Every connection to one file in the process, and every
@@ -95,8 +92,8 @@ through one while another holds the file's write transaction is
 `:nextomic/nested` from Nextomic and `:db/busy` from `db/*`, never a
 wait on itself.
 
-Every commit, a transaction's and the one that creates, completes or
-re-tokenises a store at connect alike, is atomic and seen at once by
+Every commit, a transaction's and the one that creates a store at
+connect alike, is atomic and seen at once by
 every connection and process sharing the file; whether it syncs is the
 connection's durability (§3 "Durability", `docs/DB.md` §3.3). The file
 is opened with 4,096 reader slots (`db.reader_slots`, `docs/DB.md`
@@ -278,7 +275,7 @@ past 256 bytes bypasses the clue (a slower seek, not an error).
 | `"aid"` | u32 next attribute / ident id |
 | `"ig"` | u64 ident generation, bumped by every rename; absent reads as 0. A connection's ident cache remembers the generation it loaded under and reloads at the start of an operation when the store's has moved, so a rename in another connection or process is seen at once; it keeps what a read finds only when the read's snapshot is at that generation, so a read older than its own connection's rename (a query function that renames) never puts a retired name back |
 | `"sg"` | u64 schema generation, bumped by every transaction that writes a datom on an attribute-partition entity; absent reads as 0. A connection's schema cache serves a newer basis while the generation is the one it was built under and the txlog entries committed since hold no attribute-partition datom, since only data was committed; the entries settle it for a writer that leaves the generation alone, and each is read once per connection |
-| `"ft"` | `[fold:1][t:6]`: the case folding the `nx/fulltext` rows were written under (3, the tokenizer of §5 "fulltext") and the `t` they are current at; absent means rows that fold ASCII only. Bootstrap and every transaction stamp their `t`; a transaction that finds the stamp stale (another folding, or a `t` committed without a stamp) first rebuilds every row from the current values, as `Conn.open` does, and until a rebuild a search re-tokenises the values instead of reading the rows |
+| `"ft"` | `[fold:1][t:6]`: the case folding the `nx/fulltext` rows are written under (3, the tokenizer of §5 "fulltext") and the `t` they are current at, stamped by bootstrap and every transaction. The folding is part of the format: a build that folds otherwise writes another format number |
 | `"n"` `[a:4]` | u64 count of the current datoms of attribute `a`, at most `2^47 - 1` (no more than there are ids), kept by every transaction and excision; the planner's estimate (§5) |
 
 ### 2.4 Bootstrap
@@ -289,10 +286,8 @@ agree: the attributes `:db/ident`, `:db/valueType`, `:db/cardinality`,
 `:db/txInstant`, the idents `:db.type/{long double instant keyword
 ref string uuid bytes boolean}`, `:db.cardinality/{one many}`,
 `:db.unique/{identity value}`, and the attribute `:db/fulltext`
-(boolean, cardinality one) at id 22. Bootstrap is transaction `t = 1`.
-A store whose idents lack `:db/fulltext` receives it at open, in a
-transaction of its own at the store's next ident id, so its id is the
-one the store reports (`Store.fulltext_aid`), not 22.
+(boolean, cardinality one) at id 22. Bootstrap is transaction `t = 1`,
+and creates all twelve trees in the same commit.
 
 ### 2.5 Write order and page fill
 
@@ -1200,7 +1195,7 @@ src/nextomic/
   schema.zig     Schema from attribute datoms as-of a basis, per-attribute counts
   transact.zig   §3
   excise.zig     §4 "Excision": the tree deletes and the txlog rewrite
-  fulltext.zig   the case-folding tokenizer and the nx/fulltext rows: put, delete, search, rebuild
+  fulltext.zig   the case-folding tokenizer and the nx/fulltext rows: put, delete, search
   db.zig         Conn, DbValue, datoms, entity, entid/ident, tx-range
   handle.zig     heap bodies of the three value kinds
   marshal.zig    VM values to and from datom values: the entity, value and cell contracts

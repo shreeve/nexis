@@ -94,7 +94,7 @@ const Fixture = struct {
         try self.attrOps(&ops, "age", "person/age", boot.type_long, .{ .a = boot.index, .v = .{ .boolean = true } });
         try self.attrOps(&ops, "team", "person/team", boot.type_ref, null);
         try self.attrOps(&ops, "score", "person/score", boot.type_long, null);
-        try self.attrOps(&ops, "bio", "person/bio", boot.type_string, .{ .a = self.tc.conn.store.fulltext_aid, .v = .{ .boolean = true } });
+        try self.attrOps(&ops, "bio", "person/bio", boot.type_string, .{ .a = boot.fulltext, .v = .{ .boolean = true } });
         try self.attrOps(&ops, "team-name", "team/name", boot.type_string, .{ .a = boot.unique, .v = identity });
         const r = try self.commit(ops.items);
         const ids = [_]*u32{ &self.email, &self.name, &self.age, &self.team, &self.score, &self.bio, &self.team_name };

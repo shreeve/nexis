@@ -1139,9 +1139,6 @@ const Ctx = struct {
     /// the write transaction open with the datoms, txlog and counters
     /// written.
     fn apply(self: *Ctx) !void {
-        // Stale rows (another folding, a commit without a stamp) are
-        // replaced before this transaction adds its own.
-        if (!try self.conn.store.fulltextFresh(self.txn, self.now)) try fulltext.rebuild(self.conn.store, self.txn, self.arena, self.now);
         try self.bindIdents();
         try self.bindTempids();
         try self.claimAll();
@@ -1785,7 +1782,6 @@ const Ctx = struct {
         if (!self.schema_touched) return;
         var changes: std.ArrayList(SchemaChange) = .empty;
         var index: std.AutoHashMapUnmanaged(u32, usize) = .empty;
-        const fulltext_aid = self.conn.store.fulltext_aid;
         for (self.overlay.items) |p| {
             if (!key.isAttrPartition(p.e)) continue;
             const a: u32 = @intCast(p.e);
@@ -1795,13 +1791,12 @@ const Ctx = struct {
                 try changes.append(self.arena, .{ .a = a, .existing = self.schema.attr(a) });
             }
             const c = &changes.items[g.value_ptr.*];
-            if (p.attr.id == fulltext_aid) {
-                // A `false` flag gives way to `true`; `true` stays.
-                if (!p.added and p.v.boolean) return self.conflict(p.e, p.attr.id);
-                if (p.added and p.v.boolean) c.fulltext = true;
-                continue;
-            }
             switch (p.attr.id) {
+                boot.fulltext => {
+                    // A `false` flag gives way to `true`; `true` stays.
+                    if (!p.added and p.v.boolean) return self.conflict(p.e, p.attr.id);
+                    if (p.added and p.v.boolean) c.fulltext = true;
+                },
                 boot.value_type => {
                     if (!p.added or c.existing != null) return self.conflict(p.e, p.attr.id);
                     c.value_type = boot.valueTypeOf(p.v.keyword);

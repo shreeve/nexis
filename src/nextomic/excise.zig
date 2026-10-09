@@ -157,7 +157,7 @@ test "removeDatoms empties every tree of the entity and reports its transactions
             .{ .e = 100, .a = boot.value_type, .vbytes = vt_s, .added = true, .avet = false, .vaet = false },
             .{ .e = 100, .a = boot.cardinality, .vbytes = c1, .added = true, .avet = false, .vaet = false },
             .{ .e = 100, .a = boot.index, .vbytes = yes, .added = true, .avet = false, .vaet = false },
-            .{ .e = 100, .a = store.fulltext_aid, .vbytes = yes, .added = true, .avet = false, .vaet = false },
+            .{ .e = 100, .a = boot.fulltext, .vbytes = yes, .added = true, .avet = false, .vaet = false },
             .{ .e = 101, .a = boot.value_type, .vbytes = vt_r, .added = true, .avet = false, .vaet = false },
             .{ .e = 101, .a = boot.cardinality, .vbytes = c1, .added = true, .avet = false, .vaet = false },
             .{ .e = e, .a = 100, .vbytes = s1, .added = true, .avet = true, .vaet = false },

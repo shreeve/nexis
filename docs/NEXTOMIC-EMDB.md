@@ -128,7 +128,7 @@ behind, the data it describes.
 
 | Nextomic need | In emdb, by name |
 |---|---|
-| Twelve named trees (four current indexes EAVT, AEVT, AVET, VAET; four history indexes with the transaction in the key; txlog, idents, sys; a full-text tokens tree created on demand) | Named sub-databases: INV-SUB01..06; `Txn.openTree(name, create)`, `getFromTree`, `putInTree`, `delFromTree`, `openCursorForTree`, `openWriteCursorForTree`, `treeStat`, `dropTree`. `EnvOptions.maxNamedTrees` defaults to 128; a `TreeId` survives across transactions (INV-SUB03) |
+| Twelve named trees (four current indexes EAVT, AEVT, AVET, VAET; four history indexes with the transaction in the key; txlog, idents, sys; a full-text tokens tree), all created by the bootstrap commit | Named sub-databases: INV-SUB01..06; `Txn.openTree(name, create)`, `getFromTree`, `putInTree`, `delFromTree`, `openCursorForTree`, `openWriteCursorForTree`, `treeStat`, `dropTree`. `EnvOptions.maxNamedTrees` defaults to 128; a `TreeId` survives across transactions (INV-SUB03) |
 | Binary-sortable composite keys | Unsigned lexicographic byte order, API-K03, `emdb.defaultKeyCmp` over `simd.compare` |
 | Snapshot isolation for one query across all indexes | INV-T02, INV-T03: one read transaction is one consistent snapshot over every tree |
 | Atomic multi-index commit | INV-SUB04 (named-tree roots and the main-tree `TreeStat` entries commit together), INV-T07A, INV-M02, INV-M03: one meta-page publish; every image a power loss can leave is enumerated by `test/crash.zig` (SPEC §10.3) |

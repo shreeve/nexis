@@ -7,21 +7,19 @@
 //!     fixed for the file's life.
 //!   - All twelve trees are opened at open and their `TreeId`s are
 //!     cached for the store's life (tree registration is the only
-//!     non-thread-safe engine call). A complete store opens in a read
-//!     transaction; a write transaction creates a tree absent from the
-//!     file, so a store written without one gains it.
+//!     non-thread-safe engine call). A store opens in a read
+//!     transaction; a write transaction runs only to create the trees
+//!     of a file that holds none and bootstrap them, all in one commit,
+//!     so a file holding some of them, or the trees without their
+//!     header, is `error.Corrupted`.
 //!   - Every store and `db/*` connection of one file in this process
 //!     shares the file's one environment (`db.StoreFile`), so a second
 //!     writer is `error.WriterActive`, never a wait on this process's own
 //!     writer lock.
 //!   - `sys["t"]` is the last committed logical transaction number and
 //!     commits atomically with the datoms it counts.
-//!   - Bootstrap ids are fixed (`boot`): a store created by any build has
-//!     `:db/ident` at 1, `:db.unique/value` at 21 and `:db/fulltext` at
-//!     22, and a reopened store reads the same ids back from the file. A
-//!     store whose idents lack `:db/fulltext` receives it at open, minted
-//!     at the store's next ident id in a transaction of its own, and the
-//!     id it took is `fulltext_aid`.
+//!   - Bootstrap ids are fixed (`boot`): every store has `:db/ident` at
+//!     1, `:db.unique/value` at 21 and `:db/fulltext` at 22.
 //!   - A current fact's latest assertion lives in the current trees
 //!     alone, whose values are `[t:6]`, `nx/eavt`'s followed by an
 //!     out-of-line value's payload. The history trees hold every other
@@ -108,13 +106,8 @@ pub const SyncMode = enum {
 };
 
 pub const Options = struct {
-    /// How the commit that creates, bootstraps or completes the store
-    /// syncs.
+    /// How the commit that creates and bootstraps the store syncs.
     sync: SyncMode = .full,
-    /// False leaves `:db/fulltext` out of the bootstrap, making a store
-    /// as one written without the attribute, for the test of its mint
-    /// at open.
-    fulltext_attr: bool = true,
     /// Given the format of a store refused as another format's
     /// (`error.Format`).
     refused_format: ?*u16 = null,
@@ -150,7 +143,6 @@ pub const boot = struct {
     // Unique idents.
     pub const unique_identity: u32 = 20;
     pub const unique_value: u32 = 21;
-    /// The `:db/fulltext` attribute, in a store bootstrapped with it.
     pub const fulltext: u32 = 22;
     /// First id minted after bootstrap.
     pub const next_aid: u32 = 23;
@@ -182,9 +174,6 @@ pub const boot = struct {
         .{ .id = unique_value, .name = "db.unique/value" },
         .{ .id = fulltext, .name = "db/fulltext" },
     };
-    /// The idents through `unique_value`: the bootstrap without
-    /// `:db/fulltext`.
-    pub const idents_without_fulltext = idents[0 .. idents.len - 1];
     /// The idents that are entities without a value type: the
     /// `:db.type/*`, `:db.cardinality/*` and `:db.unique/*`
     /// enumerations, each bootstrapped by its `:db/ident` datom alone.
@@ -208,18 +197,12 @@ pub const boot = struct {
         .{ .id = tx_instant, .type_ident = type_instant, .indexed = true },
         .{ .id = fulltext, .type_ident = type_boolean },
     };
-    /// The ident and attribute datoms of `:db/fulltext`.
-    pub const fulltext_attr: Attr = attrs[attrs.len - 1];
-    /// The attributes through `:db/txInstant`: the bootstrap without
-    /// `:db/fulltext`.
-    pub const attrs_without_fulltext = attrs[0 .. attrs.len - 1];
 
     comptime {
         // The txlog codec rebuilds a transaction's instant datom.
         std.debug.assert(tx_instant == datom_mod.tx_instant_attr);
         // `idents[i]` carries id `i + 1`, so the enumerations slice by id.
         for (idents, 1..) |id, i| std.debug.assert(id.id == i);
-        std.debug.assert(fulltext_attr.id == fulltext);
         std.debug.assert(enum_idents[0].id == type_long and enum_idents[enum_idents.len - 1].id == unique_value);
     }
 
@@ -258,15 +241,12 @@ pub const Store = struct {
     file: *db_layer.StoreFile,
     trees: Trees,
     uuid: [16]u8,
-    /// The id of the `:db/fulltext` attribute in this store.
-    fulltext_aid: u32,
 
-    /// Open or create the store at `path`. The store is heap-allocated
-    /// so it never moves while transactions reference it. A store that
-    /// has every tree, its header and `:db/fulltext` opens in a read
-    /// transaction alone; a write transaction runs only to create,
-    /// bootstrap or complete one. A file this process may not write
-    /// opens read-only.
+    /// Open the store at `path`, creating and bootstrapping it in a
+    /// file that holds none of its trees. The store is heap-allocated
+    /// so it never moves while transactions reference it. A store opens
+    /// in a read transaction alone, so a file this process may not
+    /// write opens read-only.
     pub fn open(allocator: Allocator, path: [*:0]const u8, options: Options) !*Store {
         const self = try allocator.create(Store);
         errdefer allocator.destroy(self);
@@ -275,22 +255,27 @@ pub const Store = struct {
             .file = try db_layer.StoreFile.acquire(path, .{ .allocator = allocator }),
             .trees = undefined,
             .uuid = @splat(0),
-            .fulltext_aid = boot.fulltext,
         };
         errdefer self.file.release();
 
-        if (!try self.openComplete(options.refused_format)) {
-            const txn = try self.file.beginWrite(.{ .sync = options.sync.override() });
-            errdefer txn.abort();
-            try self.openTrees(txn);
-            if (try self.sysGet(txn, "format")) |_| {
+        {
+            const txn = try self.file.env.beginRead();
+            defer txn.abort();
+            if (try self.findTrees(txn)) {
                 try self.readHeader(txn, options.refused_format);
-                try self.ensureFulltextAttr(txn);
-            } else {
-                try self.bootstrap(txn, options.fulltext_attr);
+                return self;
             }
-            try self.file.commit(txn);
         }
+        const txn = try self.file.beginWrite(.{ .sync = options.sync.override() });
+        errdefer txn.abort();
+        // Another process may have bootstrapped the file since the read.
+        if (try self.findTrees(txn)) {
+            try self.readHeader(txn, options.refused_format);
+        } else {
+            try self.createTrees(txn);
+            try self.bootstrap(txn);
+        }
+        try self.file.commit(txn);
         return self;
     }
 
@@ -301,26 +286,26 @@ pub const Store = struct {
         self.allocator.destroy(self);
     }
 
-    /// Open the trees, header and `:db/fulltext` id of a complete store
-    /// in a read transaction; false when anything is missing.
-    fn openComplete(self: *Store, refused_format: ?*u16) !bool {
-        const txn = try self.file.env.beginRead();
-        defer txn.abort();
+    /// Open the twelve trees in `txn`: true when the file holds all of
+    /// them, false when it holds none. Bootstrap creates all twelve in
+    /// one commit, so a file holding some is `error.Corrupted`.
+    fn findTrees(self: *Store, txn: *Txn) !bool {
         var ids: [tree_names.len]TreeId = undefined;
-        for (tree_names, 0..) |name, i| {
-            ids[i] = txn.openTree(name, false) catch |err| switch (err) {
-                error.NotFound => return false,
+        var found: usize = 0;
+        for (tree_names, &ids) |name, *id| {
+            id.* = txn.openTree(name, false) catch |err| switch (err) {
+                error.NotFound => continue,
                 else => return err,
             };
+            found += 1;
         }
+        if (found == 0) return false;
+        if (found < ids.len) return error.Corrupted;
         self.setTrees(ids);
-        if ((try self.sysGet(txn, "format")) == null) return false;
-        try self.readHeader(txn, refused_format);
-        self.fulltext_aid = (try self.identIdByName(txn, "db/fulltext")) orelse return false;
         return true;
     }
 
-    fn openTrees(self: *Store, txn: *Txn) !void {
+    fn createTrees(self: *Store, txn: *Txn) !void {
         var ids: [tree_names.len]TreeId = undefined;
         for (tree_names, 0..) |name, i| {
             ids[i] = try txn.openTree(name, true);
@@ -1040,7 +1025,10 @@ pub const Store = struct {
 
     // ── bootstrap (§2.4) ──────────────────────────────────────────
 
-    fn bootstrap(self: *Store, txn: *Txn, with_fulltext: bool) !void {
+    /// The bootstrap transaction, `t = 1` (§2.4): the header, the
+    /// idents, the attributes' datoms and the transaction's instant,
+    /// with their counts, txlog entry and counters.
+    fn bootstrap(self: *Store, txn: *Txn) !void {
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -1049,92 +1037,53 @@ pub const Store = struct {
         std.Io.Threaded.global_single_threaded.io().random(&self.uuid);
         try self.sysPut(txn, "uuid", &self.uuid);
 
-        const idents = if (with_fulltext) &boot.idents else boot.idents_without_fulltext;
-        const attrs = if (with_fulltext) &boot.attrs else boot.attrs_without_fulltext;
-        for (idents) |id| try self.putIdent(txn, id.name, id.id);
+        for (boot.idents) |id| try self.putIdent(txn, id.name, id.id);
 
         var datoms: std.ArrayList(Datom) = .empty;
         const now = nowMillis();
-        for (attrs) |a| try appendAttrDatoms(arena, &datoms, a, boot.t);
+        for (boot.attrs) |a| try appendAttrDatoms(arena, &datoms, a);
         for (boot.enum_idents) |id| {
             try datoms.append(arena, .{ .e = id.id, .a = boot.ident, .v = .{ .keyword = id.id }, .t = boot.t, .added = true });
         }
         try datoms.append(arena, .{ .e = key.txEntity(boot.t), .a = boot.tx_instant, .v = .{ .instant = now }, .t = boot.t, .added = true });
-        try self.writeSystemTransaction(txn, arena, boot.t, now, datoms.items);
 
+        const batch = try arena.alloc(Prepared, datoms.items.len);
+        var counts: std.AutoHashMapUnmanaged(u32, u64) = .empty;
+        for (datoms.items, batch) |d, *p| {
+            p.* = .{
+                .e = d.e,
+                .a = d.a,
+                .vbytes = try key.valBytes(arena, d.v),
+                .added = true,
+                .avet = d.a == boot.ident or d.a == boot.tx_instant,
+                .vaet = false,
+            };
+            const g = try counts.getOrPut(arena, d.a);
+            if (!g.found_existing) g.value_ptr.* = 0;
+            g.value_ptr.* += 1;
+        }
+        try self.writeBatch(txn, boot.t, batch, arena);
+        var it = counts.iterator();
+        while (it.next()) |e| try self.writeAttrCount(txn, e.key_ptr.*, e.value_ptr.*);
+
+        try self.putTxlog(txn, boot.t, try datom_mod.encodeTxlog(arena, boot.t, now, datoms.items, &.{}));
+        try self.writeT(txn, boot.t);
+        try self.bumpSchemaGen(txn);
+        // No attribute is full-text yet: the empty tree is current.
+        try self.writeFulltextStamp(txn, boot.t);
         try self.writeNextEid(txn, key.user_partition_start);
-        try self.writeNextAid(txn, if (with_fulltext) boot.next_aid else boot.fulltext);
+        try self.writeNextAid(txn, boot.next_aid);
     }
 
     /// The ident, value type, cardinality, unique and index datoms of a
-    /// bootstrap attribute at `t`.
-    fn appendAttrDatoms(arena: Allocator, datoms: *std.ArrayList(Datom), a: boot.Attr, t: u64) !void {
+    /// bootstrap attribute.
+    fn appendAttrDatoms(arena: Allocator, datoms: *std.ArrayList(Datom), a: boot.Attr) !void {
+        const t = boot.t;
         try datoms.append(arena, .{ .e = a.id, .a = boot.ident, .v = .{ .keyword = a.id }, .t = t, .added = true });
         try datoms.append(arena, .{ .e = a.id, .a = boot.value_type, .v = .{ .keyword = a.type_ident }, .t = t, .added = true });
         try datoms.append(arena, .{ .e = a.id, .a = boot.cardinality, .v = .{ .keyword = if (a.many) boot.card_many else boot.card_one }, .t = t, .added = true });
         if (a.unique_ident) |u| try datoms.append(arena, .{ .e = a.id, .a = boot.unique, .v = .{ .keyword = u }, .t = t, .added = true });
         if (a.indexed) try datoms.append(arena, .{ .e = a.id, .a = boot.index, .v = .{ .boolean = true }, .t = t, .added = true });
-    }
-
-    /// Write assertions the store makes on its own behalf as
-    /// transaction `t`: the index trees, the counts, the txlog entry and
-    /// `sys["t"]`. Every keyword value is an ident already in
-    /// `nx/idents`.
-    fn writeSystemTransaction(self: *Store, txn: *Txn, arena: Allocator, t: u64, now: i64, datoms: []const Datom) !void {
-        const batch = try arena.alloc(Prepared, datoms.len);
-        for (datoms, 0..) |d, i| {
-            const avet = d.a == boot.ident or d.a == boot.tx_instant;
-            batch[i] = .{
-                .e = d.e,
-                .a = d.a,
-                .vbytes = try key.valBytes(arena, d.v),
-                .added = true,
-                .avet = avet,
-                .vaet = false,
-            };
-        }
-        try self.writeBatch(txn, t, batch, arena);
-
-        var counts = std.AutoHashMapUnmanaged(u32, u64).empty;
-        for (datoms) |d| {
-            const g = try counts.getOrPut(arena, d.a);
-            if (!g.found_existing) g.value_ptr.* = 0;
-            g.value_ptr.* += 1;
-        }
-        var it = counts.iterator();
-        while (it.next()) |e| try self.writeAttrCount(txn, e.key_ptr.*, (try self.attrCount(txn, e.key_ptr.*)) + e.value_ptr.*);
-
-        try self.putTxlog(txn, t, try datom_mod.encodeTxlog(arena, t, now, datoms, &.{}));
-        try self.writeT(txn, t);
-        try self.bumpSchemaGen(txn);
-        // No attribute is full-text yet: the empty tree is current.
-        try self.writeFulltextStamp(txn, t);
-    }
-
-    /// A store whose idents lack `:db/fulltext` receives the attribute
-    /// as a transaction of its own at the store's next ident id.
-    fn ensureFulltextAttr(self: *Store, txn: *Txn) !void {
-        if (try self.identIdByName(txn, "db/fulltext")) |id| {
-            self.fulltext_aid = id;
-            return;
-        }
-        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-        const id = try self.readNextAid(txn);
-        if (id == std.math.maxInt(u32)) return error.DatabaseFull;
-        const t = (try self.readT(txn)) + 1;
-        if (t >= key.tx_partition_bit) return error.DatabaseFull;
-        try self.putIdent(txn, "db/fulltext", id);
-        var attr = boot.fulltext_attr;
-        attr.id = id;
-        var datoms: std.ArrayList(Datom) = .empty;
-        const now = nowMillis();
-        try appendAttrDatoms(arena, &datoms, attr, t);
-        try datoms.append(arena, .{ .e = key.txEntity(t), .a = boot.tx_instant, .v = .{ .instant = now }, .t = t, .added = true });
-        try self.writeSystemTransaction(txn, arena, t, now, datoms.items);
-        try self.writeNextAid(txn, id + 1);
-        self.fulltext_aid = id;
     }
 };
 
@@ -1281,68 +1230,6 @@ test "a new store file starts small and grows a step at a time" {
     const grown = store.file.env.info().mapSize;
     try testing.expect(grown > db_layer.initial_map_size and grown < 64 << 20);
     try testing.expectEqual(0, (grown - db_layer.initial_map_size) % db_layer.map_grow_step);
-}
-
-test "a store without :db/fulltext receives it at open, at its next ident id" {
-    var td = try TestDir.init("store_fulltext_open");
-    defer td.deinit();
-    {
-        const store = try Store.open(testing.allocator, td.path.ptr, .{ .fulltext_attr = false });
-        defer store.close();
-        const txn = try store.beginRead();
-        defer txn.abort();
-        try testing.expect((try store.identIdByName(txn, "db/fulltext")) == null);
-        try testing.expectEqual(boot.fulltext, try store.readNextAid(txn));
-        try testing.expectEqual(@as(u64, 1), try store.readT(txn));
-    }
-    {
-        const store = try Store.open(testing.allocator, td.path.ptr, .{});
-        defer store.close();
-        try testing.expectEqual(boot.fulltext, store.fulltext_aid);
-        const txn = try store.beginRead();
-        defer txn.abort();
-        try testing.expectEqual(@as(?u32, boot.fulltext), try store.identIdByName(txn, "db/fulltext"));
-        try testing.expectEqual(boot.next_aid, try store.readNextAid(txn));
-        try testing.expectEqual(@as(u64, 2), try store.readT(txn));
-        try testing.expect((try store.getTxlog(txn, 2)) != null);
-        try testing.expectEqual(@as(u64, boot.idents.len), try store.attrCount(txn, boot.ident));
-        const prefix = try key.prefixBytes(testing.allocator, .eavt, .{ .e = boot.fulltext });
-        defer testing.allocator.free(prefix);
-        var s = try Store.scan(txn, store.trees.cur(.eavt), prefix);
-        var n: usize = 0;
-        while (try s.next()) |_| n += 1;
-        try testing.expectEqual(@as(usize, 3), n);
-    }
-    // Opening again mints nothing more.
-    {
-        const store = try Store.open(testing.allocator, td.path.ptr, .{});
-        defer store.close();
-        const txn = try store.beginRead();
-        defer txn.abort();
-        try testing.expectEqual(@as(u64, 2), try store.readT(txn));
-        try testing.expectEqual(boot.next_aid, try store.readNextAid(txn));
-    }
-}
-
-test "a store whose next ident id is taken mints :db/fulltext past it" {
-    var td = try TestDir.init("store_fulltext_taken");
-    defer td.deinit();
-    {
-        const store = try Store.open(testing.allocator, td.path.ptr, .{ .fulltext_attr = false });
-        defer store.close();
-        const txn = try store.beginWrite(.none);
-        try store.putIdent(txn, "user/name", boot.fulltext);
-        try store.writeNextAid(txn, boot.fulltext + 1);
-        try txn.commit();
-    }
-    const store = try Store.open(testing.allocator, td.path.ptr, .{});
-    defer store.close();
-    try testing.expectEqual(boot.fulltext + 1, store.fulltext_aid);
-    const txn = try store.beginRead();
-    defer txn.abort();
-    try testing.expectEqual(@as(?u32, boot.fulltext + 1), try store.identIdByName(txn, "db/fulltext"));
-    try testing.expectEqual(@as(?u32, boot.fulltext), try store.identIdByName(txn, "user/name"));
-    try testing.expectEqual(boot.fulltext + 2, try store.readNextAid(txn));
 }
 
 test "bootstrap datoms are in every index they belong to" {
@@ -1655,6 +1542,27 @@ test "a retraction of a fact that is not current is Corrupted" {
     const txn = try store.beginWrite(.none);
     defer txn.abort();
     try testing.expectError(error.Corrupted, store.writeBatch(txn, 2, &.{.{ .e = 1 << 33, .a = 100, .vbytes = try key.valBytes(arena, .{ .long = 1 }), .added = false, .avet = false, .vaet = false }}, arena));
+}
+
+test "a file holding some of the trees, or the trees without their header, is Corrupted, never bootstrapped again" {
+    var tds = [2]TestDir{ try TestDir.init("store_headless"), try TestDir.init("store_treeless") };
+    defer for (&tds) |*td| td.deinit();
+    for (tds, 0..) |td, i| {
+        (try Store.open(testing.allocator, td.path.ptr, .{})).close();
+        {
+            const file = try db_layer.StoreFile.acquire(td.path.ptr, .{ .allocator = testing.allocator });
+            defer file.release();
+            const txn = try file.beginWrite(.{});
+            errdefer txn.abort();
+            if (i == 0) {
+                _ = try txn.delFromTree(try txn.openTree("nx/sys", false), "format");
+            } else {
+                try txn.dropTree(try txn.openTree("nx/fulltext", false), true);
+            }
+            try file.commit(txn);
+        }
+        try testing.expectError(error.Corrupted, Store.open(testing.allocator, td.path.ptr, .{}));
+    }
 }
 
 test "a store opens at this build's format alone and names any other" {
