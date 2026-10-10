@@ -2248,9 +2248,9 @@ test "multimethods: methods, get-method, prefers, remove-all-methods and what ea
         \\[(= rv (defmethod rv :a [_] :a)) (= rv (prefer-method rv :a :b)) (prefers rv) (= rv (remove-method rv :a))
         \\ (do (defmethod rv :c [_] :c) (= rv (remove-all-methods rv))) (methods rv) (prefers rv)
         \\ (multifn? rv) (multifn? inc) (fn? rv) (ifn? rv) (= rv rv) (get {rv 1} rv) (meta rv)
-        \\ (try (with-meta rv {:a 1}) (catch any e e)) (try (methods {}) (catch ClassCastException e e))
+        \\ (meta (with-meta rv {:a 1})) (try (methods {}) (catch ClassCastException e e))
         \\ (try (defmethod {} :a [] 1) (catch any e e))]
-    , "[true true {:a #{:b}} true true {} {} true false true true true 1 nil {:error :kind-mismatch, :message kind mismatch, :fn test-form} {:error :kind-mismatch, :message expected a multimethod, got a map, :fn test-form} {:error :kind-mismatch, :message expected a multimethod, got a map, :fn test-form}]");
+    , "[true true {:a #{:b}} true true {} {} true false true true true 1 nil {:a 1} {:error :kind-mismatch, :message expected a multimethod, got a map, :fn test-form} {:error :kind-mismatch, :message expected a multimethod, got a map, :fn test-form}]");
     // get-method: an ambiguity throws as a call does; no match and no default is nil.
     try expectOutputProgram(
         \\(derive :user/a :user/c) (derive :user/b :user/c) (derive :user/ab :user/a) (derive :user/ab :user/b)
@@ -4610,15 +4610,12 @@ test "nexis.string: lower-case + upper-case: ASCII baseline" {
     try expectOutput("(nexis.string/upper-case \"\")", "");
 }
 
-test "nexis.string: lower-case + upper-case: non-ASCII passes through unchanged" {
-    // ASCII letters map; non-ASCII bytes are preserved verbatim
-    // (STDLIB.md §3). UTF-8 validity is preserved by
-    // construction because bytes ≥ 0x80 are never modified.
-    try expectOutput("(nexis.string/lower-case \"HéLLO\")", "héllo");
-    try expectOutput("(nexis.string/upper-case \"abç\")", "ABç");
-    try expectOutput("(nexis.string/lower-case \"🦀A\")", "🦀a");
-    // Round-trip identity: codepoint count survives transform.
-    try expectOutput("(count (nexis.string/lower-case \"HéLLO\"))", "5");
+test "nexis.string: lower-case + upper-case map every character as Java's Character does" {
+    try expectOutput("(nexis.string/lower-case \"H\u{c9}LLO \u{1c5} \u{130} \u{1e9e} \u{3a3}\u{391}\")", "h\u{e9}llo \u{1c6} i \u{df} \u{3c3}\u{3b1}");
+    try expectOutput("(nexis.string/upper-case \"h\u{e9}llo \u{1c5} \u{131} \u{17f} \u{3c2} \u{2c65}\")", "H\u{c9}LLO \u{1c4} I S \u{3a3} \u{23a}");
+    // The simple one-to-one maps: no expansion, no final sigma.
+    try expectOutput("[(nexis.string/upper-case \"\u{df}\") (nexis.string/lower-case \"\u{3a3}\")]", "[\u{df} \u{3c3}]");
+    try expectOutput("[(nexis.string/lower-case \"\u{1f980}A\") (count (nexis.string/upper-case \"\u{2c65}\u{2c65}\"))]", "[\u{1f980}a 2]");
 }
 
 test "nexis.string: trim: whitespace on both sides" {
@@ -5152,7 +5149,7 @@ test "json: read-str takes :key-fn and :value-fn as clojure.data.json does" {
     , "{:a {:b 1}}");
 }
 
-test "json: malformed text is :json-error, with its line and column" {
+test "json: malformed text is :json-error, with its line and column in the text" {
     const cases = [_]struct { []const u8, []const u8 }{
         .{ "", "[1 1 \"JSON: the text ends before its value at line 1, column 1\"]" },
         .{ "  ", "[1 3 \"JSON: the text ends before its value at line 1, column 3\"]" },
@@ -5178,7 +5175,7 @@ test "json: malformed text is :json-error, with its line and column" {
         .{ "[[[", "[1 4 \"JSON: the text ends before its value at line 1, column 4\"]" },
     };
     for (cases) |case| {
-        const src = try std.fmt.allocPrint(testing.allocator, "(pr-str (try (nexis.json/read-str \"{s}\") (catch :json-error e [(:line e) (:column e) (ex-message e)])))", .{case[0]});
+        const src = try std.fmt.allocPrint(testing.allocator, "(pr-str (try (nexis.json/read-str \"{s}\") (catch :json-error e [(:json-line e) (:json-column e) (ex-message e)])))", .{case[0]});
         defer testing.allocator.free(src);
         try expectOutput(src, case[1]);
     }
@@ -8672,6 +8669,141 @@ test "a user macro named like a core macro is the namespace's own" {
         \\(defmacro when-let [b & body] :mine)
         \\[(when-let [x 1] x) (nexis.core/when-let [x 1] x)]
     , "[:mine 1]");
+}
+
+// =============================================================================
+// Natives' rooting under the collector (GC.md §11.5)
+// =============================================================================
+
+const mk_lazy = "(defn mk [n] (map (fn [i] [i i]) (range n))) ";
+
+test "gc: reduce over a cycle keeps the accumulator while the source realizes" {
+    try expectOutputUnderGc(
+        \\(def src (take 50 (map (fn [i] (vec (range i (+ i 40)))) (iterate inc 0))))
+        \\(def r (reduce (fn [acc x] (if (= (count acc) 120) (reduced acc) (conj acc [(first x) (str "v" (first x))]))) [] (cycle src)))
+        \\[(count r) (first r) (nth r 49) (nth r 50) (nth r 119)]
+    , "[120 [0 v0] [49 v49] [0 v0] [19 v19]]");
+}
+
+test "gc: nexis.string/join keeps a map entry while its lazy value realizes" {
+    try expectOutputUnderGc(mk_lazy ++ "(let [s (nexis.string/join \"|\" {:a (mk 3000) :b (mk 3000)})] [(count s) (subs s 0 12)])", "[67573 [:a ([0 0] []");
+}
+
+test "gc: conj in place keeps its transient while a lazy key realizes" {
+    try expectOutputUnderGc(mk_lazy ++ "(sort (map #(if (number? %) % (count %)) (conj #{1 2 3} (mk 1500) (mk 1501) (mk 1502) (mk 1503) (mk 1504))))", "(1 2 3 1500 1501 1502 1503 1504)");
+    try expectOutputUnderGc(mk_lazy ++ "(sort (map #(if (number? %) % (count %)) (keys (conj {0 0} [(mk 1500) 1] [(mk 1501) 2] [(mk 1502) 3] [(mk 1503) 4]))))", "(0 1500 1501 1502 1503)");
+}
+
+test "gc: into a hash target keeps the entries a map walk built" {
+    try expectOutputUnderGc(mk_lazy ++ "(sort (map count (vals (into {} (hash-map :a (mk 300) :b (mk 301) :c (mk 302) :d (mk 303))))))", "(300 301 302 303)");
+    try expectOutputUnderGc(mk_lazy ++ "(count (into #{} {(mk 1500) 1 (mk 1600) 2 (mk 1700) 3 (mk 1800) 4}))", "4");
+}
+
+// =============================================================================
+// spit streams its text (STDLIB.md §6)
+// =============================================================================
+
+/// `expectOutputWithIo` for a program whose `@STORE@` names a fresh
+/// path in a directory private to the call.
+fn expectOutputWithIoAt(name: []const u8, template: []const u8, expected: []const u8) !void {
+    var store = try SeamStore.init(name);
+    defer store.deinit();
+    const src = try store.source(template);
+    defer testing.allocator.free(src);
+    try expectOutputWithIo(src, expected);
+}
+
+test "io: spit writes to a FIFO, replacing or appending" {
+    try expectOutputWithIoAt("spit-fifo",
+        \\(defn through-fifo [f & opts]
+        \\  (nexis.shell/sh "rm" "-f" f (str f ".got"))
+        \\  (nexis.shell/sh "mkfifo" f)
+        \\  (nexis.shell/sh "sh" "-c" "(cat \"$0\" > \"$0.tmp\"; mv \"$0.tmp\" \"$0.got\") >/dev/null 2>&1 &" f)
+        \\  (apply spit f "through a fifo" opts)
+        \\  (nexis.shell/sh "sh" "-c" "while [ ! -e \"$0.got\" ]; do sleep 0.01; done" f)
+        \\  (slurp (str f ".got")))
+        \\[(through-fifo "@STORE@") (through-fifo "@STORE@" :append true)]
+    , "[through a fifo through a fifo]");
+}
+
+test "io: spit :append lands at the end while another process appends" {
+    try expectOutputWithIoAt("spit-appenders",
+        \\(def f "@STORE@")
+        \\(nexis.shell/sh "sh" "-c" "(i=0; while [ $i -lt 400 ]; do echo b >> \"$0\"; i=$((i+1)); done; touch \"$0.done\") >/dev/null 2>&1 &" f)
+        \\(dotimes [_ 400] (spit f "a\n" :append true))
+        \\(nexis.shell/sh "sh" "-c" "while [ ! -e \"$0.done\" ]; do sleep 0.01; done" f)
+        \\(let [lines (nexis.string/split-lines (slurp f))] [(count (filter #{"a"} lines)) (count (filter #{"b"} lines))])
+    , "[400 400]");
+}
+
+// =============================================================================
+// A library error carries the place, as a runtime error does (VM.md §13)
+// =============================================================================
+
+test "json: a :json-error carries the program's place; the text's position is :json-line and :json-column" {
+    try expectOutput("(try (nexis.json/read-str \"[1,\\n 2,]\") (catch :json-error e [(:fn e) (:json-line e) (:json-column e) (contains? e :line)]))", "[test-form 2 4 false]");
+    try expectOutput("(try (nexis.json/write-str ##NaN) (catch :json-error e [(:fn e) (contains? e :json-line)]))", "[test-form false]");
+    try expectLocatedOutput("(try (nexis.json/read-str \"x\") (catch :json-error e (select-keys e [:file :line :column :json-column])))", "{:file \"t.nx\", :line 1, :column 6, :json-column 1}");
+}
+
+test "#%raise of a map throws it with the place of the program's call" {
+    try expectOutput("(try (nexis.internal/#%raise {:error :no-method :value 1 :message \"m\"}) (catch :no-method e [(:fn e) (:value e) (:message e)]))", "[test-form 1 m]");
+    try expectOutput("(try (nexis.internal/#%raise :kind-mismatch \"f takes a number, got\" \"s\") (catch any e [(:fn e) (:message e)]))", "[test-form f takes a number, got a string]");
+    try expectOutput("(try (nexis.internal/#%raise [1]) (catch any e (:error e)))", ":kind-mismatch");
+    try expectOutput("(try (nexis.internal/#%raise :no-method \"f has no method for\" 1 {:value 1}) (catch :no-method e [(:fn e) (:value e) (:message e)]))", "[test-form 1 f has no method for an integer]");
+    try expectOutput("(try (nexis.internal/#%raise :no-method \"m\" 1 [1]) (catch any e (:error e)))", ":kind-mismatch");
+}
+
+test "json: write-str escapes U+2028 and U+2029 unless :escape-js-separators is false" {
+    try expectOutput("(nexis.json/write-str (str \"a\" (char 0x2028) (char 0x2029) \"b\" (char 0x2027)))", "\"a\\u2028\\u2029b\u{2027}\"");
+    try expectOutput("(= (nexis.json/write-str (str (char 0x2028)) :escape-js-separators false) (str \\\" (char 0x2028) \\\"))", "true");
+    try expectOutput("(nexis.json/write-str (str (char 0x2029)) :escape-js-separators nil)", "\"\u{2029}\"");
+    try expectOutput("(nexis.json/write-str (str (char 0x2029)) :escape-unicode true :escape-js-separators false)", "\"\\u2029\"");
+}
+
+test "shell: sh names a missing :dir, an :env name of another kind and an unknown option" {
+    try expectOutputWithIo("(try (nexis.shell/sh \"ls\" :dir \"/nexis-no-such-dir\") (catch any e [(:error e) (:message e)]))", "[:file-not-found sh: cannot run ls in /nexis-no-such-dir]");
+    try expectOutputWithIo("(try (nexis.shell/sh \"env\" :env {1 \"x\"}) (catch any e [(:error e) (:message e)]))", "[:kind-mismatch sh: an :env name is a string, keyword or symbol, got an integer]");
+    try expectOutputWithIo("(try (nexis.shell/sh \"true\" :out-enc \"UTF-8\") (catch any e [(:error e) (:message e)]))", "[:invalid-argument sh: no option :out-enc; the options are :in, :dir, :env]");
+}
+
+// =============================================================================
+// A fn carries metadata (SEMANTICS.md §7)
+// =============================================================================
+
+test "with-meta of a fn is a fn carrying the map, calling as the original" {
+    try expectOutput("(meta (with-meta (fn [] 1) {:a 1}))", "{:a 1}");
+    try expectOutput("[(meta (fn [] 1)) ((with-meta (fn [] 1) {:a 1})) (let [x 5 f (with-meta (fn [y] (+ x y)) {:a 1})] (f 2))]", "[nil 1 7]");
+    try expectOutput("(let [f (fn [] 1) g (with-meta f {:a 1})] [(meta f) (= f g) (fn? g) (meta (vary-meta g assoc :b 2)) (meta (with-meta g nil))])", "[nil false true {:a 1, :b 2} nil]");
+    try expectOutput("(defn f \"d\" [] 1) (meta (with-meta f {:x true}))", "{:x true}");
+}
+
+test "gc: a fn's metadata and captures survive the cycles after with-meta" {
+    try expectOutputUnderGc(churn ++ "(let [x (str \"cap\" 1) f (with-meta (fn [] x) {:k (str \"m\" 2)})] (dotimes [i 20] (churn i)) [(f) (:k (meta f))])", "[cap1 m2]");
+}
+
+test "nano-time is an integer that never runs backwards" {
+    try expectOutput("(let [a (nano-time) b (nano-time)] [(integer? a) (<= a b) (>= (- b a) 0)])", "[true true true]");
+}
+
+test "io: slurp and spit take :encoding \"UTF-8\", the one encoding" {
+    try expectOutputProgramWithStore("spit-encoding",
+        \\(spit "@STORE@" "h\u{e9}" :encoding "UTF-8")
+        \\(spit "@STORE@" "!" :append true :encoding "utf8")
+        \\[(slurp "@STORE@" :encoding "utf-8") (slurp "@STORE@")
+        \\ (try (spit "@STORE@" "x" :encoding "ISO-8859-1") (catch any e (:error e)))
+        \\ (try (slurp "@STORE@" :encoding "UTF-16") (catch any e (:error e)))
+        \\ (try (slurp "@STORE@" :append true) (catch any e (:error e)))
+        \\ (try (slurp "@STORE@" :encoding) (catch any e (:error e)))]
+    , "[h\u{e9}! h\u{e9}! :invalid-argument :invalid-argument :invalid-argument :arity-mismatch]");
+}
+
+test "db: db/open refuses an option it does not take, naming it" {
+    try expectOutputProgramWithStore("open-unknown-option",
+        \\[(try (db/open "@STORE@" {:durabilty :commit}) (catch any e [(:error e) (:message e)]))
+        \\ (try (db/open "@STORE@" {"durability" :commit}) (catch any e [(:error e) (:message e)]))
+        \\ (let [c (db/open "@STORE@" {:durability :commit})] (db/close c) :ok)]
+    , "[[:invalid-argument db/open: no option :durabilty; the options are :durability] [:invalid-argument db/open: no option of class string; the options are :durability] :ok]");
 }
 
 test "nexis.string: reverse and escape take a string, as every function there does" {

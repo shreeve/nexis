@@ -119,7 +119,7 @@ Var inside a `binding`.
 | `nexis.test` | — | `test.nx` | TOOLING.md §3 |
 | `nexis.pprint` | — | `pprint.nx` | TOOLING.md §4 |
 | `nexis.simd` | `simd_natives` | — | TYPED_VECTOR.md §7.2 |
-| `nexis.internal` | `internal_natives` | — | the `#%` helpers macros emit: records and protocols (PROTOCOLS.md §7), `#%catch-matches?` (`try`), `#%raise` (the library's own error, `(#%raise :tag "sentence, got" x)`: the error map of `docs/VM.md` §13, its message naming the kind of `x`), `#%kwargs` (`& {:keys ...}`), `#%current-ns` (TOOLING.md §3), `#%delay` (`delay`, §8), `#%sorted-map` / `#%sorted-set` (a sorted collection a macro returns, MACROEXPAND.md §5), `#%push-out` / `#%pop-out` (`with-out-str`, §6), `#%mm-lookup` (a multimethod's call, §9.3), and the natives the namespaces of §11–§13 call |
+| `nexis.internal` | `internal_natives` | — | the `#%` helpers macros emit: records and protocols (PROTOCOLS.md §7), `#%catch-matches?` (`try`), `#%raise` (the library's own error, `(#%raise :tag "sentence, got" x)`: the error map of `docs/VM.md` §13, its message naming the kind of `x`; `(#%raise :tag "sentence, got" x data)` adds the entries of the map `data`; `(#%raise m)` throws the error map `m`; either carries the place of the program's call, as a runtime error does), `#%kwargs` (`& {:keys ...}`), `#%current-ns` (TOOLING.md §3), `#%delay` (`delay`, §8), `#%sorted-map` / `#%sorted-set` (a sorted collection a macro returns, MACROEXPAND.md §5), `#%push-out` / `#%pop-out` (`with-out-str`, §6), `#%mm-lookup` (a multimethod's call, §9.3), and the natives the namespaces of §11–§13 call |
 
 **Resolution.** Every other namespace has `nexis.core` as its parent,
 so an unqualified symbol a namespace does not define resolves in
@@ -235,8 +235,8 @@ the result and write it once; a `replace` that finds nothing returns
 
 | Name | Arity | Semantics |
 |---|---|---|
-| `lower-case`, `upper-case` | 1 | ASCII letters mapped; every other byte, every byte of a multibyte scalar included, unchanged: `(upper-case "héllo")` is `"HéLLO"` |
-| `capitalize` | 1 | The first character upper-case and the rest lower-case, by the same ASCII rule |
+| `lower-case`, `upper-case` | 1 | Every character mapped as Java's `Character/toLowerCase` and `Character/toUpperCase` map it (`src/regex_tables.zig`, generated from Java's `Character`): `(upper-case "héllo")` is `"HÉLLO"`. The maps are one character to one, where Clojure's `String.toUpperCase` also expands (`"ß"` to `"SS"`) and lower-cases a final `Σ` to `ς`; a byte that is not UTF-8 is kept |
+| `capitalize` | 1 | The first character upper-case and the rest lower-case, by the same maps |
 | `reverse` | 1 | The code points in reverse order (not grapheme clusters) |
 | `trim`, `triml`, `trimr` | 1 | Without whitespace at both ends, the start, the end. Whitespace is Java's `Character/isWhitespace`, as Clojure's: tab through CR, FS through US, space, and the Unicode space, line and paragraph separators except the no-break ones (U+2003 and U+3000 are trimmed, U+00A0 stays). A byte that is not part of a well-formed UTF-8 sequence is not whitespace: it stops the trim and stays |
 | `trim-newline` | 1 | Without every `\n` and `\r` at the end |
@@ -257,8 +257,9 @@ string argument as UTF-8 before scanning and throw `:utf8-error` on a
 malformed one, so a separator can never cut a scalar in two; the
 code-point functions throw `:utf8-error` as §2 says.
 
-Full Unicode case mapping, normalization and grapheme segmentation
-are absent (STRING.md §6).
+The case maps are Java's simple ones; the full ones that change a
+string's length or read context, normalization and grapheme
+segmentation are absent.
 
 ---
 
@@ -398,10 +399,10 @@ buffered, so nothing is lost at `exit`). A VM with no `io` throws
 | `newline` | 0 | `(print "\n")` (`core.nx`) | — |
 | `flush` | 0 | nil: every print writes through at once, so there is nothing to flush (`core.nx`) | — |
 | `with-out-str` | macro | The body's printed output as a string; nothing reaches stdout. Captures nest; a throw discards the buffer and propagates | — |
-| `slurp` | 1 | The whole file at a path (relative to the working directory) as a string; no size cap; the text must be UTF-8 | `:kind-mismatch` (non-string path), `:invalid-path` (empty, or holding a NUL byte), `:file-not-found`, `:utf8-error`, `:io-error` (a directory, a permission, any other failure) |
-| `spit` | 2+ | `(spit path x)` writes `(str x)` (nil: an empty file), replacing the file; `(spit path x :append true)` writes after its end. Parent directories are not created (`db/open` is the one call that creates them). nil | as `slurp`, and `:file-not-found` for a missing parent; `:arity-mismatch` (an odd option list), `:invalid-argument` (an option other than `:append`) |
+| `slurp` | 1+ | The whole file at a path (relative to the working directory) as a string; no size cap; the text must be UTF-8. The one option is `:encoding` with `"UTF-8"` (any case, the dash optional), which nexis text always is | `:kind-mismatch` (non-string path), `:invalid-path` (empty, or holding a NUL byte), `:file-not-found`, `:utf8-error`, `:io-error` (a directory, a permission, any other failure), `:invalid-argument` (an option other than `:encoding`, an encoding other than UTF-8) |
+| `spit` | 2+ | `(spit path x)` writes `(str x)` (nil: an empty file), replacing the file; `(spit path x :append true)` writes after its end, opened `O_APPEND`, so the text lands at the end whatever another process appends meanwhile. The text is written as a stream, so a pipe, a FIFO or a device (`"/dev/stdout"`) takes it. Parent directories are not created (`db/open` is the one call that creates them). nil | as `slurp`, and `:file-not-found` for a missing parent; `:arity-mismatch` (an odd option list), `:invalid-argument` (an option other than `:append` and `:encoding`, an encoding other than UTF-8) |
 | `read-line` | 0 | The next line of stdin, of any length, without its `\n` or a trailing `\r`; nil at end of input. It shares one buffer with the REPL, so neither loses what the other read | `:io-error` (a read failure) |
-| `nano-time` | 0 | A monotonic clock in nanoseconds, reduced modulo the fixnum maximum, for intervals; the `time` macro prints `"Elapsed time: X msecs"` with `prn` | — |
+| `nano-time` | 0 | A monotonic clock in nanoseconds, for intervals: a 64-bit count, as Java's `System/nanoTime`, a bignum past the fixnum range (about 39 hours of the host's awake time); the `time` macro prints `"Elapsed time: X msecs"` with `prn` | — |
 | `exit` | 0–1 | Closes every store `db/open` opened and every Nextomic connection `connect` made, syncs every store file a commit left unsynced (`docs/DB.md` §3.3), then ends the process with the status (0 by default; the integer's low eight bits, so `(exit 257)` exits 1 and `(exit -1)` 255). Nothing after it runs, `finally` blocks included, as with Java's `System/exit` (`test/golden/cli/exit-status.nx`) | `:kind-mismatch` (non-integer) |
 | `*command-line-args*` | Var | The arguments after the program as a vector of strings, nil when there are none; `nexis run` binds it (TOOLING.md §1) | — |
 
@@ -708,7 +709,7 @@ as U+FFFD, as Java decodes it.
 |---|---|---|---|
 | `getenv` | 0–1 | `(getenv name)`: the value of the environment variable as a string, nil when it is not set (an empty name, or one holding a NUL byte, is never set); `(getenv)`: every variable as a map of name to value, Clojure's `(System/getenv)`. libc's environment, which nexis never changes | `:kind-mismatch` (a name that is not a string) |
 | `cwd` | 0 | The absolute path of the working directory, Java's `(System/getProperty "user.dir")` | `:io-error` |
-| `sh` | 1+ | `(sh "ls" "-l" :dir "/tmp")`: runs a program and waits for it, returning `{:exit status :out text :err text}`. The leading strings are the program, found on the PATH (`/usr/local/bin:/bin:/usr/bin` when the process has none), and its arguments; keyword options follow. `:in` is text written to the program's stdin, which otherwise reads end of input at once; `:dir` its working directory, else `*sh-dir*`; `:env` a map that is the whole of its environment, each name by `name` and value by `str`, else `*sh-env*`; nil for any of them is the process's own. A signal's status is 128 plus its number, as Java reports it; output that is not UTF-8 reads as U+FFFD | `:invalid-argument` (no program; an option other than these, among them Clojure's `:in-enc` and `:out-enc`; a NUL byte in an argument; a name no variable can have), `:kind-mismatch` (a non-string `:in`, a non-map `:env`), `:arity-mismatch` (an option without its value), `:file-not-found` (no such program, or no such `:dir`), `:io-error` (any other failure to run it; a VM with no `io`) |
+| `sh` | 1+ | `(sh "ls" "-l" :dir "/tmp")`: runs a program and waits for it, returning `{:exit status :out text :err text}`. The leading strings are the program, found on the PATH (`/usr/local/bin:/bin:/usr/bin` when the process has none), and its arguments; keyword options follow. `:in` is text written to the program's stdin, which otherwise reads end of input at once; `:dir` its working directory, else `*sh-dir*`; `:env` a map that is the whole of its environment, each name by `name` and value by `str`, else `*sh-env*`; nil for any of them is the process's own. A signal's status is 128 plus its number, as Java reports it; output that is not UTF-8 reads as U+FFFD | `:invalid-argument` (no program; an option other than these, among them Clojure's `:in-enc` and `:out-enc`; a NUL byte in an argument; a name no variable can have), `:kind-mismatch` (a non-string `:in`, a non-map `:env`, an `:env` name that is not a string, keyword or symbol), `:arity-mismatch` (an option without its value), `:file-not-found` (no such program, or no such `:dir`; with a `:dir` the message names both, `sh: cannot run ls in /x`), `:io-error` (any other failure to run it; a VM with no `io`) |
 | `*sh-dir*`, `*sh-env*` | Var | Dynamic, nil at the root: the `:dir` and `:env` of a `sh` that gives none | — |
 | `with-sh-dir`, `with-sh-env` | macro | `(with-sh-dir dir body...)`: the body with `*sh-dir*` bound to `dir`; `with-sh-env` the same for `*sh-env*` | — |
 
@@ -813,29 +814,34 @@ Nextomic attribute keeps its namespace; `:key-fn name` gives
 key is a string as it is, a keyword or symbol by its whole name, an
 integer by its digits. A string is written as UTF-8 with `"`, `\` and
 the control characters escaped (`\b`, `\f`, `\n`, `\r`, `\t`, else
-`\u00XX`); `clojure.data.json` escapes every non-ASCII character and
-`/` by default, this writer only when asked. The walk recurses on the
+`\u00XX`), and U+2028 and U+2029 as `\u2028` and `\u2029`, which
+JavaScript before ES2019 reads as line terminators, so the text stays
+one token inside a `<script>`, as `clojure.data.json`'s
+`:escape-js-separators` does by default; `clojure.data.json` also
+escapes every other non-ASCII character and `/` by default, this
+writer only when asked. The walk recurses on the
 data's depth under the stack guard, so data nested past the native
 stack is a catchable `:stack-overflow`.
 
 | Name | Arity | Semantics |
 |---|---|---|
 | `read-str` | 1+ | `(read-str s & opts)`: the value of the JSON text `s`. `:key-fn`: a function of each key's string, its result the map key (`keyword` gives keyword keys, interned without a call: an empty key, which names no keyword, is `:invalid-argument`). `:value-fn`: a function of each object member's key (after `:key-fn`) and value, inner objects first, whose result replaces the value, or drops the member when it is `:value-fn` itself |
-| `write-str` | 1+ | `(write-str x & opts)`: the JSON text of `x`, as above. `:key-fn`: a function of each map key to the string written; `:value-fn`: a function of each map entry's key and value whose result is written, the entry left out when it is `:value-fn` itself; `:indent true`: a newline before each member and element, two spaces a level, `": "` after a key, an empty collection kept as `{}` or `[]` (`clojure.data.json` 2.5's `:indent`); `:escape-unicode true`: every character past ASCII as `\uXXXX`, a pair past the BMP; `:escape-slash true`: `/` as `\/` |
+| `write-str` | 1+ | `(write-str x & opts)`: the JSON text of `x`, as above. `:key-fn`: a function of each map key to the string written; `:value-fn`: a function of each map entry's key and value whose result is written, the entry left out when it is `:value-fn` itself; `:indent true`: a newline before each member and element, two spaces a level, `": "` after a key, an empty collection kept as `{}` or `[]` (`clojure.data.json` 2.5's `:indent`); `:escape-unicode true`: every character past ASCII as `\uXXXX`, a pair past the BMP; `:escape-slash true`: `/` as `\/`; `:escape-js-separators` false or nil: U+2028 and U+2029 written as they are |
 | `read` | 1+ | `(read path & opts)`: `read-str` of the file's text (`slurp`); stdin is `(read "/dev/stdin")` |
 | `write` | 2+ | `(write x path & opts)`: `write-str` of `x` into the file, replacing it (`spit`); nil |
 
 **Errors.** Malformed text throws the map `{:error :json-error
-:message "JSON: <what> at line L, column C" :line L :column C}` (as
-the multimethod errors are maps, §9.4), the column counted in
-characters, so `(catch :json-error e (ex-message e))` takes it; the
+:message "JSON: <what> at line L, column C" :json-line L :json-column
+C}`, the column counted in characters, with the place of the
+program's call (`:fn`, `:file`, `:line`, `:column`) as every error a
+native raises; `(catch :json-error e (ex-message e))` takes it. The
 `<what>`s are `the text ends before its value`, `the text ends inside
 a string` (an `object`, an `array`), `text follows the value`,
 `unexpected 'c'`, `expected a string key`, `expected ':' after a
 key`, `expected ',' or '}'` (`']'`), `a malformed number`, `a control
 character in a string`, `an unknown escape`, `a lone surrogate`.
 Writing what JSON cannot hold throws `{:error :json-error :message
-...}` without a position: `NaN` or an infinity, a nil key, a key of
+...}`, placed, with no position in a text: `NaN` or an infinity, a nil key, a key of
 another class, a `:key-fn` result that is not a string, a value of any
 other class (a function, an atom). A text that is not a string, or an
 options map that is not a map, is `:kind-mismatch`; a string that is

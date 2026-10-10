@@ -614,7 +614,7 @@ and any operation on a closed connection or through a ref of one is
 
 | Form | Arity | Result |
 |---|---|---|
-| `(db/open path)` / `(db/open path {:durability d})` | 1–2 | A connection; creates the file and its parent directories. An empty path or one with a NUL byte is `:invalid-path` (§2). A file the process may only read opens read-only. `d` is `:commit` or `:durable` (§3.3), else `:invalid-argument`; nil or no `:durability` takes the process's. |
+| `(db/open path)` / `(db/open path {:durability d})` | 1–2 | A connection; creates the file and its parent directories. An empty path or one with a NUL byte is `:invalid-path` (§2). A file the process may only read opens read-only. `d` is `:commit` or `:durable` (§3.3), else `:invalid-argument`; nil or no `:durability` takes the process's. Any other key of the options map is `:invalid-argument`, its message naming the key. |
 | `(db/close conn)` | 1 | nil; aborts the connection's open transactions, whose handles then report `:tx-closed` (§3), and syncs the file when a commit left it unsynced (§3.3), nothing once a sync of the file has failed; closing twice is nil; from a callback a native runs over one of its transactions, `:db/busy`. |
 | `(db/sync conn)` | 1 | nil once every commit to the connection's file is durable: one full sync when a commit left it unsynced (§3.3); `:db/sync-failed` once a sync of the file has failed, until it is reopened (§3.3 "A failed sync is final"). |
 | `(db/ref conn tree key)` | 3 | A durable ref (§4); prints `#<durable-ref :tree hex:…>`. |
