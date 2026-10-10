@@ -118,13 +118,14 @@ pub const Lexer = struct {
                         // string is, the reader keeps its text.
                         '"' => return self.scanString(start, start + 1, .regex, pre),
                         ' ', '\t', '\r', '\n', ',' => {},
-                        // An unsupported dispatch (`#?`, `#inst`) is
-                        // one err token, so the parse error names the
-                        // construct.
+                        // `#` and a letter is a tag (`#inst`, `#my/tag`),
+                        // which the reader reads or rejects; any other
+                        // dispatch (`#?`, `#=`) is one err token, so the
+                        // parse error names the construct.
                         else => |after| {
                             self.base.pos = start + 2;
                             if (isIdentCont(after)) self.skipConstituents();
-                            return self.finish(.err, start, pre);
+                            return self.finish(if (std.ascii.isAlphabetic(after)) .tag else .err, start, pre);
                         },
                     }
                 }

@@ -1517,11 +1517,38 @@ test "loader: a Clojure idiom nexis lacks is reported with what to use instead" 
     try expectLoaded("(defn thread [f] (f)) (thread (fn [] 7))", "7");
     // Libraries: clojure.java.io.
     try expectLoadFailure("(clojure.java.io/file \"x\")", "compile error: unable to resolve symbol: clojure.java.io/file; nexis has no clojure.java.io: slurp and spit read and write a file, read-line reads stdin", "clojure.java.io/file");
-    // Literals: a ratio, a BigDecimal, #inst and #uuid.
+    // Literals: a ratio, a BigDecimal, a tag other than #inst and #uuid.
     try expectLoadFailure("(+ 1/3 1)", "reader error: :bad-number-literal 1/3; nexis has no ratios: (/ 1 3) divides, to a double when inexact", "1/3");
     try expectLoadFailure("1.5M", "reader error: :bad-number-literal 1.5M; nexis has no BigDecimal: 1.5 is a double", "1.5M");
-    try expectLoadFailure("#inst \"2026-10-09\"", "parse error: unexpected `#inst`; nexis has no #inst literal: (nexis.time/parse \"2026-10-09T12:00:00Z\") is an instant", "#inst");
-    try expectLoadFailure("#uuid \"x\"", "parse error: unexpected `#uuid`; nexis has no #uuid literal: a UUID is its canonical string", "#uuid");
+    try expectLoadFailure("(f #js {:a 1})", "reader error: :unknown-tag #js; nexis reads the tags #inst and #uuid", "#js {:a 1}");
+    try expectLoadFailure("#inst \"2026-13\"", "reader error: :invalid-inst not an instant: \"2026-13\"", "#inst \"2026-13\"");
+}
+
+test "reader: #inst and #uuid are values, printed as Clojure prints them, that read back equal" {
+    try expectOutput("(pr-str #inst \"2020\")", "#inst \"2020-01-01T00:00:00.000-00:00\"");
+    try expectOutput("#inst \"2026-10-09T12:30:15.123+02:00\"", "#inst \"2026-10-09T10:30:15.123-00:00\"");
+    try expectOutput("#uuid \"0123ABCD-4567-89EF-0123-456789ABCDEF\"", "#uuid \"0123abcd-4567-89ef-0123-456789abcdef\"");
+    try expectOutput(
+        \\(let [i #inst "2026-10-09T12:30:15.123+02:00" u #uuid "1-2-3-4-5"]
+        \\  [(= i (read-string (pr-str i))) (= (hash i) (hash (read-string (pr-str i))))
+        \\   (= u (read-string (pr-str u))) (= (hash u) (hash (read-string (pr-str u))))
+        \\   (class i) (class '#uuid "1-2-3-4-5") (= #inst "1970" 0) (= u (str u))])
+    , "[true true true true :inst :uuid false false]");
+    // Quoted, syntax-quoted, a macro's argument or its value: the value.
+    try expectOutput("`[#inst \"1970\" ~(count [#uuid \"1-2-3-4-5\"])]", "[#inst \"1970-01-01T00:00:00.000-00:00\" 1]");
+    try expectOutputProgram(
+        \\(defmacro same [x] x)
+        \\(defmacro built [] (read-string "[#inst \"1970\" #uuid \"1-2-3-4-5\"]"))
+        \\[(same #uuid "1-2-3-4-5") (built) (case #inst "1970" #inst "1970-01-01T00:00Z" :same :other)]
+    , "[#uuid \"00000001-0002-0003-0004-000000000005\" [#inst \"1970-01-01T00:00:00.000-00:00\" #uuid \"00000001-0002-0003-0004-000000000005\"] :same]");
+    // No metadata, no arithmetic; an order of their own.
+    try expectOutput("[(try (with-meta #inst \"2020\" {}) (catch any e (:error e))) (try (with-meta #uuid \"1-2-3-4-5\" {}) (catch any e (:error e))) (meta #inst \"2020\")]", "[:no-metadata-on-immediate :no-metadata-on-immediate nil]");
+    try expectOutput("[(try (< #inst \"2020\" #inst \"2021\") (catch any e (:error e))) (try (compare #inst \"2020\" 1) (catch any e (:error e)))]", "[:kind-mismatch :kind-mismatch]");
+    try expectOutput("[(sort [#inst \"2021\" #inst \"2020\"]) (compare #uuid \"ffffffff-0-0-0-0\" #uuid \"0-0-0-0-0\")]", "[(#inst \"2020-01-01T00:00:00.000-00:00\" #inst \"2021-01-01T00:00:00.000-00:00\") 1]");
+    // str: the ISO text and the canonical text alone, the literal inside a collection.
+    try expectOutput("[(str #inst \"2020\") (str #inst \"2020-01-01T00:00:00.5Z\") (str #uuid \"1-2-3-4-5\") (str [#inst \"2020\"])]", "[2020-01-01T00:00:00Z 2020-01-01T00:00:00.500Z 00000001-0002-0003-0004-000000000005 [#inst \"2020-01-01T00:00:00.000-00:00\"]]");
+    // Two spellings of one instant in a set literal are a duplicate.
+    try expectOutput("(try (read-string \"#{#inst \\\"2020\\\" #inst \\\"2020-01-01T00:00Z\\\"}\") (catch any e (:error e)))", ":reader-error");
 }
 
 test "loader: a parse error names the delimiter left open" {
@@ -7223,12 +7250,13 @@ test "edn: nexis.edn/read-string reads one value as data and evaluates nothing" 
         \\         (nexis.edn/read-string "(+ 1 2)") (nexis.edn/read-string "") (nexis.edn/read-string nil)
         \\         (nexis.edn/read-string {:eof :done} " ; nothing") (nexis.edn/read-string {:eof :done} nil)])
     , "[{:a [1 2.5 \"s\" \\c sym nil true #{:k}]} (+ 1 2) nil nil :done nil]");
-    // No tagged literals: a tag is a reader error whatever :readers says.
+    // EDN's two tags read; any other is a reader error whatever
+    // :readers says.
     try expectOutput(
-        \\[(try (nexis.edn/read-string "#inst \"2020\"") (catch any e e))
+        \\[(nexis.edn/read-string "#inst \"2020\"") (nexis.edn/read-string "{:id #uuid \"1-2-3-4-5\"}")
         \\ (try (nexis.edn/read-string {:readers {'foo inc}} "#foo 1") (catch any e e))
         \\ (try (nexis.edn/read-string {} "") (catch any e e)) (read-string "[1]")]
-    , "[{:error :reader-error, :message reader error, :fn test-form} {:error :reader-error, :message reader error, :fn test-form} {:error :reader-error, :message reader error, :fn test-form} [1]]");
+    , "[#inst \"2020-01-01T00:00:00.000-00:00\" {:id #uuid \"00000001-0002-0003-0004-000000000005\"} {:error :reader-error, :message reader error, :fn test-form} {:error :reader-error, :message reader error, :fn test-form} [1]]");
 }
 
 // =============================================================================

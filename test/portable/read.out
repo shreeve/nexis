@@ -18,6 +18,9 @@
 "float-third" 0.3333333333333333
 "float-tiny" 4.9E-324
 "i64-vector" #i64[0 -1 9007199254740993 -9223372036854775808 9223372036854775807]
+"inst" #inst "2026-10-09T10:30:15.123-00:00"
+"inst-before-1970" #inst "1969-07-20T20:17:40.000-00:00"
+"inst-max" #inst "+292278994-08-17T07:12:55.807-00:00"
 "keyword" :plain
 "keyword-ns" :app/state
 "lazy-seq" (1 2 3 4 5)
@@ -35,6 +38,8 @@
 "string-utf8" "naïve café 日本語 ΣΟΦΙΑΣ 😀"
 "symbol" my.ns/sym
 "true" true
+"uuid" #uuid "0123abcd-4567-89ef-0123-456789abcdef"
+"uuid-high" #uuid "ffffffff-ffff-4fff-bfff-ffffffffffff"
 "vector" [1 2.5 "x" :y nil true]
 -- tree :keys
 "mmmmmmmm... 4078 bytes" :longest

@@ -20,6 +20,7 @@ const heap_mod = @import("heap.zig");
 const bignum_mod = @import("bignum.zig");
 const stack = @import("stack.zig");
 const string_mod = @import("string.zig");
+const uuid_mod = @import("uuid.zig");
 const regex_mod = @import("regex.zig");
 const dispatch = @import("dispatch.zig");
 
@@ -312,7 +313,7 @@ fn expandFormDepth(ctx: *ExpandContext, form: *const Form, depth: u32) ExpandErr
     try checkStack();
     const b = Builder{ .ctx = ctx, .origin = form.origin };
     return switch (form.datum) {
-        .nil, .bool_, .int, .bigint, .real, .char, .string, .regex, .keyword, .symbol => mutCast(form),
+        .nil, .bool_, .int, .bigint, .real, .char, .string, .regex, .inst, .uuid, .keyword, .symbol => mutCast(form),
         .list => |items| try expandList(ctx, form, items, depth),
         // Collection literals are expressions: their items expand.
         .vector, .map, .set => try mapChildren(ctx, form, Walk{}),
@@ -529,6 +530,8 @@ fn describeForm(form: *const Form) []const u8 {
         .char => "a char",
         .string => "a string",
         .regex => "a regex",
+        .inst => "an instant",
+        .uuid => "a UUID",
         .keyword => "a keyword",
         .symbol => |sym| if (sym.ns != null) "a qualified symbol" else "a symbol",
         .list => "a list",
@@ -1288,7 +1291,7 @@ fn formValue(ctx: *ExpandContext, form: *const Form) ExpandError!value_mod.Value
         error.Malformed => ctx.fail(form.origin, "{s} that makes no value", .{describeForm(form)}),
     };
     return switch (form.datum) {
-        .nil, .bool_, .int, .bigint, .real, .char, .string, .regex, .symbol, .keyword => unreachable,
+        .nil, .bool_, .int, .bigint, .real, .char, .string, .regex, .inst, .uuid, .symbol, .keyword => unreachable,
         .list, .vector, .set, .map => |items| blk: {
             if (form.datum == .list) if (sortedMarker(items)) |set| break :blk try sortedValue(ctx, form, set, items[1..]);
             const values = try ctx.allocator.alloc(value_mod.Value, items.len);
@@ -1341,6 +1344,8 @@ pub fn scalarValue(heap: ?*heap_mod.Heap, interner: ?*intern_mod.Interner, scrat
             .ok => |p| p,
             .err => error.Malformed,
         },
+        .inst => |ms| value_mod.fromInst(ms),
+        .uuid => |u| uuid_mod.make(heap orelse return error.Unsupported, u) catch error.OutOfMemory,
         .symbol => |name| (interner orelse return error.Unsupported).internQualifiedSymbol(name.ns, name.name) catch error.OutOfMemory,
         .keyword => |name| (interner orelse return error.Unsupported).internQualifiedKeyword(name.ns, name.name) catch error.OutOfMemory,
         else => null,
@@ -1428,6 +1433,8 @@ pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, call_origin: SrcSpan
         // A macro may return a pattern, as Clojure's may: the literal
         // of its source, a new pattern where it is evaluated.
         .regex => .{ .regex = try ctx.allocator.dupe(u8, regex_mod.sourceOf(v)) },
+        .inst => .{ .inst = v.asInstMs() },
+        .uuid => .{ .uuid = uuid_mod.bytesOf(v).* },
         .symbol => .{ .symbol = nameOf(ctx.interner.symbolName(v.asSymbolId())) },
         .keyword => .{ .keyword = nameOf(ctx.interner.keywordName(v.asKeywordId())) },
         .list => blk: {
@@ -2032,7 +2039,7 @@ fn expandCond(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) 
 /// keyword, `true`, a number, a string or a char.
 fn isTruthyLiteral(form: *const Form) bool {
     return switch (form.datum) {
-        .keyword, .int, .bigint, .real, .string, .regex, .char => true,
+        .keyword, .int, .bigint, .real, .string, .regex, .inst, .uuid, .char => true,
         .bool_ => |v| v,
         else => false,
     };
@@ -2640,7 +2647,7 @@ fn syntaxQuote(ctx: *ExpandContext, scope: *GensymScope, payload: *const Form) E
     const b = Builder{ .ctx = ctx, .origin = payload.origin };
     return switch (payload.datum) {
         // Self-evaluating: no quote needed.
-        .nil, .bool_, .int, .bigint, .real, .char, .string, .regex, .keyword => mutCast(payload),
+        .nil, .bool_, .int, .bigint, .real, .char, .string, .regex, .inst, .uuid, .keyword => mutCast(payload),
         .symbol => |name| b.list(.{ "quote", if (name.ns) |ns_prefix| blk: {
             const target = aliasTarget(ctx, ns_prefix);
             break :blk if (target.ptr == ns_prefix.ptr) mutCast(payload) else try makeQualifiedSymbol(ctx, target, name.name, payload.origin);

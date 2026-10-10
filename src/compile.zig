@@ -1621,7 +1621,7 @@ fn lowerDatum(
         .nil => try allocTiny(allocator, .nil),
         .bool_ => |b| try allocTiny(allocator, .{ .bool = b }),
         .int => |n| if (value_mod.isFixnumRange(n)) try allocTiny(allocator, .{ .int = n }) else try lowerScalar(allocator, form, ctx),
-        .bigint, .real, .char, .string, .regex, .keyword => try lowerScalar(allocator, form, ctx),
+        .bigint, .real, .char, .string, .regex, .inst, .uuid, .keyword => try lowerScalar(allocator, form, ctx),
         .symbol => |name| blk: {
             // Qualified symbols `ns/name` lower to
             // `Tiny.qualified_symbol`; compileSymbol handles
@@ -1851,7 +1851,7 @@ fn lowerQuoted(allocator: std.mem.Allocator, payload: *const reader_mod.Form, ct
     try stack.check();
     switch (payload.datum) {
         .nil, .bool_, .int => return lowerDatum(allocator, payload, ctx),
-        .bigint, .real, .char, .string, .regex, .keyword, .symbol => return lowerScalar(allocator, payload, ctx),
+        .bigint, .real, .char, .string, .regex, .inst, .uuid, .keyword, .symbol => return lowerScalar(allocator, payload, ctx),
         else => {},
     }
     var expander = expand_mod.ExpandContext{

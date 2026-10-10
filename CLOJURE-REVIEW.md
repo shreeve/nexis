@@ -193,12 +193,12 @@ are the map for someone who knows Clojure.
 | String escapes | `\b \f`, octal, `\uHHHH` | Clojure's, and `\u{HEX}` | `\u{HEX}` names any scalar in one escape (§23 #26) |
 | `#:ns{:a 1}`, `::k` | namespaced map, auto-resolved keyword | parse error | no current namespace at read time |
 | `#?(...)` | reader conditional | parse error | one target (PLAN §4) |
-| `#inst`, `#uuid` | tagged literals | parse error; `nexis.time/parse` reads an instant's text | PLAN §4, §24 #3 |
+| `#inst`, `#uuid` | tagged literals: a `java.util.Date` and a `java.util.UUID` | an instant and a UUID, value kinds (`docs/SEMANTICS.md` §2.8), read in Clojure's `#inst` grammar and Java's `UUID.fromString`'s, which nexis widens: a signed or longer year, a lower-case `T` or `Z`, an offset without its colon. Any other tag, and `*data-readers*`, is `:unknown-tag` | PLAN §24 #3, `docs/FORMS.md` §3 |
 | `#"re"` | a `Pattern` | a pattern, compiled when the source is read; a construct that needs backtracking is `:invalid-regex` | a linear-time engine (`docs/REGEX.md`) |
 | `#=(...)`, `#<...>`, `#^{...}` | read-eval, unreadable, old metadata | parse error | no read-time evaluation; one `^` spelling |
 
 The `#` dispatch set is `#{}`, `#(...)`, `#_`, `#'` (`#'foo` is
-`(var foo)`) and `#"..."`. Clojure's reader
+`(var foo)`), `#"..."` and the tags `#inst` and `#uuid`. Clojure's reader
 throws ad-hoc exceptions for malformed input; nexis reports a stable
 keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 `:nested-anon-fn`, `:unquote-outside-syntax-quote`, ...; PLAN §28.3).
@@ -231,7 +231,7 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | `(reduced x)` | an opaque box | a `nexis.core/Reduced` record with field `:val`; `reduce`, `reductions`, `reduce-kv` and `run!` honour it | `src/stdlib/core.nx` |
 | `(read-string s)`, `(read-string opts s)` | the full reader; `opts` takes `:eof`, `:read-cond` and `:features` | the first form as data, `^meta` on a collection kept (on a symbol dropped); syntax-quote and unquote are not data and raise `:reader-error`; `opts` takes `:eof`, the value of a string that holds no form | `docs/STDLIB.md` §2 |
 | `clojure.math` | doubles in and out; `floor` and `ceil` of a long give a double | `nexis.math`: the same functions over doubles, except that `floor` and `ceil` give an integer back unchanged (`(floor 3)` is `3`, Clojure's `3.0`), and `floor-div` of `Long/MIN_VALUE` by `-1` is `2^63`, a bignum, where Java's wraps to `Long/MIN_VALUE`, since every integer operator promotes (`docs/SEMANTICS.md` §2.2); the last bit of a transcendental result is the platform library's | `docs/TOOLING.md` §4 |
-| `clojure.edn/read-string` | the EDN reader: no reader sugar, tagged literals through `:readers` and `:default` | `nexis.edn/read-string`, the nexis reader with `{:eof nil}`: `'x`, `@x` and `#()` read as the forms they stand for, and a tagged literal is a `:reader-error` whatever `:readers` holds (there are none, PLAN §4); nothing is evaluated | `docs/STDLIB.md` §4 |
+| `clojure.edn/read-string` | the EDN reader: no reader sugar, tagged literals through `:readers` and `:default` | `nexis.edn/read-string`, the nexis reader with `{:eof nil}`: `'x`, `@x` and `#()` read as the forms they stand for; `#inst` and `#uuid` read, and any other tag is a `:reader-error` whatever `:readers` holds (PLAN §24 #3); nothing is evaluated | `docs/STDLIB.md` §4 |
 | `(eval form)` | binds `*ns*` | compiles in the current namespace as the REPL does; a compile error is the catchable map `{:error :compile-error :message sentence :form form :kind name}` | `docs/MACROEXPAND.md` |
 | `(macroexpand form)` | with `&env` | no lexical environment; subforms never expand | `docs/MACROEXPAND.md` |
 | `(with-meta inc m)`, `(with-meta 'sym m)` | metadata on native fns and symbols | `:kind-mismatch`; `:no-metadata-on-immediate` (a `fn` carries metadata) | `docs/SEMANTICS.md` §7 |
@@ -269,6 +269,6 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 
 The deliberate ones are PLAN §4's non-goals: STM,
 agents, `core.async`, reader conditionals,
-tagged literals, rationals and decimals, full hygiene, other compile
+rationals and decimals, full hygiene, other compile
 targets, Java interop. Library functions that do not exist are known gaps, not decisions
 (`HANDOFF.md` §6).

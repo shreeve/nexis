@@ -319,8 +319,9 @@ as they are, so with no `:eof` in them a string with no form is
 evaluated (the reader has no `#=`). It reads nexis's syntax, which
 EDN's is a part of: reader sugar (`'x`, `@x`, `#()`) reads as the form
 it stands for, where Clojure's EDN reader refuses it, and the reader
-has no tagged literals (PLAN §4), so a tag is a `:reader-error` and
-`:readers` and `:default` have nothing to apply to. There is no `read`
+reads the tags `#inst` and `#uuid` (EDN's two built-in tags,
+`docs/FORMS.md` §3); any other tag is `:reader-error`, and `:readers`
+and `:default` have nothing to apply to (PLAN §24 #3). There is no `read`
 from a stream.
 
 ---

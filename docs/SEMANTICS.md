@@ -450,6 +450,9 @@ How each kind prints in the `pr-str` and `str` modes is
 
 - `nil`, booleans, `char`, fixnum, bignum, float, string, keyword and
   symbol (as text, re-interned on read).
+- An instant, as `#inst "…"`, and a UUID, as `#uuid "…"`, for every
+  i64 instant and every UUID (§2.8): Clojure's text, which the reader
+  reads (`docs/FORMS.md` §3).
 - `list` (a vector view included), `vector`, `map`, `set`,
   recursively. A sorted map or set reads back as the hash map or set
   with its entries, which is `=` to it and hashes alike; a lazy seq,
@@ -458,8 +461,8 @@ How each kind prints in the `pr-str` and `str` modes is
 - Not a typed vector: it prints as `#i64[1 2 3]` / `#f64[1.0 2.0]`,
   which the reader rejects at the `#`; the codec is its round trip.
 - Not a record: it prints as `#ns.Type{:field value, ...}` in both
-  modes, as Clojure does; the reader has no tagged literals (PLAN §24
-  item 3).
+  modes, as Clojure does; the reader reads no tag but `#inst` and
+  `#uuid` (PLAN §24 item 3), so the text is `:unknown-tag`.
 - Not a durable ref: `#<durable-ref :tree hex:key-bytes>`.
 - A var prints as `#'ns/name`, which reads as `(var ns/name)`: not a
   value that round-trips, but a form that evaluates to the same Var.

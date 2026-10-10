@@ -1,0 +1,2 @@
+; Two spellings of one instant in a set literal are a duplicate.
+#{#inst "2020" #inst "2020-01-01T00:00Z"}

@@ -14,6 +14,8 @@
 //!   - Merge stacked metadata into one map; an outer `^` overrides an inner.
 //!   - Store `#(...)` as the `anon_fn` datum, rejecting nesting.
 //!   - Read `#'x` as the list `(var x)`.
+//!   - Read `#inst "..."` and `#uuid "..."` as the `inst` and `uuid`
+//!     atoms, and reject every other tag.
 //!   - Tag `(syntax-quote x)` only: auto-qualification, auto-gensym and
 //!     unquote expansion live in the macroexpander (MACROEXPAND.md).
 //!
@@ -30,6 +32,8 @@ const nexis = @import("nexis.zig");
 const stack = @import("stack.zig");
 const string_mod = @import("string.zig");
 const regex = @import("regex.zig");
+const inst_mod = @import("inst.zig");
+const uuid_mod = @import("uuid.zig");
 
 pub const Tag = nexis.Tag;
 pub const Sexp = parser.Sexp;
@@ -79,6 +83,11 @@ pub const Datum = union(enum) {
     /// processing (a backslash and the byte after it as written),
     /// borrowed from the source. Checked to compile.
     regex: []const u8,
+    /// `#inst "text"`: the instant the text names, in milliseconds
+    /// since 1970-01-01T00:00:00Z.
+    inst: i64,
+    /// `#uuid "text"`: the UUID's 16 bytes.
+    uuid: [16]u8,
     keyword: Name,
     symbol: Name,
     list: []const *Form,
@@ -140,16 +149,6 @@ pub fn numberLiteralHint(allocator: std.mem.Allocator, text: []const u8) std.mem
     return null;
 }
 
-/// What to write instead of a Clojure tagged literal nexis does not
-/// read, for the report of a parse error at `token` (`#inst`, `#uuid`,
-/// any `#tag`); null for any other token.
-pub fn taggedLiteralHint(token: []const u8) ?[]const u8 {
-    if (token.len < 2 or token[0] != '#' or !std.ascii.isAlphabetic(token[1])) return null;
-    if (std.mem.eql(u8, token, "#inst")) return "nexis has no #inst literal: (nexis.time/parse \"2026-10-09T12:00:00Z\") is an instant";
-    if (std.mem.eql(u8, token, "#uuid")) return "nexis has no #uuid literal: a UUID is its canonical string";
-    return "nexis reads no tagged literals";
-}
-
 pub const ErrorKind = enum {
     duplicate_literal_key,
     duplicate_literal_element,
@@ -169,6 +168,12 @@ pub const ErrorKind = enum {
     nesting_too_deep,
     /// A regex literal that does not compile (`docs/REGEX.md` §2).
     invalid_regex,
+    /// `#inst` of anything but a string naming an instant.
+    invalid_inst,
+    /// `#uuid` of anything but a string naming a UUID.
+    invalid_uuid,
+    /// A tag other than `#inst` and `#uuid`.
+    unknown_tag,
 };
 
 /// `kind` as nexis spells it, in kebab case (`:bad-number-literal`).
@@ -273,6 +278,7 @@ pub const Reader = struct {
             .quote, .deref, .@"syntax-quote", .unquote, .@"unquote-splicing" => return self.readPrefix(tag, s),
             .@"with-meta-raw" => return self.readWithMetaRaw(s),
             .@"var-quote" => return self.readVarQuote(s),
+            .tagged => return self.readTagged(s),
             .program => return self.fail(.unknown_reader_construct, sexpSpan(s), "nested (program ...) not allowed"),
         }
     }
@@ -385,6 +391,43 @@ pub const Reader = struct {
         const name = splitNamespace(raw) orelse
             return self.fail(.invalid_symbol, span, raw);
         return try self.makeForm(.{ .symbol = name }, span);
+    }
+
+    /// `#inst "text"` and `#uuid "text"`, the two tags EDN builds in:
+    /// the string, escapes decoded, read once into the atom (Clojure's
+    /// `#inst` grammar, Java's `UUID.fromString`'s; `src/inst.zig`,
+    /// `src/uuid.zig`). Any other tag is `unknown_tag`, before its form
+    /// is read. The span is the tag through its form.
+    fn readTagged(self: *Reader, s: Sexp) ReaderError!*Form {
+        const items = s.items();
+        const span = sexpSpan(s);
+        const tag_span = tokenSpan(items[1].src);
+        const tag = self.source[tag_span.pos..][0..tag_span.len];
+        const which: enum { inst, uuid } = if (std.mem.eql(u8, tag, "#inst"))
+            .inst
+        else if (std.mem.eql(u8, tag, "#uuid"))
+            .uuid
+        else {
+            const detail = try std.fmt.allocPrint(self.allocator(), "{s}; nexis reads the tags #inst and #uuid", .{tag});
+            return self.fail(.unknown_tag, span, detail);
+        };
+        const target = try self.readOneForm(items[2]);
+        switch (which) {
+            .inst => {
+                if (target.datum != .string) return self.fail(.invalid_inst, span, "#inst takes a string");
+                const text = target.datum.string;
+                const ms = inst_mod.parse(text) orelse
+                    return self.fail(.invalid_inst, span, try std.fmt.allocPrint(self.allocator(), "not an instant: \"{s}\"", .{text}));
+                return try self.makeForm(.{ .inst = ms }, span);
+            },
+            .uuid => {
+                if (target.datum != .string) return self.fail(.invalid_uuid, span, "#uuid takes a string");
+                const text = target.datum.string;
+                const bytes = uuid_mod.parse(text) orelse
+                    return self.fail(.invalid_uuid, span, try std.fmt.allocPrint(self.allocator(), "not a UUID: \"{s}\"", .{text}));
+                return try self.makeForm(.{ .uuid = bytes }, span);
+            },
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -718,7 +761,7 @@ pub fn firstFormEnd(text: []const u8) ?u32 {
                 if (depth == 0) need += 1;
                 continue;
             },
-            .quote_tok, .syntax_quote_tok, .unquote_tok, .unquote_splicing_tok, .deref_tok, .var_quote_tok => continue,
+            .quote_tok, .syntax_quote_tok, .unquote_tok, .unquote_splicing_tok, .deref_tok, .var_quote_tok, .tag => continue,
             else => if (depth > 0) continue,
         }
         need -= 1;
@@ -862,11 +905,11 @@ fn splitNamespace(text: []const u8) ?Name {
 }
 
 /// A Form is a "literal key" eligible for static duplicate detection iff it
-/// is an atom (nil/bool/int/real/char/string/keyword/symbol) AND its value
-/// is compile-time known. Every atom is treated as literal.
+/// is an atom (nil/bool/int/real/char/string/inst/uuid/keyword/symbol) AND
+/// its value is compile-time known. Every atom but a regex is literal.
 pub fn isLiteralKey(f: *const Form) bool {
     return switch (f.datum) {
-        .nil, .bool_, .int, .bigint, .real, .char, .string, .keyword, .symbol => true,
+        .nil, .bool_, .int, .bigint, .real, .char, .string, .inst, .uuid, .keyword, .symbol => true,
         else => false,
     };
 }
@@ -884,6 +927,8 @@ pub const LiteralSet = std.HashMapUnmanaged(*const Form, void, struct {
             // 0.0 and -0.0 are equal under `==`, so they hash alike.
             .real => |r| h.update(std.mem.asBytes(&(if (r == 0) @as(f64, 0) else if (std.math.isNan(r)) std.math.nan(f64) else r))),
             .char => |c| h.update(std.mem.asBytes(&@as(u32, c))),
+            .inst => |ms| h.update(std.mem.asBytes(&ms)),
+            .uuid => |u| h.update(&u),
             .keyword, .symbol => |n| {
                 h.update(n.ns orelse "");
                 h.update("/");
@@ -909,6 +954,8 @@ pub fn formLiteralEq(a: *const Form, b: *const Form) bool {
         .real => |ar| b.datum == .real and (b.datum.real == ar or (std.math.isNan(ar) and std.math.isNan(b.datum.real))), // `=` makes NaN equal NaN
         .char => |ac| b.datum == .char and b.datum.char == ac,
         .string => |s| b.datum == .string and std.mem.eql(u8, s, b.datum.string),
+        .inst => |ms| b.datum == .inst and b.datum.inst == ms,
+        .uuid => |u| b.datum == .uuid and std.mem.eql(u8, &u, &b.datum.uuid),
         .keyword => |ak| b.datum == .keyword and nameEq(ak, b.datum.keyword),
         .symbol => |ak| b.datum == .symbol and nameEq(ak, b.datum.symbol),
         else => false,
@@ -953,6 +1000,16 @@ fn writeFormIndent(f: *const Form, w: *std.Io.Writer, indent: u32) std.Io.Writer
         .char => |c| try writeCharAtom(c, w),
         .string => |s| try writeStringAtom("string", s, w),
         .regex => |s| try writeStringAtom("regex", s, w),
+        .inst => |ms| {
+            try w.writeAll("(inst \"");
+            try inst_mod.write(w, ms, .literal);
+            try w.writeAll("\")");
+        },
+        .uuid => |u| {
+            var text: [uuid_mod.text_len]u8 = undefined;
+            uuid_mod.writeText(&text, u);
+            try w.print("(uuid \"{s}\")", .{&text});
+        },
         .keyword => |k| try writeKeywordAtom(k, w),
         .symbol => |s| try writeSymbolAtom(s, w),
         .list => |xs| try writeCompound("list", xs, w, indent),
@@ -1603,9 +1660,17 @@ test "a Clojure literal nexis does not read is reported with what to write inste
     defer a.free(decimal);
     try std.testing.expectEqualStrings("nexis has no BigDecimal: 1.5 is a double", decimal);
     for ([_][]const u8{ "1abc", "1/", "/2", "1/2/3", "1.5x", "M", "1.5N" }) |text| try std.testing.expect((try numberLiteralHint(a, text)) == null);
-    try std.testing.expectEqualStrings("nexis has no #uuid literal: a UUID is its canonical string", taggedLiteralHint("#uuid").?);
-    try std.testing.expectEqualStrings("nexis reads no tagged literals", taggedLiteralHint("#js").?);
-    for ([_][]const u8{ "#", "#(", "#{", "#_", ")", "inst" }) |token| try std.testing.expect(taggedLiteralHint(token) == null);
+}
+
+test "#inst and #uuid read their string once; the same instant or UUID twice in a set is a duplicate" {
+    try expectReads("#inst \"2026-10-09T12:30:15.123+02:00\"", "(inst \"2026-10-09T10:30:15.123-00:00\")\n");
+    try expectReads("[#uuid \"1-2-3-4-5\" #inst #_x \"1970\"]", "(vector (uuid \"00000001-0002-0003-0004-000000000005\") (inst \"1970-01-01T00:00:00.000-00:00\"))\n");
+    try expectReaderError("#{#inst \"2020\" #inst \"2020-01-01T00:00Z\"}", .duplicate_literal_element, null);
+    try expectReaderError("{#uuid \"0123abcd-4567-89ef-0123-456789abcdef\" 1 #uuid \"0123ABCD-4567-89EF-0123-456789ABCDEF\" 2}", .duplicate_literal_key, null);
+    try expectReaderError("#inst \"2020-13\"", .invalid_inst, "not an instant: \"2020-13\"");
+    try expectReaderError("#inst 5", .invalid_inst, "#inst takes a string");
+    try expectReaderError("#uuid \"x\"", .invalid_uuid, "not a UUID: \"x\"");
+    try expectReaderError("#foo/bar 1", .unknown_tag, "#foo/bar; nexis reads the tags #inst and #uuid");
 }
 
 test "symbols and keywords take any UTF-8 character" {
