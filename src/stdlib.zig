@@ -486,7 +486,7 @@ const core_rows = .{
     .{ "identical?", 2, 2, &fnIdenticalQ, .leaf, "[x y]", "Returns true if x and y are the same value bit for bit: the same\n  immediate (a fixnum, float, char, keyword, ...) or the same heap\n  object." },
     .{ "assoc", 3, null, &fnAssocLeaf, .leaf, &fnAssoc, "[map key val] [map key val & kvs]", "Returns map with each key mapped to its val. Of a vector, key is an\n  index up to the count (the count appends); nil makes a map." },
     .{ "dissoc", 1, null, &fnDissoc, "[map] [map key] [map key & ks]", "Returns map, a map or record, without the keys; nil gives nil." },
-    .{ "get", 2, 3, &fnGetLeaf, .leaf, &fnGet, "[map key] [map key not-found]", "Returns the value mapped to key in map, else not-found (nil). A\n  vector or string takes an index; a value that is no collection has\n  no entries, so get never throws for the kind of map." },
+    .{ "get", 2, 3, fnGetLeaf, .leaf, fnGet, "[map key] [map key not-found]", "Returns the value mapped to key in map, else not-found (nil). A\n  vector or string takes an index; a value that is no collection has\n  no entries, so get never throws for the kind of map." },
     .{ "contains?", 2, 2, &fnContainsQ, "[coll key]", "Returns true if key is present in coll: a key of a map or record, a\n  member of a set, an index of a vector or string. It does not search\n  values; a list is :kind-mismatch." },
     .{ "keys", 1, 1, bind(mapPart, .key), "[map]", "Returns the keys of map (a map or record) as a list, nil when it\n  has none." },
     .{ "vals", 1, 1, bind(mapPart, .value), "[map]", "Returns the values of map (a map or record) as a list, nil when it\n  has none." },
@@ -854,31 +854,53 @@ const fnCount = countNative(false);
 const fnCountLeaf = countNative(true);
 
 /// `count`, the leaf's or the general native: one body, not a leaf
-/// that calls the general one, so the count is returned where the
-/// caller reads it, not copied on (`docs/VM.md` §8).
+/// that calls the general one, and each count returned by a statement
+/// of its own, so it is stored where the caller reads it, not merged
+/// in a temporary and copied on (`docs/VM.md` §8). A vector's count,
+/// the common case, is taken before the switch over every kind.
 fn countNative(comptime leaf: bool) *const fn (*VM, []const Value) VmError!Value {
     return struct {
         fn call(vm: *VM, args: []const Value) VmError!Value {
-            const c = args[0];
-            const n: i64 = switch (c.kind()) {
-                .nil => 0,
-                .list => @intCast(list_mod.count(c)),
-                .persistent_vector => @intCast(vector_mod.count(c)),
-                .typed_vector => @intCast(typed_vector_mod.count(c)),
-                .persistent_map => @intCast(champ_mod.mapCount(c)),
-                .record => @intCast(champ_mod.mapCount(record_mod.fieldsOf(c))),
-                .nextomic_entity => if (leaf) return VmError.NeedsReentry else @intCast(champ_mod.mapCount(try nextomic_mod.natives.entityMap(vm, c))),
-                .persistent_set => @intCast(champ_mod.setCount(c)),
-                .sorted_map, .sorted_set => @intCast(sorted_mod.count(c)),
-                .string => @intCast(string_mod.codepointCount(c) catch return VmError.Utf8Error),
-                .transient => @intCast(try transientCount(vm, c)),
-                .lazy_seq => if (leaf) return VmError.NeedsReentry else @intCast(try countConsumed(vm, c)),
+            if (args[0].tag == vector_tag) return countValue(vector_mod.count(args[0]));
+            switch (args[0].kind()) {
+                .nil => return countValue(0),
+                .list => return countValue(list_mod.count(args[0])),
+                .persistent_vector => return countValue(vector_mod.count(args[0])),
+                .typed_vector => return countValue(typed_vector_mod.count(args[0])),
+                .persistent_map => return countValue(champ_mod.mapCount(args[0])),
+                .record => return countValue(champ_mod.mapCount(record_mod.fieldsOf(args[0]))),
+                .nextomic_entity => {
+                    if (leaf) return VmError.NeedsReentry;
+                    return countValue(champ_mod.mapCount(try nextomic_mod.natives.entityMap(vm, args[0])));
+                },
+                .persistent_set => return countValue(champ_mod.setCount(args[0])),
+                .sorted_map, .sorted_set => return countValue(sorted_mod.count(args[0])),
+                .string => return countValue(string_mod.codepointCount(args[0]) catch return VmError.Utf8Error),
+                .transient => return countValue(try transientCount(vm, args[0])),
+                // A lazy seq's count may pass the fixnum range: an
+                // unrealized range of more elements than memory holds.
+                .lazy_seq => {
+                    if (leaf) return VmError.NeedsReentry;
+                    return value_mod.fromFixnum(@intCast(try countConsumed(vm, args[0]))) orelse VmError.ArithmeticOverflow;
+                },
                 else => return VmError.KindMismatch,
-            };
-            const v = value_mod.fromFixnum(n) orelse return VmError.ArithmeticOverflow;
-            return v;
+            }
         }
     }.call;
+}
+
+/// The whole tag word of every vector value (`vector.valueFromRoot`).
+/// A leaf tests its common receiver, a vector, by it: a test of the
+/// whole word the optimizer keeps apart from the switch on the kind
+/// after it, where a test of the kind joins that switch's table.
+const vector_tag: u64 = @as(u64, @backingInt(Kind.persistent_vector)) | (@as(u64, vector_mod.subkind_root) << 16);
+
+/// The fixnum of the count of a collection held in memory, which is
+/// always in the fixnum range.
+inline fn countValue(n: usize) Value {
+    const i: i64 = @intCast(n);
+    if (!value_mod.isFixnumRange(i)) unreachable;
+    return value_mod.fromFixnum(i).?;
 }
 
 /// How many elements a lazy seq `count` consumes has: an unrealized
@@ -897,12 +919,27 @@ fn countConsumed(vm: *VM, s: Value) VmError!usize {
     return n;
 }
 
+/// Whether `k` is a fixnum index of the vector `coll`'s elements:
+/// the case `nth` and `get` take first.
+inline fn isVectorIndex(coll: Value, k: Value) bool {
+    if (coll.tag != vector_tag or k.kind() != .fixnum) return false;
+    const idx = k.asFixnum();
+    return idx >= 0 and @as(usize, @intCast(idx)) < vector_mod.count(coll);
+}
+
 /// `nth` (`leaf`), and `nth` called other than as a leaf, which walks
 /// a lazy seq as far as the index (`seq.nthOf` computes an unrealized
 /// range's element).
 fn nthNative(comptime leaf: bool) Native {
     return &struct {
+        /// A vector's element at an index in range, the common case,
+        /// is taken before the switch over every kind.
         fn call(vm: *VM, args: []const Value) VmError!Value {
+            if (isVectorIndex(args[0], args[1])) return vector_mod.nth(args[0], @intCast(args[1].asFixnum()));
+            return @call(.always_inline, full, .{ vm, args });
+        }
+
+        fn full(vm: *VM, args: []const Value) VmError!Value {
             const coll = args[0];
             const idx_v = args[1];
             const has_default = args.len > 2;
@@ -1996,27 +2033,58 @@ fn fnDisj(vm: *VM, args: []const Value) VmError!Value {
 /// `(get m k)` / `(get m k default)`: never throws for the kind of
 /// `m`; a value that is not a collection has no entries (Clojure's
 /// `RT.get`).
-fn fnGet(vm: *VM, args: []const Value) VmError!Value {
-    const default = if (args.len > 2) args[2] else value_mod.nilValue();
-    if (args[0].kind() == .string) return (try stringIndex(args[0], args[1])) orelse default;
-    if (args[0].kind() == .typed_vector) return (try typedVectorIndex(vm, args[0], args[1])) orelse default;
-    // A key the order cannot place is an error, as in Clojure
-    // (SORTED.md §6).
-    if (sorted_mod.isSortedKind(args[0].kind())) return vm_mod.lookupIn(vm, args[0], args[1], default);
-    return vm_mod.lookup(args[0], args[1], default) catch |err| if (err == VmError.KindMismatch) default else err;
-}
+const fnGet = getNative(false);
 
 /// `get` as a leaf (VM.md §6). It refuses what only `fnGet` may run:
 /// a sorted collection (its comparator), an entity (the store), and a
 /// hashed collection searched by a key on the heap, whose hash and `=`
 /// may realize a lazy seq or walk nested data.
-fn fnGetLeaf(vm: *VM, args: []const Value) VmError!Value {
-    switch (args[0].kind()) {
-        .sorted_map, .sorted_set, .nextomic_entity => return VmError.NeedsReentry,
-        .persistent_map, .persistent_set, .record, .transient => if (args[1].kind().isHeap()) return VmError.NeedsReentry,
-        else => {},
-    }
-    return fnGet(vm, args);
+const fnGetLeaf = getNative(true);
+
+/// `get`, the leaf's or the general native: one body, each result
+/// returned by a statement of its own, so it is stored where the
+/// caller reads it, not merged in a temporary and copied on
+/// (`docs/VM.md` §8).
+fn getNative(comptime leaf: bool) Native {
+    return &struct {
+        /// A vector's element at an index in range, the common case,
+        /// is taken before the switch over every kind.
+        fn call(vm: *VM, args: []const Value) VmError!Value {
+            if (isVectorIndex(args[0], args[1])) return vector_mod.nth(args[0], @intCast(args[1].asFixnum()));
+            return @call(.always_inline, full, .{ vm, args });
+        }
+
+        fn full(vm: *VM, args: []const Value) VmError!Value {
+            const coll = args[0];
+            const key = args[1];
+            const default = if (args.len > 2) args[2] else value_mod.nilValue();
+            switch (coll.kind()) {
+                // Not at an index in range (`isVectorIndex`).
+                .persistent_vector => return default,
+                .nil => return default,
+                .persistent_map, .record => {
+                    if (leaf and key.kind().isHeap()) return VmError.NeedsReentry;
+                    const m = if (coll.kind() == .record) record_mod.fieldsOf(coll) else coll;
+                    switch (champ_mod.mapGet(m, key, &dispatch_mod.hashValue, &dispatch_mod.equal)) {
+                        .present => |v| return v,
+                        .absent => return default,
+                    }
+                },
+                .persistent_set, .transient => if (leaf and key.kind().isHeap()) return VmError.NeedsReentry,
+                .sorted_map, .sorted_set => {
+                    if (leaf) return VmError.NeedsReentry;
+                    // A key the order cannot place is an error, as in
+                    // Clojure (SORTED.md §6).
+                    return vm_mod.lookupIn(vm, coll, key, default);
+                },
+                .nextomic_entity => if (leaf) return VmError.NeedsReentry,
+                .string => return (try stringIndex(coll, key)) orelse default,
+                .typed_vector => return (try typedVectorIndex(vm, coll, key)) orelse default,
+                else => return default,
+            }
+            return vm_mod.lookup(coll, key, default) catch |err| if (err == VmError.KindMismatch) default else err;
+        }
+    }.call;
 }
 
 /// The element at fixnum index `k` of typed vector `tv`, or null
@@ -7808,6 +7876,46 @@ test "stdlib: subseq knows the four relations by their rows' functions" {
         if (want != null) found += 1;
     }
     try testing.expectEqual(4, found);
+}
+
+test "stdlib: count, nth and get take a vector first as their full bodies take it" {
+    var stub_code = [_]vm_mod.Inst{vm_mod.asm_.returnNil()};
+    const stub = vm_mod.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var vm = try VM.init(testing.allocator, &stub);
+    defer vm.deinit();
+    const fx = struct {
+        fn of(n: i64) Value {
+            return value_mod.fromFixnum(n).?;
+        }
+    }.of;
+    // Past a tail of 32, so an index reaches into the trie.
+    var elems: [40]Value = undefined;
+    for (&elems, 0..) |*e, i| e.* = fx(@intCast(i * 10));
+    const v = try vector_mod.fromSlice(vm.ensureHeap(), &elems);
+    const empty = try vector_mod.fromSlice(vm.ensureHeap(), &.{});
+    const keys = [_]Value{ fx(0), fx(5), fx(31), fx(32), fx(39), fx(40), fx(-1), fx(1 << 40), value_mod.nilValue(), value_mod.fromFloat(1.0) };
+    const same = struct {
+        fn check(a: VmError!Value, b: VmError!Value) !void {
+            if (a) |x| try testing.expect(x.identicalTo(try b)) else |e| try testing.expectError(e, b);
+        }
+    }.check;
+    for ([_]Value{ v, empty }) |coll| {
+        for (keys) |k| {
+            for ([_][]const Value{ &.{ coll, k }, &.{ coll, k, fx(-7) } }) |args| {
+                try same(fnGetLeaf(&vm, args), fnGet(&vm, args));
+                try same(nthNative(true)(&vm, args), nthNative(false)(&vm, args));
+            }
+        }
+        try same(fnCountLeaf(&vm, &.{coll}), fnCount(&vm, &.{coll}));
+    }
+    try testing.expectEqual(@as(i64, 50), (try fnGetLeaf(&vm, &.{ v, fx(5) })).asFixnum());
+    try testing.expectEqual(@as(i64, 390), (try nthNative(true)(&vm, &.{ v, fx(39) })).asFixnum());
+    try testing.expectEqual(@as(i64, -7), (try nthNative(true)(&vm, &.{ v, fx(40), fx(-7) })).asFixnum());
+    try testing.expectError(VmError.IndexOutOfBounds, nthNative(true)(&vm, &.{ v, fx(-1) }));
+    try testing.expectError(VmError.KindMismatch, nthNative(true)(&vm, &.{ v, value_mod.nilValue() }));
+    try testing.expect((try fnGetLeaf(&vm, &.{ v, fx(40) })).isNil());
+    try testing.expectEqual(@as(i64, 40), (try fnCountLeaf(&vm, &.{v})).asFixnum());
+    try testing.expectEqual(@as(i64, 0), (try fnCountLeaf(&vm, &.{empty})).asFixnum());
 }
 
 test "stdlib: name of a string is the string itself" {

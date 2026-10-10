@@ -2789,6 +2789,97 @@ What the rows say:
   and 2% of before, inside their ranges, while their cycles under
   `perf stat` are level.
 
+### 3.42 Leaf bodies that take a vector first, Linux x86-64 and Apple M5
+
+A call of `get`, `nth` or `count` through a Var is a leaf call
+(`docs/VM.md` §6), whose cost past the call is the native's body. `get`
+was a leaf that tested its receiver and called the general native,
+whose result it copied on; `nth` and `count` switched over every kind
+first. `get` is one body for the leaf and the general native, each
+result returned by a statement of its own; `count` returns a count per
+kind; and all three take their common receiver, a vector, before the
+switch over every kind, by a test of the whole tag word every vector
+value carries, which the optimizer keeps apart from the switch where a
+test of the kind joins its table (`docs/VM.md` §8). Before is
+`843a74e`, after its stdlib commit; one ReleaseFast build of each on
+each host. Provenance: §11.
+
+Apple M5, the micro kit (`docs/BENCH.md` §13), five interleaved
+rounds under `tools/heavy` (1 core; load 5.8 → 6.1), instructions and
+cycles an iteration, the median with the range:
+
+| Program | Instructions | Δ | Cycles |
+|---|---:|---:|---:|
+| `getnl`, `(get v 3)` | 395.0 [394.9–395.4] → 295.0 [295.0–295.3] | −25.3% | 50.0 → 38.0 |
+| `vnth`, `(nth v j)` | 328.0 [328.0–328.3] → 297.1 [296.9–297.2] | −9.4% | 50.3 → 42.9 |
+| `leaf1`, `(count v)` | 262.0 [261.9–262.2] → 253.0 [252.9–253.2] | −3.4% | 32.8 → 31.7 |
+| `vdestr` | 1,164.3 → 1,103.4 | −5.2% | 145.2 → 142.4 |
+| `casek`, a `case` over `(:shape m)` | 724.1 → 655.0 | −9.5% | 101.8 → 91.6 |
+| `mcall`, a multimethod on `:shape` | 1,235.1 → 1,122.1 | −9.1% | 187.3 → 174.3 |
+
+Every other program retires the same instructions within 0.5 a unit,
+its cycles within their ranges, and every peak resident set is the
+same.
+
+Linux x86-64, the micro kit with `--counter perf --pin 2`, five
+interleaved rounds in one hold of the host's benchmark lease (load
+3.6 → 3.6), per unit, the median and the range:
+
+| Program | Instructions | Cycles | Δ cycles | Blocked loads |
+|---|---:|---:|---:|---:|
+| `getnl` | 400.0 → 304.0 | 88.7 [87.9–88.9] → 60.1 [59.4–61.5] | −32.2% | 0 → 0 |
+| `vnth` | 338.0 → 313.0 | 66.4 [65.0–66.7] → 60.9 [60.2–61.0] | −8.3% | 0 → 0 |
+| `leaf1` | 268.0 → 258.0 | 54.7 [54.5–55.5] → 53.0 [51.1–54.1] | −3.1% | 0 → 0 |
+| `vdestr` | 1,190.9 → 1,135.9 | 254.9 [250.0–256.3] → 242.0 [238.7–251.2] | −5.1% | 0.001 → 0.008 |
+| `casek` | 776.0 → 707.0 | 174.1 [173.7–175.7] → 154.8 [151.4–155.3] | −11.1% | 0 → 0 |
+| `mcall` | 1,335.0 → 1,232.0 | 361.9 [361.2–365.6] → 320.3 [319.2–321.5] | −11.5% | 0.014 → 0 |
+| `count`, `fib`, `gcall`, `leaf`, `kw`, the callback programs | the same | within their ranges | | the same |
+
+The `bench/compare` language programs (`prelude.nx` with the body),
+whole process, the builds interleaved, medians (Linux: `taskset -c 2`,
+`perf stat`, seven rounds, load 2.1 → 2.6; M5: `/usr/bin/time -l`,
+five rounds under `tools/heavy`, load 4.9 → 5.3):
+
+| Row | Linux instructions | Linux cycles | M5 instructions | M5 cycles |
+|---|---:|---:|---:|---:|
+| destructuring loop | 3,093.7 → 3,038.7 M (−1.8%) | 805.2 [791.3–818.0] → 834.0 [824.1–837.9] M | 3,003.7 → 2,942.5 M (−2.0%) | 475.0 → 460.4 M |
+| vector `conj` and `nth` | 758.5 → 733.5 M (−3.3%) | 243.8 → 235.3 M (−3.5%) | 769.9 → 739.6 M (−3.9%) | 126.7 → 123.4 M |
+| map build and read | 3,479.5 → 3,410.5 M (−2.0%) | 4,628 [4,136–5,101] → 4,453 [4,062–4,732] M | 3,357.6 → 3,288.4 M (−2.1%) | 2,128 → 2,170 M, within range |
+| map through transients | 1,708.4 → 1,639.4 M (−4.0%) | within range | 1,736.8 → 1,668.3 M (−3.9%) | within range |
+| `sort` | the same | 229.1 → 227.5 M | the same, 773.1 M | 159.4 [155.2–164.9] → 171.7 [166.0–180.4] M (15 rounds) |
+| pipeline, `fib`, loop, `frequencies`/`group-by`, string split | the same within 0.3% | within range | the same within 0.1% | within range |
+
+`bench/compare/run.clj --only lang --impls nexis,bb --workloads
+destructure,vector-conj-nth,pipeline,map-build-read --n 10 --max-load 4
+--pin 0-11` on the Linux host, after then before (load 1.5 → 2.9):
+the destructuring loop 183 ms against 182, vectors 58.2 against 62.2,
+the pipeline 45.7 against 49.8, the map build 980 against 990; every
+answer equal.
+
+What the rows say:
+
+- `get` of a vector by an index in range returns the element in place
+  with no second call: a quarter of `getnl`'s instructions and a third
+  of its cycles on x86-64. A map's lookup by a keyword returns from
+  the same body (`casek`, `mcall`, 9–12%).
+- `nth` reaches a vector's element before its switch: `vnth` 8–9%,
+  `vdestr` 5%.
+- `count`'s vector test runs before its switch, but its vector path
+  keeps the stack frame its other kinds need, on both hosts: `leaf1`
+  3%.
+- Two rows' cycles move with the code's placement alone. The
+  destructuring loop calls no `get` (a `-Dopcodes=true` build: per
+  iteration two `call:lookup`, two `nth`, a `count` and an `nthnext`),
+  yet a build with only the `get` change retires its instructions
+  exactly (3,093.7 M) and runs 6% more cycles, its memory-ordering
+  machine clears 0.35 → 0.51 M: the row's hot code (`opColl`,
+  `champ.fromSlice`, `Heap.alloc`, `callLeaf`) sits 0x1c0 bytes later
+  in that build. A build with only the `nth` change runs it 3% faster.
+  `run.clj`, over twelve CPUs, has it level (183 against 182 ms). On
+  the M5 `sort`, one call of the `sort` native whose code the change
+  does not touch, retires the same instructions and runs 7.7% more
+  cycles; on the Linux host it is level.
+
 ## 6. Levers and dead ends
 
 Each lever is a measured change: a before/after from `zig build bench`
@@ -2913,6 +3004,12 @@ Each lever is a measured change: a before/after from `zig build bench`
 
 **Levers pulled.**
 
+- *Leaf bodies that take a vector first* (§3.42, `docs/VM.md` §8):
+  `get` is one body for the leaf and the general native, and `count`,
+  `nth` and `get` take a vector by its whole tag word before the
+  switch over every kind. On the M5 `getnl` 395 → 295 instructions,
+  `vnth` 328 → 297, `leaf1` 262 → 253; on the Linux host `getnl`
+  88.7 → 60.1 cycles and `vnth` 66.4 → 60.9.
 - *Natives that return in place* (§3.41, `docs/VM.md` §8): `count`,
   `nth` and `nthnext` return each result by a statement of its own,
   the leaf and the general native of `count` and `nthnext` one body
@@ -3331,4 +3428,5 @@ is one invocation's 30-sample median.
 | §3 "Durable commits", §6 "Fewer pages per durable commit", §3.15's durable note | Intel Core Ultra 9 185H, 30 GiB, Ubuntu 26.04.1 LTS, Linux 7.0.0-34-generic, ext4 on NVMe, governor `powersave`, as §3.15; Datalevin 1.1.0; and Apple M5, 10 cores, 32 GiB, macOS 27.0.1, APFS; Zig 0.17.0, ReleaseFast (`-Doptimize=fast`), emdb `b3370fb` | 2026-10-08 23:56 – 2026-10-09 00:25 MDT, durable: `bin/nexis` of `bd2cf5c`; on Linux under the `pup-bench` lease, processes pinned to CPUs 0–11, a probe of 300 durable commits per shape (`.nx` for Nextomic and `db/*`, a `dtlv exec` twin) over a copy of the `bench/compare` load, five runs of rounds with the shapes and systems alternating, the rounds whose `db/*` commit ran under 1.9 ms kept; `strace -f -c`, `strace -f -T` and `perf stat -e task-clock,page-faults` over 100 and 400 commits outside the lease; pages from a ReleaseFast build printing emdb's dirty-page count, not committed; Datalevin's writes from `strace -e pwrite64,writev,fdatasync` over 200 commits; the program table's Linux load from `bb bench/compare/run.clj --only db --impls nexis,datalevin --n 10 --max-load 4 --pin 0-11 --no-build`, its M5 rows from runs on one core at load 8–69 |
 | §3.40, §6 "A width-consistent native boundary", "A native's result assembled in a temporary" and "The boundary's other widths" | Intel Core Ultra 9 185H, 30 GiB, Ubuntu 26.04.1 LTS, Linux 7.0.0-34-generic, governor `powersave`, as §3.15; babashka v1.13.224; and Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434); Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `b3370fb` (a source snapshot on the Linux host); both hosts shared with other sessions | 2026-10-09 00:00–01:50 MDT. x86: `bin/nexis` built by `zig build install -Doptimize=fast` from `git archive` snapshots of `bd2cf5c` (before) and `4cd8e90` (after) on the Linux host; `277a3b4`'s build there has the same `.text`, byte for byte. Linux: `micro.sh`, `bb bench/micro/run.clj --counter perf --pin 2 --rounds 10 --programs count,fib,gcall,leaf,getnl,vnth,leaf1,vdestr,cbbase,cbsum,cb,lazy BEFORE AFTER`, twice, each in its own hold of the host's benchmark lease (load 0.9 → 1.2); `pairs.sh`, each run `taskset -c 2 /usr/bin/time -f %M perf stat -x, -e cpu_core/instructions/u,cpu_core/cycles/u,cpu_core/ld_blocks.store_forward/u bin/nexis run P` over `prelude.nx` with each body, the builds interleaved, ten rounds (load 1.0 → 1.3); `run.clj --n 10 --max-load 4 --pin 0-11 --no-build --only lang --impls nexis,bb --workloads destructure,vector-conj-nth,pipeline` from each snapshot, after, before, after, before (load 1.0 → 1.1). The blocked loads located with `perf mem record -t load --ldlat 4` (each sample's data source marks a load blocked on a store's data) and `perf record -e cpu_core/ld_blocks.store_forward/upp`; the dead ends from trial builds of the worktree, `perf stat` at two sizes per unit, three rounds. M5: `bb bench/micro/run.clj --rounds 5` over the same programs, twice, under `tools/heavy` (1 core; load 21.8 → 13.0), the builds `zig build install -Doptimize=fast --prefix DIR` at `bd2cf5c` and `277a3b4`. Raw output: `.git/revamp/r3/boundary/` (`pup-micro-*.txt`, `pup-pairs-1.txt`, `pup-runclj-*.txt`, `runclj/`, `m5-micro-*`) |
 | §3.41, §6 "A native's result assembled in a temporary" and "A map literal's sort" | Intel Core Ultra 9 185H, 30 GiB, Ubuntu 26.04.1 LTS, Linux 7.0.0-34-generic, governor `powersave`, as §3.15; babashka v1.13.224; and Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434); Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `8463a21` (a source snapshot on the Linux host); both hosts shared with other sessions | 2026-10-09 04:40–05:50 MDT. x86: `bin/nexis` built by `zig build install -Doptimize=fast` on the Linux host from `git archive` snapshots of `1957422` (before) and of `1957422` with the stdlib and champ commits (after; a snapshot of the two commits themselves builds the same `.text` there, byte for byte). Linux: `micro.sh`, `bb bench/micro/run.clj --counter perf --pin 2 --rounds 10 --programs count,fib,gcall,leaf,getnl,vnth,leaf1,vdestr,cbbase,cbsum,cb,lazy BEFORE AFTER`, twice, each in its own hold of the host's benchmark lease (load 0.7 → 1.4); `pairs.sh`, each run `taskset -c 2 /usr/bin/time -f %M perf stat -x, -e cpu_core/instructions/u,cpu_core/cycles/u,cpu_core/ld_blocks.store_forward/u bin/nexis run P` over `prelude.nx` with each body, the builds interleaved, ten rounds (load 0.9 → 1.7); `run.clj --n 10 --max-load 4 --pin 0-11 --no-build --only lang --impls nexis,bb --workloads destructure,vector-conj-nth,pipeline,map-build-read` from each snapshot, after, before, after, before (load 1.3 → 1.7). The natives-alone build and the dead ends from snapshots of the worktree, `perf stat` at two sizes per unit, three rounds, and the destructuring program three or four rounds; the blocked loads located with `perf record -e cpu_core/ld_blocks.store_forward/upp`. M5: `bb bench/micro/run.clj --rounds 5` over the same programs, twice, under `tools/heavy` (1 core; load 17.5 → 14.9, then 6.2 → 6.8), the builds `zig build install -Doptimize=fast --prefix DIR` of the same two trees. Raw output: `.git/revamp/r3/boundary2/` (`pup-micro-*`, `pup-pairs-w1.txt`, `pup-runclj-*.txt`, `runclj/`, `pup-probe-*.txt`, `pup-sites-w1.txt`, `m5-micro-*`) |
+| §3.42 | Intel Core Ultra 9 185H, 30 GiB, Ubuntu 26.04.1 LTS, Linux 7.0.0-34-generic, governor `powersave`, as §3.15; babashka v1.13.224; and Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434); Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `fb97dac` on the M5 and, on the Linux host, the source snapshot its revamp worktrees build against; both hosts shared with other sessions | 2026-10-10 15:18–16:08 MDT, varcall. `bin/nexis` built by `zig build install -Doptimize=fast` from `git archive` snapshots of `843a74e` (before), of `843a74e` with the stdlib commit (after), with the mask on top (the arity test), and with the `get`, `count` or `nth` change alone, on the Linux host; on the M5 with `--prefix DIR` from the worktree and a snapshot. Linux: `bb bench/micro/run.clj --counter perf --pin 2 --rounds 5 --programs count,fib,gcall,leaf,getnl,vnth,leaf1,vdestr,casek,mcall,kw,cbbase,cbsum,cb,lazy,xform BEFORE AFTER MASK` in one hold of the host's benchmark lease (load 3.6 → 3.6); `pairs.sh`, each run `taskset -c 2 /usr/bin/time -f %M perf stat -x, -e cpu_core/instructions/u,cpu_core/cycles/u,cpu_core/ld_blocks.store_forward/u bin/nexis run P` over `prelude.nx` with each of the ten bodies, the builds interleaved, seven rounds (load 2.1 → 2.6), and the destructuring loop and the pipeline fifteen rounds; the single-change builds by `perf stat` with `cpu_core/machine_clears.count/u` and `cpu_core/machine_clears.memory_ordering/u`, three rounds; `run.clj --n 10 --max-load 4 --pin 0-11 --no-build --only lang --impls nexis,bb --workloads destructure,vector-conj-nth,pipeline,map-build-read` from each snapshot, after then before (load 1.5 → 2.9). M5: `bb bench/micro/run.clj --rounds 5` over every program under `tools/heavy` (1 core; load 5.8 → 6.1), the mask and frameless builds `--rounds 3` against the build before each; `m5pairs.sh`, each run `/usr/bin/time -l bin/nexis run P` over the same ten programs, the builds interleaved, five rounds (load 4.9 → 5.3), and `sort` fifteen. Dispatch and native counts from a `-Dopcodes=true` build of the after tree. Raw output: `.git/revamp/r3/varcall/` (`m5-final.*`, `m5pairs.txt`, `m5sort.txt`, `pup/out/micro3.*`, `pup/out/pairs*.txt`, `pup/out/runclj-1-*`) |
 | §6 "Levers pulled", the `cc935cc` figures of §3.11 | as §3.11 language and database rows, shared with concurrent builds (1-minute load average 5–15) | 2026-09-26: `bb bench/compare/run.clj --only db --n 10 --max-load 6 --no-build` over ReleaseFast binaries of the ws-durability branch (after) and of `cc935cc` (before), run one after the other; each run's third attempt, the first two having seen the load pass 6; ten rounds after a warm-up. The `bin/nexis` read figures: a probe program timing 10,000 of each operation over 10,000 entities with `nano-time`, three runs of each binary, alternating. `db_put_commit_scalar`: `zig build bench -Doptimize=ReleaseFast -- --filter db-integrated,nextomic`, three invocations at the branch head and two at `cc935cc`, alternating, the best median; §3.6's durable M5 figure is the `cc935cc` run's, and the branch head measured 7.2–8.9 ms under `NEXIS_DURABILITY=durable` at load 7 |
