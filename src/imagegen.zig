@@ -56,7 +56,7 @@ pub fn main(init: std.process.Init) !u8 {
 
 fn fail(io: std.Io, comptime fmt: []const u8, args: anytype) u8 {
     var buf: [512]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "nexis-imagegen: " ++ fmt ++ "\n", args) catch "nexis-imagegen: failed\n";
+    const msg = std.mem.print(&buf, "nexis-imagegen: " ++ fmt ++ "\n", args) catch "nexis-imagegen: failed\n";
     std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
     return 1;
 }

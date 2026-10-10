@@ -17,7 +17,7 @@
 //!   - Tag `(syntax-quote x)` only: auto-qualification, auto-gensym and
 //!     unquote expansion live in the macroexpander (MACROEXPAND.md).
 //!
-//! `readForm` calls `stack.check` on entry, so input nested past the stack's
+//! `readOneForm` calls `stack.check` on entry, so input nested past the stack's
 //! budget is `:nesting-too-deep`, and each Form's span comes from its
 //! tokens in O(1). An integer literal beyond i64, in any radix, is a
 //! `bigint` carrying canonical decimal text, so the compiler lifts it into
@@ -171,6 +171,22 @@ pub const ErrorKind = enum {
     invalid_regex,
 };
 
+/// `kind` as nexis spells it, in kebab case (`:bad-number-literal`).
+pub fn kindName(kind: ErrorKind) []const u8 {
+    const names = comptime blk: {
+        const tags = std.enums.values(ErrorKind);
+        var out: [tags.len][]const u8 = undefined;
+        for (tags, &out) |tag, *name| {
+            var text: [@tagName(tag).len]u8 = @tagName(tag).*;
+            std.mem.replaceScalar(u8, &text, '_', '-');
+            const final = text;
+            name.* = &final;
+        }
+        break :blk out;
+    };
+    return names[@backingInt(kind)];
+}
+
 pub const Error = struct {
     kind: ErrorKind,
     span: SrcSpan,
@@ -210,13 +226,7 @@ pub const Reader = struct {
     /// Normalize a top-level `(program forms...)` sexp into a slice of
     /// Forms.
     pub fn readProgram(self: *Reader, tree: Sexp) ReaderError![]const *Form {
-        if (!tree.isKind(.program)) return self.fail(.unknown_reader_construct, sexpSpan(tree), null);
         return try self.readFormsList(tree.items()[1..]);
-    }
-
-    /// Normalize a single `form` sexp into one `*Form`.
-    pub fn readOneForm(self: *Reader, tree: Sexp) ReaderError!*Form {
-        return try self.readForm(tree);
     }
 
     // -------------------------------------------------------------------------
@@ -227,7 +237,7 @@ pub const Reader = struct {
     /// forms: an atom holds its one token, a compound its children
     /// between its delimiter tokens, a prefix form its token and its
     /// target (`nexis.grammar`).
-    fn readForm(self: *Reader, s: Sexp) ReaderError!*Form {
+    pub fn readOneForm(self: *Reader, s: Sexp) ReaderError!*Form {
         stack.check() catch return self.fail(.nesting_too_deep, sexpSpan(s), null);
         const items = s.items();
         if (items.len < 2 or items[0] != .tag or items[1] != .src)
@@ -269,7 +279,7 @@ pub const Reader = struct {
 
     fn readFormsList(self: *Reader, items: []const Sexp) ReaderError![]const *Form {
         const out = try self.allocator().alloc(*Form, items.len);
-        for (items, out) |item, *f| f.* = try self.readForm(item);
+        for (items, out) |item, *f| f.* = try self.readOneForm(item);
         return out;
     }
 
@@ -320,13 +330,9 @@ pub const Reader = struct {
         return try self.makeForm(.{ .real = value }, span);
     }
 
+    /// The scanner's string token runs from its `"` to its closing one.
     fn readString(self: *Reader, text: []const u8, span: SrcSpan) ReaderError!*Form {
-        const raw = text;
-        if (raw.len < 2 or raw[0] != '"' or raw[raw.len - 1] != '"') {
-            return self.fail(.invalid_string_escape, span, raw);
-        }
-        const body = raw[1 .. raw.len - 1];
-        const decoded = try self.decodeStringEscapes(body, span);
+        const decoded = try self.decodeStringEscapes(text[1 .. text.len - 1], span);
         return try self.makeForm(.{ .string = decoded }, span);
     }
 
@@ -353,26 +359,18 @@ pub const Reader = struct {
         }
     }
 
+    /// The scanner's char token is `\` and at least one byte.
     fn readChar(self: *Reader, text: []const u8, span: SrcSpan) ReaderError!*Form {
-        const raw = text;
-        if (raw.len < 2 or raw[0] != '\\') {
-            return self.fail(.invalid_char_literal, span, raw);
-        }
-        const body = raw[1..];
-        const scalar = parseCharLiteral(body) orelse
-            return self.fail(.invalid_char_literal, span, raw);
+        const scalar = parseCharLiteral(text[1..]) orelse
+            return self.fail(.invalid_char_literal, span, text);
         return try self.makeForm(.{ .char = scalar }, span);
     }
 
+    /// The scanner's keyword token is `:` and at least one byte.
     fn readKeyword(self: *Reader, text: []const u8, span: SrcSpan) ReaderError!*Form {
-        const raw = text;
-        if (raw.len < 2 or raw[0] != ':') {
-            return self.fail(.invalid_keyword, span, raw);
-        }
-        if (!std.unicode.utf8ValidateSlice(raw)) return self.fail(.invalid_utf8, span, null);
-        const body = raw[1..];
-        const name = splitNamespace(body) orelse
-            return self.fail(.invalid_keyword, span, raw);
+        if (!std.unicode.utf8ValidateSlice(text)) return self.fail(.invalid_utf8, span, null);
+        const name = splitNamespace(text[1..]) orelse
+            return self.fail(.invalid_keyword, span, text);
         return try self.makeForm(.{ .keyword = name }, span);
     }
 
@@ -449,7 +447,7 @@ pub const Reader = struct {
             .unquote, .@"unquote-splicing" => self.syntax_quote_depth += 1,
             else => {},
         };
-        const inner = try self.readForm(items[2]);
+        const inner = try self.readOneForm(items[2]);
         const datum: Datum = switch (tag) {
             .quote => .{ .quote = inner },
             .deref => .{ .deref = inner },
@@ -467,7 +465,7 @@ pub const Reader = struct {
     fn readVarQuote(self: *Reader, s: Sexp) ReaderError!*Form {
         const items = s.items();
         const head = try self.makeForm(.{ .symbol = .{ .ns = null, .name = "var" } }, tokenSpan(items[1].src));
-        const inner = try self.readForm(items[2]);
+        const inner = try self.readOneForm(items[2]);
         const list = try self.allocator().dupe(*Form, &.{ head, inner });
         return try self.makeForm(.{ .list = list }, spanTo(items[1].src.pos, inner.origin));
     }
@@ -494,7 +492,7 @@ pub const Reader = struct {
             try metas.append(self.allocator(), items[3]);
             current = items[2];
         }
-        const target = try self.readForm(current);
+        const target = try self.readOneForm(current);
         const span = spanTo(s.items()[1].src.pos, target.origin);
         const merged = try self.mergeMetaChain(metas.items, span);
         return try self.makeForm(.{ .with_meta = .{ .target = target, .meta = merged } }, span);
@@ -511,7 +509,7 @@ pub const Reader = struct {
         var i = raw_metas.len;
         while (i > 0) {
             i -= 1;
-            const m = try self.readForm(raw_metas[i]);
+            const m = try self.readOneForm(raw_metas[i]);
             try self.appendMetaEntries(&entries, m, span);
         }
         // Walk the pairs from the end, keeping each literal key's last
@@ -676,6 +674,20 @@ pub fn openDelimiter(allocator: std.mem.Allocator, text: []const u8, pos: u32) e
         }
     }
     return open.pop();
+}
+
+/// The literal a `"` or `#"` at `pos` opens that no quote closes,
+/// which a parse error at `pos` reports as unterminated (more input
+/// may close it); null for any other text at `pos`.
+pub fn unterminatedLiteral(text: []const u8, pos: u32) ?enum { string, regex } {
+    var lexer = nexis.Lexer.init(text);
+    lexer.base.pos = pos;
+    const t = lexer.next();
+    if (t.cat != .err or t.pos != pos) return null;
+    const token = text[t.pos..][0..t.len];
+    if (std.mem.eql(u8, token, "\"")) return .string;
+    if (std.mem.eql(u8, token, "#\"")) return .regex;
+    return null;
 }
 
 /// Where the first form of `text` ends, by the scanner's tokens: past
@@ -1081,56 +1093,19 @@ fn writeSymbolAtom(s: Name, w: *std.Io.Writer) std.Io.Writer.Error!void {
 // -----------------------------------------------------------------------------
 
 test "number token boundary: a digit-led run is one token the reader rejects" {
-    const allocator = std.testing.allocator;
     // Each source holds one malformed number; the error spans exactly
     // that token and carries its text (FORMS.md §3, "Number token
     // boundary").
-    const cases = [_]struct { src: []const u8, pos: u32, text: []const u8 }{
-        .{ .src = "1abc", .pos = 0, .text = "1abc" },
-        .{ .src = "(println 1-2)", .pos = 9, .text = "1-2" },
-        .{ .src = "[1.5x]", .pos = 1, .text = "1.5x" },
-        .{ .src = "-1abc", .pos = 0, .text = "-1abc" },
-        .{ .src = "1/2", .pos = 0, .text = "1/2" },
-        .{ .src = "0x", .pos = 0, .text = "0x" },
-        .{ .src = "0b12", .pos = 0, .text = "0b12" },
-        .{ .src = "1.", .pos = 0, .text = "1." },
-        .{ .src = "1e", .pos = 0, .text = "1e" },
-        .{ .src = "1:a", .pos = 0, .text = "1:a" },
-        .{ .src = "1'", .pos = 0, .text = "1'" },
-        .{ .src = "3.14M", .pos = 0, .text = "3.14M" },
-        .{ .src = "1.5N", .pos = 0, .text = "1.5N" },
-        .{ .src = "1_000", .pos = 0, .text = "1_000" },
-        .{ .src = "1.0_5", .pos = 0, .text = "1.0_5" },
-        .{ .src = "1e1_0", .pos = 0, .text = "1e1_0" },
-        .{ .src = "+1x", .pos = 0, .text = "+1x" },
-    };
-    for (cases) |c| {
-        var p = parser.Parser.init(allocator, c.src);
-        defer p.deinit();
-        const tree = try p.parseProgram();
-        var rd = Reader.init(allocator, c.src);
-        defer rd.deinit();
-        try std.testing.expectError(error.ReaderFailure, rd.readProgram(tree));
-        const e = rd.err orelse return error.TestUnexpectedResult;
-        try std.testing.expect(e.kind == .bad_number_literal);
-        try std.testing.expectEqualStrings(c.text, e.detail.?);
-        try std.testing.expectEqual(c.pos, e.span.pos);
-        try std.testing.expectEqual(@as(u32, @intCast(c.text.len)), e.span.len);
-    }
-
+    for ([_][2][]const u8{
+        .{ "1abc", "1abc" }, .{ "(println 1-2)", "1-2" }, .{ "[1.5x]", "1.5x" }, .{ "-1abc", "-1abc" },
+        .{ "1/2", "1/2" },   .{ "0x", "0x" },             .{ "0b12", "0b12" },   .{ "1.", "1." },
+        .{ "1e", "1e" },     .{ "1:a", "1:a" },           .{ "1'", "1'" },       .{ "3.14M", "3.14M" },
+        .{ "1.5N", "1.5N" }, .{ "1_000", "1_000" },       .{ "1.0_5", "1.0_5" }, .{ "1e1_0", "1e1_0" },
+        .{ "+1x", "+1x" },
+    }) |c| try expectTokenError(c[0], .bad_number_literal, c[1]);
     // A reader macro character or a delimiter ends the number, as it
     // would end a symbol: `1@x` is `1` then `(deref x)`.
-    const two = "(1@x)";
-    var p = parser.Parser.init(allocator, two);
-    defer p.deinit();
-    var rd = Reader.init(allocator, two);
-    defer rd.deinit();
-    const forms = try rd.readProgram(try p.parseProgram());
-    try std.testing.expectEqual(@as(usize, 1), forms.len);
-    const items = forms[0].datum.list;
-    try std.testing.expectEqual(@as(usize, 2), items.len);
-    try std.testing.expectEqual(@as(i64, 1), items[0].datum.int);
-    try std.testing.expect(items[1].datum == .deref);
+    try expectReads("(1@x)", "(list\n  (int 1)\n  (deref (symbol x)))\n");
 }
 
 test "signed numbers and digit-led keywords read as in Clojure" {
@@ -1313,6 +1288,21 @@ fn expectReaderError(src: []const u8, kind: ErrorKind, detail: ?[]const u8) !voi
     if (detail) |d| try std.testing.expectEqualStrings(d, rd.err.?.detail.?);
 }
 
+/// `src` fails to read with `kind` over exactly the token `token`,
+/// which is its detail.
+fn expectTokenError(src: []const u8, kind: ErrorKind, token: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var p = parser.Parser.init(allocator, src);
+    defer p.deinit();
+    var rd = Reader.init(allocator, src);
+    defer rd.deinit();
+    try std.testing.expectError(error.ReaderFailure, rd.readProgram(try p.parseProgram()));
+    const e = rd.err.?;
+    try std.testing.expectEqual(kind, e.kind);
+    try std.testing.expectEqualStrings(token, e.detail.?);
+    try std.testing.expectEqualStrings(token, src[e.span.pos..][0..e.span.len]);
+}
+
 test "strings: may span lines, must be UTF-8, fail at their bad escape" {
     try expectReads("\"Line one.\n  Line two.\"", "(string \"Line one.\\n  Line two.\")\n");
     try expectReads("\"é\\u{2603}\"", "(string \"\\u{C3}\\u{A9}\\u{E2}\\u{98}\\u{83}\")\n");
@@ -1356,17 +1346,8 @@ test "char literals: one token to the next delimiter, judged whole" {
     // letter or digit run after a char, a surrogate and a scalar past
     // U+10FFFF are errors over the whole token, never a char followed
     // by more forms.
-    const allocator = std.testing.allocator;
-    for ([_][]const u8{ "\\u041", "\\u00411", "\\uD800", "\\o101", "\\a1", "\\ab", "\\é1", "\\u{D800}", "\\u{110000}", "\\u{41}x" }) |src| {
-        var p = parser.Parser.init(allocator, src);
-        defer p.deinit();
-        var rd = Reader.init(allocator, src);
-        defer rd.deinit();
-        try std.testing.expectError(error.ReaderFailure, rd.readProgram(try p.parseProgram()));
-        try std.testing.expect(rd.err.?.kind == .invalid_char_literal);
-        try std.testing.expectEqualStrings(src, rd.err.?.detail.?);
-        try std.testing.expectEqual(@as(u32, @intCast(src.len)), rd.err.?.span.len);
-    }
+    for ([_][]const u8{ "\\u041", "\\u00411", "\\uD800", "\\o101", "\\a1", "\\ab", "\\é1", "\\u{D800}", "\\u{110000}", "\\u{41}x" }) |src|
+        try expectTokenError(src, .invalid_char_literal, src);
 }
 
 test "discard applies uniformly across aggregator contexts" {
@@ -1591,9 +1572,10 @@ test "##Inf, ##-Inf and ##NaN are the symbolic floats" {
 test "an unsupported construct is one err token, so the parse error names it" {
     const allocator = std.testing.allocator;
     const cases = [_][2][]const u8{
-        .{ "#\"a.*", "#\"" },  .{ "##Infinity", "##Infinity" }, .{ "#!/usr/bin/env nexis", "#!/usr/bin/env" },
-        .{ "::k", "::k" },     .{ "#?(:clj 1)", "#?" },         .{ "# x", "#" },
-        .{ "##inf", "##inf" }, .{ "(##NaN1)", "##NaN1" },
+        .{ "#\"a.*", "#\"" },      .{ "##Infinity", "##Infinity" },
+        .{ "::k", "::k" },         .{ "#?(:clj 1)", "#?" },
+        .{ "# x", "#" },           .{ "##inf", "##inf" },
+        .{ "(##NaN1)", "##NaN1" },
     };
     for (cases) |c| {
         var p = parser.Parser.init(allocator, c[0]);
@@ -1633,78 +1615,27 @@ test "symbols and keywords take any UTF-8 character" {
     try expectReaderError(":k\xc3", .invalid_utf8, null);
 }
 
-test "keyword starting with `-` is accepted" {
-    const allocator = std.testing.allocator;
-    const src: []const u8 = ":-foo :-> :-";
-    var p = parser.Parser.init(allocator, src);
-    defer p.deinit();
-    const tree = try p.parseProgram();
-    var rd = Reader.init(allocator, src);
-    defer rd.deinit();
-    const forms = try rd.readProgram(tree);
-    try std.testing.expectEqual(@as(usize, 3), forms.len);
-    for (forms) |f| try std.testing.expect(f.datum == .keyword);
-    try std.testing.expectEqualStrings("-foo", forms[0].datum.keyword.name);
-    try std.testing.expectEqualStrings("->", forms[1].datum.keyword.name);
-    try std.testing.expectEqualStrings("-", forms[2].datum.keyword.name);
+test "a keyword may start with `-`" {
+    try expectReads(":-foo :-> :-", "(keyword :-foo)\n(keyword :->)\n(keyword :-)\n");
 }
 
 test "multi-slash qualified names are rejected" {
-    const allocator = std.testing.allocator;
-    const cases = [_][]const u8{ "foo/bar/baz", ":foo/bar/baz" };
-    for (cases) |src| {
-        var p = parser.Parser.init(allocator, src);
-        defer p.deinit();
-        const tree = try p.parseProgram();
-        var rd = Reader.init(allocator, src);
-        defer rd.deinit();
-        try std.testing.expectError(error.ReaderFailure, rd.readProgram(tree));
-    }
+    try expectReaderError("foo/bar/baz", .invalid_symbol, "foo/bar/baz");
+    try expectReaderError(":foo/bar/baz", .invalid_keyword, ":foo/bar/baz");
 }
 
 test "anon-fn stores body only (no synthetic head)" {
     const allocator = std.testing.allocator;
-    const src: []const u8 = "#(+ % 1)";
-    var p = parser.Parser.init(allocator, src);
+    var p = parser.Parser.init(allocator, "#(+ % 1)");
     defer p.deinit();
-    const tree = try p.parseProgram();
-    var rd = Reader.init(allocator, src);
+    var rd = Reader.init(allocator, "#(+ % 1)");
     defer rd.deinit();
-    const forms = try rd.readProgram(tree);
-    try std.testing.expectEqual(@as(usize, 1), forms.len);
-    try std.testing.expect(forms[0].datum == .anon_fn);
-    // Body is exactly the source forms — no pre-pended `#%anon-fn` symbol.
-    const body = forms[0].datum.anon_fn;
-    try std.testing.expectEqual(@as(usize, 3), body.len);
-    try std.testing.expect(body[0].datum == .symbol);
-    try std.testing.expectEqualStrings("+", body[0].datum.symbol.name);
-    try std.testing.expect(body[1].datum == .symbol);
-    try std.testing.expectEqualStrings("%", body[1].datum.symbol.name);
-    try std.testing.expect(body[2].datum == .int);
-    try std.testing.expectEqual(@as(i64, 1), body[2].datum.int);
+    const forms = try rd.readProgram(try p.parseProgram());
+    try std.testing.expectEqual(@as(usize, 3), forms[0].datum.anon_fn.len);
+    try std.testing.expectEqualStrings("+", forms[0].datum.anon_fn[0].datum.symbol.name);
 }
 
-test "end-to-end: simple reader + pretty-print round trip" {
-    const allocator = std.testing.allocator;
-    const source: []const u8 = "(def x 42)";
-    var p = parser.Parser.init(allocator, source);
-    defer p.deinit();
-    const tree = try p.parseProgram();
-
-    var rd = Reader.init(allocator, source);
-    defer rd.deinit();
-
-    const forms = try rd.readProgram(tree);
-
-    var al: std.Io.Writer.Allocating = .init(allocator);
-    defer al.deinit();
-    try writeProgram(forms, &al.writer);
-    const out = al.written();
-
-    const expected =
-        \\(program
-        \\  (list (symbol def) (symbol x) (int 42)))
-        \\
-    ;
-    try std.testing.expectEqualStrings(expected, out);
+test "kindName spells an ErrorKind as nexis does" {
+    try std.testing.expectEqualStrings("bad-number-literal", kindName(.bad_number_literal));
+    try std.testing.expectEqualStrings("invalid-utf8", kindName(.invalid_utf8));
 }

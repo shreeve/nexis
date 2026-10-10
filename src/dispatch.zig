@@ -1,4 +1,5 @@
-//! dispatch.zig — `=` and `hash` over any Value (SEMANTICS §2, §3).
+//! dispatch.zig — `=` and `hash` over any Value (SEMANTICS §2, §3),
+//! and the metadata a heap block carries as a Value.
 //!
 //! Immediates go to `Value.equalImmediate` / `Value.hashImmediate`;
 //! heap kinds to their own modules. The collection modules take the
@@ -8,10 +9,10 @@
 //!
 //! Four rules decide every pair of values:
 //!
-//!   - **Identity kinds** (functions, vars, handles, atoms, transients,
-//!     protocols, Nextomic connections) are equal to themselves only
-//!     and hash their pointer. The collector never moves a block, so
-//!     the pointer is stable for the value's life.
+//!   - **Identity kinds** (`isIdentityKind`: functions, Vars, handles,
+//!     atoms, transients, protocols, regexes, matchers) are equal to
+//!     themselves only and hash their pointer. The collector never
+//!     moves a block, so the pointer is stable for the value's life.
 //!   - **Sequential kinds** (list, vector, lazy seq) compare
 //!     element-wise across kinds and share one hash domain byte, so
 //!     `(= '(1 2) [1 2])` and their hashes agree. A lazy block whose
@@ -152,7 +153,7 @@ pub fn hashValue(v: Value) u64 {
 }
 
 /// A heap kind's hash before the domain byte is mixed in.
-pub fn heapHashBase(v: Value) u64 {
+fn heapHashBase(v: Value) u64 {
     const k = v.kind();
     std.debug.assert(k.isHeap());
     if (isIdentityKind(k)) return hash_mod.hashU64(v.payload);
@@ -397,6 +398,14 @@ fn lazyHash(v: Value) u64 {
     const truncated: u32 = @truncate(hash_mod.finalizeOrdered(acc, n));
     if (cacheable and truncated != 0) h.setCachedHash(truncated);
     return truncated;
+}
+
+/// The metadata block `h` carries, as a value: a hash map or, when
+/// `with-meta` was given one, a sorted map; nil when it carries none.
+pub fn metaOf(h: *const heap_mod.HeapHeader) Value {
+    const m = h.getMeta() orelse return value.nilValue();
+    if (m.kind == @backingInt(Kind.sorted_map)) return Heap.valueFromHeader(.sorted_map, m);
+    return champ.valueFromMapHeader(m);
 }
 
 // =============================================================================

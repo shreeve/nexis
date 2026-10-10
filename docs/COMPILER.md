@@ -7,7 +7,7 @@ specifies what the emitted bytecode does, `docs/MACROEXPAND.md` the
 Form → Form rewriter that runs first, `docs/FORMS.md` the Form schema.
 The frozen decisions it refines are `PLAN.md` §23 #19 (`recur`), #21
 (operand kinds) and #31 (the primitive core). It pins what each stage
-guarantees, not the Zig shape of `Tiny`, `Compiled` or the `Emitter`
+guarantees, not the Zig shape of `Tiny` or the `Emitter`
 (§11).
 
 ---
@@ -37,8 +37,9 @@ guarantees, not the Zig shape of `Tiny`, `Compiled` or the `Emitter`
 - A bytecode cache or object file: every run compiles from source.
 - A separate resolver or analyzer module: classification and
   capture marking happen inside `lowerForm`.
-- Register allocation beyond a stack of slots (§4.4); inline caches,
-  operand-specialized opcodes.
+- Register allocation beyond a stack of slots (§4.4) and inline
+  caches. Operand-specialized forms are the VM's quickening of the
+  finished code (§4.5, VM.md §10.10), not opcodes the emitter chooses.
 
 ---
 
@@ -143,6 +144,9 @@ and a reused subform its own (MACROEXPAND.md §4b).
 
    `(not x)` inlines the same way, as `(if x false true)`, which is
    what the fn computes; as an `if` test it is a branch (§5.2).
+   Clojure inlines neither `not` nor `mod`, so a redefinition of their
+   roots reaches compiled calls there and not here
+   (`CLOJURE-REVIEW.md` §4.3).
 
    It inlines only when the operator means `nexis.core`'s Var
    (`namesCore`): it is not lexically bound, the namespace resolves it
@@ -163,7 +167,7 @@ and a reused subform its own (MACROEXPAND.md §4b).
    namespace, then its parent chain (`user`'s parent is `nexis.core`).
 7. **Declared-later name**: a name the file or REPL line defines
    anywhere, at any depth (`def`, `defn`, `defn-`, `defonce`, `defmacro`,
-   `defrecord` and its derived names, `defprotocol` and its methods;
+   `defmulti`, `deftest`, `defrecord` and its derived names, `defprotocol` and its methods;
    `DeclaredNames`, collected before any form compiles), so a form
    may refer to a Var a later form defines.
 8. Otherwise `UnresolvedSymbol`, at the symbol's own span.
@@ -189,8 +193,8 @@ is an ordinary call.
 - A name repeated in one parameter list, the rest parameter
   included, names its last occurrence, as in Clojure: each takes its
   argument's slot, and the later binding shadows the earlier
-  (`(fn* [_ _ old new] ...)`). A name repeated in one `letfn*` is
-  `DuplicateBinding`. `&` is never a parameter name:
+  (`(fn* [_ _ old new] ...)`); so does a name repeated in one
+  `letfn*`, in every body of the form. `&` is never a parameter name:
   `(fn* [a b & r] body)` lowers with `rest_param = "r"`, and a
   `letfn*` binding takes a rest parameter the same way.
 - Every binding a closure captures is marked as the reference is
@@ -200,11 +204,9 @@ is an ordinary call.
   `UnsupportedFeature` (the expander lowers every surface matcher to
   `any`, MACROEXPAND.md §2b). The catch binding may be captured.
 - An integer literal outside the i48 fixnum range lowers to a bignum
-  constant; `IntegerOutOfFixnumRange` is only for a hand-built
-  `Tiny.int` outside it.
+  constant, so a `Tiny.int` is always a fixnum.
 
-**Errors**: `UnresolvedSymbol`, `DuplicateBinding`,
-`MalformedForm`, `ExpectedSymbol`, `ExpectedVector`,
+**Errors**: `UnresolvedSymbol`, `MalformedForm`, `ExpectedSymbol`, `ExpectedVector`,
 `UnsupportedFeature`, `StackOverflow`.
 
 #### 4.4 Emitter: slots, captures, codegen
@@ -594,9 +596,10 @@ when §4.4 allows it. The body compiles as `do`.
   captured parameter, rest included, is boxed at function entry.
 - `fn*` takes one parameter vector and its body, or one or more
   clauses `([params...] body...)`, as Clojure's `fn*` does. The clauses
-  keep Clojure's rules, else `MalformedForm`: no two take the same
-  fixed count, at most one has a rest parameter, and its fixed count
-  is at least every other clause's.
+  keep Clojure's rules, else `MalformedForm` at the clause at fault,
+  saying which: no two take the same fixed count, at most one has a
+  rest parameter, and its fixed count is at least every other
+  clause's; `&` takes exactly one parameter after it.
 
 **Clauses.** Each clause compiles into a routine of its own, in a
 child Emitter of its own, so a clause is an ordinary `fn*` body for
@@ -915,18 +918,15 @@ not):
 | Variant | Raised for |
 |---|---|
 | `UnresolvedSymbol` | a symbol that resolves to nothing (§4.3); the detail names it |
-| `DuplicateBinding` | a repeated `letfn*` name |
 | `MalformedForm` | a special form of the wrong shape (`(if)`, `(quote)`, an odd `#%map`) |
 | `ExpectedSymbol`, `ExpectedVector` | a binding name that is not a symbol; a binding or parameter spec that is not a vector |
 | `UnsupportedFeature` | a non-`any` catch matcher; a syntax-quote, `#(...)`, `@x` or `^meta` datum reaching lowering, a syntax-quote or unquote inside a quote; a quoted symbol or keyword without an interner, a string, bignum or quoted compound without a heap |
-| `RecurOutsideTail`, `RecurArityMismatch` | §4.4 |
+| `RecurOutsideTail`, `RecurArityMismatch` | §4.4; the sentence says which, and for the count what the target takes |
 | `SlotOverflow` | the limits of §4.4 that remain: slots live at once, upvalues |
 | `MacroDepthExceeded` | 256 expansions in a row (MACROEXPAND.md §6) |
 | `MacroExpansionFailure` | every other expansion error: a malformed macro call, a macro that threw or returned a non-form (MACROEXPAND.md §8) |
 | `StackOverflow` | a form nested past the native stack budget (below) |
 | `ReaderFailure` | `compileSourceWith` could not parse or read its text |
-| `IntegerOutOfFixnumRange` | a hand-built `Tiny.int` outside i48 (§4.3) |
-| `UnsupportedForm` | `eval` given a value that is not a form (MACROEXPAND.md §1.2); the compiler never raises it |
 | `RequiredFileFailed`, `ControlTransferred` | not compile errors: the loader's run signals for a `require`d file, passed through under their own names (MACROEXPAND.md §8) |
 | `InternalCompilerBug` | an invariant the compiler believes impossible, reported instead of miscompiled |
 | `OutOfMemory` | |
@@ -969,8 +969,8 @@ is none), on the calling VM, a catchable value like any other throw
 - Lowering allocates every node as a `TinyNode{span, tiny}` stamped
   with its Form's span; a node lowering synthesizes (the `do` around a
   body, the constant 1 of an inlined `inc`) has none and inherits its
-  enclosing form's. A hand-built `Tiny` tree compiles without spans
-  (`compileTiny`).
+  enclosing form's. Every tree the `Emitter` takes is made of these
+  nodes.
 - The `Emitter` attributes every instruction to the innermost node
   being compiled: `compileExpr` sets the current span on entry and
   restores the parent's on exit, so an instruction a parent emits
@@ -1043,9 +1043,8 @@ end through every host macro and every `try` exit path.
 
 | Entry | What it does |
 |---|---|
-| `compileFormWith(allocator, form, options)` | Macroexpand, lower and emit one Form into a `Compiled` routine. The loader (`nexis run`, the REPL, `require`) and `eval` compile through it. |
+| `compileFormWith(allocator, form, options)` | Macroexpand, lower and emit one Form into a `vm.Routine` named `<top>`. The loader (`nexis run`, the REPL, `require`) and `eval` compile through it. |
 | `compileSourceWith(allocator, source, options)` | Parse and read the first form of `source`, then `compileFormWith`; `ReaderFailure` when it cannot. |
-| `compileTiny(allocator, tiny)` | Emit a hand-built `Tiny` tree: no namespace, no expansion, no span table. |
 
 `CompileOptions` (every field optional): `namespace`, `interner`,
 `host_macros`, `out_span`, `out_detail`, `io` (what a user macro's
@@ -1067,6 +1066,6 @@ top-level `do` one form at a time (MACROEXPAND.md §2b).
 
 ### 11. Left to the implementation
 
-The Zig shapes of `Tiny`, `Compiled`, the scope tables and the `Emitter`,
+The Zig shapes of `Tiny`, the scope tables and the `Emitter`,
 and the frame stack's backing storage, are not part of this contract;
 any representation that keeps the invariants above conforms.

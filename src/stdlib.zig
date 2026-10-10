@@ -8247,6 +8247,22 @@ test "stdlib: the image refuses what it cannot carry" {
     try testing.expectEqualStrings("sorted_map", why);
 }
 
+test "stdlib: the image refuses sorted-map metadata as it refuses a sorted map" {
+    const gpa = testing.allocator;
+    var a: ImageTestRuntime = undefined;
+    try a.init();
+    defer a.deinit();
+    try installNatives(a.loader.registry);
+    var natives = try image_mod.NativeIndex.scan(gpa, a.loader.registry);
+    defer natives.deinit(gpa);
+    try bootSources(&a.loader);
+    const meta = try a.eval("nexis.core", "(def image-test-sorted-meta (with-meta [1] (sorted-map :a 1)))");
+    gpa.free(meta);
+    var why: []const u8 = "";
+    try testing.expectError(error.Unsupported, image_mod.write(gpa, &a.v, &natives, &embedded, .{ .auto_gensyms = 0, .gensyms = 0 }, &why));
+    try testing.expectEqualStrings("sorted_map", why);
+}
+
 test "stdlib: reduce, mapv, filterv and the lazy producers call a closure in batches with one call's results" {
     // Expected values from babashka and JVM Clojure 1.12.6.
     const gpa = testing.allocator;

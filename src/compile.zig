@@ -228,6 +228,8 @@ const Clause = struct {
 const FnBinding = struct {
     name: []const u8,
     clauses: []const Clause,
+    /// The entry's span, its routine's origin.
+    span: reader_mod.SrcSpan,
 };
 
 /// The sequential bindings and body of a `let*` or `loop*`.
@@ -248,16 +250,10 @@ const Binding = struct {
     refs: u32 = 0,
 };
 
-/// How a lexical binding is realized in the current routine's
-/// frame. A binding lowering marks as captured is boxed where it
-/// is bound and is a `.cell_slot`; every other binding is a
-/// `.direct_slot`.
-///
-/// Same-frame read dispatch (in `compileSymbol`):
-///   .direct_slot(s)  → emit `mov:move dst, slot(s)`
-///   .cell_slot(s)    → emit `closure:get-cell dst, slot(s)`
-///   .upvalue(u)      → emit `mov:move dst, u:u` (resolve(u)
-///                      deref's the cell at runtime)
+/// How a lexical binding is held in the current routine's frame: a
+/// binding lowering marked captured is boxed where it is bound and is
+/// a `.cell_slot`, an enclosing routine's an `.upvalue`, any other a
+/// `.direct_slot` (COMPILER.md §6.1).
 const BindingRef = union(enum) {
     /// Ordinary slot; binding's value lives directly in
     /// `slot[s]`. Most bindings stay here.
@@ -315,30 +311,17 @@ fn ScopeTable(comptime T: type) type {
     };
 }
 
-/// Routine-level capture cache entry. Maps a captured name to its upvalue index, so repeat references
-/// to the same outer name from different lexical scopes share
-/// a single upvalue/descriptor entry.
+/// A captured name and its upvalue, so every reference to the name
+/// shares one upvalue.
 const CapturedName = struct {
     name: []const u8,
     upvalue: u12,
 };
 
-/// Where `(recur args...)` should jump and which slots it
-/// rebinds. Threaded through `compileExpr` in tail position.
-///
-/// Lifetime: the struct (and the slices it points to) is owned
-/// by whichever compile* function established the target —
-/// `compileLoopStar` or `compileFn`. Body compilation must
-/// complete before the owning function returns.
-///
-/// Tail-position propagation rules (per COMPILER.md §4.4):
-///   - `if` then/else: propagate the outer target
-///   - `do` last expr, `let*` body, `letfn*` body: propagate
-///   - `fn*` body: RESET to a new fn target (NEVER propagate
-///     across function boundaries — `recur` inside a nested fn
-///     must NOT escape to the outer loop/fn)
-///   - `loop*` body: REPLACE with new loop target
-///   - all other positions: pass `null` (recur invalid here)
+/// Where `(recur args...)` jumps and which slots it rebinds, passed
+/// to the forms in tail position (COMPILER.md §4.4): a `loop*` or
+/// `fn*` sets it, `if`, `do`, `let*` and `letfn*` pass it on, and
+/// every other position passes null.
 const RecurTarget = struct {
     entry_pc: u32,
     /// The slots `recur` rebinds, in argument order: a loop's
@@ -387,119 +370,23 @@ const BottomTest = struct {
 // Errors
 // =============================================================================
 
+/// The compiler's errors; COMPILER.md §7 says when each is raised.
 pub const CompileError = error{
-    /// `eval` was given a value that is not a form, such as a list
-    /// holding a function (MACROEXPAND.md §1.2); the compiler itself
-    /// never raises it.
-    UnsupportedForm,
-
-    /// A hand-built `Tiny.int` outside the i48 fixnum range. Form
-    /// lowering never produces one: a wider literal lowers to a
-    /// bignum `Tiny.literal`.
-    IntegerOutOfFixnumRange,
-
-    /// A routine needs more than 4096 slots live at once or more
-    /// than 4096 upvalues, the two limits the 12-bit slot and
-    /// upvalue operands leave (COMPILER.md §4.4); `LowerDiag.detail`
-    /// names the routine and the limit.
     SlotOverflow,
-
-    /// A symbol resolves to nothing COMPILER.md §4.3 classifies: no
-    /// local, upvalue, namespace Var or name the file or line
-    /// defines. Without a namespace, anything that is not a local
-    /// or an upvalue raises this.
     UnresolvedSymbol,
-
-    /// Two bindings in the same `letfn*` group carry the same
-    /// name. Unlike `let*` (sequential shadowing allowed),
-    /// `letfn*` names are mutually visible — duplicates
-    /// create resolution ambiguity. Matches Clojure
-    /// (`letfn` rejects duplicate names).
-    DuplicateBinding,
-
-    /// `(recur ...)` appears in a position that is not a tail
-    /// position of an enclosing `loop*` or `fn*` body. Per
-    /// COMPILER.md §4.4, §5.6 + VM.md §11: `recur` MUST
-    /// be in tail position to preserve the constant-stack
-    /// guarantee.
     RecurOutsideTail,
-
-    /// `(recur ...)` has a different argument count than the
-    /// target's binding count. Per VM.md §11 + COMPILER.md
-    /// §5.6. Caught at compile time (no runtime arity
-    /// revalidation — recur is not a call opcode).
     RecurArityMismatch,
-
-    /// A feature is recognized but not lowered. Raised for a
-    /// non-`any` catch matcher, quoted symbols /
-    /// keywords / strings without an Interner or Heap, and
-    /// `reader.Form` datums that only the expander consumes
-    /// (syntax-quote, unquote, `#(...)`, `@x`, `^{...}`
-    /// metadata) reaching the lowerer. Trapping loudly is better
-    /// than emitting subtly-wrong code.
     UnsupportedFeature,
-
-    /// The parser or reader rejected the source string given to
-    /// `compileSourceWith`.
-    /// Bucketed error wrapping any error from `parser.parseForm`
-    /// / `reader.readOneForm`; the reader's own ErrorKind is not
-    /// carried through.
     ReaderFailure,
-
-    /// A list form (call or special form) has the wrong shape.
-    /// Emitted for malformed `(if)`, `(quote)`,
-    /// `(let* ...)` without a binding vector, etc. Covers
-    /// arity and structural errors that the reader accepted
-    /// as syntactically valid lists but the compiler rejects
-    /// as semantically malformed.
     MalformedForm,
-
-    /// Macroexpansion exceeded the depth limit (256 per
-    /// MACROEXPAND.md §6). Almost always an infinite macro
-    /// loop. Distinct from `MacroExpansionFailure` because
-    /// users debugging macros want this signaled clearly.
     MacroDepthExceeded,
-
-    /// Bucket for all other macroexpand errors — malformed
-    /// macro call, macro returned a non-Form, etc. The original
-    /// variant is not carried through; `out_span` carries the
-    /// form's span.
     MacroExpansionFailure,
-
-    /// A `require` in the form ran a file whose form failed at run
-    /// time with no handler in force. The failure is a runtime
-    /// error, not a compile error: the VM's `traced_error` names
-    /// it and `error_trace` locates it (TOOLING.md §1).
     RequiredFileFailed,
-
-    /// A `require` in the form ran a file whose form threw, and a
-    /// handler in the running program took the throw: the VM has
-    /// already unwound to that handler. Reaches only `eval`, which
-    /// returns it as the VM signal of the same name.
     ControlTransferred,
-
-    /// A position required a symbol but got something else
-    /// (e.g., `(let* [1 2] body)` — binding name `1` is not
-    /// a symbol; `(def 42 ...)` — def name `42` is not a
-    /// symbol).
     ExpectedSymbol,
-
-    /// A position required a vector but got something else
-    /// (e.g., `(let* (x 1) body)` — binding spec is a list,
-    /// not a vector; `(fn* (x) body)` — param spec is a
-    /// list, not a vector).
     ExpectedVector,
-
-    /// A compiler invariant was violated: the compiler reached a
-    /// state it believes impossible, such as a closure capturing a
-    /// binding lowering did not mark captured. Reported as an
-    /// error rather than miscompiled.
     InternalCompilerBug,
-
-    /// The form nests deeper than the native stack's budget allows
-    /// lowering or emitting it (`stack.check`, VM.md §13.1).
     StackOverflow,
-
     OutOfMemory,
 };
 
@@ -507,64 +394,12 @@ pub const CompileError = error{
 // Output
 // =============================================================================
 
-/// The compiler's product. Wrap with `toRoutine(name)` to get a
-/// `vm.Routine` ready for `vm.VM.init`. `capture_descs` supports
-/// `closure:make` lowering and `fixed_arity` call-site validation.
-///
-/// **Ownership**: the slices live on the routine allocator
-/// (`CompileOptions.routine_allocator`, else the compile allocator)
-/// until it is reset or destroyed; there is no `deinit`.
-pub const Compiled = struct {
-    code: []const Inst,
-    consts: []const Value,
-    capture_descs: []const vm.CaptureDescriptor = &.{},
-    /// The routine's `try` forms, which `ctrl:try-enter` names.
-    tries: []const vm.Try = &.{},
-    /// Per-routine Var table. The V operand index
-    /// resolves through this table at runtime. Lifetime: same
-    /// as the rest of the Compiled (compile-arena-owned).
-    var_table: []const *vm.Var = &.{},
-    slot_count: u16,
-    /// Top-level Compiled has fixed_arity 0; child routines built
-    /// by `compileFn` set this to their fixed parameter count.
-    fixed_arity: u16 = 0,
-    /// True for `(fn* [a b & r] ...)`. The VM packs
-    /// excess args into a list at call time.
-    variadic: bool = false,
-    /// PC → source span table (VM.md §5); empty for a hand-built
-    /// tree.
-    spans: []const vm.SpanEntry = &.{},
-    /// The span of the form this routine was lowered from.
-    origin: ?vm.SourceSpan = null,
-    /// The source the spans index into.
-    source: ?*const vm.SourceInfo = null,
-
-    pub fn toRoutine(self: Compiled, name: []const u8) Routine {
-        return .{
-            .code = self.code,
-            .consts = self.consts,
-            .capture_descs = self.capture_descs,
-            .tries = self.tries,
-            .var_table = self.var_table,
-            .slot_count = self.slot_count,
-            .fixed_arity = self.fixed_arity,
-            .variadic = self.variadic,
-            .upvalue_count = 0, // top-level routines have no upvalues
-            .name = name,
-            .spans = self.spans,
-            .origin = self.origin,
-            .source = self.source,
-        };
-    }
-};
-
 /// What lowering allocates for every Tiny node: the node and the
 /// span of the Form it came from. A node lowering synthesizes
 /// without a Form (the `do` around a body) has no span and inherits
 /// the span of the form that encloses it. The Emitter recovers the
-/// node from the `Tiny` pointer with `@fieldParentPtr`, so a tree
-/// compiled with spans must consist of these nodes only; hand-built
-/// `&Tiny{...}` trees compile without spans.
+/// node from the `Tiny` pointer with `@fieldParentPtr`, so every
+/// tree it compiles consists of these nodes (`allocTiny`).
 const TinyNode = struct {
     span: ?reader_mod.SrcSpan = null,
     tiny: Tiny,
@@ -606,24 +441,10 @@ const Scratch = struct { lo: u12, dst: u12 };
 /// of its own while its neighbours run (COMPILER.md §4.4).
 const HeldVar = struct { var_: *vm.Var, slot: u12 };
 
-/// `Emitter` accumulates a routine's bytecode, constants, slot
-/// count, and active lexical scope as a tree of `compileExpr`
-/// calls runs. It's allocator-owned and turned into a `Compiled`
-/// at the end via `finish()`.
-///
-/// **Slot allocation**: a stack (`slot_top`); `compileExpr` frees
-/// what a node allocated once the node is compiled.
-///
-/// **Constant pool**: one entry per identical Value (COMPILER.md
-/// §4.4).
-///
-/// **Lexical scope**: a `ScopeTable` of each local's `BindingRef`.
-/// Bindings are made at let* binding-time (after the RHS is compiled,
-/// per COMPILER.md §4.3's strict left-of-self rule) and unmade at
-/// let-body exit via `defer scope.restore(mark)`, `defer` so an error
-/// mid-body leaves no scope behind for a recovering caller. Nested
-/// function compilation resolves free names through the `parent`
-/// chain (capture analysis at function boundaries).
+/// One routine's code, pools, slots and lexical scope as
+/// `compileExpr` builds them, turned into a `vm.Routine` by `finish`.
+/// A nested `fn*` compiles in a child Emitter whose free names
+/// resolve through `parent` (COMPILER.md §4.4, §6).
 const Emitter = struct {
     /// Scratch: what compiling needs and nothing after it.
     allocator: std.mem.Allocator,
@@ -650,56 +471,22 @@ const Emitter = struct {
     slot_top: u16 = 0,
     /// The most slots live at once: the routine's frame size.
     slot_count: u16 = 0,
-    /// Pointer to the enclosing routine's Emitter, or null for the
-    /// top-level routine. Capture discovery walks the parent
-    /// chain in `resolveOrCapture`. Synchronous compilation
-    /// guarantees the parent pointer remains valid throughout
-    /// child compilation (parent is blocked in its
-    /// `compileFn` call).
+    /// The enclosing routine's Emitter, null at top level; capture
+    /// walks it (`resolveOrCapture`).
     parent: ?*Emitter = null,
-    /// Captures THIS routine has registered (in
-    /// upvalue-index order). Each entry is a `CaptureSource`
-    /// describing how to source the cell from the PARENT
-    /// frame when the parent's `closure:make` runs. The
-    /// list grows in `resolveOrCapture` as inner functions
-    /// discover free-variable references. At `compileFn`
-    /// finalization, the parent builds a `CaptureDescriptor`
-    /// from `child.captures` and registers it in its own
-    /// `capture_descs` table.
+    /// How the parent's `closure:make` sources each upvalue, in
+    /// upvalue order (COMPILER.md §6.1).
     captures: std.ArrayList(vm.CaptureSource) = .empty,
-    /// Routine-level cache of captured names → upvalue-index.
-    /// Separate from
-    /// `scope` so inner `let_star` scope restoration cannot
-    /// pop a captured-binding entry. Without this, the same
-    /// outer name referenced in two unrelated inner scopes
-    /// would be captured twice (two upvalue indices, two
-    /// descriptor sources, double-allocated cell pointer in
-    /// the closure). Lexical locals take precedence (resolved
-    /// via `scope` first), so shadowing is preserved.
+    /// The names captured so far with their upvalues, kept apart from
+    /// `scope`, so a name captured in two inner scopes takes one
+    /// upvalue and a scope's restore cannot drop it.
     captured_names: std.ArrayList(CapturedName) = .empty,
-    /// Per-routine Var table. The compiler appends
-    /// to this when it sees a `def`, a `(var x)`, or a
-    /// symbol-fall-through-to-Var resolution. Index in this
-    /// list becomes the V operand index in emitted bytecode.
-    /// Routines built from a child Emitter (compileFn) carry
-    /// their own table independent of the parent's; Vars are
-    /// global per-namespace and only the index encoding is
-    /// per-routine.
+    /// The Vars `v` operands index, the routine's own.
     var_table: std.ArrayList(*vm.Var) = .empty,
-    /// Namespace used for `def` / `var` / symbol fall-through.
-    /// `null` means no namespace was passed to `compileTiny`;
-    /// in that case `def`/`var_ref` raise `UnresolvedSymbol`
-    /// and unresolved symbols stay unresolved. Child Emitters
-    /// inherit the parent's namespace pointer.
+    /// Where Vars resolve; null, in a test, for none.
     namespace: ?*vm.Namespace = null,
-    /// Whether every Tiny node is the `tiny` field of a `TinyNode`
-    /// (a tree `lowerForm` built), so its span can be read; false
-    /// for a hand-built tree, which compiles without a span table.
-    spanned: bool = false,
-    /// The span the next emitted instruction is attributed to:
-    /// that of the innermost form being compiled, set on entry to
-    /// `compileExpr` and restored on exit, so an instruction a
-    /// parent emits after its children carries the parent's span.
+    /// The span the next instruction carries, the innermost node's
+    /// (`enterNode`).
     current_span: ?reader_mod.SrcSpan = null,
     /// The run-length table `emit` grows: a new entry whenever
     /// `current_span` differs from the last entry's.
@@ -745,9 +532,7 @@ const Emitter = struct {
         self.var_table.deinit(self.allocator);
     }
 
-    /// Look up a name in the routine-level capture cache.
-    /// Returns the existing upvalue index if this routine has
-    /// already captured `name`; null otherwise.
+    /// The upvalue this routine already captured `name` as.
     fn lookupCapturedName(self: *const Emitter, name: []const u8) ?u12 {
         for (self.captured_names.items) |c| {
             if (std.mem.eql(u8, c.name, name)) return c.upvalue;
@@ -763,64 +548,25 @@ const Emitter = struct {
         try self.scope.bind(self.allocator, name, if (captured) .{ .cell_slot = slot } else .{ .direct_slot = slot });
     }
 
-    /// Resolve `name` to a `BindingRef` via innermost-shadow
-    /// lookup of ONLY the current Emitter's scope. Returns null
-    /// if no binding matches; callers walk the parent chain via
-    /// `resolveOrCapture` if appropriate. Returns the full
-    /// BindingRef so callers can dispatch on direct/cell/upvalue
-    /// at emit time.
+    /// `name`'s innermost binding in this routine's own scope.
     fn resolveLocalRef(self: *const Emitter, name: []const u8) ?BindingRef {
         return self.scope.lookup(name);
     }
 
-    /// Walk self, then parents, to resolve `name` into a
-    /// `BindingRef` suitable for emit-time dispatch in
-    /// `compileSymbol`. If found in self.scope, returns the
-    /// ref directly. If found in a parent, performs the capture
-    /// dance per COMPILER.md §6.1: registers `self.captures`
-    /// (recording how to source the cell from parent), pushes
-    /// the binding into self.scope as `.upvalue(u)` so
-    /// subsequent references in the same routine resolve
-    /// directly, returns `.upvalue(u)`. Recurses transitively
-    /// for grandparent-and-beyond captures (each level
-    /// captures from its own parent so the chain delivers a
-    /// cell pointer to the innermost level).
-    ///
-    /// Lowering marked every binding a closure captures, so it is
-    /// a `.cell_slot` (or, further out, an `.upvalue`) by the time
-    /// a child resolves it here; a `.direct_slot` would be a
-    /// compiler bug. Nothing boxes a binding mid-codegen.
-    ///
-    /// Returns `UnresolvedSymbol` if no enclosing scope (up
-    /// the entire parent chain) has the name.
+    /// `name` as this routine reaches it: its own binding, an upvalue
+    /// it already captured, or a new upvalue over the binding an
+    /// enclosing routine reaches it as, each level capturing from its
+    /// parent (COMPILER.md §6.1). Lowering marked every captured
+    /// binding, so a parent's `.direct_slot` here is a compiler bug.
     fn resolveOrCapture(self: *Emitter, name: []const u8) CompileError!BindingRef {
-        // 1. Lexical scope, innermost-first. Lexical locals
-        // (params, let_star bindings) shadow any captures with
-        // the same name, preserving lexical scope semantics.
         if (self.resolveLocalRef(name)) |ref| return ref;
-        // 2. Routine-level capture cache. If THIS routine has
-        // already captured `name` (from a sibling scope, or
-        // earlier in the body), reuse the existing upvalue index
-        // instead of registering a new one. This avoids the
-        // "synthetic upvalue popped by inner let_star scope
-        // restoration" hazard.
         if (self.lookupCapturedName(name)) |u| return .{ .upvalue = u };
-        // 3. Walk the parent chain.
         const parent = self.parent orelse return CompileError.UnresolvedSymbol;
-        const parent_ref = try parent.resolveOrCapture(name);
-        // 4. How the parent's frame supplies the cell.
-        const source: vm.CaptureSource = switch (parent_ref) {
+        const source: vm.CaptureSource = switch (try parent.resolveOrCapture(name)) {
             .cell_slot => |s| .{ .local_cell_slot = s },
             .upvalue => |u| .{ .inherited_upvalue = u },
             .direct_slot => return CompileError.InternalCompilerBug,
         };
-        // 5. Register the capture. Append the source to
-        // self.captures (in upvalue-index order) AND record
-        // the name → upvalue mapping in captured_names so
-        // subsequent lookups dedupe. NOT pushed into self.scope
-        // because scope is for lexical bindings only — a
-        // capture there could be popped by inner let_star
-        // scope restoration.
         const u_idx_usize = self.captures.items.len;
         if (u_idx_usize >= max_operands) return self.limit("captured locals");
         const u_idx: u12 = @intCast(u_idx_usize);
@@ -864,6 +610,37 @@ const Emitter = struct {
 
     /// `SlotOverflow`, with `LowerDiag.detail` naming this routine
     /// and the limit it reached, `what` (COMPILER.md §7).
+    /// What compiling one node changes and `leaveNode` restores: the
+    /// span its instructions carry (a parent's instructions after it
+    /// carry the parent's again) and the slots it allocates, dead once
+    /// it is compiled.
+    const NodeMark = struct { span: ?reader_mod.SrcSpan, slot_top: u16 };
+
+    fn enterNode(self: *Emitter, t: *const Tiny) NodeMark {
+        const mark: NodeMark = .{ .span = self.current_span, .slot_top = self.slot_top };
+        if (@as(*const TinyNode, @fieldParentPtr("tiny", t)).span) |span| self.current_span = span;
+        return mark;
+    }
+
+    fn leaveNode(self: *Emitter, mark: NodeMark) void {
+        self.current_span = mark.span;
+        self.slot_top = mark.slot_top;
+    }
+
+    /// Locate a failure at the innermost node being compiled.
+    fn locateError(self: *const Emitter) void {
+        if (self.diag) |d| if (d.span == null) {
+            d.span = self.current_span;
+        };
+    }
+
+    /// `err`, saying why when nothing has yet (COMPILER.md §7).
+    fn fail(self: *const Emitter, err: CompileError, comptime fmt: []const u8, args: anytype) CompileError {
+        const d = self.diag orelse return err;
+        if (d.detail == null) d.detail = self.allocator.print(fmt, args) catch return CompileError.OutOfMemory;
+        return err;
+    }
+
     fn limit(self: *const Emitter, comptime what: []const u8) CompileError {
         const d = self.diag orelse return CompileError.SlotOverflow;
         if (d.detail != null) return CompileError.SlotOverflow;
@@ -903,16 +680,8 @@ const Emitter = struct {
         return idx;
     }
 
-    /// Get-or-create a V operand index for `name` in
-    /// the current routine's var_table. Interns the Var in the
-    /// namespace (creating an unbound Var if absent), then
-    /// dedup-appends to var_table. Returns the V operand index.
-    /// Requires `self.namespace != null`; callers should check
-    /// first and surface `UnresolvedSymbol` otherwise.
-    ///
-    /// Dedup: a routine that references `x` twice gets ONE
-    /// var_table entry (same V index). Matches the const-pool
-    /// dedup pattern.
+    /// The `v` operand index of the namespace's Var `name`, interned
+    /// unbound when absent, one entry per Var.
     fn addVarRef(self: *Emitter, name: []const u8) CompileError!u32 {
         const ns = self.namespace orelse return CompileError.InternalCompilerBug;
         // Lookup walks the parent chain (auto-refer fallback to
@@ -1047,7 +816,7 @@ const Emitter = struct {
     /// any `toOwnedSlice` fails after a previous one succeeded,
     /// the earlier slice would leak under a non-arena allocator.
     /// The chained errdefers guard against that.
-    fn finish(self: *Emitter) CompileError!Compiled {
+    fn finish(self: *Emitter) CompileError!Routine {
         const code = try self.out.dupe(Inst, self.code.items);
         errdefer self.out.free(code);
         const consts = try self.out.dupe(Value, self.consts.items);
@@ -1070,25 +839,29 @@ const Emitter = struct {
             .tries = tries,
             .var_table = vt,
             .slot_count = slot_count,
-            .fixed_arity = 0, // top-level only; compileFn sets this for child routines via Routine struct
-            .variadic = false, // top-level routine never variadic
+            .name = "<top>",
             .spans = spans,
             .source = self.source,
         };
     }
 };
 
+/// Whether `inst` is the opcode `group`:`variant`.
+fn isOp(inst: Inst, group: vm.Group, variant: anytype) bool {
+    return inst.group == @backingInt(group) and inst.variant == @backingInt(variant);
+}
+
+/// Set `i` of the bit sets of `w` words each laid end to end in `sets`.
+fn setAt(sets: []u64, i: usize, w: usize) []u64 {
+    return sets[i * w ..][0..w];
+}
+
 /// Whether control never passes from `inst` to the instruction after
 /// it: a jump, a return, a throw, or a `try` or `finally` exit.
 fn transfersAway(inst: Inst) bool {
     if (inst.kind != .primary) return false;
-    const is = struct {
-        fn op(i: Inst, g: vm.Group, v: anytype) bool {
-            return i.group == @backingInt(g) and i.variant == @backingInt(v);
-        }
-    }.op;
-    return is(inst, .jump, vm.Jump.jmp) or is(inst, .call, vm.Call.@"return") or is(inst, .call, vm.Call.return_nil) or
-        is(inst, .ctrl, vm.CtrlOp.throw_) or is(inst, .ctrl, vm.CtrlOp.try_exit) or is(inst, .ctrl, vm.CtrlOp.finally_exit);
+    return isOp(inst, .jump, vm.Jump.jmp) or isOp(inst, .call, vm.Call.@"return") or isOp(inst, .call, vm.Call.return_nil) or
+        isOp(inst, .ctrl, vm.CtrlOp.throw_) or isOp(inst, .ctrl, vm.CtrlOp.try_exit) or isOp(inst, .ctrl, vm.CtrlOp.finally_exit);
 }
 
 // =============================================================================
@@ -1171,13 +944,11 @@ fn bitOr(dst: []u64, src: []const u64) void {
 fn effectsOf(inst: Inst, caps: []const vm.CaptureDescriptor, slot_count: u16) ?Effects {
     var fx: Effects = .{};
     if (inst.kind != .primary) return null;
-    const shape = Routine.shapeOf(vm.VM.opIndex(inst)) orelse return fx;
+    // Of the opcodes with no shape, only these two are written, and
+    // they read no slot; any other is left unmodelled.
+    const shape = Routine.shapeOf(vm.VM.opIndex(inst)) orelse
+        return if (isOp(inst, .call, vm.Call.return_nil) or isOp(inst, .ctrl, vm.CtrlOp.finally_exit)) fx else null;
     const group = inst.groupOf();
-    const is = struct {
-        fn op(i: Inst, g: vm.Group, v: anytype) bool {
-            return i.group == @backingInt(g) and i.variant == @backingInt(v);
-        }
-    }.op;
     const wide = shape.wide != null;
     const operands = [3]Operand{ inst.a, inst.b, inst.c };
     const roles = [3]Routine.Role{ shape.a, if (wide) .none else shape.b, if (wide) .none else shape.c };
@@ -1191,13 +962,13 @@ fn effectsOf(inst: Inst, caps: []const vm.CaptureDescriptor, slot_count: u16) ?E
             if (op.kind != .slot) return null;
             if (shape.block and i == 0) {
                 fx.block_lo = op.index;
-                fx.block_len = @as(u32, inst.b.index) + @intFromBool(is(inst, .call, vm.Call.call));
+                fx.block_len = @as(u32, inst.b.index) + @intFromBool(isOp(inst, .call, vm.Call.call));
             } else if (shape.pair and i == 1) {
                 fx.block_lo = op.index;
                 fx.block_len = 2;
-            } else if (is(inst, .closure, vm.Closure_.new_cell)) {
+            } else if (isOp(inst, .closure, vm.Closure_.new_cell)) {
                 fx.def = op.index;
-            } else if (is(inst, .closure, vm.Closure_.box_local)) {
+            } else if (isOp(inst, .closure, vm.Closure_.box_local)) {
                 fx.def = op.index;
                 fx.use(op.index);
             } else if (group != .ctrl) {
@@ -1254,17 +1025,12 @@ const Flow = struct {
     /// whose sets of `words` words would pass the budget.
     fn build(arena: std.mem.Allocator, code: []const Inst, tries: []const vm.Try, extents: []const TryExtent, words: usize) error{OutOfMemory}!?Flow {
         const n = code.len;
-        const is = struct {
-            fn op(i: Inst, g: vm.Group, v: anytype) bool {
-                return i.group == @backingInt(g) and i.variant == @backingInt(v);
-            }
-        }.op;
         const leader = try arena.alloc(bool, n + 1);
         @memset(leader, false);
         leader[0] = true;
         leader[n] = true;
         for (code, 0..) |inst, pc| {
-            const jumps = inst.groupOf() == .jump or is(inst, .ctrl, vm.CtrlOp.try_exit);
+            const jumps = inst.groupOf() == .jump or isOp(inst, .ctrl, vm.CtrlOp.try_exit);
             if (jumps) {
                 if (inst.wide() >= n) return null;
                 leader[inst.wide()] = true;
@@ -1278,7 +1044,7 @@ const Flow = struct {
         for (tries, extents, 0..) |t, x, i| {
             const fin = t.finally_pc orelse t.catch_pc;
             if (!(x.enter < t.catch_pc and t.catch_pc <= fin and fin < x.end and x.end <= n)) return null;
-            if (!is(code[x.enter], .ctrl, vm.CtrlOp.try_enter) or code[x.enter].wide() != i) return null;
+            if (!isOp(code[x.enter], .ctrl, vm.CtrlOp.try_enter) or code[x.enter].wide() != i) return null;
             leader[x.enter + 1] = true;
             leader[t.catch_pc] = true;
             leader[fin] = true;
@@ -1310,14 +1076,14 @@ const Flow = struct {
             const next: u32 = if (last + 1 < n) block_of[last + 1] else none;
             if (inst.groupOf() == .jump) {
                 s[0] = block_of[inst.wide()];
-                if (!is(inst, .jump, vm.Jump.jmp)) s[1] = next;
-            } else if (is(inst, .ctrl, vm.CtrlOp.try_exit)) {
+                if (!isOp(inst, .jump, vm.Jump.jmp)) s[1] = next;
+            } else if (isOp(inst, .ctrl, vm.CtrlOp.try_exit)) {
                 // The exit of the try ending where it jumps, from its
                 // body or its handler.
                 const i = exit_try[inst.wide()];
                 if (i == none or last <= extents[i].enter or last >= (tries[i].finally_pc orelse extents[i].end)) return null;
                 s[0] = block_of[tries[i].finally_pc orelse extents[i].end];
-            } else if (is(inst, .ctrl, vm.CtrlOp.finally_exit)) {
+            } else if (isOp(inst, .ctrl, vm.CtrlOp.finally_exit)) {
                 // The last instruction of a finally, which goes on
                 // past its try; a throw it resumes is its enclosing
                 // region's.
@@ -1430,22 +1196,17 @@ fn clearDeadMoves(
     const h_body = try arena.alloc(u64, tries.len * words);
     const h_handler = try arena.alloc(u64, tries.len * words);
     const out = try arena.alloc(u64, words);
-    const at = struct {
-        fn set(sets: []u64, i: usize, w: usize) []u64 {
-            return sets[i * w ..][0..w];
-        }
-    }.set;
     var passes: usize = 0;
     while (true) : (passes += 1) {
         if (passes == clear_max_passes) return false;
         for (tries, extents, 0..) |t, x, i| {
-            const hb = at(h_body, i, words);
-            const hh = at(h_handler, i, words);
-            @memcpy(hb, at(live_in, flow.block_of[t.catch_pc], words));
+            const hb = setAt(h_body, i, words);
+            const hh = setAt(h_handler, i, words);
+            @memcpy(hb, setAt(live_in, flow.block_of[t.catch_pc], words));
             bitClear(hb, code[x.enter].a.index);
             @memset(hh, 0);
             if (t.finally_pc) |f| {
-                @memcpy(hh, at(live_in, flow.block_of[f], words));
+                @memcpy(hh, setAt(live_in, flow.block_of[f], words));
                 bitOr(hb, hh);
             }
         }
@@ -1454,10 +1215,10 @@ fn clearDeadMoves(
         while (b > 0) {
             b -= 1;
             @memset(out, 0);
-            for (flow.succ[b]) |s| if (s != Flow.none) bitOr(out, at(live_in, s, words));
-            for (out, at(use, b, words), at(def, b, words)) |*o, u, d| o.* = u | (o.* & ~d);
-            for (flow.regions(b)) |r| bitOr(out, at(if (r.handler) h_handler else h_body, r.t, words));
-            const in = at(live_in, b, words);
+            for (flow.succ[b]) |s| if (s != Flow.none) bitOr(out, setAt(live_in, s, words));
+            for (out, setAt(use, b, words), setAt(def, b, words)) |*o, u, d| o.* = u | (o.* & ~d);
+            for (flow.regions(b)) |r| bitOr(out, setAt(if (r.handler) h_handler else h_body, r.t, words));
+            const in = setAt(live_in, b, words);
             if (!std.mem.eql(u64, in, out)) {
                 @memcpy(in, out);
                 changed = true;
@@ -1474,8 +1235,8 @@ fn clearDeadMoves(
     for (0..nb) |b| {
         @memset(live, 0);
         @memset(held, 0);
-        for (flow.succ[b]) |s| if (s != Flow.none) bitOr(live, at(live_in, s, words));
-        for (flow.regions(b)) |r| bitOr(held, at(if (r.handler) h_handler else h_body, r.t, words));
+        for (flow.succ[b]) |s| if (s != Flow.none) bitOr(live, setAt(live_in, s, words));
+        for (flow.regions(b)) |r| bitOr(held, setAt(if (r.handler) h_handler else h_body, r.t, words));
         var pc = flow.starts[b + 1];
         while (pc > flow.starts[b]) {
             pc -= 1;
@@ -1487,14 +1248,14 @@ fn clearDeadMoves(
             effects[pc].backward(live);
         }
     }
-    if (std.debug.runtime_safety and cleared) try checkClears(arena, code, effects, &flow, tries, extents, words);
+    if (@import("builtin").optimize.runtimeSafety() and cleared) try checkClears(arena, code, effects, &flow, tries, extents, words);
     return true;
 }
 
 /// Whether `inst` is a `mov:move` of one slot to another, which
 /// clears its source where the source is dead after it.
 fn isSlotMove(inst: Inst) bool {
-    return inst.group == @backingInt(vm.Group.mov) and inst.variant == @backingInt(vm.Mov.move) and
+    return isOp(inst, .mov, vm.Mov.move) and
         inst.b.kind == .slot and inst.a.kind == .slot and inst.b.index != inst.a.index;
 }
 
@@ -1521,11 +1282,6 @@ fn checkClears(
     const state = try arena.alloc(u64, words);
     @memset(in, 0);
     @memset(seen, 0);
-    const at = struct {
-        fn set(sets: []u64, i: usize, w: usize) []u64 {
-            return sets[i * w ..][0..w];
-        }
-    }.set;
     var changed = true;
     while (changed) {
         changed = false;
@@ -1533,28 +1289,28 @@ fn checkClears(
         // carries.
         @memset(thrown, 0);
         for (0..nb) |b| for (flow.regions(b)) |r| {
-            bitOr(at(thrown, 2 * r.t + @intFromBool(r.handler), words), at(seen, b, words));
+            bitOr(setAt(thrown, 2 * r.t + @intFromBool(r.handler), words), setAt(seen, b, words));
         };
         for (tries, extents, 0..) |t, x, i| {
-            const body = at(thrown, 2 * i, words);
+            const body = setAt(thrown, 2 * i, words);
             bitClear(body, code[x.enter].a.index);
-            changed = orChanged(at(in, flow.block_of[t.catch_pc], words), body) or changed;
-            if (t.finally_pc) |f| changed = orChanged(at(in, flow.block_of[f], words), at(thrown, 2 * i + 1, words)) or changed;
+            changed = orChanged(setAt(in, flow.block_of[t.catch_pc], words), body) or changed;
+            if (t.finally_pc) |f| changed = orChanged(setAt(in, flow.block_of[f], words), setAt(thrown, 2 * i + 1, words)) or changed;
         }
         for (0..nb) |b| {
-            @memcpy(state, at(in, b, words));
-            const s = at(seen, b, words);
+            @memcpy(state, setAt(in, b, words));
+            const s = setAt(seen, b, words);
             changed = orChanged(s, state) or changed;
             for (flow.starts[b]..flow.starts[b + 1]) |pc| {
                 const fx = &effects[pc];
                 if (fx.readsAny(state)) return CompileError.InternalCompilerBug;
                 const inst = code[pc];
-                if (inst.group == @backingInt(vm.Group.mov) and inst.variant == @backingInt(vm.Mov.move_clear)) bitSet(state, inst.b.index);
+                if (isOp(inst, .mov, vm.Mov.move_clear)) bitSet(state, inst.b.index);
                 if (fx.def) |d| bitClear(state, d);
                 changed = orChanged(s, state) or changed;
             }
             for (flow.succ[b]) |succ| if (succ != Flow.none) {
-                changed = orChanged(at(in, succ, words), state) or changed;
+                changed = orChanged(setAt(in, succ, words), state) or changed;
             };
         }
     }
@@ -1574,21 +1330,11 @@ fn orChanged(dst: []u64, src: []const u64) bool {
 // Public API
 // =============================================================================
 
-/// Compile a `Tiny` tree built by hand: no namespace (every symbol
-/// must be lexical) and no span table. Source and Form callers use
-/// `compileSourceWith` / `compileFormWith`.
-fn compileTiny(allocator: std.mem.Allocator, form: *const Tiny) CompileError!Compiled {
-    return emitRoutine(allocator, form, .{});
-}
-
 /// What `emitRoutine` compiles a top-level `Tiny` tree with.
 const EmitOptions = struct {
     /// Where the routines go; the scratch allocator when null.
     out: ?std.mem.Allocator = null,
     namespace: ?*vm.Namespace = null,
-    /// Whether every node is a `TinyNode` (a tree `lowerForm`
-    /// built), so the routines carry span tables.
-    spanned: bool = false,
     /// The span of the form the tree was lowered from.
     origin: ?reader_mod.SrcSpan = null,
     source: ?*const vm.SourceInfo = null,
@@ -1599,11 +1345,10 @@ const EmitOptions = struct {
 /// The top-level routine for `form`: its value in slot 0, returned.
 /// There is no enclosing `recur` target, so a top-level `(recur)`
 /// is `RecurOutsideTail`.
-fn emitRoutine(allocator: std.mem.Allocator, form: *const Tiny, opts: EmitOptions) CompileError!Compiled {
+fn emitRoutine(allocator: std.mem.Allocator, form: *const Tiny, opts: EmitOptions) CompileError!Routine {
     var emitter = Emitter.init(allocator, opts.out orelse allocator);
     defer emitter.deinit();
     emitter.namespace = opts.namespace;
-    emitter.spanned = opts.spanned;
     emitter.current_span = opts.origin;
     emitter.source = opts.source;
     emitter.diag = opts.diag;
@@ -1620,19 +1365,8 @@ fn emitRoutine(allocator: std.mem.Allocator, form: *const Tiny, opts: EmitOption
 // Form → Tiny lowering
 // =============================================================================
 //
-// `lowerForm` converts a `reader.Form` tree into a `Tiny` IR tree on the
-// passed allocator. The Tiny tree is then compiled via the backend
-// (`emitRoutine`), so the entire codegen pipeline
-// (RecurTarget threading, variadic rest, Var fall-through, etc.) runs
-// on the one Tiny path. Lowering also marks every binding a closure
-// captures (`Lexical`).
-//
-// Lowering covers literals, symbols, list dispatch (ordinary calls,
-// special forms, the inlined core fns when not shadowed),
-// binding/fn forms (let*, fn*, letfn*, loop*, recur), var forms
-// (def, var), try/throw, quote, and collection literals. The
-// lexical bindings in force (`LowerCtx.lexicals`) decide shadowing
-// for intrinsic dispatch.
+// `lowerForm` turns a Form into the `Tiny` tree the Emitter compiles,
+// and marks every binding a closure captures (COMPILER.md §4.3).
 
 /// Allocate and initialize a Tiny node on the given allocator.
 /// Used by `lowerForm` to build the IR tree. The arena passed to
@@ -1748,7 +1482,7 @@ pub const DeclaredNames = struct {
         const name_form = if (items[1].datum == .with_meta) items[1].datum.with_meta.target else items[1];
         if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) return;
         const name = name_form.datum.symbol.name;
-        const plain = [_][]const u8{ "def", "defn", "defn-", "defonce", "defmacro" };
+        const plain = [_][]const u8{ "def", "defn", "defn-", "defonce", "defmacro", "defmulti", "deftest" };
         if (for (plain) |h| {
             if (std.mem.eql(u8, head, h)) break true;
         } else false) {
@@ -1813,12 +1547,11 @@ fn symbolResolves(ctx: LowerCtx, declared: *const DeclaredNames, name: []const u
 
 /// The namespace a qualified symbol's prefix names from `ns`: an
 /// alias registered there resolves to its target, any other
-/// prefix is a namespace name. Null when nothing is registered
-/// under it.
+/// prefix is a namespace name (`expand.canonicalNs`). Null when
+/// nothing is registered under it.
 fn qualifiedTarget(ns: *const vm.Namespace, ns_prefix: []const u8) ?*vm.Namespace {
     const registry = ns.registry orelse return null;
-    const effective = ns.lookupAlias(ns_prefix) orelse ns_prefix;
-    return registry.lookupNs(effective);
+    return registry.lookupNs(expand_mod.canonicalNs(ns.lookupAlias(ns_prefix) orelse ns_prefix));
 }
 
 /// Whether a bare operator `name` means `nexis.core`'s Var of that
@@ -1887,8 +1620,8 @@ fn lowerDatum(
     return switch (form.datum) {
         .nil => try allocTiny(allocator, .nil),
         .bool_ => |b| try allocTiny(allocator, .{ .bool = b }),
-        .int => |n| try lowerInt(allocator, n, ctx),
-        .bigint => |text| try lowerBigInt(allocator, text, ctx),
+        .int => |n| if (value_mod.isFixnumRange(n)) try allocTiny(allocator, .{ .int = n }) else try lowerScalar(allocator, form, ctx),
+        .bigint, .real, .char, .string, .regex, .keyword => try lowerScalar(allocator, form, ctx),
         .symbol => |name| blk: {
             // Qualified symbols `ns/name` lower to
             // `Tiny.qualified_symbol`; compileSymbol handles
@@ -1914,46 +1647,6 @@ fn lowerDatum(
             break :blk try allocTiny(allocator, .{ .symbol = name.name });
         },
         .list => |items| try lowerList(allocator, items, ctx),
-        // Bare keywords are self-evaluating per Clojure
-        // semantics. Lowers to Tiny.literal via the Interner.
-        // Without an Interner, falls back to UnsupportedFeature.
-        // A qualified keyword interns its full `ns/name` text, the
-        // same way qualified symbols do.
-        .keyword => |name| blk: {
-            const interner = ctx.interner orelse return CompileError.UnsupportedFeature;
-            const v = interner.internQualifiedKeyword(name.ns, name.name) catch return CompileError.OutOfMemory;
-            break :blk try allocTiny(allocator, .{ .literal = v });
-        },
-        // Floats and chars are immediates: they lower straight
-        // to `Tiny.literal` with no interner or heap involved.
-        .real => |f| try allocTiny(allocator, .{ .literal = value_mod.fromFloat(f) }),
-        .char => |c| try allocTiny(allocator, .{
-            .literal = value_mod.fromChar(c) orelse return CompileError.MalformedForm,
-        }),
-        // String literals lower through the heap plumbed into
-        // LowerCtx. The Value goes into `Tiny.literal`; the heap
-        // is the same one routines and closures use, so the
-        // string lifetime tracks the artifact. Without a heap the
-        // form raises UnsupportedFeature.
-        .string => |bytes| blk: {
-            const h = ctx.heap orelse return CompileError.UnsupportedFeature;
-            const v = string_mod.fromBytes(h, bytes) catch return CompileError.OutOfMemory;
-            break :blk try allocTiny(allocator, .{ .literal = v });
-        },
-        // A regex literal is a pattern constant of the routine, as a
-        // string is, so each evaluation of one `#"..."` gives the same
-        // pattern, as Clojure's constant does (docs/REGEX.md §10).
-        .regex => |text| blk: {
-            const h = ctx.heap orelse return CompileError.UnsupportedFeature;
-            const made = regex_mod.make(h, allocator, text) catch |err| return switch (err) {
-                error.OutOfMemory => CompileError.OutOfMemory,
-                error.StackOverflow => CompileError.StackOverflow,
-            };
-            break :blk try allocTiny(allocator, .{ .literal = switch (made) {
-                .ok => |p| p,
-                .err => return CompileError.MalformedForm,
-            } });
-        },
         // `{k1 v1 ...}`, `#{a b}` and `[a b]` as expressions: each
         // item is an expression, evaluated left to right.
         .map => |items| try lowerColl(allocator, .map, items, ctx),
@@ -2008,7 +1701,7 @@ fn lowerList(
             if (namesCore(ctx, name)) return try lowerPrim(allocator, in, items[1..], ctx);
         }
         if (items.len == 2 and std.mem.eql(u8, name, "not") and namesCore(ctx, name)) return try lowerNot(allocator, items[1], ctx);
-    } else if (items[0].datum == .symbol and std.mem.eql(u8, items[0].datum.symbol.ns.?, "nexis.core")) {
+    } else if (items[0].datum == .symbol and std.mem.eql(u8, expand_mod.canonicalNs(items[0].datum.symbol.ns.?), "nexis.core")) {
         // A qualified head is never a lexical local, so `nexis.core/+`
         // inlines unconditionally. Host macros emit these
         // (MACROEXPAND.md §5).
@@ -2130,7 +1823,7 @@ fn constantColl(allocator: std.mem.Allocator, op: vm.CollOp, items: []const *con
     const values = try allocator.alloc(Value, items.len);
     defer allocator.free(values);
     for (items, values) |item, *v| v.* = try constValue(item) orelse return null;
-    return buildColl(heap, op, values) catch CompileError.OutOfMemory;
+    return expand_mod.collOf(heap, op, values) catch CompileError.OutOfMemory;
 }
 
 /// The constant `t` is, if it is one.
@@ -2138,31 +1831,10 @@ fn constValue(t: *const Tiny) CompileError!?Value {
     return switch (t.*) {
         .nil => value_mod.nilValue(),
         .bool => |b| value_mod.fromBool(b),
-        .int => |n| value_mod.fromFixnum(n) orelse CompileError.IntegerOutOfFixnumRange,
+        .int => |n| value_mod.fromFixnum(n).?,
         .literal => |v| v,
         else => null,
     };
-}
-
-fn buildColl(heap: *heap_mod.Heap, op: vm.CollOp, values: []const Value) !Value {
-    switch (op) {
-        .list => return list_mod.fromSlice(heap, values),
-        .vector => return if (values.len == 0) vector_mod.empty(heap) else vector_mod.fromSlice(heap, values),
-        .map => {
-            var m = try champ_mod.mapEmpty(heap);
-            var i: usize = 0;
-            while (i < values.len) : (i += 2) {
-                m = try champ_mod.mapAssoc(heap, m, values[i], values[i + 1], &dispatch_mod.hashValue, &dispatch_mod.equal);
-            }
-            return m;
-        },
-        .set => {
-            var set = try champ_mod.setEmpty(heap);
-            for (values) |v| set = try champ_mod.setConj(heap, set, v, &dispatch_mod.hashValue, &dispatch_mod.equal);
-            return set;
-        },
-        else => unreachable,
-    }
 }
 
 /// `(quote x)` and `'x`: `x` as data. A self-evaluating scalar lowers
@@ -2178,12 +1850,8 @@ fn buildColl(heap: *heap_mod.Heap, op: vm.CollOp, values: []const Value) !Value 
 fn lowerQuoted(allocator: std.mem.Allocator, payload: *const reader_mod.Form, ctx: LowerCtx) CompileError!*Tiny {
     try stack.check();
     switch (payload.datum) {
-        .nil, .bool_, .int, .bigint, .real, .char, .string, .regex, .keyword => return lowerDatum(allocator, payload, ctx),
-        .symbol => |name| {
-            const interner = ctx.interner orelse return CompileError.UnsupportedFeature;
-            const v = interner.internQualifiedSymbol(name.ns, name.name) catch return CompileError.OutOfMemory;
-            return allocTiny(allocator, .{ .literal = v });
-        },
+        .nil, .bool_, .int => return lowerDatum(allocator, payload, ctx),
+        .bigint, .real, .char, .string, .regex, .keyword, .symbol => return lowerScalar(allocator, payload, ctx),
         else => {},
     }
     var expander = expand_mod.ExpandContext{
@@ -2200,24 +1868,19 @@ fn lowerQuoted(allocator: std.mem.Allocator, payload: *const reader_mod.Form, ct
     return allocTiny(allocator, .{ .literal = v });
 }
 
-/// An integer literal: `Tiny.int` in the fixnum range, otherwise a
-/// bignum `Tiny.literal` on the heap plumbed into `LowerCtx`
-/// (without a heap the literal is `UnsupportedFeature`, as a string
-/// literal is).
-fn lowerInt(allocator: std.mem.Allocator, n: i64, ctx: LowerCtx) CompileError!*Tiny {
-    if (value_mod.isFixnumRange(n)) return allocTiny(allocator, .{ .int = n });
-    const h = ctx.heap orelse return CompileError.UnsupportedFeature;
-    const v = bignum_mod.fromI64(h, n) catch return CompileError.OutOfMemory;
-    return allocTiny(allocator, .{ .literal = v });
-}
-
-/// A `bigint` literal (the reader's canonical decimal text) as a
-/// bignum `Tiny.literal`.
-fn lowerBigInt(allocator: std.mem.Allocator, text: []const u8, ctx: LowerCtx) CompileError!*Tiny {
-    const h = ctx.heap orelse return CompileError.UnsupportedFeature;
-    const parsed = bignum_mod.parseDecimal(h, text) catch return CompileError.OutOfMemory;
-    const v = parsed orelse return CompileError.MalformedForm;
-    return allocTiny(allocator, .{ .literal = v });
+/// A self-evaluating scalar as a `Tiny.literal` (`expand.scalarValue`):
+/// a keyword interned, a string, regex or integer past the fixnum
+/// range on the lowering heap, so that each evaluation of a literal
+/// gives the same constant (docs/REGEX.md §10). Without the interner
+/// or heap it needs, `UnsupportedFeature`.
+fn lowerScalar(allocator: std.mem.Allocator, form: *const reader_mod.Form, ctx: LowerCtx) CompileError!*Tiny {
+    const v = expand_mod.scalarValue(ctx.heap, ctx.interner, allocator, form.datum) catch |err| return switch (err) {
+        error.OutOfMemory => CompileError.OutOfMemory,
+        error.StackOverflow => CompileError.StackOverflow,
+        error.Unsupported => CompileError.UnsupportedFeature,
+        error.Malformed => CompileError.MalformedForm,
+    };
+    return allocTiny(allocator, .{ .literal = v.? });
 }
 
 /// The inlined core fn `name` is at `argc` arguments, if any.
@@ -2322,26 +1985,24 @@ const ParsedParams = struct {
 
 fn parseParams(
     allocator: std.mem.Allocator,
-    param_vector_items: []const *reader_mod.Form,
+    vector: *const reader_mod.Form,
+    diag: ?*LowerDiag,
 ) CompileError!ParsedParams {
-    // Scan for the `&` separator. Validation:
-    //   - at most one `&`
-    //   - `&` followed by exactly one symbol
-    //   - no symbols after the rest param
+    const param_vector_items = try expectVector(vector);
     var amp_pos: ?usize = null;
     for (param_vector_items, 0..) |item, i| {
         if (item.datum == .symbol and
             item.datum.symbol.ns == null and
             std.mem.eql(u8, item.datum.symbol.name, "&"))
         {
-            if (amp_pos != null) return CompileError.MalformedForm;
+            if (amp_pos != null) return malformed(allocator, diag, vector.origin, "fn: & appears twice", .{});
             amp_pos = i;
         }
     }
     if (amp_pos) |pos| {
         // `& rest` form. Expect exactly `pos + 2` items
         // (the `&` itself + one rest symbol).
-        if (pos + 2 != param_vector_items.len) return CompileError.MalformedForm;
+        if (pos + 2 != param_vector_items.len) return malformed(allocator, diag, vector.origin, "fn: & takes exactly one parameter after it", .{});
         const rest_name = try expectUnqualifiedSymbol(param_vector_items[pos + 1]);
         const params = try allocator.alloc([]const u8, pos);
         for (param_vector_items[0..pos], 0..) |item, i| {
@@ -2413,7 +2074,7 @@ fn lowerFnStar(
         self_name = try expectUnqualifiedSymbol(args[0]);
         pos = 1;
     }
-    const parsed = try parseClauses(allocator, args[pos..]);
+    const parsed = try parseClauses(allocator, args[pos..], ctx.diag);
 
     // The self-name belongs to the enclosing scope, so the bodies'
     // references to it are captures of a placeholder cell.
@@ -2444,11 +2105,11 @@ const ParsedClause = struct {
 /// The clauses keep Clojure's rules (COMPILER.md §5.5): no two take
 /// the same fixed count, at most one has a rest parameter, and its
 /// fixed count is at least every other clause's.
-fn parseClauses(allocator: std.mem.Allocator, forms: []const *reader_mod.Form) CompileError![]const ParsedClause {
+fn parseClauses(allocator: std.mem.Allocator, forms: []const *reader_mod.Form, diag: ?*LowerDiag) CompileError![]const ParsedClause {
     if (forms.len == 0) return CompileError.ExpectedVector;
     if (forms[0].datum != .list) {
         const one = try allocator.alloc(ParsedClause, 1);
-        one[0] = .{ .params = try parseParams(allocator, try expectVector(forms[0])), .body = forms[1..] };
+        one[0] = .{ .params = try parseParams(allocator, forms[0], diag), .body = forms[1..] };
         return one;
     }
     const clauses = try allocator.alloc(ParsedClause, forms.len);
@@ -2459,20 +2120,31 @@ fn parseClauses(allocator: std.mem.Allocator, forms: []const *reader_mod.Form) C
             else => return CompileError.MalformedForm,
         };
         if (items.len == 0) return CompileError.MalformedForm;
-        c.* = .{ .params = try parseParams(allocator, try expectVector(items[0])), .body = items[1..] };
+        c.* = .{ .params = try parseParams(allocator, items[0], diag), .body = items[1..] };
         const fixed = c.params.params.len;
         if (c.params.rest_param != null) {
-            if (rest_fixed != null) return CompileError.MalformedForm;
+            if (rest_fixed != null) return malformed(allocator, diag, form.origin, "fn: at most one overload clause may be variadic", .{});
             rest_fixed = fixed;
         }
         for (clauses[0..i]) |before| {
-            if (before.params.rest_param == null and c.params.rest_param == null and before.params.params.len == fixed) return CompileError.MalformedForm;
+            if (before.params.rest_param == null and c.params.rest_param == null and before.params.params.len == fixed)
+                return malformed(allocator, diag, form.origin, "fn: two overload clauses take {d} argument{s}", .{ fixed, if (fixed == 1) "" else "s" });
         }
     }
-    if (rest_fixed) |r| for (clauses) |c| {
-        if (c.params.rest_param == null and c.params.params.len > r) return CompileError.MalformedForm;
+    if (rest_fixed) |r| for (forms, clauses) |form, c| {
+        if (c.params.rest_param == null and c.params.params.len > r)
+            return malformed(allocator, diag, form.origin, "fn: a fixed arity of {d} is above the variadic clause's {d}", .{ c.params.params.len, r });
     };
     return clauses;
+}
+
+/// `MalformedForm` at `span`, saying why (COMPILER.md §7).
+fn malformed(allocator: std.mem.Allocator, diag: ?*LowerDiag, span: reader_mod.SrcSpan, comptime fmt: []const u8, args: anytype) CompileError {
+    const d = diag orelse return CompileError.MalformedForm;
+    if (d.detail != null) return CompileError.MalformedForm;
+    d.span = span;
+    d.detail = allocator.print(fmt, args) catch return CompileError.OutOfMemory;
+    return CompileError.MalformedForm;
 }
 
 /// The fixed arities a self-call may name (COMPILER.md §5.5): every
@@ -2543,9 +2215,9 @@ fn lowerLetFnStar(
         };
         if (entry_items.len < 2) return CompileError.MalformedForm;
         const name = try expectUnqualifiedSymbol(entry_items[0]);
-        parsed[i] = try parseClauses(allocator, entry_items[1..]);
+        parsed[i] = try parseClauses(allocator, entry_items[1..], ctx.diag);
         try ctx.bind(allocator, name, &names_captured, null);
-        bindings[i] = .{ .name = name, .clauses = &.{} };
+        bindings[i] = .{ .name = name, .clauses = &.{}, .span = entry.origin };
     }
     for (bindings, parsed) |*b, clauses| b.clauses = try lowerClauses(allocator, clauses, ctx);
     const body = try lowerBody(allocator, args[1..], ctx);
@@ -2556,13 +2228,8 @@ fn lowerLetFnStar(
 // Form var-form lowering
 // =============================================================================
 //
-// `def`, `(var x)`. The backend (Tiny.def,
-// Tiny.var_ref) handles forward references, identity-stable
-// rebind, and the named-fn placeholder pattern. This layer is
-// purely Form-side dispatch + structural validation.
-//
-// A `def` binds no lexical name: a Var is not lexical.
-// `namesCore` consults the namespace and the declared names instead.
+// A `def` binds no lexical name: `namesCore` consults the namespace
+// and the declared names instead.
 
 /// `(def name)` or `(def name value)`. Per Tiny.def shape, the
 /// value is optional (declare-only).
@@ -2602,19 +2269,8 @@ fn lowerVarRef(
     return try allocTiny(allocator, .{ .var_ref = .{ .ns = sym.ns, .name = sym.name } });
 }
 
-/// Lower `(try body+ (catch any binding handler+) (finally ...)?)`.
-/// The only catch matcher at this level is `any`; the expander
-/// lowers keyword matchers and several clauses onto it.
-///
-/// Form syntax:
-///   (try body... (catch any binding handler...))
-///   (try body... (catch any binding handler...) (finally ...))
-///
-/// Enforcement:
-///   - Exactly one body+catch+optional-finally shape.
-///   - catch matcher MUST be the unqualified symbol `any`;
-///     anything else is UnsupportedFeature.
-///   - catch binding MUST be an unqualified symbol.
+/// `(try body... (catch any binding handler...) (finally ...)?)`, the
+/// primitive the expander makes of every `try` (MACROEXPAND.md §2b).
 fn lowerTry(
     allocator: std.mem.Allocator,
     args: []const *reader_mod.Form,
@@ -2743,7 +2399,8 @@ fn compileEvalCallback(user_data: *anyopaque, form: *const reader_mod.Form, fail
         return err;
     };
     const routine = try persistent.create(vm.Routine);
-    routine.* = compiled.toRoutine("defmacro-eval");
+    routine.* = compiled;
+    routine.name = "defmacro-eval";
     const heap = registryHeap(opts.namespace);
     var sub = try vm.VM.init(if (heap != null) data.allocator else persistent, routine);
     defer if (heap != null) sub.deinit();
@@ -2797,12 +2454,22 @@ pub const RuntimeHooks = struct {
         const origin = reader_mod.SrcSpan{ .pos = 0, .len = 0 };
         // A form is data: its lazy seqs are realized and made lists.
         const form = expand_mod.valueToForm(&ctx, try seq_mod.asLists(v, form_value), origin) catch |err|
-            return failure(v, err, "macro-expansion-failure");
+            return expansionFailure(v, &ctx, err);
         const expanded = expand_mod.expandOnce(&ctx, form) catch |err|
-            return failure(v, err, "macro-expansion-failure");
+            return expansionFailure(v, &ctx, err);
         const out = expanded orelse return null;
         return expand_mod.formToValue(&ctx, out) catch |err|
-            return failure(v, err, "macro-expansion-failure");
+            return expansionFailure(v, &ctx, err);
+    }
+
+    /// Out of memory stays an error; any other failure of `macroexpand-1`
+    /// throws `:macro-expansion-failure`, its message the expander's
+    /// sentence (what the macro threw, or why the form is malformed)
+    /// when there is one, placed as a runtime error is (VM.md §13).
+    fn expansionFailure(v: *vm.VM, ctx: *const expand_mod.ExpandContext, err: anyerror) vm.VmError {
+        if (err == error.OutOfMemory) return vm.VmError.OutOfMemory;
+        const tag = v.ensureInterner().internKeywordValue("macro-expansion-failure") catch return vm.VmError.OutOfMemory;
+        return v.throwErrorMap(v.errorValue(tag, if (ctx.failure) |f| f.message else "", null));
     }
 
     /// The first form of `source`, as data; null when it holds none.
@@ -2924,7 +2591,8 @@ pub const RuntimeHooks = struct {
             }
             const compiled = compileFormWith(scratch.allocator(), top, opts) catch |err| return self.evalFailure(v, scratch, err, form, form_value, detail);
             const routine = persistent.create(vm.Routine) catch return vm.VmError.OutOfMemory;
-            routine.* = compiled.toRoutine("<eval>");
+            routine.* = compiled;
+            routine.name = "<eval>";
             last = try v.runRoutine(routine);
         }
         return last;
@@ -3046,7 +2714,7 @@ pub const CompileOptions = struct {
     clear_locals: bool = true,
 };
 
-const no_macros: expand_mod.HostMacroTable = .{};
+const no_macros: expand_mod.HostMacroTable = .empty;
 
 /// The heap of `namespace`'s registry, where constants and macro
 /// values live; null without one.
@@ -3120,7 +2788,7 @@ pub fn compileFormWith(
     allocator: std.mem.Allocator,
     form: *const reader_mod.Form,
     opts: CompileOptions,
-) CompileError!Compiled {
+) CompileError!Routine {
     const interner = opts.interner orelse return compileExpanded(allocator, form, opts);
     try publishNamespace(opts, interner);
     var ceval_data = CompileEvalData{ .allocator = allocator, .opts = opts };
@@ -3134,7 +2802,7 @@ fn compileExpanded(
     allocator: std.mem.Allocator,
     working_form: *const reader_mod.Form,
     opts: CompileOptions,
-) CompileError!Compiled {
+) CompileError!Routine {
     const namespace = opts.namespace;
     const out_span = opts.out_span;
     const declared = opts.declared;
@@ -3167,7 +2835,6 @@ fn compileExpanded(
     return emitRoutine(allocator, tiny, .{
         .out = opts.routine_allocator,
         .namespace = namespace,
-        .spanned = true,
         .origin = working_form.origin,
         .source = opts.source,
         .diag = &diag,
@@ -3184,7 +2851,7 @@ pub fn compileSourceWith(
     allocator: std.mem.Allocator,
     source: []const u8,
     opts: CompileOptions,
-) CompileError!Compiled {
+) CompileError!Routine {
     var p = reader_mod.parser.parseForm(allocator, source) catch {
         return CompileError.ReaderFailure;
     };
@@ -3211,22 +2878,10 @@ fn compileExpr(
     dst: u12,
     recur_target: ?*const RecurTarget,
 ) CompileError!void {
-    // Instructions this node emits carry its own span; whatever the
-    // parent emits after this call carries the parent's again.
-    const saved_span = e.current_span;
-    defer e.current_span = saved_span;
-    if (e.spanned) {
-        const node: *const TinyNode = @fieldParentPtr("tiny", form);
-        if (node.span) |span| e.current_span = span;
-    }
-    // The innermost form reports the error.
-    errdefer if (e.diag) |d| {
-        if (d.span == null) d.span = e.current_span;
-    };
+    const node = e.enterNode(form);
+    defer e.leaveNode(node);
+    errdefer e.locateError();
     try stack.check();
-    // What this node allocates is dead once it is compiled.
-    const slot_mark = e.slot_top;
-    defer e.slot_top = slot_mark;
     // In a tail of the function a form returns its value itself: in
     // place when it is a literal, a local or a Var, else from `dst`
     // once computed. The forms that pass the tail on to their parts
@@ -3240,7 +2895,7 @@ fn compileExpr(
     switch (form.*) {
         .nil => try e.emit(vm.asm_.loadNil(dst)),
         .bool => |b| try e.emit(if (b) vm.asm_.loadTrue(dst) else vm.asm_.loadFalse(dst)),
-        .int => |n| try e.emit(vm.asm_.loadConst(dst, try e.addValueConst(value_mod.fromFixnum(n) orelse return CompileError.IntegerOutOfFixnumRange))),
+        .int => |n| try e.emit(vm.asm_.loadConst(dst, try e.addValueConst(value_mod.fromFixnum(n).?))),
         .literal => |v| try e.emit(vm.asm_.loadConst(dst, try e.addValueConst(v))),
         .symbol => |name| try compileSymbol(e, name, dst),
         .qualified_symbol => |qs| try compileQualifiedSymbol(e, qs.ns, qs.name, dst),
@@ -3273,8 +2928,7 @@ fn compileExpr(
 /// return (or recur, or throw) on every path.
 fn passesTail(form: *const Tiny) bool {
     return switch (form.*) {
-        .if_, .let_star, .letfn_star, .loop_star, .recur, .throw_ => true,
-        .do_ => |items| items.len > 0,
+        .if_, .let_star, .letfn_star, .loop_star, .recur, .throw_, .do_ => true,
         else => false,
     };
 }
@@ -3505,7 +3159,7 @@ fn primOperand(e: *Emitter, t: *const Tiny, allow_var: bool, dst: u12, free_dst:
 fn isInert(e: *const Emitter, t: *const Tiny) bool {
     return switch (t.*) {
         .nil, .bool, .literal => true,
-        .int => |n| value_mod.isFixnumRange(n),
+        .int => true,
         .symbol => |name| e.resolveLocalRef(name) != null,
         else => false,
     };
@@ -3588,32 +3242,12 @@ fn qualifiedVarIndex(e: *Emitter, ns_prefix: []const u8, name: []const u8) Compi
 }
 
 fn compileSymbol(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
-    // Symbol resolution order for the Tiny backend (the Form
-    // frontend sits ABOVE this; resolution itself lives here):
-    //   1. local (this routine) → dispatch on BindingRef
-    //      (.direct_slot / .cell_slot / .upvalue)
-    //   2. captured upvalue (parent chain) → resolve.upvalue
-    //      + capture (bindings are boxed where they are bound,
-    //      so BindingRef is stable across all control-flow paths)
-    //   3. namespace Var (if namespace exists) → var:load-var
-    //      (lazy-interns unbound Vars so forward references
-    //      work)
-    //   4. otherwise `UnresolvedSymbol`
-    //
-    // Form lowering does NOT resolve symbols to slots
-    // — it preserves names and dispatches operator-position
-    // special forms / intrinsics. Slot resolution happens here.
+    // A local, a captured upvalue, else the namespace's Var
+    // (COMPILER.md §4.3).
     const ref = e.resolveOrCapture(name) catch |err| switch (err) {
-        // Lexical resolution failed; try the
-        // namespace before giving up. Critical that this is
-        // ONLY done for UnresolvedSymbol — other errors
-        // (SlotOverflow, OutOfMemory, InternalCompilerBug)
-        // are real bugs and must propagate untouched.
         CompileError.UnresolvedSymbol => {
             if (e.namespace) |_| {
-                // Intern (or get existing) Var, add to var_table,
-                // emit var:load-var. The Var may be unbound at
-                // compile time; runtime traps :unbound-var if so.
+                // An unbound Var traps :unbound-var when it runs.
                 const idx = try e.addVarRef(name);
                 try e.emit(vm.asm_.varLoadVar(dst, idx));
                 return;
@@ -3643,17 +3277,8 @@ fn compileSymbol(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
     }
 }
 
-/// Lower `(def name value?)`. Interns the Var in the current
-/// namespace itself (creating an unbound Var if absent; a referred
-/// Var of the same name is shadowed, never rebound), stores the
-/// value, read in place where it can be, as its root
-/// (`var:store-var`), and yields the Var object (`var:var-object`).
-///
-/// Without a Namespace (`e.namespace == null`), `def` raises
-/// `UnresolvedSymbol`.
-///
-/// `(def x)` (no value) is a forward-declaration: the Var is
-/// interned and stays as it was.
+/// `(def name value?)` (COMPILER.md §5.8): the namespace's own Var,
+/// its root the value when there is one, the Var itself the value.
 fn compileDef(
     e: *Emitter,
     name: []const u8,
@@ -3862,20 +3487,10 @@ fn compileThrow(e: *Emitter, value: *const Tiny) CompileError!void {
     try e.emit(vm.asm_.throwOp(try compileOperand(e, value, true)));
 }
 
-/// Lower `(loop* [b1 v1 b2 v2 ...] body)` per COMPILER.md §5.7
-/// + VM.md §11.
-///
-/// Same as `let*` for binding setup (sequential RHS visibility,
-/// captured bindings boxed as they are bound). After the bindings
-/// are set up, mark the entry PC and compile the body with a
-/// loop `RecurTarget` so any `(recur ...)` in tail position
-/// rebinds the loop slots and jumps back to entry.
-///
-/// Entry-PC placement: AFTER the
-/// binding setup + captured-binding boxing prelude. Jumping
-/// back must NOT re-evaluate initial RHSs and must NOT re-box
-/// the binding slots — the recur path handles cell installation
-/// directly.
+/// `(loop* [b v ...] body)` (COMPILER.md §5.7): the bindings as
+/// `let*`'s, then the body under a target whose entry is after them,
+/// so a `recur` neither runs an initial value nor boxes a binding
+/// again.
 fn compileLoopStar(
     e: *Emitter,
     bindings: []const Binding,
@@ -3893,7 +3508,6 @@ fn compileLoopStar(
     for (bindings, captured_mask) |b, *c| c.* = b.captured;
     try bindSequential(e, bindings, binding_slots);
 
-    // 4. Mark entry PC (AFTER box-local prelude).
     const entry_pc = try e.nextPc();
     const names = try e.allocator.alloc([]const u8, bindings.len);
     defer e.allocator.free(names);
@@ -3910,10 +3524,7 @@ fn compileLoopStar(
         .numeric = numeric,
     };
 
-    // 5. Compile body with the loop target installed. The
-    // body REPLACES (not propagates) any outer recur target —
-    // a recur inside the body always targets THIS loop, not an
-    // enclosing one (nested-loop rule).
+    // A `recur` in the body targets this loop, never an outer one.
     try compileExpr(e, body, dst, &loop_target);
 }
 
@@ -3936,8 +3547,9 @@ fn compileRecur(
     args: []const *const Tiny,
     recur_target: ?*const RecurTarget,
 ) CompileError!void {
-    const target = recur_target orelse return CompileError.RecurOutsideTail;
-    if (args.len != target.binding_slots.len) return CompileError.RecurArityMismatch;
+    const target = recur_target orelse return e.fail(CompileError.RecurOutsideTail, "recur is only in tail position", .{});
+    if (args.len != target.binding_slots.len)
+        return e.fail(CompileError.RecurArityMismatch, "recur takes {d} argument{s}, got {d}", .{ target.binding_slots.len, if (target.binding_slots.len == 1) "" else "s", args.len });
 
     const n = args.len;
     const reads = try e.allocator.alloc(bool, n * n);
@@ -4217,18 +3829,7 @@ fn compileDo(
     dst: u12,
     recur_target: ?*const RecurTarget,
 ) CompileError!void {
-    // Empty do is nil.
-    if (exprs.len == 0) {
-        try e.emit(vm.asm_.loadNil(dst));
-        return;
-    }
-    // Single-expression do compiles directly into dst, inheriting
-    // tail position from the enclosing form.
-    if (exprs.len == 1) {
-        try compileExpr(e, exprs[0], dst, recur_target);
-        return;
-    }
-    // The forms before the last run for effect and are not in tail
+    // `lowerBody` makes a `do` of two forms or more. The forms before the last run for effect and are not in tail
     // position.
     for (exprs[0 .. exprs.len - 1]) |expr| try compileEffect(e, expr);
     // Last expression IS tail position; inherit recur target.
@@ -4242,18 +3843,10 @@ fn compileDo(
 /// slot freed at once.
 fn compileEffect(e: *Emitter, t: *const Tiny) CompileError!void {
     if (isInert(e, t)) return;
-    const saved_span = e.current_span;
-    defer e.current_span = saved_span;
-    if (e.spanned) {
-        const node: *const TinyNode = @fieldParentPtr("tiny", t);
-        if (node.span) |span| e.current_span = span;
-    }
-    errdefer if (e.diag) |d| {
-        if (d.span == null) d.span = e.current_span;
-    };
+    const node = e.enterNode(t);
+    defer e.leaveNode(node);
+    errdefer e.locateError();
     try stack.check();
-    const slot_mark = e.slot_top;
-    defer e.slot_top = slot_mark;
     switch (t.*) {
         .do_ => |items| for (items) |item| try compileEffect(e, item),
         .if_ => |i| {
@@ -4370,7 +3963,6 @@ fn compileClause(parent: *Emitter, f: FnSpec, clause: Clause, shared: *Captures)
     var child = Emitter.init(parent.allocator, parent.out);
     child.parent = parent;
     child.namespace = parent.namespace;
-    child.spanned = parent.spanned;
     child.source = parent.source;
     // The prelude (parameter boxing) carries the fn form's span.
     child.current_span = parent.current_span;
@@ -4412,45 +4004,18 @@ fn compileClause(parent: *Emitter, f: FnSpec, clause: Clause, shared: *Captures)
     try shared.sources.appendSlice(parent.allocator, child.captures.items);
     shared.names.clearRetainingCapacity();
     try shared.names.appendSlice(parent.allocator, child.captured_names.items);
-    const child_compiled = try child.finish();
-    // The routine lives on the compile allocator with the tree it
-    // belongs to; its name is copied because it borrows from source
-    // text that need not outlive the routine.
-    return .{
-        .code = child_compiled.code,
-        .consts = child_compiled.consts,
-        .capture_descs = child_compiled.capture_descs,
-        .tries = child_compiled.tries,
-        .var_table = child_compiled.var_table,
-        .slot_count = child_compiled.slot_count,
-        .fixed_arity = @intCast(clause.params.len),
-        .variadic = clause.rest_param != null,
-        .name = if (f.display_name) |n| try parent.out.dupe(u8, n) else "fn",
-        .spans = child_compiled.spans,
-        .origin = if (parent.current_span) |sp| toSourceSpan(sp) else null,
-        .source = parent.source,
-    };
+    var routine = try child.finish();
+    routine.fixed_arity = @intCast(clause.params.len);
+    routine.variadic = clause.rest_param != null;
+    // The name borrows from source text that need not outlive the
+    // routine.
+    routine.name = if (f.display_name) |n| try parent.out.dupe(u8, n) else "fn";
+    routine.origin = if (parent.current_span) |sp| toSourceSpan(sp) else null;
+    return routine;
 }
 
-/// Lower `letfn*` per COMPILER.md §5.6b: mutually-recursive
-/// function bindings via the placeholder-cell pattern.
-///
-/// Sequence (COMPILER.md §5.6b):
-///   1. Allocate placeholder cells: `closure:new-cell` for
-///      each binding's name. Push each into scope as
-///      `.cell_slot`.
-///   2. For each binding, compile its fn body (constructing
-///      a closure via `closure:make`). Each fn body is
-///      compiled in a child Emitter, so references to letfn*
-///      names are captured from the parent's `.cell_slot`s
-///      and read at runtime as upvalues (cell deref via the
-///      U-operand). The letfn* body itself sees the
-///      bindings as same-frame `.cell_slot` reads
-///      (`closure:get-cell`).
-///   3. For each binding, init the cell with the
-///      constructed closure: `closure:init-cell s_cell, s_closure`.
-///   4. Compile body (with all letfn* bindings still in
-///      scope).
+/// `letfn*` (COMPILER.md §5.6b): a cell per name, then each function
+/// capturing the cells, then the cells filled, then the body.
 fn compileLetFnStar(
     e: *Emitter,
     bindings: []const FnBinding,
@@ -4458,22 +4023,10 @@ fn compileLetFnStar(
     dst: u12,
     recur_target: ?*const RecurTarget,
 ) CompileError!void {
-    // Reject duplicate binding names. Unlike let* (sequential
-    // shadowing OK), letfn* names are mutually visible — two
-    // with the same name create resolution ambiguity.
-    for (bindings, 0..) |b, i| {
-        for (bindings[0..i]) |b2| {
-            if (std.mem.eql(u8, b.name, b2.name)) return CompileError.DuplicateBinding;
-        }
-    }
-
     const scope_mark = e.scope.mark();
     defer e.scope.restore(scope_mark);
 
-    // 1. Allocate placeholder cells for each binding;
-    // push each into scope as .cell_slot. Cells must exist
-    // BEFORE any closure:make so the cap_desc local_cell_slot
-    // sources can reference them.
+    // The cells exist before any closure:make captures them.
     const cell_slots = try e.allocator.alloc(u12, bindings.len);
     defer e.allocator.free(cell_slots);
     for (bindings, cell_slots) |b, *s| {
@@ -4482,33 +4035,22 @@ fn compileLetFnStar(
         try e.scope.bind(e.allocator, b.name, .{ .cell_slot = s.* });
     }
 
-    // 2. Compile each fn (constructing closures). We
-    // allocate a fresh result slot for each closure value.
-    // The fn bodies see all letfn* names in scope (as
-    // .cell_slot via the entries we just pushed).
     const closure_slots = try e.allocator.alloc(u12, bindings.len);
     defer e.allocator.free(closure_slots);
+    const outer_span = e.current_span;
     for (bindings, 0..) |b, i| {
+        e.current_span = b.span;
         const cs = try e.allocSlot();
         closure_slots[i] = cs;
-        // compileFn handles the named case via the
-        // placeholder pattern when the body references its
-        // own name. For letfn*, we don't pass `b.name` as
-        // the fn's self-name because the binding-name's cell
-        // is already in scope (so the fn body's references
-        // resolve via parent-chain capture); using the
-        // self-name machinery here would double-allocate.
+        // No self-name: the name's cell is already in scope.
         try compileFn(e, .{ .display_name = b.name, .clauses = b.clauses }, cs);
     }
+    e.current_span = outer_span;
 
-    // 3. Init each cell with its closure.
     for (bindings, 0..) |_, i| {
         try e.emit(vm.asm_.closureInitCell(cell_slots[i], vm.Operand.slot(closure_slots[i])));
     }
 
-    // 4. Compile body in the now-fully-bound scope. Body
-    // is in tail position relative to the enclosing form; inherit
-    // recur target.
     try compileExpr(e, body, dst, recur_target);
 }
 
@@ -4709,7 +4251,8 @@ const stub_routine = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count
 fn runBare(arena: std.mem.Allocator, v: *vm.VM, src: []const u8) !Value {
     const compiled = try compileSourceWith(arena, src, .{ .namespace = v.ensureNamespace(), .interner = v.ensureInterner() });
     const routine = try arena.create(vm.Routine);
-    routine.* = compiled.toRoutine("test");
+    routine.* = compiled;
+    routine.name = "test";
     try v.retargetTop(routine);
     return v.run();
 }
@@ -4751,7 +4294,6 @@ test "compile errors: each malformed program fails with its variant" {
         .{ .src = "(def)", .err = CompileError.MalformedForm },
         .{ .src = "(def 42 5)", .err = CompileError.ExpectedSymbol },
         .{ .src = "(var)", .err = CompileError.MalformedForm },
-        .{ .src = "(letfn* [(f [] 1) (f [] 2)] (f))", .err = CompileError.DuplicateBinding },
         .{ .src = "(recur)", .err = CompileError.RecurOutsideTail },
         .{ .src = "(loop* [i 0] (let* [x (recur 1)] x))", .err = CompileError.RecurOutsideTail },
         .{ .src = "(loop* [i 0] (do (recur 1) i))", .err = CompileError.RecurOutsideTail },
@@ -4787,9 +4329,6 @@ test "compile errors: each malformed program fails with its variant" {
         std.debug.print("\n  source: {s} compiled\n", .{c.src});
         return error.TestExpectedError;
     }
-    // Only a hand-built tree can carry an integer past the fixnum
-    // range: lowering makes a wider literal a bignum.
-    try testing.expectError(CompileError.IntegerOutOfFixnumRange, compileTiny(a, &.{ .int = value_mod.fixnum_max + 1 }));
 }
 
 test "compile errors: a macro failure is reported at the innermost form, with the expander's message" {
@@ -4826,7 +4365,7 @@ test "compile errors: a macro that never stops expanding is MacroDepthExceeded" 
             return @constCast(call_form);
         }
     };
-    var host_macros: expand_mod.HostMacroTable = .{};
+    var host_macros: expand_mod.HostMacroTable = .empty;
     defer host_macros.deinit(arena.allocator());
     try host_macros.put(arena.allocator(), "boom", Wrap.loopForever);
     var span: ?reader_mod.SrcSpan = null;
@@ -4880,7 +4419,8 @@ test "bytecode: only a captured binding is boxed, and on every path" {
         var boxes: usize = 0;
         var routines: std.ArrayList(*const vm.Routine) = .empty;
         const top = try arena.allocator().create(vm.Routine);
-        top.* = compiled.toRoutine("t");
+        top.* = compiled;
+        top.name = "t";
         try routines.append(arena.allocator(), top);
         while (routines.pop()) |r| {
             for (r.code) |inst| {
@@ -4945,7 +4485,8 @@ test "bytecode: recur runs a 10k-iteration loop in constant stack space" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const compiled = try compileSourceWith(arena.allocator(), "(loop* [i 0] (if (< i 10000) (recur (+ i 1)) i))", .{});
-    const routine = compiled.toRoutine("10k-loop");
+    var routine = compiled;
+    routine.name = "10k-loop";
     var v = try vm.VM.init(testing.allocator, &routine);
     defer v.deinit();
     const stack_before = v.stack_high_water;
@@ -5029,7 +4570,8 @@ test "bytecode: forms compile and run in a bare namespace" {
     try testing.expectError(vm.VmError.ArityMismatch, runBare(a, &v, "((fn* [x y] x) 1)"));
     // A closure over the catch binding sees the thrown value.
     const caught = try compileSourceWith(a, "((try (throw 7) (catch any e (fn* [] e))))", .{});
-    const routine = caught.toRoutine("t");
+    var routine = caught;
+    routine.name = "t";
     try v.retargetTop(&routine);
     try testing.expectEqual(@as(i64, 7), (try v.run()).asFixnum());
 }
@@ -5177,17 +4719,17 @@ test "stack guard: a form nested past the stack budget is StackOverflow, not a c
         const shallow = try nestedVectorForm(a, 100, quoted);
         _ = try compileFormWith(a, shallow, opts);
     }
-    // A hand-built Tiny tree reaches the Emitter without lowering;
-    // a one-form `do` allocates no slot, so only depth can fail it.
-    var tiny: *const Tiny = &.{ .int = 1 };
+    // A tree that reaches the Emitter that deep fails there: a `do`
+    // of a nil and the tree below allocates no slot it keeps, so
+    // only depth can fail it.
+    var tiny: *const Tiny = try allocTiny(a, .{ .int = 1 });
     for (0..100_000) |_| {
-        const node = try a.create(Tiny);
-        const items = try a.alloc(*const Tiny, 1);
-        items[0] = tiny;
-        node.* = .{ .do_ = items };
-        tiny = node;
+        const items = try a.alloc(*const Tiny, 2);
+        items[0] = try allocTiny(a, .nil);
+        items[1] = tiny;
+        tiny = try allocTiny(a, .{ .do_ = items });
     }
-    try testing.expectError(CompileError.StackOverflow, compileTiny(a, tiny));
+    try testing.expectError(CompileError.StackOverflow, emitRoutine(a, tiny, .{}));
 }
 
 test "declared names: an unresolved symbol is reported at its own span" {
@@ -5297,7 +4839,8 @@ test "span table: entries ascend from pc 0, cover the source and carry the form'
     try testing.expect(compiled.source == &info);
     // Every instruction resolves, and the inlined `math:add` carries
     // the span of `(+ 1 2)`.
-    const routine = compiled.toRoutine("t");
+    var routine = compiled;
+    routine.name = "t";
     var saw_add = false;
     for (routine.code, 0..) |inst, pc| {
         const span = routine.spanAt(@intCast(pc)) orelse return error.TestFailed;
@@ -5330,12 +4873,24 @@ test "span table: a nested routine carries its own table, origin and name" {
     try testing.expectEqualStrings("(* x x)", src[last.pos .. last.pos + last.len]);
 }
 
+test "span table: each letfn* function's routine is at its own entry" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src = "(letfn* [(g [] 1) (k [] 2)] (g))";
+    const compiled = try compileSourceWith(arena.allocator(), src, .{});
+    if (compiled.capture_descs.len != 2) return error.TestFailed;
+    for (compiled.capture_descs, [_][]const u8{ "(g [] 1)", "(k [] 2)" }) |desc, entry| {
+        const origin = desc.routine.origin orelse return error.TestFailed;
+        try testing.expectEqualStrings(entry, src[origin.pos .. origin.pos + origin.len]);
+    }
+}
+
 test "span table: a loop's test repeated at its recur carries the test's spans" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const src = "(loop* [i 0] (if (< i 3) (recur (inc i)) i))";
     const info = vm.SourceInfo{ .path = "t.nx", .text = src };
-    const routine = (try compileSourceWith(arena.allocator(), src, .{ .source = &info })).toRoutine("t");
+    const routine = try compileSourceWith(arena.allocator(), src, .{ .source = &info });
     // Each instruction of the test, at the entry and at the recur,
     // names `(< i 3)` or the `if` it branches for.
     var seen: [2][2][]const u8 = undefined;
@@ -5352,13 +4907,4 @@ test "span table: a loop's test repeated at its recur carries the test's spans" 
     try testing.expectEqualStrings("(< i 3)", seen[0][0]);
     try testing.expectEqualStrings(src[13 .. src.len - 1], seen[0][1]);
     for (0..2) |k| try testing.expectEqualStrings(seen[0][k], seen[1][k]);
-}
-
-test "span table: a hand-built Tiny compiles with no table" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const form = Tiny{ .int = 7 };
-    const compiled = try compileTiny(arena.allocator(), &form);
-    try testing.expectEqual(@as(usize, 0), compiled.spans.len);
-    try testing.expect(compiled.toRoutine("t").spanAt(0) == null);
 }

@@ -1182,8 +1182,12 @@ test "multi-arity fn: anonymous, named and letfn clauses dispatch by argc" {
     try expectOutput("(letfn [(f [[a b]] (+ a b))] (f [1 2]))", "3");
     try expectOutput("(let [f (fn ([[a b]] (+ a b)) ([m k] (get m k)))] [(f [1 2]) (f {:k 3} :k)])", "[3 3]");
     try expectOutput("(try ((fn ([x] x)) 1 2) (catch any e e))", "{:error :arity-mismatch, :message fn takes 1 argument, got 2, :fn test-form}");
-    try expectProgramError("(fn ([x] 1) ([x] 2))", compile.CompileError.MacroExpansionFailure);
-    try expectProgramError("(fn ([x y] 1) ([x & r] 2))", compile.CompileError.MacroExpansionFailure);
+    try expectLoadFailure("(fn ([x] 1) ([x] 2))", "compile error: fn: two overload clauses take 1 argument", "([x] 2)");
+    try expectLoadFailure("(fn ([x y] 1) ([x & r] 2))", "compile error: fn: a fixed arity of 2 is above the variadic clause's 1", "([x y] 1)");
+    try expectLoadFailure("(fn* ([x] x) ([x] x))", "compile error: fn: two overload clauses take 1 argument", "([x] x)");
+    try expectLoadFailure("(fn [a & b c] a)", "compile error: fn: & takes exactly one parameter after it", "[a & b c]");
+    try expectLoadFailure("(loop [i 0] (recur 1 2))", "compile error: recur takes 1 argument, got 2", "(recur 1 2)");
+    try expectLoadFailure("(do (recur) 1)", "compile error: recur is only in tail position", "(recur)");
 }
 
 test "multi-arity fn: each clause is called at its count through every path" {
@@ -2015,7 +2019,7 @@ test "integration: with-open closes each binding in reverse order, through Close
         \\ (try (with-open [c (->R 3)] (throw :boom)) (catch any e e)) @log (with-open [] 7)]
     , "[:result [:body 2 1] :boom [:body 2 1 3] 7]");
     try expectOutput("(try (with-open [a 1] 2) (catch any e e))", "{:error :no-protocol-impl, :message no impl of close for an integer, :fn test-form}");
-    try expectOutput("(try (macroexpand '(with-open [a] 1)) (catch any e e))", "{:error :macro-expansion-failure, :message macro expansion failure, :fn test-form}");
+    try expectOutput("(try (macroexpand '(with-open [a] 1)) (catch any e e))", "{:error :macro-expansion-failure, :message macro with-open threw with-open takes a vector of symbol and value pairs, :fn test-form}");
     try expectOutputProgramWithStore("with-open-conns",
         \\(def c (with-open [c (db/open "@STORE@")] c))
         \\(def n (with-open [n (nextomic/connect "@STORE@.nextomic")] n))
@@ -3636,7 +3640,8 @@ test "integration: catchable — KindMismatch BYPASSES translation when no handl
     var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     const compiled = try compile.compileSourceWith(arena.allocator(), "(+ 1 :hello)", .{ .namespace = ns, .interner = interner, .host_macros = &host_macros });
-    const routine = compiled.toRoutine("catchable-no-handler");
+    var routine = compiled;
+    routine.name = "catchable-no-handler";
     v.frames.items[0].routine = &routine;
     v.frames.items[0].pc = 0;
     if (v.stack.items.len < routine.slot_count) {
@@ -5754,7 +5759,7 @@ test "protocol methods: several arities, in either Clojure spelling, dispatch by
         \\(try (m (->R 1) 2) (catch any e e))
     , "{:error :arity-mismatch, :message fn takes 1 argument, got 2, :fn test-form}");
     // The same arity twice is the fn overload error.
-    try expectMacroFailure("(defprotocol P (m [s]))", "(defrecord R [a] P (m [this] 1) (m [that] 2))", "fn: two overload clauses take 1 arguments", "(m [that] 2)");
+    try expectLoadFailure("(defprotocol P (m [s])) (defrecord R [a] P (m [this] 1) (m [that] 2))", "compile error: fn: two overload clauses take 1 argument", "(m [that] 2)");
     try expectMacroFailure("(defprotocol P (m [s]))", "(extend-type :string P (m ([s] 1) [s]))", "expected the method's parameter vector or its arities ([params] body...), not a vector", "[s]");
 }
 
@@ -7261,7 +7266,7 @@ test "eval: a compile error is a catchable map; a throw inside the form is an or
     // The message is the compiler's sentence, the CompileError's name
     // in words when it has none; :kind is the name.
     try expectOutput("(try (eval '(nope 1)) (catch :compile-error e [(:error e) (:message e) (:form e) (:kind e)]))", "[:compile-error unable to resolve symbol: nope (nope 1) UnresolvedSymbol]");
-    try expectOutput("(try (eval '(recur 1)) (catch :compile-error e [(:kind e) (:message e)]))", "[RecurOutsideTail recur outside tail]");
+    try expectOutput("(try (eval '(recur 1)) (catch :compile-error e [(:kind e) (:message e)]))", "[RecurOutsideTail recur is only in tail position]");
     try expectOutput("(try (eval '(quote)) (catch :compile-error e [(:kind e) (:message e)]))", "[MalformedForm malformed form]");
     try expectOutput("(try (eval '(let* [x] x)) (catch :compile-error e [(:kind e) (:message e)]))", "[MacroExpansionFailure let*: the binding vector needs an even number of forms]");
     try expectOutput("(try (eval (list 'a (fn [] 1))) (catch :compile-error e [(:kind e) (:message e)]))", "[UnsupportedForm unsupported form]");
@@ -7764,7 +7769,7 @@ fn runLocated(program: *Program, info: *const vm.SourceInfo) anyerror!value_mod.
             .declared = &declared,
             .source = info,
         });
-        const routine = compiled.toRoutine("<top>");
+        const routine = compiled;
         try program.v.retargetTop(&routine);
         last = try program.v.run();
     }
@@ -7926,7 +7931,9 @@ fn compileRoutineForTest(program: *Program, src: []const u8) !vm.Routine {
         .registry = program.registry,
         .declared = &declared,
     });
-    return compiled.toRoutine("nested");
+    var routine = compiled;
+    routine.name = "nested";
+    return routine;
 }
 
 var nested_routine: ?*const vm.Routine = null;
@@ -8046,7 +8053,7 @@ const RequireDir = struct {
 
     /// Compile `src` (one form) with the loader in place, so a
     /// `require` in it runs while the form is being compiled.
-    fn compileOne(self: *RequireDir, program: *Program, src: []const u8) !compile.Compiled {
+    fn compileOne(self: *RequireDir, program: *Program, src: []const u8) !vm.Routine {
         var parse_result = try reader_mod.parser.parseProgram(testing.allocator, src);
         defer parse_result.parser.deinit();
         var rdr = reader_mod.Reader.init(testing.allocator, src);
@@ -8087,7 +8094,8 @@ fn expectOutputWithFiles(files: []const [2][]const u8, src: []const u8, expected
             .registry = program.registry,
             .load_callback = dir.callback(),
         });
-        const routine = compiled.toRoutine("test-form");
+        var routine = compiled;
+        routine.name = "test-form";
         try program.v.retargetTop(&routine);
         last = try program.v.run();
     }
@@ -8669,6 +8677,113 @@ test "a user macro named like a core macro is the namespace's own" {
         \\(defmacro when-let [b & body] :mine)
         \\[(when-let [x 1] x) (nexis.core/when-let [x 1] x)]
     , "[:mine 1]");
+}
+
+test "loader: an unresolved symbol whose namespace ends in a period is reported, with no hint" {
+    try expectLoadFailure("a./b", "compile error: unable to resolve symbol: a./b", "a./b");
+    try expectLoadFailure("(./x 1)", "compile error: unable to resolve symbol: ./x", "./x");
+}
+
+test "clojure.core is a permanent name for nexis.core" {
+    try expectOutputProgram("(clojure.core/inc 1)", "2");
+    try expectOutputProgram("(clojure.core/when true (clojure.core/let [[a] [3]] a))", "3");
+    try expectOutputProgram("`clojure.core/inc", "nexis.core/inc");
+    try expectOutputProgram(
+        \\(ns my.app (:refer-clojure :exclude [get]))
+        \\(defn get [m k] :mine)
+        \\[(get {} 1) (clojure.core/get {:a 1} :a)]
+    , "[:mine 1]");
+    try expectOutputWithFiles(&.{}, "(require '[clojure.core :as c]) [(c/inc 1) (c/when true 2)]", "[2 2]");
+    try expectOutputWithFiles(&.{}, "(require '[clojure.core :refer [inc]]) (inc 1)", "2");
+}
+
+test "defmacro: a lazy result whose realization fails says why, as a failing call does" {
+    try expectMacroFailure("(defn g [x] x) (defmacro m [] (lazy-seq [(g)]))", "(m)", "macro m failed: ArityMismatch: g takes 1 argument, got 0", "(m)");
+}
+
+test "loader: an unterminated string or regex is reported as one, and as incomplete" {
+    try expectLoadFailure("(println \"abc)", "parse error: unterminated string", "\"");
+    try expectLoadFailure("(println #\"abc)", "parse error: unterminated regex", "#\"");
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const info = vm.SourceInfo{ .path = "<test>", .text = "(re-find #\"a" };
+    try testing.expectError(error.Diagnosed, program.loader.evalSource(&info, .{ .allocator = program.arena.allocator() }));
+    try testing.expect(program.loader.diagnostic.?.incomplete);
+}
+
+test "reader: #! is a comment to the end of its line anywhere, as in Clojure" {
+    try expectOutputProgram("#!/usr/bin/env nexis\n(+ 1 #! two\n 2)", "3");
+    try expectOutputProgram("(read-string \"#!x\\n:k\")", ":k");
+}
+
+test "a failed :pre or :post carries the place keys of the condition, as a runtime error does" {
+    try expectLoaded("(try ((fn [x] {:pre [(pos? x)]} x) -1) (catch :assertion-failed e [(:message e) (:line e) (:column e)]))", "[Assert failed: (pos? x) 1 22]");
+    try expectLoaded("(try ((fn [x]\n {:post [(> % 10)]} x) 3) (catch :assertion-failed e [(:message e) (:line e) (:column e)]))", "[Assert failed: (> % 10) 2 10]");
+}
+
+test "macroexpand-1 says why a macro failed" {
+    try expectOutputProgram("(defmacro m [] (throw (ex-info \"bad input\" {}))) (try (macroexpand-1 '(m)) (catch :macro-expansion-failure e (:message e)))", "macro m threw bad input");
+    try expectOutput("(try (macroexpand-1 '(when)) (catch any e [(:error e) (:message e)]))", "[:macro-expansion-failure when: expected a test]");
+}
+
+test "defmacro: a macro returning a native fn names its kind as every message does" {
+    try expectMacroFailure("(defmacro m [] +)", "(m)", "a macro returned a function, which is not a form", "(m)");
+}
+
+/// What `evalSource` hands the REPL's callbacks: each printed value,
+/// realized as the REPL realizes it, and each failure.
+const ReplLike = struct {
+    program: *Program,
+    failures: usize = 0,
+
+    fn value(ctx: *anyopaque, v: value_mod.Value) anyerror!void {
+        const self: *ReplLike = @ptrCast(@alignCast(ctx));
+        self.program.v.realizeOutside(v) catch return error.RunFailed;
+    }
+
+    fn failure(ctx: *anyopaque, _: nx.loader.EvalError) anyerror!void {
+        const self: *ReplLike = @ptrCast(@alignCast(ctx));
+        self.failures += 1;
+        self.program.v.resetAfterError();
+    }
+};
+
+test "loader: an error realizing a printed value is placed at the form printed" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    var repl: ReplLike = .{ .program = &program };
+    const src = "1 (map inc \"a\")";
+    const info = vm.SourceInfo{ .path = "<test>", .text = src };
+    try testing.expectError(error.RunFailed, program.loader.evalSource(&info, .{ .allocator = program.arena.allocator(), .on_value = .{ .ctx = &repl, .call = &ReplLike.value } }));
+    const at = program.v.error_trace.items[0];
+    try testing.expectEqualStrings("(map inc \"a\")", src[at.span.?.pos..][0..at.span.?.len]);
+}
+
+test "loader: with on_failure, a form that fails at run time does not stop the forms after it" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    var repl: ReplLike = .{ .program = &program };
+    const src = "(defn f [x] (/ x 0)) (f 1) (map inc \"a\") (+ 1 2)";
+    const info = vm.SourceInfo{ .path = "<test>", .text = src };
+    const last = try program.loader.evalSource(&info, .{
+        .allocator = program.arena.allocator(),
+        .on_value = .{ .ctx = &repl, .call = &ReplLike.value },
+        .on_failure = .{ .ctx = &repl, .call = &ReplLike.failure },
+    });
+    try testing.expectEqual(@as(usize, 2), repl.failures);
+    try harness.expectResult(&program, src, last, "3");
+}
+
+test "letfn: a repeated name is its last binding, everywhere in the form, as in Clojure" {
+    try expectOutput("[(letfn [(f [] 1) (f [] 2)] (f)) (letfn [(f [] 1) (g [] (f)) (f [] 2)] (g))]", "[2 2]");
+}
+
+test "loader: a defmulti or deftest a file defines later is a forward reference, as a defn is" {
+    try expectLoaded("(defn f [x] (area x)) (defmulti area :shape) (defmethod area :sq [m] 1) (f {:shape :sq})", "1");
+    try expectLoaded("(require '[nexis.test :refer [deftest]]) (defn g [] (fn? t)) (deftest t) (g)", "true");
 }
 
 // =============================================================================

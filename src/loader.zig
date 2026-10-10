@@ -100,6 +100,11 @@ pub const EvalOptions = struct {
     on_routine: ?Each(*const vm_mod.Routine) = null,
     /// Each form's value as it runs (the REPL prints it).
     on_value: ?Each(Value) = null,
+    /// A top-level form that failed at run time (`error.RunFailed`,
+    /// the VM holding the failure), after which the next form runs,
+    /// as Clojure's REPL goes on; without it the failure ends the
+    /// text.
+    on_failure: ?Each(EvalError) = null,
     /// The namespace the text must declare in its first form, `(ns
     /// NAME ...)` with `^meta` on the name allowed: a required file
     /// that declares another name, or none, is refused before any of
@@ -207,12 +212,7 @@ pub const Loader = struct {
         defer rdr.deinit();
         const forms = rdr.readProgram(sexp) catch {
             const e = rdr.err orelse return error.OutOfMemory;
-            // Kinds are spelled with underscores in Zig and dashes in
-            // nexis; the detail is the user's own text.
-            var kind_buf: [64]u8 = undefined;
-            const kind = kind_buf[0..@tagName(e.kind).len];
-            @memcpy(kind, @tagName(e.kind));
-            std.mem.replaceScalar(u8, kind, '_', '-');
+            const kind = reader_mod.kindName(e.kind);
             const base: Diagnostic = .{ .source = info, .span = e.span, .label = "", .reading = true };
             if (e.detail) |detail| {
                 // A Clojure number literal says what to write instead.
@@ -245,28 +245,38 @@ pub const Loader = struct {
             defer scratch.deinit();
             if (options.on_routine) |each| {
                 const routine = try self.compileForm(info, top, scratch.allocator(), options.allocator, decl);
-                each.call(each.ctx, routine) catch |err| return self.callbackFailure(err);
+                each.call(each.ctx, routine) catch |err| return self.callbackFailure(err, info, top);
                 continue;
             }
-            // A top-level `do` runs its forms one at a time, so an
-            // `ns`, `def` or `defmacro` among them is in force for
-            // the ones after it (MACROEXPAND.md §2b).
-            try pending.append(self.allocator, top);
-            while (pending.pop()) |form| {
-                const expanded = try self.expandTopLevel(info, form, scratch.allocator(), decl);
-                if (compile_mod.doForms(expanded)) |body| {
-                    if (decl) |d| try d.declareForm(expanded);
-                    last = nil;
-                    var i = body.len;
-                    while (i > 0) {
-                        i -= 1;
-                        try pending.append(self.allocator, body[i]);
+            const failed: EvalError = failed: {
+                // A top-level `do` runs its forms one at a time, so an
+                // `ns`, `def` or `defmacro` among them is in force for
+                // the ones after it (MACROEXPAND.md §2b).
+                try pending.append(self.allocator, top);
+                while (pending.pop()) |form| {
+                    const expanded = try self.expandTopLevel(info, form, scratch.allocator(), decl);
+                    if (compile_mod.doForms(expanded)) |body| {
+                        if (decl) |d| try d.declareForm(expanded);
+                        last = nil;
+                        var i = body.len;
+                        while (i > 0) {
+                            i -= 1;
+                            try pending.append(self.allocator, body[i]);
+                        }
+                        continue;
                     }
-                    continue;
+                    last = self.run(try self.compileForm(info, expanded, scratch.allocator(), options.allocator, decl)) catch |err| break :failed err;
                 }
-                last = try self.run(try self.compileForm(info, expanded, scratch.allocator(), options.allocator, decl));
-            }
-            if (options.on_value) |each| each.call(each.ctx, last) catch |err| return self.callbackFailure(err);
+                if (options.on_value) |each| each.call(each.ctx, last) catch |err| break :failed self.callbackFailure(err, info, top);
+                continue;
+            };
+            // A form that failed at run time ends the text, unless
+            // `on_failure` takes the failure and the next form runs.
+            const each = options.on_failure orelse return failed;
+            if (failed != error.RunFailed) return failed;
+            pending.clearRetainingCapacity();
+            last = nil;
+            each.call(each.ctx, failed) catch |err| return self.callbackFailure(err, info, top);
         }
         return last;
     }
@@ -307,7 +317,7 @@ pub const Loader = struct {
         // A run that fails leaves its frame for the trace, and the
         // frame points at the routine.
         const routine = try out.create(vm_mod.Routine);
-        routine.* = compiled.toRoutine("<top>");
+        routine.* = compiled;
         return routine;
     }
 
@@ -346,7 +356,7 @@ pub const Loader = struct {
             if (open) |o| return self.diagnose(.{ .source = info, .span = o, .label = "", .reading = true, .incomplete = true }, "parse error: unclosed `{s}`", .{text[o.pos..][0..o.len]});
             return self.diagnose(.{ .source = info, .span = .{ .pos = pos, .len = 1 }, .label = "", .reading = true, .incomplete = true }, "parse error: unexpected end of input", .{});
         }
-        if (unterminatedString(text[pos..])) return self.diagnose(.{ .source = info, .span = .{ .pos = pos, .len = 1 }, .label = "", .reading = true, .incomplete = true }, "parse error: unterminated string", .{});
+        if (reader_mod.unterminatedLiteral(text, pos)) |lit| return self.diagnose(.{ .source = info, .span = .{ .pos = pos, .len = if (lit == .regex) 2 else 1 }, .label = "", .reading = true, .incomplete = true }, "parse error: unterminated {t}", .{lit});
         const token = text[pos..@min(text.len, pos + @max(end -| start, 1))];
         const at: Diagnostic = .{ .source = info, .span = .{ .pos = pos, .len = @intCast(token.len) }, .label = "", .reading = true };
         const closer = token.len == 1 and std.mem.findScalar(u8, ")]}", token[0]) != null;
@@ -358,29 +368,25 @@ pub const Loader = struct {
         return self.diagnose(at, "parse error: unexpected `{s}`", .{token});
     }
 
-    /// Whether `rest` opens a string literal that no unescaped `"`
-    /// closes: the parser stops at the opening quote, and more input
-    /// may complete it.
-    fn unterminatedString(rest: []const u8) bool {
-        if (rest.len == 0 or rest[0] != '"') return false;
-        var i: usize = 1;
-        while (i < rest.len) : (i += 1) switch (rest[i]) {
-            '\\' => i += 1,
-            '"' => return false,
-            else => {},
-        };
-        return true;
-    }
-
     /// A failure of an `on_value` or `on_routine` callback (the REPL
-    /// or `-e` printing a value, `disasm` printing a routine): out of
-    /// memory as itself, a runtime error realizing the value to print
-    /// as one, anything else, such as a closed stdout, as a diagnostic
-    /// naming it, never a runtime error the VM did not have.
-    fn callbackFailure(self: *Loader, err: anyerror) EvalError {
+    /// or `-e` printing a value, `disasm` printing a routine) on the
+    /// value of `top`: out of memory as itself, a runtime error
+    /// realizing the value to print as one, placed at `top` when no
+    /// frame of the realization was (TOOLING.md §1), anything else,
+    /// such as a closed stdout, as a diagnostic naming it, never a
+    /// runtime error the VM did not have.
+    fn callbackFailure(self: *Loader, err: anyerror, info: *const vm_mod.SourceInfo, top: *const reader_mod.Form) EvalError {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         // Realizing a printed result failed (docs/LAZY.md §8).
-        if (err == error.RunFailed) return error.RunFailed;
+        if (err == error.RunFailed) {
+            if (self.vm.error_trace.items.len == 0) self.vm.error_trace.append(self.vm.allocator, .{
+                .name = "<top>",
+                .pc = 0,
+                .span = .{ .pos = top.origin.pos, .len = top.origin.len },
+                .source = info,
+            }) catch return error.OutOfMemory;
+            return error.RunFailed;
+        }
         self.diagnose(.{ .label = "" }, "cannot write the result: {s}", .{@errorName(err)}) catch return error.OutOfMemory;
         return error.Diagnosed;
     }
@@ -433,21 +439,30 @@ pub const Loader = struct {
 
         const rel_path = try nsNameToRelPath(self.allocator, ns_name);
         defer self.allocator.free(rel_path);
-        const path = (try searchLoadPaths(self.allocator, self.io, self.load_paths, rel_path)) orelse {
+        // The text and the path outlive the load: every routine
+        // compiled from the file points at them for its error
+        // reports (TOOLING.md §1). The first load path holding the
+        // file is the one read.
+        const path, const file = for (self.load_paths) |dir| {
+            const candidate = try std.Io.Dir.path.join(self.allocator, &.{ dir, rel_path });
+            const bytes = std.Io.Dir.cwd().readFileAlloc(self.io, candidate, self.persistent_allocator, .unlimited) catch |err| {
+                if (err == error.FileNotFound) {
+                    self.allocator.free(candidate);
+                    continue;
+                }
+                defer self.allocator.free(candidate);
+                if (err == error.OutOfMemory) return LoadError.OutOfMemory;
+                try self.diagnose(.{ .label = "" }, "require: cannot read {s}: {s}", .{ candidate, @errorName(err) });
+                return LoadError.LoadFailed;
+            };
+            break .{ candidate, bytes };
+        } else {
             if (expand_mod.namespaceHint(ns_name)) |hint| {
                 try self.diagnose(.{ .label = "" }, "require: no file {s} on the load path; {s}", .{ rel_path, hint });
             } else try self.diagnose(.{ .label = "" }, "require: no file {s} on the load path", .{rel_path});
             return LoadError.LoadFailed;
         };
         defer self.allocator.free(path);
-
-        // The text and the path outlive the load: every routine
-        // compiled from the file points at them for its error
-        // reports (TOOLING.md §1).
-        const file = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.persistent_allocator, .unlimited) catch |err| {
-            try self.diagnose(.{ .label = "" }, "require: cannot read {s}: {s}", .{ path, @errorName(err) });
-            return LoadError.LoadFailed;
-        };
         const source = if (std.mem.startsWith(u8, file, byte_order_mark)) file[byte_order_mark.len..] else file;
         const info = try self.persistent_allocator.create(vm_mod.SourceInfo);
         info.* = .{ .path = try self.persistent_allocator.dupe(u8, path), .text = source };
@@ -511,20 +526,6 @@ fn nsNameToRelPath(allocator: std.mem.Allocator, ns_name: []const u8) ![]u8 {
     return buf;
 }
 
-/// The first of `load_paths` holding `rel_path`, joined; the caller
-/// owns it.
-fn searchLoadPaths(allocator: std.mem.Allocator, io: std.Io, load_paths: []const []const u8, rel_path: []const u8) !?[]u8 {
-    for (load_paths) |dir| {
-        const candidate = try std.Io.Dir.path.join(allocator, &.{ dir, rel_path });
-        std.Io.Dir.cwd().access(io, candidate, .{}) catch {
-            allocator.free(candidate);
-            continue;
-        };
-        return candidate;
-    }
-    return null;
-}
-
 /// Whether `forms` opens with `(ns NAME ...)`, `^meta` on NAME allowed.
 fn opensWithNs(forms: []const *reader_mod.Form, name: []const u8) bool {
     if (forms.len == 0 or forms[0].datum != .list) return false;
@@ -564,7 +565,7 @@ test "loader: memory that runs out while reading or compiling is OutOfMemory, ne
     const registry = try v.ensureRegistry();
     // What a `def` sets its Var's metadata through, when it runs.
     _ = try registry.core.intern("reset-meta!");
-    const no_macros: expand_mod.HostMacroTable = .{};
+    const no_macros: expand_mod.HostMacroTable = .empty;
     const info = vm_mod.SourceInfo{ .path = "<test>", .text = "(do 1 [1 2 3 4 5 6 7 8 9] {:a [2 3] :b #{1 2}} '(a b))" };
     var failed_somewhere = false;
     for (0..400) |n| {

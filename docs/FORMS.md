@@ -113,7 +113,8 @@ foo, ns/foo, set!, ->>               ;; symbol
 | `#"a\d"` | the `regex` datum of the text `a\d`: a backslash and the character after it are kept as written, so `#"\""` holds `\"` |
 | `#"("`, `#"a{2,1}"`, `#"(?=a)"` | `:invalid-regex`, detail the compiler's sentence and the code-point index in the pattern (`"Unclosed group at index 1"`), the span the literal |
 | `#"abc` with no closing quote | parse error at the `#"` |
-| `##Infinity`, `#?(...)`, `#!`, `::k`, `#%x`, `:` | parse error naming the token (`` unexpected `##Infinity` ``): none is in the reader (`CLOJURE-REVIEW.md` §4) |
+| `#! text`, `; text` | a comment to the end of the line, anywhere, as in Clojure, so a script may begin `#!/usr/bin/env nexis` |
+| `##Infinity`, `#?(...)`, `::k`, `#%x`, `:` | parse error naming the token (`` unexpected `##Infinity` ``): none is in the reader (`CLOJURE-REVIEW.md` §4) |
 | a form nested past the native stack's budget | `:nesting-too-deep` (`src/stack.zig`) |
 | a source text past 4 GiB (`reader.max_source_len`, 2^32 - 1 bytes) | reader error naming the bound and the size, before a byte is read: positions are `u32` offsets |
 

@@ -25,9 +25,9 @@ Every command evaluates through `Loader.evalSource`: parse and read
 every top-level form, then compile and run each before compiling the
 next, on one VM (MACROEXPAND.md §2b, the loader). `require` searches
 the working directory, then the directory of the file being run.
-`*command-line-args*` holds the ARGs (`run` and `-e`); a first line
-that begins `#!`, after a byte-order mark if one opens the file, is a
-comment, so a script can be made executable. A
+`*command-line-args*` holds the ARGs (`run` and `-e`); `#!` begins a
+comment to the end of its line (FORMS.md §3), so a script can be made
+executable. A
 file (run, tested, disassembled or required) that opens with a UTF-8
 byte-order mark is read without it, so its line-1 columns and carets
 count from the character after the mark (`test/golden/cli/bom.nx`;
@@ -137,7 +137,8 @@ of another kind (``unexpected `)`; the `[` at 1:10 is open``);
 ``parse error: unclosed `(` `` at the innermost delimiter the text
 leaves open, or `parse error: unexpected end of input` at the end when
 none is; or `parse error: unterminated string` at the `"` of a string
-literal no quote closes;
+literal no quote closes (`unterminated regex` at the `#"` of a regex
+literal);
 `reader error:
 :KIND DETAIL` at the form the reader rejected (`:duplicate-literal-key
 (keyword :a_b)`, FORMS.md §3); `compile error: SENTENCE` at the span

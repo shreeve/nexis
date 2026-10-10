@@ -76,7 +76,7 @@ const UpvalCell = vm_mod.UpvalCell;
 pub const Source = struct { ns: []const u8, info: vm_mod.SourceInfo };
 
 const magic = "nexisimg";
-const version: u32 = 2;
+const version: u32 = 3;
 
 // The structs the image carries field by field. A field added to one
 // of them must be carried (or deliberately left at its default) here
@@ -96,7 +96,7 @@ comptime {
     expectFields(Namespace, &.{ "name", "parent", "registry", "aliases", "map_allocator", "var_allocator", "vars" });
     expectFields(vm_mod.Closure, &.{ "routine", "upvalues" });
     expectFields(record_mod.RecordBody, &.{ "type_id", "_pad", "fields" });
-    std.debug.assert(@import("builtin").cpu.arch.endian() == .little);
+    std.debug.assert(@import("builtin").target.cpu.arch.endian() == .little);
     std.debug.assert(@sizeOf(vm_mod.Inst) == 8);
 }
 
@@ -154,11 +154,8 @@ pub fn matches(bytes: []const u8, sources: []const Source) bool {
 const RefTag = enum(u8) { nil, immediate, keyword, symbol, object, native, var_ };
 const ObjTag = enum(u8) { cell, atom, string, bignum, regex, vector, empty_list, cons, map, set, function, protocol, protocol_fn, record };
 const EntryTag = enum(u8) {
-    /// The namespace's own Var, keyed by its name.
-    own,
-    /// Another namespace's Var keyed by that Var's own name storage:
-    /// a Clojure library namespace standing for a nexis one.
-    shared,
+    /// A Var keyed by its own name storage: the namespace's own.
+    named,
     /// Another namespace's Var under a name of this namespace.
     referral,
 };
@@ -326,7 +323,7 @@ const Writer = struct {
     impl_out: Out = undefined,
 
     const Names = struct {
-        ids: std.AutoHashMapUnmanaged(u32, u32) = .{},
+        ids: std.AutoHashMapUnmanaged(u32, u32) = .empty,
         texts: std.ArrayList([]const u8) = .empty,
     };
 
@@ -550,7 +547,7 @@ const Writer = struct {
     fn entry(w: *Writer, out: *Out, ns: *Namespace, key: []const u8, v: *Var, states: *u32) WriteError!void {
         const keyed_by_name = key.ptr == v.name.ptr;
         const own = keyed_by_name and v.ns.ptr == ns.name.ptr;
-        try out.byte(@backingInt(if (own) EntryTag.own else if (keyed_by_name) EntryTag.shared else EntryTag.referral));
+        try out.byte(@backingInt(if (keyed_by_name) EntryTag.named else EntryTag.referral));
         try out.int(u32, try w.varIndex(v));
         if (!keyed_by_name) try out.str(key);
         if (!own or w.natives.untouched(v)) return;
@@ -714,7 +711,7 @@ const Writer = struct {
         const h = header(v);
         var meta: Out = .{ .gpa = w.gpa };
         defer meta.deinit();
-        if (tag != .atom and tag != .cell) try w.ref(&meta, metaOf(h));
+        if (tag != .atom and tag != .cell) try w.ref(&meta, dispatch_mod.metaOf(h));
         const id = w.totals.objects;
         w.totals.objects += 1;
         try w.objects.put(w.gpa, @intFromPtr(h), .{ .id = id, .tag = v.tag });
@@ -776,7 +773,7 @@ const Writer = struct {
         }
         const a = atom_mod.body(shell);
         if (a.in_flight != 0) return w.unsupported("an atom in the middle of a swap");
-        try w.ref(&w.fill_out, metaOf(h));
+        try w.ref(&w.fill_out, dispatch_mod.metaOf(h));
         try w.ref(&w.fill_out, a.value);
         try w.ref(&w.fill_out, a.validator);
         try w.ref(&w.fill_out, a.watches);
@@ -853,11 +850,6 @@ fn header(v: Value) *HeapHeader {
     return @ptrFromInt(v.payload);
 }
 
-fn metaOf(h: *HeapHeader) Value {
-    const m = h.getMeta() orelse return value_mod.nilValue();
-    return champ_mod.valueFromMapHeader(m);
-}
-
 // =============================================================================
 // Loading
 // =============================================================================
@@ -868,7 +860,7 @@ fn metaOf(h: *HeapHeader) Value {
 /// release build loads only those bytes (`matches` refuses any other
 /// image) and trusts them; verifying costs it 0.35 M instructions, 1.6%
 /// of a start (docs/PERF.md §3.18).
-pub const verify_routines = std.debug.runtime_safety;
+pub const verify_routines = @import("builtin").optimize.runtimeSafety();
 
 /// Load the image `bytes`, which `matches` accepted for `sources`,
 /// into `vm`, whose natives are installed and which has run nothing:
@@ -1377,7 +1369,7 @@ const Verifier = struct {
     const Error = error{ Mismatch, OutOfMemory };
 
     fn fail(v: *Verifier, comptime fmt: []const u8, args: anytype) Error {
-        v.why = std.fmt.bufPrint(&v.buf, fmt, args) catch fmt;
+        v.why = std.mem.print(&v.buf, fmt, args) catch fmt;
         return error.Mismatch;
     }
 
@@ -1434,7 +1426,7 @@ const Verifier = struct {
             var inner: [256]u8 = undefined;
             const was = inner[0..v.why.len];
             @memcpy(was, v.why);
-            v.why = std.fmt.bufPrint(&v.buf, "{s}/{s} {s}: {s}", .{ ns, name, what, was }) catch v.why;
+            v.why = std.mem.print(&v.buf, "{s}/{s} {s}: {s}", .{ ns, name, what, was }) catch v.why;
         }
         return err;
     }
@@ -1475,7 +1467,7 @@ const Verifier = struct {
         const hx = Heap.asHeapHeader(x);
         const hy = Heap.asHeapHeader(y);
         if (try v.seen(@intFromPtr(hx), @intFromPtr(hy))) return;
-        try v.value(metaOf(hx), metaOf(hy));
+        try v.value(dispatch_mod.metaOf(hx), dispatch_mod.metaOf(hy));
         switch (x.kind()) {
             .string, .bignum, .regex => if (!std.mem.eql(u8, Heap.bodyBytes(hx), Heap.bodyBytes(hy)) and !(x.kind() == .regex and std.mem.eql(u8, regex_mod.sourceOf(x), regex_mod.sourceOf(y)))) return v.fail("{t} differs", .{x.kind()}),
             .persistent_vector => {
@@ -1494,7 +1486,7 @@ const Verifier = struct {
                     const tx = Heap.asHeapHeader(cx);
                     const ty = Heap.asHeapHeader(cy);
                     if (try v.seen(@intFromPtr(tx), @intFromPtr(ty))) return;
-                    try v.value(metaOf(tx), metaOf(ty));
+                    try v.value(dispatch_mod.metaOf(tx), dispatch_mod.metaOf(ty));
                 }
             },
             .persistent_map => {

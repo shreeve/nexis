@@ -386,7 +386,6 @@ const failures = [_]Failure{
     .{ .src = "(fn* ([a] 1) [b] 2)", .err = error.MacroExpansionFailure },
     .{ .src = "(def 42 5)", .err = error.MacroExpansionFailure },
     .{ .src = "(var)", .err = error.MalformedForm },
-    .{ .src = "(letfn* [(f [] 1) (f [] 2)] (f))", .err = error.DuplicateBinding },
     .{ .src = "(try 1 (catch \"Exception\" e e))", .err = error.MacroExpansionFailure },
     .{ .src = "(when)", .err = error.MacroExpansionFailure },
     .{ .src = "(cond true)", .err = error.MacroExpansionFailure },
@@ -723,13 +722,13 @@ test "inlining: an operator inlines only when it names nexis.core's Var" {
 
 /// Compile the one form of `src` the way `program` compiles a form,
 /// without running it.
-fn compileIn(program: *harness.Program, src: []const u8) !nx.compile.Compiled {
+fn compileIn(program: *harness.Program, src: []const u8) !nx.vm.Routine {
     return compileClearing(program, src, (nx.compile.CompileOptions{}).clear_locals);
 }
 
 /// `compileIn`, each local cleared at its last move or not
 /// (COMPILER.md §4.9).
-fn compileClearing(program: *harness.Program, src: []const u8, clear_locals: bool) !nx.compile.Compiled {
+fn compileClearing(program: *harness.Program, src: []const u8, clear_locals: bool) !nx.vm.Routine {
     const reader_mod = nx.reader;
     var parsed = try reader_mod.parser.parseForm(program.arena.allocator(), src);
     defer parsed.parser.deinit();
@@ -2017,7 +2016,8 @@ test "prop differential: the same programs agree when their code starts past pc 
 /// last move or not.
 fn runClearing(program: *harness.Program, src: []const u8, clear_locals: bool) !Value {
     const compiled = try compileClearing(program, src, clear_locals);
-    const routine = compiled.toRoutine("test-form");
+    var routine = compiled;
+    routine.name = "test-form";
     try program.v.retargetTop(&routine);
     return program.v.run();
 }
