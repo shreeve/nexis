@@ -273,8 +273,7 @@ pub const embedded = [_]image_mod.Source{
     .{ .ns = "nexis.shell", .info = .{ .path = "shell.nx", .text = @embedFile("stdlib/shell.nx"), .library = true } },
     // Instants, ISO-8601 text and durations.
     .{ .ns = "nexis.time", .info = .{ .path = "time.nx", .text = @embedFile("stdlib/time.nx"), .library = true } },
-    // JSON, in clojure.data.json's shape; after time.nx, whose
-    // instants it writes.
+    // JSON, in clojure.data.json's shape.
     .{ .ns = "nexis.json", .info = .{ .path = "json.nx", .text = @embedFile("stdlib/json.nx"), .library = true } },
 };
 
@@ -476,8 +475,8 @@ const core_rows = .{
     .{ "ns-publics", 1, 1, bind(nsVars, true), "[ns]", "Returns ns-interns of the namespace the symbol ns names without the\n  Vars marked :private." },
     .{ "resolve", 1, 1, &fnResolve, "[sym]", "Returns the Var sym names in the current namespace, resolved as the\n  compiler resolves a global, else nil. A host macro such as when has\n  no Var, so it resolves to nil." },
     .{ "ns-resolve", 2, 2, &fnNsResolve, "[ns sym]", "Returns the Var sym names in the namespace the symbol ns names, as\n  resolve does, else nil; :no-such-namespace when ns names none." },
-    .{ "random-uuid", 0, 0, &fnRandomUuid, "[]", "Returns a random version-4 UUID as its canonical lowercase text: a\n  UUID is a string, and there is no #uuid literal." },
-    .{ "parse-uuid", 1, 1, &fnParseUuid, "[s]", "Returns the canonical lowercase text of the UUID the string s spells\n  in 8-4-4-4-12 hex digits of either case, else nil." },
+    .{ "random-uuid", 0, 0, &fnRandomUuid, "[]", "Returns a random version-4 UUID, from the process's cryptographically\n  secure generator." },
+    .{ "parse-uuid", 1, 1, &fnParseUuid, "[s]", "Returns the UUID the string s names, in the grammar of Java's\n  UUID.fromString (five groups of hex digits joined by -, of either\n  case, 0123abcd-4567-89ef-0123-456789abcdef or 1-2-3-4-5), else nil." },
     .{ "indexed?", 1, 1, kindPredicate(isIndexed), .leaf, "[coll]", "Returns true if coll is a vector or a typed vector, whose nth takes\n  constant time." },
     // Collection construction + access.
     .{ "vector", 0, null, &fnVector, "[& args]", "Returns a vector of the args." },
@@ -701,6 +700,8 @@ const internal_rows = .{
     .{ "#%sh", 2, 2, &fnSh },
     // The natives under nexis.time (time.nx, STDLIB.md §12).
     .{ "#%now-ms", 0, 0, &fnNowMs },
+    .{ "#%inst", 1, 1, &fnInst },
+    .{ "#%inst-ms", 1, 1, &fnInstMs },
     .{ "#%format-instant", 1, 1, &fnFormatInstant },
     .{ "#%parse-instant", 1, 1, &fnParseInstant },
     // The natives under nexis.json (json.nx, STDLIB.md §13).
@@ -1281,8 +1282,8 @@ fn fnBitClear(vm: *VM, args: []const Value) VmError!Value {
     return integerValue(vm, try intArg(args[0]) & ~try bitMask(args[1]));
 }
 
-/// The generator behind `rand`, `rand-int`, `shuffle` and
-/// `random-uuid`, seeded from the I/O's entropy at first use. One
+/// The generator behind `rand`, `rand-int` and `shuffle`, seeded from
+/// the I/O's entropy at first use. One
 /// isolate, one thread.
 var prng: ?std.Random.DefaultPrng = null;
 
@@ -3521,7 +3522,7 @@ const namespace_docs = std.StaticStringMap([]const u8).initComptime(.{
     .{ "nexis.pprint", "Clojure's clojure.pprint, which names it: pprint and pprint-str." },
     .{ "nexis.sys", "The process's environment and working directory: getenv and cwd.\n  exit and *command-line-args* are nexis.core's." },
     .{ "nexis.shell", "Clojure's clojure.java.shell: sh runs a program and returns\n  {:exit :out :err}; with-sh-dir and with-sh-env set its defaults." },
-    .{ "nexis.time", "Instants, the record Instant of epoch milliseconds: now, parse and\n  format (ISO-8601), durations in milliseconds, plus, minus, between.\n  Each takes Nextomic's epoch-millisecond longs as well." },
+    .{ "nexis.time", "Instants, the inst values #inst reads: now, parse and format\n  (ISO-8601), durations in milliseconds, plus, minus, between. Each\n  takes epoch milliseconds and ISO-8601 text as well." },
     .{ "nexis.json", "JSON in clojure.data.json's shape: read-str, write-str, read and\n  write, with :key-fn, :value-fn and :indent." },
     .{ "nexis.simd", "Kernels over typed vectors (i64-vector, f64-vector): sum, dot,\n  scale and map." },
     .{ "nexis.internal", "The helpers macro expansions call. Not for programs." },
@@ -4186,24 +4187,22 @@ fn fnNsResolve(vm: *VM, args: []const Value) VmError!Value {
     return resolveIn(vm, try theNs(vm, args[0]), args[1]);
 }
 
+/// Version 4, variant 10, from the I/O's cryptographically secure
+/// generator, as Java's `randomUUID` draws on `SecureRandom`: an
+/// identity minted for a store is not predictable from `rand`'s
+/// output.
 fn fnRandomUuid(vm: *VM, _: []const Value) VmError!Value {
     var u: [16]u8 = undefined;
-    random(vm).bytes(&u);
+    ioOf(vm).random(&u);
     u[6] = (u[6] & 0x0F) | 0x40;
     u[8] = (u[8] & 0x3F) | 0x80;
-    var text: [uuid_mod.text_len]u8 = undefined;
-    uuid_mod.writeText(&text, u);
-    return string_mod.fromBytes(vm.ensureHeap(), &text) catch VmError.OutOfMemory;
+    return uuid_mod.make(vm.ensureHeap(), u) catch VmError.OutOfMemory;
 }
 
 fn fnParseUuid(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .string) return VmError.KindMismatch;
-    const s = string_mod.asBytes(args[0]);
-    if (s.len != uuid_mod.text_len) return value_mod.nilValue();
-    const u = uuid_mod.parse(s) orelse return value_mod.nilValue();
-    var text: [uuid_mod.text_len]u8 = undefined;
-    uuid_mod.writeText(&text, u);
-    return string_mod.fromBytes(vm.ensureHeap(), &text) catch VmError.OutOfMemory;
+    const u = uuid_mod.parse(string_mod.asBytes(args[0])) orelse return value_mod.nilValue();
+    return uuid_mod.make(vm.ensureHeap(), u) catch VmError.OutOfMemory;
 }
 
 // =============================================================================
@@ -6120,10 +6119,10 @@ fn shExchange(vm: *VM, io: std.Io, child: *std.process.Child, input: []const u8,
 // Instants (nexis.time, STDLIB.md §12)
 // =============================================================================
 //
-// An instant is a count of milliseconds since 1970-01-01T00:00:00Z on
-// the proleptic Gregorian calendar, as Nextomic's `:db.type/instant`
-// values are; these natives turn one into ISO-8601 text and back
-// (`src/inst.zig`).
+// An instant is the `inst` kind, its payload the milliseconds since
+// 1970-01-01T00:00:00Z on the proleptic Gregorian calendar; these
+// natives make one, take it apart, and turn it into ISO-8601 text and
+// back (`src/inst.zig`).
 
 /// `(#%now-ms)` → the wall clock in epoch milliseconds.
 fn fnNowMs(vm: *VM, _: []const Value) VmError!Value {
@@ -6131,22 +6130,40 @@ fn fnNowMs(vm: *VM, _: []const Value) VmError!Value {
     return value_mod.fromFixnum(@intCast(@divFloor(now.nanoseconds, std.time.ns_per_ms))) orelse VmError.ArithmeticOverflow;
 }
 
-/// `(#%format-instant ms)` → the ISO-8601 text of the instant `ms`.
+/// `(#%inst n)` → the instant `n` milliseconds after the epoch;
+/// `:invalid-argument` past the i64 range an instant holds.
+fn fnInst(vm: *VM, args: []const Value) VmError!Value {
+    return switch (args[0].kind()) {
+        .fixnum => value_mod.fromInst(args[0].asFixnum()),
+        .bignum => value_mod.fromInst(bignum_mod.toI64(args[0]) orelse
+            return vm.fail(VmError.InvalidArgument, "an instant is within 2^63 milliseconds of the epoch", .{})),
+        else => VmError.KindMismatch,
+    };
+}
+
+/// `(#%inst-ms i)` → the epoch milliseconds of the instant `i`, a
+/// fixnum or, past the fixnum range, a bignum.
+fn fnInstMs(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .inst) return VmError.KindMismatch;
+    return integerValue(vm, args[0].asInstMs());
+}
+
+/// `(#%format-instant i)` → the ISO-8601 text of the instant `i`.
 fn fnFormatInstant(vm: *VM, args: []const Value) VmError!Value {
-    var buf: [40]u8 = undefined;
+    if (args[0].kind() != .inst) return VmError.KindMismatch;
+    var buf: [inst_mod.max_text_len]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    inst_mod.write(&w, try requireFixnum(args[0]), .iso) catch unreachable;
+    inst_mod.write(&w, args[0].asInstMs(), .iso) catch unreachable;
     return string_mod.fromBytes(vm.ensureHeap(), w.buffered()) catch VmError.OutOfMemory;
 }
 
-/// `(#%parse-instant s)` → the instant the ISO-8601 text `s` names, in
-/// epoch milliseconds; `:invalid-argument` for any other text, or an
-/// instant past the fixnum range (-2490-03-17 to 6429-10-17).
+/// `(#%parse-instant s)` → the instant the ISO-8601 text `s` names;
+/// `:invalid-argument` for any other text.
 fn fnParseInstant(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .string) return VmError.KindMismatch;
     const s = string_mod.asBytes(args[0]);
     const ms = inst_mod.parse(s) orelse return vm.fail(VmError.InvalidArgument, "not an ISO-8601 instant: \"{s}\"", .{s});
-    return value_mod.fromFixnum(ms) orelse vm.fail(VmError.InvalidArgument, "an instant past the fixnum range: \"{s}\"", .{s});
+    return value_mod.fromInst(ms);
 }
 
 // =============================================================================
@@ -6568,12 +6585,20 @@ const JsonWriter = struct {
             .keyword => try jw.string(interner.keywordName(v.asKeywordId())),
             .symbol => try jw.string(interner.symbolName(v.asSymbolId())),
             .persistent_map, .sorted_map => try jw.object(v),
-            .record => if (jw.instantMs(v)) |ms| {
-                var buf: [40]u8 = undefined;
+            .record => try jw.object(v),
+            // clojure.data.json's choices: an instant as
+            // `Instant.toString`'s text, a UUID as its own.
+            .inst => {
+                var buf: [inst_mod.max_text_len]u8 = undefined;
                 var fixed: std.Io.Writer = .fixed(&buf);
-                inst_mod.write(&fixed, ms, .iso) catch unreachable;
+                inst_mod.write(&fixed, v.asInstMs(), .iso) catch unreachable;
                 try jw.string(fixed.buffered());
-            } else try jw.object(v),
+            },
+            .uuid => {
+                var text: [uuid_mod.text_len]u8 = undefined;
+                uuid_mod.writeText(&text, uuid_mod.bytesOf(v).*);
+                try jw.string(&text);
+            },
             .nextomic_entity => {
                 const m = try (seq_mod.entity_map orelse return VmError.KindMismatch)(jw.vm, v);
                 try jw.scope.push(m);
@@ -6582,15 +6607,6 @@ const JsonWriter = struct {
             .persistent_vector, .list, .lazy_seq, .persistent_set, .sorted_set, .typed_vector => try jw.array(v),
             else => |k| return throwJson(jw.vm, null, "cannot write a value of class {s}", .{className(k)}),
         }
-    }
-
-    /// The epoch milliseconds of a `nexis.time.Instant`, null for any
-    /// other record (STDLIB.md §12).
-    fn instantMs(jw: *JsonWriter, v: Value) ?i64 {
-        const t = jw.vm.recordType(record_mod.typeId(v)) orelse return null;
-        if (!std.mem.eql(u8, t.ns_name, "nexis.time") or !std.mem.eql(u8, t.type_name, "Instant")) return null;
-        const ms = (keywordGet(jw.vm, record_mod.fieldsOf(v), "ms") catch return null) orelse return null;
-        return if (ms.kind() == .fixnum) ms.asFixnum() else null;
     }
 
     fn array(jw: *JsonWriter, v: Value) VmError!void {

@@ -2898,7 +2898,7 @@ const member_hints = [_][3][]const u8{
     .{ "System", "getenv", "nexis.sys/getenv" },
     .{ "System", "exit", "exit" },
     .{ "System", "nanoTime", "nano-time" },
-    .{ "System", "currentTimeMillis", "(nexis.time/inst-ms (nexis.time/now))" },
+    .{ "System", "currentTimeMillis", "(inst-ms (nexis.time/now))" },
     .{ "Integer", "parseInt", "parse-long" },
     .{ "Long", "parseLong", "parse-long" },
     .{ "Double", "parseDouble", "parse-double" },

@@ -314,7 +314,7 @@ test "doc, find-doc, apropos and dir read the documentation of Vars, natives, sp
     try expectOutput("[(doc no-such-thing) (with-out-str (doc no-such-thing))]", "[nil ]");
     // apropos: sorted qualified symbols, host macros included.
     try expectOutput("(apropos \"cond-\")", "(nexis.core/cond-> nexis.core/cond->>)");
-    try expectOutput("(apropos #\"^->\")", "(nexis.core/-> nexis.core/->> nexis.time/->Instant)");
+    try expectOutput("(apropos #\"^->\")", "(nexis.core/-> nexis.core/->>)");
     try expectOutput("(some #{'nexis.string/split-lines} (apropos \"split\"))", "nexis.string/split-lines");
     // dir: a namespace or an alias; nexis.core with its host macros.
     try expectOutput("(dir-fn 'nexis.set)", "(difference intersection map-invert rename-keys select subset? superset? union)");
@@ -2418,10 +2418,14 @@ test "vars: *ns* is the current namespace's name symbol where a form is compiled
     try expectOutput("[(flush) (var? #'*ns*) *ns*]", "[nil true user]");
 }
 
-test "integration: a UUID is its canonical string" {
-    try expectOutput("(let [u (random-uuid)] [(uuid? u) (string? u) (count u) (subs u 14 15) (contains? #{\\8 \\9 \\a \\b} (nth u 19)) (= u (parse-uuid u)) (not= u (random-uuid))])", "[true true 36 4 true true true]");
-    try expectOutput("(pr-str [(parse-uuid \"0123ABCD-4567-89EF-0123-456789ABCDEF\") (parse-uuid \"nope\") (parse-uuid \"0123abcd-4567-89ef-0123-456789abcdef0\") (parse-uuid \"0123abcd+4567-89ef-0123-456789abcdef\") (parse-uuid \"0123abcd-4567-89ef-0123-456789abcdeg\")])", "[\"0123abcd-4567-89ef-0123-456789abcdef\" nil nil nil nil]");
-    try expectOutput("[(uuid? \"0123abcd-4567-89ef-0123-456789abcdef\") (uuid? \"0123ABCD-4567-89EF-0123-456789ABCDEF\") (uuid? 1) (uuid? nil) (try (parse-uuid nil) (catch any e e)) (try (parse-uuid 1) (catch any e e))]", "[true false false false {:error :kind-mismatch, :message kind mismatch, :fn test-form} {:error :kind-mismatch, :message kind mismatch, :fn test-form}]");
+test "integration: a UUID is a value of its own kind, as Clojure's" {
+    try expectOutput("(let [u (random-uuid) t (str u)] [(uuid? u) (string? u) (class u) (count t) (subs t 14 15) (contains? #{\\8 \\9 \\a \\b} (nth t 19)) (= u (parse-uuid t)) (not= u (random-uuid))])", "[true false :uuid 36 4 true true true]");
+    try expectOutput("(pr-str [(parse-uuid \"0123ABCD-4567-89EF-0123-456789ABCDEF\") (parse-uuid \"1-2-3-4-5\") (parse-uuid \"nope\") (parse-uuid \"0123abcd-4567-89ef-0123-456789abcdef0\") (parse-uuid \"0123abcd+4567-89ef-0123-456789abcdef\") (parse-uuid \"0123abcd-4567-89ef-0123-456789abcdeg\")])", "[#uuid \"0123abcd-4567-89ef-0123-456789abcdef\" #uuid \"00000001-0002-0003-0004-000000000005\" nil nil nil nil]");
+    // Java's accidents are refused: a sign on a group, an over-long group.
+    try expectOutput("[(parse-uuid \"+1-2-3-4-5\") (parse-uuid \"123456789-1-1-1-1\")]", "[nil nil]");
+    try expectOutput("[(uuid? \"0123abcd-4567-89ef-0123-456789abcdef\") (uuid? #uuid \"1-2-3-4-5\") (uuid? 1) (uuid? nil) (try (parse-uuid nil) (catch any e e)) (try (parse-uuid 1) (catch any e e))]", "[false true false false {:error :kind-mismatch, :message kind mismatch, :fn test-form} {:error :kind-mismatch, :message kind mismatch, :fn test-form}]");
+    // Unsigned byte order, the text's order.
+    try expectOutput("(let [lo (parse-uuid \"00000000-0000-0000-0000-000000000000\") hi (parse-uuid \"80000000-0000-0000-0000-000000000000\")] [(compare hi lo) (compare lo hi) (compare lo lo) (sort [hi lo])])", "[1 -1 0 (#uuid \"00000000-0000-0000-0000-000000000000\" #uuid \"80000000-0000-0000-0000-000000000000\")]");
 }
 
 test "integration: in-ns switches the namespace the next forms compile in" {
@@ -5075,25 +5079,27 @@ test "time: format writes an instant as Java's Instant.toString does" {
     try expectOutput("(nexis.time/format -62167219200000)", "0000-01-01T00:00:00Z");
     try expectOutput("(nexis.time/format -62198755200000)", "-0001-01-01T00:00:00Z");
     try expectOutput("(nexis.time/format 1791549015120)", "2026-10-09T12:30:15.120Z");
-    try expectOutput("(try (nexis.time/format \"2026\") (catch any e (:error e)))", ":kind-mismatch");
+    try expectOutput("(nexis.time/format \"2026\")", "2026-01-01T00:00:00Z");
+    try expectOutput("(try (nexis.time/format :x) (catch any e (:error e)))", ":kind-mismatch");
 }
 
 test "time: parse reads ISO-8601 instants, a missing offset UTC" {
-    try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"2026-10-09\"))", "1791504000000");
-    try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"2026-10-09T12:30Z\"))", "1791549000000");
-    try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"2026-10-09T12:30:15.5+02:00\"))", "1791541815500");
-    try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"2026-10-09t12:30:15.123456789z\"))", "1791549015123");
-    try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"2026-10-09T12:30:00-0530\"))", "1791568800000");
-    try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"2026-10-09T12:30\"))", "1791549000000");
+    try expectOutput("(nexis.time/parse \"2026-10-09\")", "#inst \"2026-10-09T00:00:00.000-00:00\"");
+    try expectOutput("(inst-ms (nexis.time/parse \"2026-10-09\"))", "1791504000000");
+    try expectOutput("(inst-ms (nexis.time/parse \"2026-10-09T12:30Z\"))", "1791549000000");
+    try expectOutput("(inst-ms (nexis.time/parse \"2026-10-09T12:30:15.5+02:00\"))", "1791541815500");
+    try expectOutput("(inst-ms (nexis.time/parse \"2026-10-09t12:30:15.123456789z\"))", "1791549015123");
+    try expectOutput("(inst-ms (nexis.time/parse \"2026-10-09T12:30:00-0530\"))", "1791568800000");
+    try expectOutput("(inst-ms (nexis.time/parse \"2026-10-09T12:30\"))", "1791549000000");
     // Clojure's #inst grammar: an hour alone, and a leap second in
     // minute 59, which rolls into the next minute.
-    try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"2026-10-09T12Z\"))", "1791547200000");
-    try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"2026-10-09T12:59:60Z\"))", "1791550800000");
-    try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"2026\"))", "1767225600000");
-    try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"2026-10\"))", "1790812800000");
-    try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"-0001-01-01T00:00:00Z\"))", "-62198755200000");
+    try expectOutput("(inst-ms (nexis.time/parse \"2026-10-09T12Z\"))", "1791547200000");
+    try expectOutput("(inst-ms (nexis.time/parse \"2026-10-09T12:59:60Z\"))", "1791550800000");
+    try expectOutput("(inst-ms (nexis.time/parse \"2026\"))", "1767225600000");
+    try expectOutput("(inst-ms (nexis.time/parse \"2026-10\"))", "1790812800000");
+    try expectOutput("(inst-ms (nexis.time/parse \"-0001-01-01T00:00:00Z\"))", "-62198755200000");
     try expectOutput("(= (nexis.time/instant \"2026-10-09\") (nexis.time/parse \"2026-10-09T00:00:00.000Z\"))", "true");
-    for ([_][]const u8{ "", "x", "2026-13-01", "2026-02-29", "2026-10-09T24:00Z", "2026-10-09T12:60Z", "2026-10-09T12:30:61Z", "2026-10-09T12:58:60Z", "2026-10-09T12:30:15.Z", "2026-10-09T12:30+25:00", "2026-10-09T12:30Zx", "26-10-09", "2026-1-09", "99999-01-01" }) |text| {
+    for ([_][]const u8{ "", "x", "2026-13-01", "2026-02-29", "2026-10-09T24:00Z", "2026-10-09T12:60Z", "2026-10-09T12:30:61Z", "2026-10-09T12:58:60Z", "2026-10-09T12:30:15.Z", "2026-10-09T12:30+25:00", "2026-10-09T12:30Zx", "26-10-09", "2026-1-09", "1000000000-01-01" }) |text| {
         const src = try std.fmt.allocPrint(testing.allocator, "(try (nexis.time/parse \"{s}\") (catch any e (:error e)))", .{text});
         defer testing.allocator.free(src);
         try expectOutput(src, ":invalid-argument");
@@ -5101,44 +5107,59 @@ test "time: parse reads ISO-8601 instants, a missing offset UTC" {
     try expectOutput("(try (nexis.time/parse 5) (catch any e (:error e)))", ":kind-mismatch");
 }
 
-test "time: nexis.core's inst? and inst-ms know an Instant, through Clojure's Inst protocol" {
+test "time: nexis.core's inst? and inst-ms know an instant, through Clojure's Inst protocol" {
     try expectOutput(
-        \\[(inst? (nexis.time/now)) (inst? 5) (inst? {:ms 5}) (inst-ms (nexis.time/instant 7))
-        \\ (satisfies? Inst (nexis.time/instant 7)) (try (inst-ms 7) (catch any e (:error e)))]
-    , "[true false false 7 true :no-protocol-impl]");
+        \\[(inst? (nexis.time/now)) (inst? #inst "2020") (inst? 5) (inst? {:ms 5}) (inst-ms (nexis.time/instant 7))
+        \\ (satisfies? Inst #inst "2020") (try (inst-ms 7) (catch any e (:error e)))]
+    , "[true true false false 7 true :no-protocol-impl]");
+    // An instant past the fixnum range has a bignum's milliseconds.
+    try expectOutput("[(inst-ms #inst \"+292278994-08-17T07:12:55.807Z\") (inst-ms #inst \"-2490-01-01\")]", "[9223372036854775807 -140744044800000]");
     // A record of the program's own extends it as Clojure's types do.
     try expectOutputProgram(
         \\(defrecord Stamp [s] Inst (inst-ms* [_] (* s 1000)))
-        \\[(inst? (->Stamp 2)) (inst-ms (->Stamp 2)) (nexis.time/format (inst-ms (->Stamp 2)))]
-    , "[true 2000 1970-01-01T00:00:02Z]");
+        \\[(inst? (->Stamp 2)) (inst-ms (->Stamp 2)) (nexis.time/format (->Stamp 2)) (nexis.time/instant (->Stamp 2))]
+    , "[true 2000 1970-01-01T00:00:02Z #inst \"1970-01-01T00:00:02.000-00:00\"]");
 }
 
 test "time: instants, the clock, durations and order" {
-    try expectOutput("(nexis.time/inst? (nexis.time/now))", "true");
-    try expectOutput("[(nexis.time/inst? 5) (nexis.time/inst? {:ms 5})]", "[false false]");
-    try expectOutput("(< 1767225600000 (nexis.time/inst-ms (nexis.time/now)))", "true");
-    try expectOutput("(nexis.time/instant 5)", "#nexis.time.Instant{:ms 5}");
+    try expectOutput("(inst? (nexis.time/now))", "true");
+    try expectOutput("(< 1767225600000 (inst-ms (nexis.time/now)))", "true");
+    try expectOutput("(nexis.time/instant 5)", "#inst \"1970-01-01T00:00:00.005-00:00\"");
+    try expectOutput("[(class (nexis.time/instant 5)) (= (nexis.time/instant 5) (nexis.time/instant 5)) (= (nexis.time/instant 5) 5)]", "[:inst true false]");
     try expectOutput("(let [i (nexis.time/instant 5)] (identical? i (nexis.time/instant i)))", "true");
-    try expectOutput("(try (nexis.time/instant :x) (catch any e (ex-message e)))", "instant takes an Instant, an integer or ISO-8601 text, got a keyword");
-    try expectOutput("(try (nexis.time/inst-ms \"x\") (catch any e (ex-message e)))", "an instant is an Instant or an integer, got a string");
+    try expectOutput("(try (nexis.time/instant :x) (catch any e (ex-message e)))", "instant takes an instant, an integer or ISO-8601 text, got a keyword");
+    try expectOutput("(try (nexis.time/instant (* 4 9223372036854775807)) (catch any e (:error e)))", ":invalid-argument");
     try expectOutput(
         \\(nexis.time/format (nexis.time/plus (nexis.time/parse "2026-10-09") (nexis.time/days 1) (nexis.time/hours 1) (nexis.time/minutes 30) (nexis.time/seconds 15) 7))
     , "2026-10-10T01:30:15.007Z");
     try expectOutput("(nexis.time/format (nexis.time/minus 1000 (nexis.time/seconds 2)))", "1969-12-31T23:59:59Z");
+    try expectOutput("(nexis.time/plus #inst \"9999-12-31T23:59:59Z\" (nexis.time/seconds 1))", "#inst \"+10000-01-01T00:00:00.000-00:00\"");
     try expectOutput("(nexis.time/between (nexis.time/parse \"2026-10-09\") (nexis.time/parse \"2026-10-08\"))", "-86400000");
-    try expectOutput("[(nexis.time/before? 1 (nexis.time/instant 2)) (nexis.time/after? 1 2) (nexis.time/before? 2 2)]", "[true false false]");
-    try expectOutput("(map nexis.time/format (sort-by nexis.time/inst-ms [(nexis.time/instant 2000) 1000]))", "(1970-01-01T00:00:01Z 1970-01-01T00:00:02Z)");
+    try expectOutput("[(nexis.time/before? 1 (nexis.time/instant 2)) (nexis.time/after? 1 2) (nexis.time/before? 2 2) (nexis.time/before? \"2020\" #inst \"2021\")]", "[true false false true]");
+    try expectOutput("(sort [#inst \"2021\" (nexis.time/instant 1000) #inst \"2020\"])", "(#inst \"1970-01-01T00:00:01.000-00:00\" #inst \"2020-01-01T00:00:00.000-00:00\" #inst \"2021-01-01T00:00:00.000-00:00\")");
+    try expectOutput("[(str #inst \"2020\") (nexis.time/format #inst \"2020\")]", "[2020-01-01T00:00:00Z 2020-01-01T00:00:00Z]");
+}
+
+test "time: an instant and a UUID in a durable ref read back equal" {
+    try expectOutputProgramWithStore("time-durable",
+        \\(def c (db/open "@STORE@"))
+        \\(def v {:at #inst "2026-10-09T12:30:15.123Z" :id (random-uuid) :past #inst "-2490-01-01"})
+        \\(db/put-key! (db/ref c :t :k) v)
+        \\(def got (db/get-key (db/ref c :t :k)))
+        \\(db/close c)
+        \\[(= v got) (= (hash v) (hash got)) (:at got)]
+    , "[true true #inst \"2026-10-09T12:30:15.123-00:00\"]");
 }
 
 test "time: Nextomic's instants are epoch milliseconds, which every time function takes" {
     try expectOutputProgramWithStore("time-nextomic",
         \\(def c (nextomic/connect "@STORE@"))
         \\(nextomic/transact! c [{:db/ident :ev/at :db/valueType :db.type/instant :db/cardinality :db.cardinality/one}])
-        \\(nextomic/transact! c [{:ev/at (nexis.time/inst-ms (nexis.time/parse "2026-10-09T12:30:15.123Z"))}])
+        \\(nextomic/transact! c [{:ev/at (inst-ms (nexis.time/parse "2026-10-09T12:30:15.123Z"))}])
         \\(def at (nextomic/q '[:find ?at . :where [_ :ev/at ?at]] (nextomic/db c)))
         \\(def tx (nextomic/q '[:find (max ?i) . :where [_ :db/txInstant ?i]] (nextomic/db c)))
         \\(nextomic/release c)
-        \\[(nexis.time/format at) (nexis.time/inst? (nexis.time/instant tx)) (not (nexis.time/after? tx (nexis.time/now)))]
+        \\[(nexis.time/format at) (inst? (nexis.time/instant tx)) (not (nexis.time/after? tx (nexis.time/now)))]
     , "[2026-10-09T12:30:15.123Z true true]");
 }
 
@@ -5231,6 +5252,7 @@ test "json: write-str writes every value nexis.json reads, and more" {
     try expectOutput("(nexis.json/write-str [123456789012345678901234567890 1.0E10 -0.0 0.1 1e-5])", "[123456789012345678901234567890,1.0E10,-0.0,0.1,1.0E-5]");
     try expectOutput("(nexis.json/write-str {1 :a :n/k :b \"s\" :c})", "{\"1\":\"a\",\"n/k\":\"b\",\"s\":\"c\"}");
     try expectOutput("(nexis.json/write-str (nexis.time/parse \"2026-10-09T12:30:15.123Z\"))", "\"2026-10-09T12:30:15.123Z\"");
+    try expectOutput("(nexis.json/write-str {:at #inst \"2026-10-09T12:30Z\" :id #uuid \"1-2-3-4-5\"})", "{\"at\":\"2026-10-09T12:30:00Z\",\"id\":\"00000001-0002-0003-0004-000000000005\"}");
     try expectOutput("(defrecord P [x]) (nexis.json/write-str (->P 1))", "{\"x\":1}");
     try expectOutput("(nexis.json/write-str \"q\\\"\\\\\\n\\t\\u0001\\u007f/\u{e9}\u{1F600}\")", "\"q\\\"\\\\\\n\\t\\u0001\x7f/\u{e9}\u{1F600}\"");
     try expectOutput("(nexis.json/write-str \"/\u{e9}\u{1F600}\" :escape-unicode true :escape-slash true)", "\"\\/\\u00e9\\ud83d\\ude00\"");

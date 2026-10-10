@@ -1342,9 +1342,9 @@
   [path] (load-string (slurp path)))
 
 (defn uuid?
-  "Returns true if x is a string holding a UUID's canonical lowercase
-  text, as random-uuid and parse-uuid make it: a UUID is that string."
-  [x] (and (string? x) (= x (parse-uuid x))))
+  "Returns true if x is a UUID, as random-uuid, parse-uuid and #uuid
+  make one; a string is not."
+  [x] (instance? :uuid x))
 
 ; ============================================================
 ; Delays, closing, taps
@@ -1388,17 +1388,19 @@
   :db_connection (close [c] (db/close c))
   :nextomic_conn (close [c] (nextomic/release c)))
 
-; Clojure's Inst: what inst? and inst-ms take as an instant. nexis.time's
-; Instant extends it (docs/STDLIB.md §12).
+; Clojure's Inst: what inst? and inst-ms take as an instant. The inst
+; kind extends it (docs/STDLIB.md §12).
 (defprotocol Inst
   "An instant: a value with epoch milliseconds, which inst-ms* returns.
-  nexis.time's Instant extends it, and so may any record."
+  An instant (#inst) extends it, and so may any record."
   (inst-ms* [inst]
     "Returns the epoch milliseconds of the instant inst."))
+(extend-protocol Inst
+  :inst (inst-ms* [i] (nexis.internal/#%inst-ms i)))
 
 (defn inst?
-  "Returns true if x is an instant: of a type extended to Inst, as
-  nexis.time's Instant is."
+  "Returns true if x is an instant: of a type extended to Inst, as an
+  #inst value is."
   [x]
   (satisfies? Inst x))
 

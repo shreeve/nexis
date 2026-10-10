@@ -108,8 +108,8 @@ as unresolved symbols. Each has a nexis spelling:
 | `(System/currentTimeMillis)`, `(System/nanoTime)` | `(inst-ms (nexis.time/now))`; `(nano-time)`, a monotonic clock in nanoseconds |
 | `(System/exit 1)` | `(exit 1)` |
 | `(System/getenv "HOME")`, `(System/getenv)` | `(nexis.sys/getenv "HOME")`, `(nexis.sys/getenv)` |
-| `java.time.Instant`, `java.util.Date` | `nexis.time`: `(now)`, `(parse "2026-10-09T12:30Z")`, `(format inst)`, durations in milliseconds; `inst?` and `inst-ms` take its Instant |
-| `#inst`, `#uuid`, `java.util.UUID` | no tagged literals: `(nexis.time/parse s)` for an instant; `(random-uuid)` and `(parse-uuid s)` work on the UUID's string |
+| `java.time.Instant`, `java.util.Date` | an instant, `#inst "2026-10-09T12:30Z"`, of millisecond precision as a `Date`; `nexis.time`: `(now)`, `(parse "2026-10-09T12:30Z")`, `(format inst)`, durations in milliseconds |
+| `java.util.UUID` | a UUID, `#uuid "..."`, `(random-uuid)`, `(parse-uuid s)`, as in Clojure |
 | `(long-array n)`, `aget`, `aset` | immutable typed vectors: `(i64-vector xs)`, `(f64-vector xs)` |
 
 `class` and `type` return a kind keyword (`:vector`, `:fixnum`,
@@ -118,9 +118,10 @@ as unresolved symbols. Each has a nexis spelling:
 `extend-protocol` take those too, or a Clojure class name standing for
 its kinds (`String`, `Long`, `Object` for anything).
 
-Reader conditionals (`#?(...)`), tagged literals, auto-resolved
-keywords (`::k`) and namespaced map literals (`#:ns{...}`) are not
-read: nexis has one target, and no namespace at read time.
+Reader conditionals (`#?(...)`), tags other than `#inst` and `#uuid`,
+auto-resolved keywords (`::k`) and namespaced map literals
+(`#:ns{...}`) are not read: nexis has one target, and no namespace at
+read time.
 
 ### 3.2 One thread
 
@@ -264,7 +265,10 @@ in `str/replace`. `docs/REGEX.md` §6 lists the differences.
 - **Vars carry less metadata.** `(meta #'f)` has `:name`, `:ns`,
   `:arglists`, `:doc` and what the definition added, but no `:file`
   or `:line`, so there is no `source`.
-- **UUIDs are strings**, in canonical lowercase form.
+- **Instants and UUIDs print as Clojure's do**, but `str` of an
+  instant is its ISO-8601 text (`2026-10-09T12:30:00Z`), not
+  `Date.toString`'s, and `compare` orders UUIDs by their text, not by
+  Java's signed halves.
 - **Map entries are vectors**: `(map-entry? [:a 1])` is true.
 - **Laziness** is Clojure's, chunked where Clojure's is, but `apply`
   realizes its last argument, and a lazy seq a closure captures keeps
