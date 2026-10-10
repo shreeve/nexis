@@ -57,6 +57,7 @@ fields:
 | `load_callback` | the loader `require` calls (§2b); null: `require` fails |
 | `value_heap` | the calling VM's heap, where macro arguments and results live; else a lazily created heap on `allocator` |
 | `io` | given to a user macro's sub-VM so its body can print |
+| `source` | the text the forms were read from, which places `&form` (§1.3); null for `eval`'s and `macroexpand`'s forms |
 | `failure` | the span and message of the innermost failure (§8) |
 | `lexical` | the lexical names in scope where the walk is (§3) |
 
@@ -94,14 +95,16 @@ otherwise it is an ordinary call. User macros shadow host macros.
    `defn`: a docstring, an attribute map and `^meta` on the name
    become the Var's metadata, with `:macro true` as Clojure's has it,
    parameters destructure and overload
-   clauses dispatch on argument count, as for `fn`. The expander
+   clauses dispatch on argument count, as for `fn`, and puts `&form`
+   and `&env` in front of each arity's parameters (§1.3). The expander
    builds `(def name (fn name ...))` (wrapped to set the metadata as
    `defn` does), expands it in the enclosing env, compiles and runs
    it through `ctx.compile_eval` in a fresh sub-VM, and sets the
    Var's `macro` flag. The form is replaced by `(var name)`, so the
    REPL prints `#'ns/name`.
-3. **Invocation**: the argument count is checked against the macro
-   function's arity, each argument Form becomes a Value
+3. **Invocation**: the argument count, with `&form` and `&env`, is
+   checked against the macro function's arities, each argument Form
+   becomes a Value
    (`formToValue`), and a fresh sub-VM (an idle routine, the
    compile-time interner, the calling VM's heap, collection off,
    `ctx.io`) calls the macro function through `callValue`. The
@@ -152,7 +155,10 @@ otherwise it is an ordinary call. User macros shadow host macros.
    which evaluates to the collection and which `quote` folds to the
    collection itself; one with a comparator of its own holds code, and
    is `MalformedMacroCall`. Any other kind (a function, a Var, an atom)
-   is `MalformedMacroCall`.
+   is `MalformedMacroCall`. A list's `:line` and `:column` metadata
+   does not become `^meta`: a form's place is its span, so a list
+   returned with `(with-meta out (meta &form))` is `out`, at the call's
+   span, and a list with other metadata keeps the rest.
 7. **Variadic macros** (`& body`) work; `recur` in a variadic macro
    body is rejected as at run time.
 8. Macro arguments are **unevaluated forms as data**: a macro body
@@ -168,8 +174,8 @@ otherwise it is an ordinary call. User macros shadow host macros.
    (`docs/VM.md` §9.1).
    - `(macroexpand-1 form)` is one macro step (`expandOnce`: a user
      or host macro at the head, never a special form or `#%`
-     primitive; the raw output, nothing inside it expanded, no
-     lexical environment), or the form itself. `^meta` on the form is
+     primitive; the raw output, nothing inside it expanded, `&env`
+     nil, §1.3), or the form itself. `^meta` on the form is
      dropped first, as on any call (§2b). `macroexpand` repeats
      it until the head is not a macro. A failure throws the error map
      of `:macro-expansion-failure` (`docs/VM.md` §13), its `:message`
@@ -210,6 +216,84 @@ otherwise it is an ordinary call. User macros shadow host macros.
    - Syntax-quote is not data at run time: a quoted form holding one
      is `UnsupportedFeature` at compile and `read-string` rejects
      it, so a form built for `eval` uses `list`, `cons` and quote.
+
+### 1.3 `&form` and `&env`
+
+A user macro's function takes two parameters before the ones its
+`defmacro` names: `&form`, the call, and `&env`, the locals in scope
+at it, as Clojure's does.
+
+- **`defmacro`** puts the plain symbols `&form` and `&env` at the
+  front of every arity's parameter vector, after the `:arglists` are
+  taken, so `(:arglists (meta #'m))` and `(doc m)` show the
+  parameters as written. They are ordinary locals of the macro's
+  function: a body or a nested binding may shadow them, a `recur` to
+  the top of the function passes them, and `(#'m form env args...)`
+  calls the function directly.
+- **At a call** (`callUserMacro`) the argument count is checked
+  against the function's arities with the two added, and an arity
+  error counts the arguments alone ("macro m takes 1 argument, got
+  0"). The function is called with `&form`, `&env` and the
+  arguments.
+- **`&form`** is the list of the head symbol, as written (`m`,
+  `a/m`, `my.ns/m`), and the argument values themselves:
+  `(identical? (second &form) x)` holds for the first parameter `x`.
+  When the form being expanded came from a source text
+  (`ExpandContext.source`), the list carries the metadata
+  `{:line l :column c}`, the 1-based line and column, in code points,
+  of the call's first character, which is where an error report puts
+  the call. A call a macro built carries the span of the macro call
+  that built it (§4b), so its place is that call's. A form `eval`,
+  `load-string` or `macroexpand-1` is given has no source, and its
+  `&form` carries no metadata. `^meta` written on a call is a hint and
+  is dropped (§2b) before the macro runs. The lists inside the
+  arguments carry their own `^meta` (item 6 of §1.2) and no place.
+- **`&env`** is nil when no local is in scope at the call: at the top
+  level, in a body whose binding forms bound nothing. Otherwise it is
+  a map from the name of every local in scope to that name, a
+  symbol: the names `ExpandContext.lexical` counts (§3), which every
+  `let*`, `loop*`, `fn*` (its parameters and its own name),
+  `letfn*` and `catch` around the call binds, and so the binding
+  forms the host macros expand to, destructuring gensyms included.
+  A name bound in a `let`'s later binding is not yet in scope in an
+  earlier one's value. The values are truthy, so `(&env 'x)`,
+  `(get &env 'x)` and `(contains? &env 'x)` each tell whether `x` is
+  a local here, and `(keys &env)` lists them. A `.cljc` macro that
+  tests `(:ns &env)` for ClojureScript takes its Clojure branch.
+- **At run time**, `macroexpand-1` and `macroexpand` (§1.2 item 9)
+  pass the form as data as `&form` and nil as `&env`, also when
+  called from inside a macro's body.
+- **Host macros** take neither: a `MacroFn` has the call form and
+  `ctx.lexical` already.
+
+Where nexis and Clojure differ, deliberately (`CLOJURE-REVIEW.md`):
+
+- `&env`'s values are the locals' symbols, not Clojure's
+  `LocalBinding`s, which only Java interop reads. A symbol costs no
+  allocation, is truthy, and is what babashka gives.
+- `&env` comes from the expander's `lexical`, not the compiler's
+  locals: nexis expands a whole top-level form before lowering it, and
+  `lexical` tracks the binding forms the compiler lowers, so "is a
+  local" means one thing here and in §3.
+- Only `&form` carries a place. Clojure's reader puts `{:line
+  :column}` on every list it reads from a file; here that would cost
+  a map per list of every argument, and errors are placed by span
+  (§4b). There is no `:file` key, as in Clojure's reader.
+- `^meta` on the call is not merged into `&form`: it is a dropped
+  hint (§2b).
+- `macroexpand-1` called from a macro body passes a nil `&env`, where
+  Clojure passes the compile environment it is running in.
+
+**Cost.** Per user-macro call: the `&form` list of n+1 cells over
+values already built, and with a source a 2-entry map and a place
+lookup; `&env` nothing with no local in scope, else one pass over
+`lexical`, a symbol intern lookup per local and one map build. The
+place is found from the last place the owning VM found
+(`VM.placeOf`, `SourceInfo.lineColFrom`, `docs/VM.md` §13), so the
+expansions of a file scan its text about once in all, not once per
+call from its start. The `&form` list and the `&env` map live on the
+calling VM's heap with the arguments, while a sub-VM that never
+collects runs the macro, so they need no rooting.
 
 ---
 
@@ -304,7 +388,8 @@ around the walk that bind it: `let*`, `loop*`, `fn*`, `letfn*` and
 `Scope` that adds its names and takes them out when it closes, so
 whether a name is lexical is one lookup however deep the forms nest,
 and macro lookup requires that it is not. Special forms cannot be
-shadowed: they are recognised before the names are consulted.
+shadowed: they are recognised before the names are consulted. The
+same table is `&env` (§1.3).
 
 ---
 
@@ -559,8 +644,6 @@ Nested `#()` never reaches the expander: the reader rejects it.
 | `defrecord` | Registers the record type and defines `T-type-id`, `->T`, `map->T`, `T?` and one impl per method under the protocol named by the preceding bare symbol, its arities written `(m [params] body) (m [params] body)` or `(m ([params] body) ...)` and gathered into one overloaded `fn` (`PROTOCOLS.md` §4.2). `T` itself is bound to the record's type, the symbol `ns.T` (`(def T 'ns.T)`), which is the form's value (`PROTOCOLS.md` §0). An inline method sees the record's fields as locals unless a parameter shadows one: `(defrecord Rect [w h] Shape (area [_] (* w h)))`. `DeclaredNames` knows the defined names, so a form may refer to `->T` before the `defrecord`. |
 | `defprotocol` | `(do (def IFoo (nexis.internal/#%register-protocol "<ns>/IFoo" [:bar ...])) (def bar (nexis.internal/#%protocol-fn IFoo :bar)) ... 'IFoo)`, whose value is the name `IFoo`; a docstring before the methods becomes `IFoo`'s `:doc`, and `:option value` pairs there are ignored; a method's parameter vectors become its Var's `:arglists` and a docstring among them its `:doc` (`PROTOCOLS.md` §4.1). |
 | `extend-type`, `extend-protocol` | Install impls in the protocol registry, a method's arities spelled as for `defrecord` (`PROTOCOLS.md` §4.2–4.3). |
-
-`&form` and `&env` are not passed to any macro (PLAN §23 #34).
 
 **Macros written in nexis.** The embedded stdlib files define more
 with `defmacro` (`STDLIB.md` §1):

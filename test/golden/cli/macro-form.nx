@@ -1,0 +1,7 @@
+; A macro that names its call and its line in its error, from &form,
+; as Clojure's assert-args does.
+(defmacro pair [& xs]
+  (when (not= 2 (count xs))
+    (throw (ex-info (str (pr-str &form) " needs two forms, at line " (:line (meta &form))) {})))
+  (vec xs))
+(pair 1)

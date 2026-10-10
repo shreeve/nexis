@@ -1194,7 +1194,9 @@ since `ctrl:try-enter` reserves the room for a finally's continuation
 and the throw's origin is dropped when it cannot be recorded (§12). A
 place is found from the last place the VM found in the same text
 (`SourceInfo.lineColFrom`), scanning only the text between the two,
-so a handler taking errors in a loop scans the text once.
+so a handler taking errors in a loop, or the expansions of a file
+placing their `&form`s (`docs/MACROEXPAND.md` §1.3), scan the text
+about once.
 
 **Not catchable** (compiler bugs or corrupt bytecode; they leave the
 run):

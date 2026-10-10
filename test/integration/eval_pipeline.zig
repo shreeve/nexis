@@ -3427,6 +3427,47 @@ test "defmacro: a failing macro call names the macro and the cause, at the call"
     try expectMacroFailure("(defmacro m [] (load-string \"(+ 1 2)\"))", "(m)", "macro m threw :no-compiler: no compiler", "(m)");
 }
 
+test "defmacro: a macro receives the call as &form and the locals in scope as &env" {
+    // &form: the head as written and the very argument values.
+    try expectOutputProgram("(defmacro f [& xs] (list 'quote &form)) [(f 1 (+ 2 3)) (nexis.core/when 1)]", "[(f 1 (+ 2 3)) nil]");
+    try expectOutputProgram("(defmacro f [& xs] (list 'quote &form)) (user/f :a)", "(user/f :a)");
+    try expectOutputProgram("(defmacro same [x] (identical? x (second &form))) (same (a b))", "true");
+    // &env: nil with no local in scope, else each local's name to itself.
+    try expectOutputProgram("(defmacro e [] (list 'quote &env)) [(e) ((fn [] (e))) (let [] (e))]", "[nil nil nil]");
+    try expectOutputProgram("(defmacro ks [] (list 'quote (sort (keys &env)))) (let [b 1 a 2] (ks))", "(a b)");
+    try expectOutputProgram(
+        \\(defmacro has? [s] (contains? &env s))
+        \\[(let [x 1] (has? x)) (has? x) ((fn f [y] [(has? f) (has? y)]) 0) (loop [i 0] (has? i))
+        \\ (letfn [(g [] (has? g))] (g)) (try (throw :t) (catch any z (has? z))) (let [a (has? a)] a)
+        \\ (do (let [x 1] x) (has? x)) (when-let [x 1] (has? x)) (let [[p q] [1 2]] (has? q))]
+    , "[true false [true true] true true true false false true true]");
+    try expectOutputProgram("(defmacro has? [s] (contains? &env s)) (defprotocol P (m1 [_])) (defrecord R [fld] P (m1 [_] (has? fld))) (m1 (->R 1))", "true");
+    try expectOutputProgram("(defmacro lv [s] (list 'quote (get &env s))) (defmacro cv [s] (list 'quote (&env s))) [(let [x 1] (lv x)) (let [x 1] (cv x))]", "[x x]");
+    // The two are the leading parameters of the macro's function:
+    // left out of :arglists and arity errors, passed by a direct call,
+    // shadowable.
+    try expectOutputProgram("(defmacro m [x] x) (:arglists (meta #'m))", "([x])");
+    try expectOutputProgram("(defmacro m [x] (list 'inc x)) (#'m '(m 1) nil 5)", "(inc 5)");
+    try expectOutputProgram("(defmacro m ([] 0) ([[a b] & {:keys [c]}] (list '+ a b c))) [(m) (m [1 2] :c 3)]", "[0 6]");
+    try expectOutputProgram("(defmacro m [] (let [&form 7] &form)) (m)", "7");
+    try expectMacroFailure("(defmacro m ([] 0) ([a b] a))", "(m 1)", "macro m takes 0 or 2 arguments, got 1", "(m 1)");
+    // At run time: the form as data and a nil &env.
+    try expectOutputProgram("(defmacro m [] (list 'quote [&form &env])) [(macroexpand-1 '(m)) (let [x 1] (macroexpand-1 '(m)))]", "[(quote [(m) nil]) (quote [(m) nil])]");
+    try expectOutputProgram("(defmacro has? [s] (contains? &env s)) (eval '(let [q 1] (has? q)))", "true");
+    try expectOutputProgram("(defmacro w [] (list 'quote (meta &form))) [(eval '(w)) (w)]", "[nil nil]");
+    // From a source text, &form carries the call's place.
+    try expectLocatedOutput("(defmacro w [] (list 'quote (meta &form)))\n[\"\u{e9}\" (w)]", "[\"\u{e9}\" {:line 2, :column 6}]");
+    try expectLocatedOutput("(defmacro w [] (list 'quote (meta &form)))\n(defmacro mw [] '(w))\n  (mw)", "{:line 3, :column 3}");
+}
+
+test "defmacro: a list a macro returns keeps no :line or :column metadata, its place being its span" {
+    try expectOutputProgram("(defmacro q [x] (list 'quote (with-meta x {:line 1 :column 2 :k 3}))) (meta (q (a)))", "{:k 3}");
+    try expectOutputProgram("(defmacro q [x] (list 'quote (with-meta x {:line 1 :column 2}))) (meta (q (a)))", "nil");
+    try expectOutputProgram("(defmacro q [x] (list 'quote (with-meta x {:line 1}))) (meta (q [a]))", "{:line 1}");
+    try expectOutputProgram("(defmacro t [& body] (with-meta (cons 'try body) {:line 9 :column 1})) (t (throw :x) (catch any e :caught))", ":caught");
+    try expectLocatedOutput("(defmacro p [x] (with-meta (list 'do x) (meta &form)))\n(p (+ 1 2))", "3");
+}
+
 test "defmacro: a macro body runs against the program's record types, namespaces and protocols" {
     // `reduced` in a macro registers its type where the program's
     // records are, so it renames none of them.

@@ -805,9 +805,11 @@ pub const Routine = struct {
 };
 
 /// `Routine.arityPhrase`: the counts a closure over `routine` takes,
-/// for `{f}`.
+/// for `{f}`, each less `hidden`, the leading parameters a caller
+/// passes unseen (a macro's `&form` and `&env`).
 pub const ArityPhrase = struct {
     routine: *const Routine,
+    hidden: u8 = 0,
 
     const Item = union(enum) { one: usize, range: [2]usize, at_least: usize };
 
@@ -862,11 +864,12 @@ pub const ArityPhrase = struct {
     };
 
     pub fn format(self: ArityPhrase, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const h = self.hidden;
         var it = Items.init(self.routine);
         var count: usize = 0;
         var singular = false;
         while (it.next()) |item| : (count += 1) singular = switch (item) {
-            .one, .at_least => |n| n == 1,
+            .one, .at_least => |n| n -| h == 1,
             .range => false,
         };
         it = Items.init(self.routine);
@@ -874,9 +877,9 @@ pub const ArityPhrase = struct {
         while (it.next()) |item| : (i += 1) {
             if (i > 0) try w.writeAll(if (i + 1 == count) " or " else ", ");
             switch (item) {
-                .one => |n| try w.print("{d}", .{n}),
-                .range => |r| try w.print("{d} to {d}", .{ r[0], r[1] }),
-                .at_least => |n| try w.print("at least {d}", .{n}),
+                .one => |n| try w.print("{d}", .{n -| h}),
+                .range => |r| try w.print("{d} to {d}", .{ r[0] -| h, r[1] -| h }),
+                .at_least => |n| try w.print("at least {d}", .{n -| h}),
             }
         }
         try w.writeAll(if (count == 1 and singular) " argument" else " arguments");
@@ -3646,8 +3649,9 @@ pub const VM = struct {
 
     /// `source.lineCol(pos)`, found from the last place found in the
     /// same text (`SourceInfo.lineColFrom`): a handler taking errors in
-    /// a loop is at one place.
-    fn placeOf(self: *VM, source: *const SourceInfo, pos: u32) SourceInfo.LineCol {
+    /// a loop is at one place, and the expansions of a file placing
+    /// their `&form`s walk it in order.
+    pub fn placeOf(self: *VM, source: *const SourceInfo, pos: u32) SourceInfo.LineCol {
         const c = &self.place_cache;
         if (c.text.ptr != source.text.ptr or c.text.len != source.text.len) {
             c.* = .{ .text = source.text, .pos = pos, .place = source.lineCol(pos) };
@@ -8248,6 +8252,18 @@ test "VM error detail: an arity sentence names every count a closure takes" {
         r.arities = null;
         var buf: [64]u8 = undefined;
         try testing.expectEqualStrings(case[1], try std.mem.print(&buf, "{f}", .{r.arityPhrase()}));
+    }
+    // Hidden leading parameters (a macro's `&form` and `&env`) are not
+    // counted.
+    for ([_]struct { Routine, []const u8 }{
+        .{ members[2], "0 arguments" },
+        .{ members[3], "1 argument" },
+        .{ rests[4], "at least 2 arguments" },
+    }) |case| {
+        var r = case[0];
+        r.arities = null;
+        var buf: [64]u8 = undefined;
+        try testing.expectEqualStrings(case[1], try std.mem.print(&buf, "{f}", .{ArityPhrase{ .routine = &r, .hidden = 2 }}));
     }
     // Every other count up to 200: past the detail's 160 bytes, the
     // sentence is cut at a character and marked.
