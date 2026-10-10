@@ -914,6 +914,10 @@ pub const Var = struct {
     /// Set once the metadata has carried `:dynamic true`, never cleared
     /// (VM.md §6.5).
     dynamic: bool = false,
+    /// Set once `meta` has filled in a library Var's packed docstring or
+    /// the metadata was set in place: the doc is not filled in again, so
+    /// removing it sticks (STDLIB.md §10).
+    doc_filled: bool = false,
     /// The binding in force when `thread_bound` (VM.md §6.5).
     thread_value: Value = value_mod.nilValue(),
     thread_bound: bool = false,

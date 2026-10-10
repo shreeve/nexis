@@ -661,7 +661,9 @@ documentation from four places:
   each), which the stdlib image carries: loading one string costs the
   boot less than a string and a map entry per Var. When `meta` reads a
   Var of a library namespace whose map has no `:doc`, it finds the
-  Var's docstring there, adds it under `:doc` and keeps it.
+  Var's docstring there, adds it under `:doc` and keeps it; once it has,
+  or once `reset-meta!` or `alter-meta!` has set the map, it does not
+  again, so removing `:doc` sticks.
 - **A native's table row** (`src/stdlib.zig`). Each row ends with two
   strings, the arglists as `doc` prints them (`"[coll] [n coll]"`)
   and the docstring; Nextomic's natives, whose descriptors live in

@@ -3166,8 +3166,9 @@ fn fnMeta(vm: *VM, args: []const Value) VmError!Value {
         const v = VM.asVar(x);
         if (v.meta.isNil()) {
             v.meta = try nativeVarMeta(vm, v);
-        } else if (v.meta.kind() == .persistent_map and isLibraryNs(v.ns)) {
+        } else if (!v.doc_filled and v.meta.kind() == .persistent_map and isLibraryNs(v.ns)) {
             v.meta = try withPackedDoc(vm, v);
+            v.doc_filled = true;
         }
         return v.meta;
     }
@@ -3234,6 +3235,7 @@ fn setRefMeta(vm: *VM, r: Value, m: Value) VmError!void {
 /// Var dynamic for good (`(def ^:dynamic *x* ...)`, VM.md §6.5).
 fn setVarMeta(vm: *VM, v: *vm_mod.Var, m: Value) VmError!void {
     v.meta = m;
+    v.doc_filled = true;
     if (m.isNil()) return;
     const key = vm.ensureInterner().internKeywordValue("dynamic") catch return VmError.OutOfMemory;
     if ((try vm_mod.lookupIn(vm, m, key, value_mod.nilValue())).isTruthy()) v.dynamic = true;

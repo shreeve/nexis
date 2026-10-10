@@ -310,6 +310,9 @@ test "doc, find-doc, apropos and dir read the documentation of Vars, natives, sp
     try expectOutputProgram("(def my-first first) (meta #'my-first)", "{:name my-first, :ns user}");
     try expectOutput("(subs (with-out-str (doc first)) 0 53)", "-------------------------\nnexis.core/first\n([coll])\n ");
     try expectOutput("(do (reset-meta! #'first {:doc \"mine\"}) (meta #'first))", "{:doc mine}");
+    // Removing a library Var's :doc sticks; `meta` does not refill it.
+    try expectOutput("(do (alter-meta! #'update dissoc :doc) (:doc (meta #'update)))", "nil");
+    try expectOutput("(do (reset-meta! #'update {}) (:doc (meta #'update)))", "nil");
     // Special forms and host macros have no Var: doc reads their table.
     try expectOutput("(with-out-str (doc if))", "-------------------------\nif\n  (if test then else?)\nSpecial Form\n  Evaluates test. If it is neither nil nor false, evaluates and yields\n  then, otherwise else, nil when there is none.\n");
     try expectOutput("(subs (with-out-str (doc catch)) 0 32)", "-------------------------\ntry\n  ");
