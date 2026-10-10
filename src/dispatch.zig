@@ -9,10 +9,10 @@
 //!
 //! Four rules decide every pair of values:
 //!
-//!   - **Identity kinds** (functions, vars, handles, atoms, transients,
-//!     protocols, Nextomic connections) are equal to themselves only
-//!     and hash their pointer. The collector never moves a block, so
-//!     the pointer is stable for the value's life.
+//!   - **Identity kinds** (`isIdentityKind`: functions, Vars, handles,
+//!     atoms, transients, protocols, regexes, matchers) are equal to
+//!     themselves only and hash their pointer. The collector never
+//!     moves a block, so the pointer is stable for the value's life.
 //!   - **Sequential kinds** (list, vector, lazy seq) compare
 //!     element-wise across kinds and share one hash domain byte, so
 //!     `(= '(1 2) [1 2])` and their hashes agree. A lazy block whose
@@ -153,7 +153,7 @@ pub fn hashValue(v: Value) u64 {
 }
 
 /// A heap kind's hash before the domain byte is mixed in.
-pub fn heapHashBase(v: Value) u64 {
+fn heapHashBase(v: Value) u64 {
     const k = v.kind();
     std.debug.assert(k.isHeap());
     if (isIdentityKind(k)) return hash_mod.hashU64(v.payload);
