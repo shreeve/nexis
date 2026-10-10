@@ -553,8 +553,8 @@ const core_rows = .{
     .{ "pr-str", 0, null, &fnPrStr, "[& xs]", "Returns the text pr prints of the xs, as a string." },
     .{ "bound?", 0, null, &fnBoundQ, "[& vars]", "Returns true if every Var given has a value, its root or a binding\n  in force." },
     .{ "nano-time", 0, 0, &fnNanoTime, "[]", "Returns a monotonic clock reading in nanoseconds, for measuring\n  intervals; it is no time of day." },
-    .{ "slurp", 1, 1, &fnSlurp, "[f]", "Returns the whole text of the file at the path f, which must be\n  UTF-8; a missing file is :file-not-found." },
-    .{ "spit", 2, null, &fnSpit, "[f content & options]", "Writes (str content) to the file at the path f, replacing it, or\n  after its end with :append true; returns nil. Parent directories\n  are not created." },
+    .{ "slurp", 1, null, &fnSlurp, "[f & options]", "Returns the whole text of the file at the path f, which must be\n  UTF-8; a missing file is :file-not-found. The one option is\n  :encoding \"UTF-8\"." },
+    .{ "spit", 2, null, &fnSpit, "[f content & options]", "Writes (str content) to the file at the path f, replacing it, or\n  after its end with :append true; returns nil. Parent directories\n  are not created. :encoding takes \"UTF-8\" alone." },
     .{ "read-line", 0, 0, &fnReadLine, "[]", "Returns the next line of stdin without its line ending, nil at end\n  of input." },
     .{ "exit", 0, 1, &fnExit, "[] [status]", "Closes every open store and Nextomic connection, syncing what a\n  commit left unsynced, and ends the process with status (0 by\n  default; its low eight bits). Nothing after it runs, finally blocks\n  included." },
     // The durable-ref natives are `db_natives`, in the `db`
@@ -5807,6 +5807,7 @@ fn fnNanoTime(vm: *VM, _: []const Value) VmError!Value {
 
 fn fnSlurp(vm: *VM, args: []const Value) VmError!Value {
     const path = try vm_mod.pathArg(args[0]);
+    _ = try fileOptions(vm, args[1..], false);
     const slice = std.Io.Dir.cwd().readFileAlloc(ioOf(vm), path, vm.allocator, .unlimited) catch |err| switch (err) {
         error.FileNotFound => return VmError.FileNotFound,
         error.OutOfMemory => return VmError.OutOfMemory,
@@ -5819,13 +5820,7 @@ fn fnSlurp(vm: *VM, args: []const Value) VmError!Value {
 
 fn fnSpit(vm: *VM, args: []const Value) VmError!Value {
     const path = try vm_mod.pathArg(args[0]);
-    if (args.len % 2 != 0) return VmError.ArityMismatch;
-    var append = false;
-    var i: usize = 2;
-    while (i < args.len) : (i += 2) {
-        if (args[i].kind() != .keyword or !std.mem.eql(u8, vm.ensureInterner().keywordName(args[i].asKeywordId()), "append")) return VmError.InvalidArgument;
-        append = args[i + 1].isTruthy();
-    }
+    const append = try fileOptions(vm, args[2..], true);
     var w = std.Io.Writer.Allocating.init(vm.allocator);
     defer w.deinit();
     try appendStrValue(vm, &w, args[1]);
@@ -5846,6 +5841,29 @@ fn fnSpit(vm: *VM, args: []const Value) VmError!Value {
     defer file.close(io);
     file.writeStreamingAll(io, w.written()) catch return VmError.IoError;
     return value_mod.nilValue();
+}
+
+/// The keyword options of `slurp` and `spit` (`spit` takes
+/// `:append`): whether to append. `:encoding` takes UTF-8 alone, the
+/// one encoding of nexis text, in any case and with or without its
+/// dash.
+fn fileOptions(vm: *VM, opts: []const Value, comptime takes_append: bool) VmError!bool {
+    if (opts.len % 2 != 0) return VmError.ArityMismatch;
+    var append = false;
+    var i: usize = 0;
+    while (i < opts.len) : (i += 2) {
+        const name = if (opts[i].kind() == .keyword) vm.ensureInterner().keywordName(opts[i].asKeywordId()) else "";
+        const v = opts[i + 1];
+        if (takes_append and std.mem.eql(u8, name, "append")) {
+            append = v.isTruthy();
+        } else if (std.mem.eql(u8, name, "encoding")) {
+            if (v.kind() != .string) return VmError.KindMismatch;
+            const e = string_mod.asBytes(v);
+            if (!std.ascii.eqlIgnoreCase(e, "UTF-8") and !std.ascii.eqlIgnoreCase(e, "UTF8"))
+                return vm.fail(VmError.InvalidArgument, "the one encoding is UTF-8, not {s}", .{e});
+        } else return VmError.InvalidArgument;
+    }
+    return append;
 }
 
 /// The process's stdin, read through one buffer: the REPL's input

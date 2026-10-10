@@ -8784,3 +8784,15 @@ test "gc: a fn's metadata and captures survive the cycles after with-meta" {
 test "nano-time is an integer that never runs backwards" {
     try expectOutput("(let [a (nano-time) b (nano-time)] [(integer? a) (<= a b) (>= (- b a) 0)])", "[true true true]");
 }
+
+test "io: slurp and spit take :encoding \"UTF-8\", the one encoding" {
+    try expectOutputProgramWithStore("spit-encoding",
+        \\(spit "@STORE@" "h\u{e9}" :encoding "UTF-8")
+        \\(spit "@STORE@" "!" :append true :encoding "utf8")
+        \\[(slurp "@STORE@" :encoding "utf-8") (slurp "@STORE@")
+        \\ (try (spit "@STORE@" "x" :encoding "ISO-8859-1") (catch any e (:error e)))
+        \\ (try (slurp "@STORE@" :encoding "UTF-16") (catch any e (:error e)))
+        \\ (try (slurp "@STORE@" :append true) (catch any e (:error e)))
+        \\ (try (slurp "@STORE@" :encoding) (catch any e (:error e)))]
+    , "[h\u{e9}! h\u{e9}! :invalid-argument :invalid-argument :invalid-argument :arity-mismatch]");
+}
