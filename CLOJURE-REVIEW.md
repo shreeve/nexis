@@ -235,6 +235,7 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | `(macroexpand form)` | with `&env` | no lexical environment; subforms never expand | `docs/MACROEXPAND.md` |
 | `(meta f)`, `(with-meta 'sym m)` | metadata on fns and symbols | nil; `:no-metadata-on-immediate` | `docs/SEMANTICS.md` §7 |
 | `(meta #'f)` | `:name`, `:ns`, `:arglists`, `:line`, `:column`, `:file` | `:name`, `:ns` (the namespace's name symbol), `:arglists` for a `defn` or `defmacro`, and what the definition carries; no `:line`, `:column` or `:file` | `docs/MACROEXPAND.md` §10 |
+| `not` and `mod` at a call site | ordinary calls through the Var (neither has `:inline`), so `with-redefs` or `alter-var-root` of either reaches a compiled call | inlined, as `+`, `inc` and the comparisons (which have `:inline` in Clojure) are: a redefinition reaches `apply` and higher-order uses, not a compiled `(not x)` or `(mod a b)` | `docs/COMPILER.md` §4.3 |
 | a `defn` calling itself | through the Var `#'f`: once `f` is redefined, the earlier function's recursive calls reach the new one | through its own name (`defn` names its fn): the earlier function keeps calling itself, and `(#'f ...)` is the call through the Var | `docs/COMPILER.md` §4.3, §5.5 |
 | `volatile!`, `vswap!`, `vreset!` | a volatile box | an atom (`atom?` is true) | `docs/ATOM.md` |
 | `(exit n)` | `System/exit` | the same: closes open stores and ends the process; no `finally` runs | `src/stdlib.zig` |

@@ -144,6 +144,9 @@ and a reused subform its own (MACROEXPAND.md §4b).
 
    `(not x)` inlines the same way, as `(if x false true)`, which is
    what the fn computes; as an `if` test it is a branch (§5.2).
+   Clojure inlines neither `not` nor `mod`, so a redefinition of their
+   roots reaches compiled calls there and not here
+   (`CLOJURE-REVIEW.md` §4.3).
 
    It inlines only when the operator means `nexis.core`'s Var
    (`namesCore`): it is not lexically bound, the namespace resolves it
