@@ -132,7 +132,8 @@ ascending, the entries from the least key not below `key`; descending,
 from the greatest key not above it. `Cursor` walks ascending by
 position through the subtree sizes, O(log n) a step in a few words;
 the codec keeps one per open container. `entryAt(v, i)`, the entry at
-position `i`, answers in O(log n).
+position `i`, answers in O(log n). `MapEntries` walks the entries of a
+hash map or a sorted map, each in its own order.
 
 `subseq` and `rsubseq` are Clojure's:
 
