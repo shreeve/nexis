@@ -252,28 +252,19 @@ pub const DbSource = struct {
     aevt_entries: ?u64 = null,
 };
 
-/// Everything planning needs about the query: the `Read` of every
-/// source (`read` is the selected one), the variable table (shared by
-/// every sub-plan) and the rule set.
+/// Everything planning needs about the query: every source (`selected`
+/// is the one the resolvers read), the variable table (shared by every
+/// sub-plan) and the rule set.
 pub const Ctx = struct {
     arena: Allocator,
-    /// The selected source's `Read`, null while a collection is
-    /// selected (`coll`); `select` switches it and `db` reads it.
-    read: ?*Read,
-    /// The selected source's tuples when it is a collection.
-    coll: ?[]const []const Cell = null,
     interner: *Interner,
     vars: std.ArrayList(ir.VarInfo),
     rules: *const RuleSet,
     rule_info: ?*rules_mod.Info = null,
-    /// The selected source's resolved attributes.
-    attr_cache: std.AutoHashMapUnmanaged(u32, ?Attr) = .empty,
     /// The query's `Ir` table size; variables at or past it are renames.
     ir_vars: usize,
     /// Run-time relation slots, by `Clause.source.id`.
     sources: std.ArrayList(*SourceSlot) = .empty,
-    /// The selected source's AEVT entries, once asked.
-    aevt_entries: ?u64 = null,
     /// The data sources by `Src`; `$` first.
     dbs: []DbSource,
     /// VM symbol ids of the sources, for `explain`.
@@ -284,6 +275,8 @@ pub const Ctx = struct {
     /// Nesting of `planSub` calls; 1 while placing the query's own
     /// clauses, whose index a refusal then reports.
     depth: usize = 0,
+    /// `liveness`'s table, by variable, all `.{}` between its calls.
+    uses: std.ArrayList(Use) = .empty,
     clause_index: ?usize = null,
     /// Where a syntax or attribute error leaves its reason.
     diag: *Diag,
@@ -298,28 +291,24 @@ pub const Ctx = struct {
             .db => |r| .{ .read = r },
             .coll => |rows| .{ .read = null, .coll = rows },
         };
-        var ctx: Ctx = .{ .arena = arena, .read = null, .interner = interner, .vars = vars, .rules = rules, .ir_vars = query.vars.len, .dbs = dbs, .source_names = query.sources, .diag = diag };
-        if (dbs.len > 0) ctx.enter(0);
-        return ctx;
+        return .{ .arena = arena, .interner = interner, .vars = vars, .rules = rules, .ir_vars = query.vars.len, .dbs = dbs, .source_names = query.sources, .diag = diag };
     }
 
     /// Make `src` (null: `$`) the source the resolvers read; a query
     /// whose `:in` names no source has none to read.
     pub fn select(self: *Ctx, src: ?ir.Src) error{QuerySyntax}!void {
         if (self.dbs.len == 0) return self.syntax("this clause reads a data source, and :in names none");
-        const next = src orelse 0;
-        if (next == self.selected) return;
-        self.dbs[self.selected].attr_cache = self.attr_cache;
-        self.dbs[self.selected].aevt_entries = self.aevt_entries;
-        self.enter(next);
+        self.selected = src orelse 0;
     }
 
-    fn enter(self: *Ctx, next: ir.Src) void {
-        self.selected = next;
-        self.read = self.dbs[next].read;
-        self.coll = self.dbs[next].coll;
-        self.attr_cache = self.dbs[next].attr_cache;
-        self.aevt_entries = self.dbs[next].aevt_entries;
+    /// The selected source.
+    fn source(self: *Ctx) *DbSource {
+        return &self.dbs[self.selected];
+    }
+
+    /// The selected source's tuples when it is a collection.
+    fn coll(self: *Ctx) ?[]const []const Cell {
+        return self.source().coll;
     }
 
     /// `select` for a clause that reads a db value: `missing?`,
@@ -332,7 +321,7 @@ pub const Ctx = struct {
     /// The selected source's `Read`; `QuerySyntax` when it is a
     /// collection.
     pub fn db(self: *Ctx) error{QuerySyntax}!*Read {
-        return self.read orelse self.syntax("this clause reads a db value, and its source is a collection");
+        return self.source().read orelse self.syntax("this clause reads a db value, and its source is a collection");
     }
 
     /// `QuerySyntax` with its reason and the top-level clause it was
@@ -366,20 +355,22 @@ pub const Ctx = struct {
 
     /// The attribute named by VM keyword `kw` as this view sees it.
     pub fn attrByKeyword(self: *Ctx, kw: u32) !?Attr {
-        if (self.attr_cache.get(kw)) |a| return a;
+        const cache = &self.source().attr_cache;
+        if (cache.get(kw)) |a| return a;
         const read = try self.db();
         const id = try read.db.conn.idents.idOf(read.txn, kw);
         const attr: ?Attr = if (id) |a| try read.attr(a) else null;
-        try self.attr_cache.put(self.arena, kw, attr);
+        try cache.put(self.arena, kw, attr);
         return attr;
     }
 
     /// Entries of AEVT this view reads: the cost of a scan over every
     /// datom.
     pub fn aevtEntries(self: *Ctx) !u64 {
-        if (self.aevt_entries) |n| return n;
+        const src = self.source();
+        if (src.aevt_entries) |n| return n;
         const n = try viewEntries(try self.db(), .aevt);
-        self.aevt_entries = n;
+        src.aevt_entries = n;
         return n;
     }
 
@@ -400,41 +391,9 @@ pub const Ctx = struct {
 };
 
 /// The variables bound at a point of planning, in the order they were
-/// bound, with constant-time membership.
-pub const Bound = struct {
-    list: std.ArrayList(Var) = .empty,
-    /// Per variable, its index in `list`, or `unbound`.
-    at: std.ArrayList(u32) = .empty,
-
-    const unbound = std.math.maxInt(u32);
-    pub const none: Bound = .{};
-
-    pub fn init(arena: Allocator, vars: []const Var) !Bound {
-        var b: Bound = .{};
-        for (vars) |v| try b.add(arena, v);
-        return b;
-    }
-
-    pub fn items(self: *const Bound) []const Var {
-        return self.list.items;
-    }
-
-    pub fn has(self: *const Bound, v: Var) bool {
-        return v < self.at.items.len and self.at.items[v] != unbound;
-    }
-
-    /// Was `v` bound at or after the `mark`-th binding?
-    fn since(self: *const Bound, v: Var, mark: usize) bool {
-        return self.has(v) and self.at.items[v] >= mark;
-    }
-
-    pub fn add(self: *Bound, arena: Allocator, v: Var) !void {
-        if (self.has(v)) return;
-        if (v >= self.at.items.len) try self.at.appendNTimes(arena, unbound, v + 1 - self.at.items.len);
-        self.at.items[v] = @intCast(self.list.items.len);
-        try self.list.append(arena, v);
-    }
-};
+/// bound, with constant-time membership: a set costs its own members,
+/// not the plan's whole variable table.
+pub const Bound = ir.VarSet;
 
 /// The rows a scan of `index` reads in this view: the current tree's
 /// entries in the plain view at the newest basis, otherwise the
@@ -481,24 +440,34 @@ pub fn planSub(ctx: *Ctx, clauses: []const Clause, input: []const Var, rows_in: 
     return out;
 }
 
+/// Per variable while `liveness` runs: one past the index of the last
+/// step that reads it, and whether the plan's caller asks for it.
+const Use = struct { last_read: usize = 0, asked: bool = false };
+
 /// Fill `p.drop` and `p.park`: after each step the relation drops the
 /// variables no later step reads and `output` does not name, and parks
 /// the ones only `output` names once there are `park_min` of them and
-/// two steps still to run.
+/// two steps still to run. Every plan shares one table of `Use`s, set
+/// for the plan's own variables and reset on the way out: a sub-plan's
+/// liveness has run before its parent's starts, so planning costs the
+/// variables of each plan, not the whole table once per sub-plan.
 fn liveness(ctx: *Ctx, p: *Plan, output: []const Var) !void {
     const arena = ctx.arena;
-    const n_vars = ctx.vars.items.len;
-    // Per variable, one past the index of the last step that reads it.
-    const last_read = try arena.alloc(usize, n_vars);
-    @memset(last_read, 0);
+    try ctx.uses.appendNTimes(arena, .{}, ctx.vars.items.len -| ctx.uses.items.len);
+    const uses = ctx.uses.items;
+    var touched: std.ArrayList(Var) = .empty;
+    defer for (touched.items) |v| {
+        uses[v] = .{};
+    };
     var scratch: std.ArrayList(Var) = .empty;
     for (p.steps, 1..) |*s, n| {
         scratch.clearRetainingCapacity();
         _ = try stepVars(arena, s, &scratch);
-        for (scratch.items) |v| last_read[v] = n;
+        for (scratch.items) |v| uses[v].last_read = n;
+        try touched.appendSlice(arena, scratch.items);
     }
-    var asked = try std.bit_set.Dynamic.initEmpty(arena, n_vars);
-    for (output) |v| asked.set(v);
+    for (output) |v| uses[v].asked = true;
+    try touched.appendSlice(arena, output);
 
     const drop = try arena.alloc([]const Var, p.steps.len);
     const park = try arena.alloc(?Park, p.steps.len);
@@ -513,9 +482,9 @@ fn liveness(ctx: *Ctx, p: *Plan, output: []const Var) !void {
         var payload: std.ArrayList(Var) = .empty;
         var kept: usize = 0;
         for (held.items) |v| {
-            const later = v != row and last_read[v] > n;
-            if (v == row or (!later and asked.isSet(v))) try payload.append(arena, v);
-            if (v == row or later or asked.isSet(v)) {
+            const later = v != row and uses[v].last_read > n;
+            if (v == row or (!later and uses[v].asked)) try payload.append(arena, v);
+            if (v == row or later or uses[v].asked) {
                 held.items[kept] = v;
                 kept += 1;
             } else try gone.append(arena, v);
@@ -594,9 +563,6 @@ fn noteRows(ctx: *Ctx, rows_after: *std.ArrayList(u64), steps: usize, rows: u64)
 const Pending = struct {
     clause: Clause,
     done: bool = false,
-    /// Every variable the clause mentions: binding one of them is what
-    /// can change its estimate.
-    vars: []const Var,
     /// The estimate given the variables bound when it was taken.
     cost: Cost = .stale,
     /// The join variables of a `not` or `or`, once asked.
@@ -615,23 +581,30 @@ const Cost = union(enum) {
 
 fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *Bound, steps: *std.ArrayList(Step), rows_after: *std.ArrayList(u64), rows: *u64) Failure!void {
     const pending = try ctx.arena.alloc(Pending, clauses.len);
-    for (clauses, pending) |c, *p| {
-        var vs: std.ArrayList(Var) = .empty;
-        try ir.allVars(ctx.arena, &.{c}, &vs);
-        p.* = .{ .clause = c, .vars = vs.items };
+    // The clauses each variable is mentioned by: binding it is what can
+    // change their estimates.
+    var mentions: Mentions = .empty;
+    var vs: ir.VarSet = .{};
+    for (clauses, pending, 0..) |c, *p, i| {
+        p.* = .{ .clause = c };
+        vs.clear();
+        try ir.collectVars(ctx.arena, .all, &.{c}, &vs);
+        for (vs.items()) |v| {
+            const gop = try mentions.getOrPut(ctx.arena, v);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(ctx.arena, @intCast(i));
+        }
     }
 
     // Variables that some clause at this level binds: `not` joins on its
     // body's variables that are in scope here.
-    var scope_list: std.ArrayList(Var) = .empty;
-    try scope_list.appendSlice(ctx.arena, bound.items());
-    try ir.boundVars(ctx.arena, clauses, &scope_list);
-    const scope = try Bound.init(ctx.arena, scope_list.items);
+    var scope = try Bound.init(ctx.arena, bound.items());
+    try ir.collectVars(ctx.arena, .bound, clauses, &scope);
 
     var remaining = clauses.len;
     while (remaining > 0) {
         const mark = bound.items().len;
-        defer invalidate(pending, bound, mark);
+        defer invalidate(pending, &mentions, bound, mark);
         // Cost-free steps first.
         var progress = false;
         for (pending, 0..) |*p, idx| {
@@ -694,7 +667,7 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *Bound, steps: *std.Ar
         // The cheapest source next.
         var best: ?*Pending = null;
         var best_cost: u64 = std.math.maxInt(u64);
-        var unbound_pattern = false;
+        var unbound: ?usize = null;
         for (pending, 0..) |*p, idx| {
             if (p.done) continue;
             if (p.cost == .stale) {
@@ -706,13 +679,15 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *Bound, steps: *std.Ar
                     best_cost = c;
                     best = p;
                 },
-                .unbound_pattern => unbound_pattern = true,
+                .unbound_pattern => unbound = unbound orelse idx,
                 .blocked, .stale => {},
             }
         }
         const p = best orelse {
-            if (unbound_pattern) return error.UnboundPattern;
-            return neverBound(ctx, pending, bound);
+            const idx = unbound orelse return neverBound(ctx, pending, bound);
+            if (ctx.depth == 1) ctx.clause_index = idx;
+            ctx.diag.set(ctx.clause_index, "{f} has nothing bound in e, a or v: no constant, and no variable an earlier clause or :in binds", .{PatternText{ .ctx = ctx, .p = pending[idx].clause.pattern }});
+            return error.UnboundPattern;
         };
         if (ctx.depth == 1) ctx.clause_index = (@intFromPtr(p) - @intFromPtr(pending.ptr)) / @sizeOf(Pending);
         switch (p.clause) {
@@ -767,16 +742,13 @@ fn estimate(ctx: *Ctx, c: Clause, bound: *const Bound) Failure!Cost {
     return if (rows) |n| .{ .rows = n } else .blocked;
 }
 
+const Mentions = std.AutoHashMapUnmanaged(Var, std.ArrayList(u32));
+
 /// Mark stale the estimates of the pending clauses that mention a
 /// variable bound since the `mark`-th binding.
-fn invalidate(pending: []Pending, bound: *const Bound, mark: usize) void {
-    if (bound.items().len == mark) return;
-    for (pending) |*p| {
-        if (p.done or p.cost == .stale) continue;
-        for (p.vars) |v| if (bound.since(v, mark)) {
-            p.cost = .stale;
-            break;
-        };
+fn invalidate(pending: []Pending, mentions: *const Mentions, bound: *const Bound, mark: usize) void {
+    for (bound.items()[mark..]) |v| {
+        for ((mentions.get(v) orelse continue).items) |i| pending[i].cost = .stale;
     }
 }
 
@@ -843,7 +815,7 @@ fn checkGetElse(ctx: *Ctx, call: ir.Call) !void {
     const a = call.args[2];
     if (a != .constant or a.constant != .keyword) return;
     const attr = (try ctx.attrByKeyword(a.constant.keyword)) orelse return;
-    if (attr.many()) return ctx.syntax("get-else takes a cardinality-one attribute");
+    if (attr.many()) return ctx.syntaxFmt("get-else takes a cardinality-one attribute, and :{s} is cardinality-many", .{ctx.interner.keywordName(a.constant.keyword)});
 }
 
 /// A call can run once its function (when a variable) and every
@@ -877,15 +849,15 @@ pub fn newVars(arena: Allocator, vars: []const Var, bound: *const Bound) ![]Var 
 /// its listed variables. At least one must join.
 fn notJoin(ctx: *Ctx, n: anytype, scope: *const Bound) ![]const Var {
     if (n.join) |js| return js;
-    var body_vars: std.ArrayList(Var) = .empty;
-    try ir.allVars(ctx.arena, n.body, &body_vars);
+    var body_vars: ir.VarSet = .{};
+    try ir.collectVars(ctx.arena, .all, n.body, &body_vars);
     var join: std.ArrayList(Var) = .empty;
-    for (body_vars.items) |v| {
+    for (body_vars.items()) |v| {
         if (scope.has(v)) try join.append(ctx.arena, v);
     }
     if (join.items.len == 0) {
-        std.debug.assert(body_vars.items.len > 0);
-        return ctx.syntaxFmt("not shares no variable with the clauses around it: {s} is bound nowhere outside; not joins on a variable bound outside it", .{ctx.varName(body_vars.items[0])});
+        std.debug.assert(body_vars.items().len > 0);
+        return ctx.syntaxFmt("not shares no variable with the clauses around it: {s} is bound nowhere outside; not joins on a variable bound outside it", .{ctx.varName(body_vars.items()[0])});
     }
     return join.toOwnedSlice(ctx.arena);
 }
@@ -893,9 +865,9 @@ fn notJoin(ctx: *Ctx, n: anytype, scope: *const Bound) ![]const Var {
 /// `or` joins on every variable of its branches; `or-join` on its list.
 fn orJoin(ctx: *Ctx, o: anytype) ![]const Var {
     if (o.join) |js| return js;
-    var vs: std.ArrayList(Var) = .empty;
-    try ir.allVars(ctx.arena, o.branches[0], &vs);
-    return vs.toOwnedSlice(ctx.arena);
+    var vs: ir.VarSet = .{};
+    try ir.collectVars(ctx.arena, .all, o.branches[0], &vs);
+    return vs.items();
 }
 
 /// Plan an `or`: every branch starts from the join variables already
@@ -909,10 +881,9 @@ pub fn planOr(ctx: *Ctx, branches: []const ir.Branch, join: []const Var, bound: 
     const plans = try ctx.arena.alloc(*Plan, branches.len);
     for (branches, plans, 1..) |br, *p, n| {
         p.* = try planSub(ctx, br, bound_join.items, rows, join);
-        var ends: std.ArrayList(Var) = .empty;
-        try ends.appendSlice(ctx.arena, bound_join.items);
-        try ir.boundVars(ctx.arena, br, &ends);
-        for (join) |v| if (!ir.containsVar(ends.items, v)) {
+        var ends = try Bound.init(ctx.arena, bound_join.items);
+        try ir.collectVars(ctx.arena, .bound, br, &ends);
+        for (join) |v| if (!ends.has(v)) {
             if (rule) |name| return ctx.syntaxFmt("rule {s} body {d} leaves {s} unbound; every body binds every head variable", .{ ctx.interner.symbolName(name), n, ctx.varName(v) });
             return ctx.syntaxFmt("or-join branch {d} leaves {s} unbound; every branch binds every join variable", .{ n, ctx.varName(v) });
         };
@@ -1037,7 +1008,7 @@ fn choose(ctx: *Ctx, p: ir.Pattern, bound: *const Bound) !Choice {
 /// body's patterns read the source of the call.
 fn patternEstimate(ctx: *Ctx, p: ir.Pattern, bound: *const Bound, src: ?ir.Src) !u64 {
     try ctx.select(p.src orelse src);
-    if (ctx.coll) |rows| return @max(1, rows.len);
+    if (ctx.coll()) |rows| return @max(1, rows.len);
     return (try choose(ctx, p, bound)).estimate;
 }
 
@@ -1045,7 +1016,7 @@ fn patternEstimate(ctx: *Ctx, p: ir.Pattern, bound: *const Bound, src: ?ir.Src) 
 /// a collection.
 fn planPattern(ctx: *Ctx, p: ir.Pattern, bound: *const Bound) Failure!Step {
     try ctx.select(p.src);
-    const rows = ctx.coll orelse return .{ .scan = try planScan(ctx, p, bound) };
+    const rows = ctx.coll() orelse return .{ .scan = try planScan(ctx, p, bound) };
     var fresh: std.ArrayList(Var) = .empty;
     var slots: [5]Slot = undefined;
     for (p.terms(), &slots) |t, *slot| slot.* = switch (t) {
@@ -1072,7 +1043,7 @@ fn varSlot(ctx: *Ctx, v: Var, bound: *const Bound, fresh: *std.ArrayList(Var)) !
 fn planScan(ctx: *Ctx, p: ir.Pattern, bound: *const Bound) Failure!Scan {
     try ctx.select(p.src);
     const choice = try choose(ctx, p, bound);
-    const hash_choice: ?Choice = choose(ctx, p, &Bound.none) catch |err| switch (err) {
+    const hash_choice: ?Choice = choose(ctx, p, &Bound.empty) catch |err| switch (err) {
         error.UnboundPattern => null,
         else => return err,
     };
@@ -1270,7 +1241,7 @@ const Line = struct {
     park: ?Park = null,
 };
 
-fn indent(w: *std.Io.Writer, depth: usize) !void {
+pub fn indent(w: *std.Io.Writer, depth: usize) !void {
     var i: usize = 0;
     while (i < depth) : (i += 1) try w.writeAll("  ");
 }
@@ -1325,52 +1296,32 @@ pub fn explainSub(p: *const Plan, ctx: *const Ctx, lines: *std.ArrayList(Line), 
                     if (s.dedup) try w.writeAll(" dedup");
                 }
                 line.join = joinKind(&s, p.rowsBefore(i));
-                line.text = out.written();
-                try lines.append(ctx.arena, line);
             },
             .pred => |pr| {
                 try w.writeAll("pred ");
                 try explainCall(pr.call, ctx, w);
-                line.text = out.written();
-                try lines.append(ctx.arena, line);
             },
             .bind => |b| {
                 try w.writeAll("bind ");
                 try explainCall(b.call, ctx, w);
                 try w.writeAll(" -> ");
                 try explainBinding(b, ctx, w);
-                line.text = out.written();
-                try lines.append(ctx.arena, line);
             },
             .not => |n| {
                 try w.writeAll("not-join [");
                 try explainVars(n.join, ctx, w);
                 try w.writeAll("]");
-                line.text = out.written();
-                try lines.append(ctx.arena, line);
-                try explainSub(n.sub, ctx, lines, depth + 1);
             },
             .@"or" => |o| {
                 try w.writeAll("or-join [");
                 try explainVars(o.join, ctx, w);
                 try w.print("] branches={d}", .{o.branches.len});
-                line.text = out.written();
-                try lines.append(ctx.arena, line);
-                for (o.branches) |br| {
-                    var bw: std.Io.Writer.Allocating = .init(ctx.arena);
-                    try indent(&bw.writer, depth + 1);
-                    try bw.writer.writeAll("branch");
-                    try lines.append(ctx.arena, .{ .text = bw.written() });
-                    try explainSub(br, ctx, lines, depth + 2);
-                }
             },
             .source => |s| {
                 try w.writeAll("source [");
                 try explainVars(s.vars, ctx, w);
                 try w.writeAll("]");
                 line.join = "hash";
-                line.text = out.written();
-                try lines.append(ctx.arena, line);
             },
             .match => |m| {
                 try w.print("match [{s}", .{ctx.interner.symbolName(ctx.source_names[m.src])});
@@ -1380,16 +1331,26 @@ pub fn explainSub(p: *const Plan, ctx: *const Ctx, lines: *std.ArrayList(Line), 
                 }
                 try w.print("] tuples={d}", .{m.rows.len});
                 line.join = "hash";
-                line.text = out.written();
-                try lines.append(ctx.arena, line);
             },
             .fix => |f| {
                 try rules_mod.explainFix(&f, ctx, w);
                 line.join = "fixpoint";
-                line.text = out.written();
-                try lines.append(ctx.arena, line);
-                try rules_mod.explainFixBodies(&f, ctx, lines, depth + 1);
             },
+        }
+        line.text = out.written();
+        try lines.append(ctx.arena, line);
+        // A sub-plan's lines follow its step's, indented.
+        switch (step) {
+            .not => |n| try explainSub(n.sub, ctx, lines, depth + 1),
+            .@"or" => |o| for (o.branches) |br| {
+                var bw: std.Io.Writer.Allocating = .init(ctx.arena);
+                try indent(&bw.writer, depth + 1);
+                try bw.writer.writeAll("branch");
+                try lines.append(ctx.arena, .{ .text = bw.written() });
+                try explainSub(br, ctx, lines, depth + 2);
+            },
+            .fix => |f| try rules_mod.explainFixBodies(&f, ctx, lines, depth + 1),
+            else => {},
         }
     }
     var tail: std.Io.Writer.Allocating = .init(ctx.arena);
@@ -1441,10 +1402,48 @@ pub fn explainCell(c: Cell, ctx: *const Ctx, w: *std.Io.Writer) !void {
         .double => |d| try w.print("{d}", .{d}),
         .boolean => |b| try w.writeAll(if (b) "true" else "false"),
         .keyword => |k| try w.print(":{s}", .{ctx.interner.keywordName(k)}),
-        .str => |s| try w.print("\"{s}\"", .{s}),
+        .str => |s| {
+            // As the reader takes it back: `"` and `\` escaped.
+            try w.writeByte('"');
+            for (s) |b| {
+                if (b == '"' or b == '\\') try w.writeByte('\\');
+                try w.writeByte(b);
+            }
+            try w.writeByte('"');
+        },
         .vm => try w.writeAll("#value"),
     }
 }
+
+/// A data pattern as the query wrote it, for a message.
+const PatternText = struct {
+    ctx: *const Ctx,
+    p: ir.Pattern,
+
+    pub fn format(self: PatternText, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const terms = self.p.terms();
+        var n: usize = terms.len;
+        while (n > 3 and terms[n - 1] == .blank) n -= 1;
+        try w.writeByte('[');
+        if (self.p.src) |src| try w.print("{s} ", .{self.ctx.interner.symbolName(self.ctx.source_names[src])});
+        for (terms[0..n], 0..) |t, i| {
+            if (i > 0) try w.writeByte(' ');
+            switch (t) {
+                .blank => try w.writeAll("_"),
+                .variable => |v| try w.writeAll(self.ctx.varName(v)),
+                .constant => |c| switch (c) {
+                    .cell => |cell| try explainCell(cell, self.ctx, w),
+                    .lookup => |l| {
+                        try w.print("[:{s} ", .{self.ctx.interner.keywordName(l.attr)});
+                        try explainCell(l.v, self.ctx, w);
+                        try w.writeByte(']');
+                    },
+                },
+            }
+        }
+        try w.writeByte(']');
+    }
+};
 
 fn explainCall(call: ir.Call, ctx: *const Ctx, w: *std.Io.Writer) !void {
     try w.writeByte('(');

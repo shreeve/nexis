@@ -58,6 +58,31 @@ ok a refused ident retraction leaves every name resolving
 ok an enum ident may start with _
 {:error :nextomic/cas, :expected :role/never, :actual :role/admin, :message :x/role holds :role/admin, not the :role/never the cas expected, :attr :x/role}
 ok a cas mints no ident for its old value
+{:error :nextomic/query-syntax, :message (foo ...) calls a rule, and :in binds no rule set (%), :clause 0}
+{:error :nextomic/query-syntax, :message (foo ...) calls a rule the rule set does not define, :clause 0}
+{:error :nextomic/query-syntax, :message rule bar takes 1 argument, and a call passes 2, :clause 0}
+{:error :nextomic/query-syntax, :message rule bar takes 1 argument, 0 of them required, and here 2, 0 required; rules with one name share an arity, :clause 1}
+{:error :nextomic/query-syntax, :message ?x appears twice in the head of rule bar, :clause 0}
+{:error :nextomic/query-syntax, :message rule bar takes 1 argument, and a call passes 2, :clause 0}
+{:error :nextomic/query-syntax, :message zork in a data pattern is no variable; a position takes ?x, _ or a constant, :clause 0}
+{:error :nextomic/query-syntax, :message zork in argument position is no variable or data source, :clause 1}
+{:error :nextomic/query-syntax, :message ?x is bound twice in :in}
+{:error :nextomic/query-syntax, :message :bogus is no query section; one of :find, :keys, :strs, :syms, :in, :with and :where}
+{:error :nextomic/query-syntax, :message $2 names no data source; declare it in :in, :clause 0}
+{:error :nextomic/query-syntax, :message ?a appears twice in a tuple binding, :clause 0}
+{:error :nextomic/unbound-pattern, :message [?x _ _] has nothing bound in e, a or v: no constant, and no variable an earlier clause or :in binds, :clause 0}
+{:error :nextomic/value-type, :message [?x ...] takes a vector, list or set, and the input is a long}
+{:error :nextomic/value-type, :message [?x ?y] takes 2 values, and the input holds 1}
+{:error :nextomic/value-type, :message [[?a ?b]] takes vectors, lists or sets as elements, and an element of the input is a long}
+{:error :nextomic/value-type, :message [?a ...] takes a vector, list or set, and the result of (ground ...) is a long}
+{:error :nextomic/value-type, :message [[?a ?b]] takes 2 values per element, and an element of the result of (ground ...) holds 1}
+{:error :nextomic/value-type, :message get-else names its attribute by keyword, not a long}
+{:error :nextomic/value-type, :message fulltext names its attribute by keyword, not a long}
+{:error :nextomic/pull-syntax, :message foo in a pull pattern is no attribute; a symbol there is *, :clause 0}
+{:error :nextomic/pull-syntax, :message :xform is no attribute option; one of :as, :limit and :default, :clause 0}
+{:error :nextomic/pull-syntax, :message :user/age takes no sub-pattern: it is no ref attribute, :clause 0}
+{:error :nextomic/query-syntax, :message unknown function: no-such-fn}
+{:error :nextomic/query-syntax, :message unknown function: no-such-agg}
 {:error :nextomic/closed, :message the connection is released, or the with scope of this db-value has ended}
 {:error :nextomic/closed, :message the connection is released, or the with scope of this db-value has ended}
 {:error :nextomic/closed, :message the connection is released, or the with scope of this db-value has ended}

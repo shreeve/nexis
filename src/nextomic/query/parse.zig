@@ -38,6 +38,7 @@ const champ = @import("../../coll/champ.zig");
 const dispatch = @import("../../dispatch.zig");
 const stack = @import("../../stack.zig");
 const gc = @import("../../gc.zig");
+const format_mod = @import("../../format.zig");
 const marshal = @import("../marshal.zig");
 const key = @import("../key.zig");
 const ir = @import("ir.zig");
@@ -85,6 +86,25 @@ pub const Diag = struct {
         self.message = std.mem.print(&self.buf, fmt, args) catch &self.buf;
     }
 };
+
+/// A value as `pr` prints it, for a message naming it (`{f}`). A
+/// message is cut at the `Diag` buffer, so the printing stops there.
+pub const Shown = struct {
+    v: Value,
+    interner: *const Interner,
+
+    pub fn format(self: Shown, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        format_mod.format(self.v, .readable, w, self.interner) catch |e| switch (e) {
+            error.WriteFailed => return error.WriteFailed,
+            else => try w.writeAll("#<unprintable>"),
+        };
+    }
+};
+
+/// The plural ending of a count's noun: `"s"` unless `n` is 1.
+pub fn plural(n: usize) []const u8 {
+    return if (n == 1) "" else "s";
+}
 
 // =============================================================================
 // Entry points
@@ -159,6 +179,10 @@ const Parser = struct {
         return error.QuerySyntax;
     }
 
+    fn shown(self: *Parser, v: Value) Shown {
+        return .{ .v = v, .interner = self.interner };
+    }
+
     fn varName(self: *Parser, v: Var) []const u8 {
         return self.interner.symbolName(self.vars.items[v].sym);
     }
@@ -210,7 +234,7 @@ const Parser = struct {
         if (self.rule_body) return self.fail("a rule body reads $ only");
         const sym = v.asSymbolId();
         for (self.sources.items, 0..) |s, i| if (s == sym) return @intCast(i);
-        return self.fail("unknown data source; declare it in :in");
+        return self.failFmt("{s} names no data source; declare it in :in", .{self.interner.symbolName(sym)});
     }
 
     fn isSeq(v: Value) bool {
@@ -254,7 +278,7 @@ const Parser = struct {
                         } else if (acc.items.len > 0) return self.fail("query must start with :find");
                         if (at_end) break;
                         const k = items[i];
-                        section = self.sectionOf(k, &find, &in, &with, &where, &keys, &strs, &syms) orelse return self.fail("unknown query section");
+                        section = self.sectionOf(k, &find, &in, &with, &where, &keys, &strs, &syms) orelse return self.unknownSection(k);
                         continue;
                     }
                     try acc.append(self.arena, items[i]);
@@ -264,7 +288,7 @@ const Parser = struct {
                 var it = champ.mapIter(query);
                 while (it.next()) |e| {
                     const k = e.key;
-                    const target = self.sectionOf(k, &find, &in, &with, &where, &keys, &strs, &syms) orelse return self.fail("unknown query section");
+                    const target = self.sectionOf(k, &find, &in, &with, &where, &keys, &strs, &syms) orelse return self.unknownSection(k);
                     target.* = try self.elems(e.value);
                 }
             },
@@ -284,7 +308,7 @@ const Parser = struct {
         if (with) |items| {
             const ws = try self.arena.alloc(Var, items.len);
             for (items, ws) |w, *slot| {
-                if (!self.isVarSym(w)) return self.fail(":with takes variables");
+                if (!self.isVarSym(w)) return self.failFmt(":with takes variables, not {f}", .{self.shown(w)});
                 slot.* = try self.varOf(w.asSymbolId());
             }
             out.with = ws;
@@ -307,6 +331,10 @@ const Parser = struct {
         return null;
     }
 
+    fn unknownSection(self: *Parser, k: Value) Error {
+        return self.failFmt("{f} is no query section; one of :find, :keys, :strs, :syms, :in, :with and :where", .{self.shown(k)});
+    }
+
     /// At most one of `:keys`, `:strs`, `:syms`: symbols, one per find
     /// element, with the relation find spec.
     fn parseKeys(self: *Parser, out: *Ir, keys: ?[]Value, strs: ?[]Value, syms: ?[]Value) Error!void {
@@ -321,7 +349,7 @@ const Parser = struct {
         if (items.len != out.find.len) return self.fail(":keys, :strs and :syms take one name per :find element");
         const names = try self.arena.alloc(u32, items.len);
         for (items, names) |x, *n| {
-            if (!x.isSymbol() or self.isVarSym(x)) return self.fail(":keys, :strs and :syms take symbols");
+            if (!x.isSymbol() or self.isVarSym(x)) return self.failFmt(":keys, :strs and :syms take symbols, not {f}", .{self.shown(x)});
             n.* = x.asSymbolId();
         }
         out.keys = .{ .kind = if (keys != null) .keyword else if (strs != null) .string else .symbol, .names = names };
@@ -359,7 +387,7 @@ const Parser = struct {
         if (v.kind() == .list) {
             const parts = try self.elems(v);
             if (parts.len == 0) return self.fail("empty :find element");
-            const name = self.symName(parts[0]) orelse return self.fail("aggregate head must be a symbol");
+            const name = self.symName(parts[0]) orelse return self.failFmt("an aggregate is named by a symbol, not {f}", .{self.shown(parts[0])});
             if (std.mem.eql(u8, name, "pull")) {
                 // The source is resolved once `:in` is parsed (`checkBound`).
                 const with_src = parts.len == 4 and self.isSrcSym(parts[1]);
@@ -389,7 +417,7 @@ const Parser = struct {
             if (parts.len != arg_at + 1 or !self.isVarSym(parts[arg_at])) return self.fail("aggregate takes one variable");
             return .{ .agg = .{ .op = op, .n = n, .sym = parts[0].asSymbolId(), .arg = try self.varOf(parts[arg_at].asSymbolId()) } };
         }
-        return self.fail(":find takes variables, aggregates and pull expressions");
+        return self.failFmt(":find takes variables, aggregates and pull expressions, not {f}", .{self.shown(v)});
     }
 
     fn parseIn(self: *Parser, items: []Value) Error![]ir.InBinding {
@@ -400,7 +428,7 @@ const Parser = struct {
             if (self.isSrcSym(x)) {
                 const sym = x.asSymbolId();
                 if (self.sources.items.len > 0 and self.isSym(x, "$")) return self.fail("$ names the first data source; declare it first");
-                for (self.sources.items) |s| if (s == sym) return self.fail("duplicate data source in :in");
+                for (self.sources.items) |s| if (s == sym) return self.failFmt("{s} is declared twice in :in", .{self.interner.symbolName(sym)});
                 try out.append(self.arena, .{ .src = @intCast(self.sources.items.len) });
                 try self.sources.append(self.arena, sym);
             } else if (self.isSym(x, "%")) {
@@ -412,21 +440,21 @@ const Parser = struct {
             } else if (x.kind() == .persistent_vector) {
                 const inner = try self.elems(x);
                 if (inner.len == 2 and self.isSym(inner[1], "...")) {
-                    if (!self.isVarSym(inner[0])) return self.fail("collection binding takes a variable");
+                    if (!self.isVarSym(inner[0])) return self.failFmt("a collection binding takes a variable, not {f}", .{self.shown(inner[0])});
                     try out.append(self.arena, .{ .collection = try self.inVar(inner[0], &seen) });
                 } else if (inner.len == 1 and inner[0].kind() == .persistent_vector) {
                     try out.append(self.arena, .{ .relation = try self.inTuple(try self.elems(inner[0]), &seen) });
                 } else {
                     try out.append(self.arena, .{ .tuple = try self.inTuple(inner, &seen) });
                 }
-            } else return self.fail("unknown :in binding form");
+            } else return self.failFmt("{f} is no :in binding; one of $src, %, ?x, [?x ...], [?a ?b] and [[?a ?b]]", .{self.shown(x)});
         }
         return out.toOwnedSlice(self.arena);
     }
 
     fn inVar(self: *Parser, x: Value, seen: *std.ArrayList(Var)) Error!Var {
         const v = try self.varOf(x.asSymbolId());
-        if (ir.containsVar(seen.items, v)) return self.fail("duplicate :in variable");
+        if (ir.containsVar(seen.items, v)) return self.failFmt("{s} is bound twice in :in", .{self.varName(v)});
         try seen.append(self.arena, v);
         return v;
     }
@@ -439,27 +467,27 @@ const Parser = struct {
                 slot.* = null;
             } else if (self.isVarSym(x)) {
                 slot.* = try self.inVar(x, seen);
-            } else return self.fail("tuple binding takes variables");
+            } else return self.failFmt("a tuple binding takes variables and _, not {f}", .{self.shown(x)});
         }
         return out;
     }
 
     /// Every `find` and `with` variable must be bound by `in` or `where`.
     fn checkBound(self: *Parser, out: *Ir) Error!void {
-        var bound: std.ArrayList(Var) = .empty;
+        var bound: ir.VarSet = .{};
         for (out.in) |b| switch (b) {
-            .scalar, .collection => |v| try ir.addVar(self.arena, &bound, v),
+            .scalar, .collection => |v| try bound.add(self.arena, v),
             .tuple, .relation => |ts| for (ts) |t| {
-                if (t) |v| try ir.addVar(self.arena, &bound, v);
+                if (t) |v| try bound.add(self.arena, v);
             },
             .src, .rules => {},
         };
-        out.in_vars = try self.arena.dupe(Var, bound.items);
-        try ir.boundVars(self.arena, out.where, &bound);
+        out.in_vars = try self.arena.dupe(Var, bound.items());
+        try ir.collectVars(self.arena, .bound, out.where, &bound);
         self.clause_index = null;
         for (self.pull_srcs.items) |ps| self.find_elems[ps.find].pull.src = try self.srcOf(ps.sym);
         for (out.find) |f| {
-            if (!ir.containsVar(bound.items, f.variable_of())) return self.failFmt(":find variable {s} is not bound by :in or :where", .{self.varName(f.variable_of())});
+            if (!bound.has(f.variable_of())) return self.failFmt(":find variable {s} is not bound by :in or :where", .{self.varName(f.variable_of())});
             if (f != .pull) continue;
             if (self.sources.items.len == 0) return self.fail("pull reads a data source, and :in names none");
             switch (f.pull.pattern) {
@@ -468,7 +496,7 @@ const Parser = struct {
             }
         }
         for (out.with) |w| {
-            if (!ir.containsVar(bound.items, w)) return self.failFmt(":with variable {s} is not bound by :in or :where", .{self.varName(w)});
+            if (!bound.has(w)) return self.failFmt(":with variable {s} is not bound by :in or :where", .{self.varName(w)});
         }
     }
 
@@ -506,19 +534,19 @@ const Parser = struct {
                 defer self.nesting -= 1;
                 const parts = try self.elems(x);
                 if (parts.len == 0) return self.fail("empty clause");
-                const head = self.symName(parts[0]) orelse return self.fail("clause head must be a symbol");
+                const head = self.symName(parts[0]) orelse return self.failFmt("a list clause starts with a symbol, not {f}", .{self.shown(parts[0])});
                 if (std.mem.eql(u8, head, "and")) {
                     for (parts[1..]) |c| try self.parseClauseInto(c, out);
                 } else if (std.mem.eql(u8, head, "not")) {
                     const body = try self.parseBody(parts[1..]);
-                    var vs: std.ArrayList(Var) = .empty;
-                    try ir.allVars(self.arena, body, &vs);
-                    if (vs.items.len == 0) return self.fail("not clause has no variables");
+                    var vs: ir.VarSet = .{};
+                    try ir.collectVars(self.arena, .all, body, &vs);
+                    if (vs.items().len == 0) return self.fail("not clause has no variables");
                     try out.append(self.arena, .{ .not = .{ .join = null, .body = body } });
                 } else if (std.mem.eql(u8, head, "not-join")) {
                     if (parts.len < 3) return self.fail("not-join takes a variable vector and clauses");
                     const join = try self.joinVars(parts[1]);
-                    try out.append(self.arena, .{ .not = .{ .join = join, .body = try self.parseBody(parts[2..]) } });
+                    try out.append(self.arena, .{ .not = .{ .join = join.vars, .body = try self.parseBody(parts[2..]) } });
                 } else if (std.mem.eql(u8, head, "or")) {
                     const branches = try self.parseBranches(parts[1..]);
                     try self.checkOrBranches(branches);
@@ -526,7 +554,7 @@ const Parser = struct {
                 } else if (std.mem.eql(u8, head, "or-join")) {
                     if (parts.len < 3) return self.fail("or-join takes a variable vector and clauses");
                     const join = try self.joinVars(parts[1]);
-                    try out.append(self.arena, .{ .@"or" = .{ .join = join, .branches = try self.parseBranches(parts[2..]), .required = try self.requiredVars(parts[1]) } });
+                    try out.append(self.arena, .{ .@"or" = .{ .join = join.vars, .branches = try self.parseBranches(parts[2..]), .required = join.required } });
                 } else if (parts[0].isSymbol() and self.isSrcSym(parts[0])) {
                     if (parts.len < 2 or self.symName(parts[1]) == null) return self.fail("a source prefix is followed by a rule name");
                     const src = try self.srcOf(parts[0]);
@@ -535,7 +563,7 @@ const Parser = struct {
                     try out.append(self.arena, .{ .rule = .{ .name = parts[0].asSymbolId(), .args = try self.parseArgs(parts[1..], true) } });
                 }
             },
-            else => return self.fail("clause must be a vector or a list"),
+            else => return self.failFmt("a clause is a vector or a list, not {f}", .{self.shown(x)}),
         }
     }
 
@@ -559,44 +587,34 @@ const Parser = struct {
     /// Every `or` branch mentions the same variables; the message names
     /// the first variable one branch has and another lacks.
     fn checkOrBranches(self: *Parser, branches: []const ir.Branch) Error!void {
-        var first: std.ArrayList(Var) = .empty;
-        try ir.allVars(self.arena, branches[0], &first);
+        var first: ir.VarSet = .{};
+        try ir.collectVars(self.arena, .all, branches[0], &first);
         for (branches[1..], 2..) |b, n| {
-            var vs: std.ArrayList(Var) = .empty;
-            try ir.allVars(self.arena, b, &vs);
-            for (first.items) |v| if (!ir.containsVar(vs.items, v)) return self.failFmt("or branch {d} does not mention {s}, which branch 1 does; every or branch uses the same variables (or-join names the join variables)", .{ n, self.varName(v) });
-            for (vs.items) |v| if (!ir.containsVar(first.items, v)) return self.failFmt("or branch {d} mentions {s}, which branch 1 does not; every or branch uses the same variables (or-join names the join variables)", .{ n, self.varName(v) });
+            var vs: ir.VarSet = .{};
+            try ir.collectVars(self.arena, .all, b, &vs);
+            for (first.items()) |v| if (!vs.has(v)) return self.failFmt("or branch {d} does not mention {s}, which branch 1 does; every or branch uses the same variables (or-join names the join variables)", .{ n, self.varName(v) });
+            for (vs.items()) |v| if (!first.has(v)) return self.failFmt("or branch {d} mentions {s}, which branch 1 does not; every or branch uses the same variables (or-join names the join variables)", .{ n, self.varName(v) });
         }
     }
 
-    /// The variables of the leading `[?a ...]` group of a join vector:
-    /// the ones an `or-join` needs bound before it runs.
-    fn requiredVars(self: *Parser, v: Value) Error![]const Var {
-        const items = try self.elems(v);
-        if (items.len == 0 or items[0].kind() != .persistent_vector) return &.{};
-        const group = try self.elems(items[0]);
-        const out = try self.arena.alloc(Var, group.len);
-        for (group, out) |x, *o| o.* = try self.varOf(x.asSymbolId());
-        return out;
-    }
-
-    /// `[?a ?b]` or `[[?a] ?b]` (a required-bound group, flattened).
-    fn joinVars(self: *Parser, v: Value) Error![]Var {
+    /// `[?a ?b]` or `[[?a] ?b]`: every variable, a group flattened, and
+    /// those of a leading group, which an `or-join` needs bound before
+    /// it runs.
+    fn joinVars(self: *Parser, v: Value) Error!struct { vars: []Var, required: []const Var } {
         if (v.kind() != .persistent_vector) return self.fail("expected a vector of variables");
         var out: std.ArrayList(Var) = .empty;
-        for (try self.elems(v)) |x| {
-            if (x.kind() == .persistent_vector) {
-                for (try self.elems(x)) |y| {
-                    if (!self.isVarSym(y)) return self.fail("expected a variable");
-                    try ir.addVar(self.arena, &out, try self.varOf(y.asSymbolId()));
-                }
-            } else {
-                if (!self.isVarSym(x)) return self.fail("expected a variable");
-                try ir.addVar(self.arena, &out, try self.varOf(x.asSymbolId()));
+        var required: []const Var = &.{};
+        for (try self.elems(v), 0..) |x, i| {
+            const group = x.kind() == .persistent_vector;
+            const start = out.items.len;
+            for (if (group) try self.elems(x) else &.{x}) |y| {
+                if (!self.isVarSym(y)) return self.failFmt("a join vector takes variables, not {f}", .{self.shown(y)});
+                try ir.addVar(self.arena, &out, try self.varOf(y.asSymbolId()));
             }
+            if (group and i == 0) required = try self.arena.dupe(Var, out.items[start..]);
         }
         if (out.items.len == 0) return self.fail("join variable vector is empty");
-        return out.toOwnedSlice(self.arena);
+        return .{ .vars = try out.toOwnedSlice(self.arena), .required = required };
     }
 
     fn parsePattern(self: *Parser, parts_in: []Value) Error!ir.Pattern {
@@ -618,7 +636,7 @@ const Parser = struct {
         if (x.isSymbol()) {
             if (self.isSym(x, "_")) return .blank;
             if (self.isVarSym(x)) return .{ .variable = try self.varOf(x.asSymbolId()) };
-            return self.fail("unknown symbol in data pattern");
+            return self.failFmt("{f} in a data pattern is no variable; a position takes ?x, _ or a constant", .{self.shown(x)});
         }
         if (x.kind() == .persistent_vector) return .{ .constant = .{ .lookup = try self.parseLookup(x) } };
         return .{ .constant = .{ .cell = Cell.fromValue(x) } };
@@ -636,7 +654,7 @@ const Parser = struct {
         const call_parts = try self.elems(parts[0]);
         if (call_parts.len == 0) return self.fail("empty function call");
         const head = call_parts[0];
-        const name = self.symName(head) orelse return self.fail("function position takes a symbol or a variable");
+        const name = self.symName(head) orelse return self.failFmt("function position takes a symbol or a variable, not {f}", .{self.shown(head)});
         const f: ir.FnRef = if (self.isVarSym(head)) .{ .variable = try self.varOf(head.asSymbolId()) } else if (ir.Builtin.fromName(name)) |b| .{ .builtin = b } else .{ .user = head.asSymbolId() };
         const call: ir.Call = .{ .f = f, .args = try self.parseArgs(call_parts[1..], false) };
         if (f == .builtin) try self.checkBuiltin(f.builtin, call.args, parts.len == 1);
@@ -694,7 +712,7 @@ const Parser = struct {
                     a.* = .{ .variable = try self.varOf(x.asSymbolId()) };
                 } else if (rule_call and self.isSym(x, "_")) {
                     a.* = .{ .variable = try self.freshVar(x.asSymbolId()) };
-                } else return self.fail("unknown symbol in argument position");
+                } else return self.failFmt("{f} in argument position is no variable or data source", .{self.shown(x)});
             } else {
                 a.* = .{ .constant = Cell.fromValue(x) };
             }
@@ -707,7 +725,7 @@ const Parser = struct {
         if (x.kind() != .persistent_vector) return self.fail("binding form is ?x, [?a ?b], [?x ...] or [[?a ?b]]");
         const inner = try self.elems(x);
         if (inner.len == 2 and self.isSym(inner[1], "...")) {
-            if (!self.isVarSym(inner[0])) return self.fail("collection binding takes a variable");
+            if (!self.isVarSym(inner[0])) return self.failFmt("a collection binding takes a variable, not {f}", .{self.shown(inner[0])});
             return .{ .collection = try self.varOf(inner[0].asSymbolId()) };
         }
         if (inner.len == 1 and inner[0].kind() == .persistent_vector) {
@@ -724,9 +742,9 @@ const Parser = struct {
                 slot.* = null;
             } else if (self.isVarSym(x)) {
                 const v = try self.varOf(x.asSymbolId());
-                for (out[0..i]) |prev| if (prev == v) return self.fail("duplicate variable in tuple binding");
+                for (out[0..i]) |prev| if (prev == v) return self.failFmt("{s} appears twice in a tuple binding", .{self.varName(v)});
                 slot.* = v;
-            } else return self.fail("tuple binding takes variables");
+            } else return self.failFmt("a tuple binding takes variables and _, not {f}", .{self.shown(x)});
         }
         return out;
     }
@@ -737,13 +755,15 @@ const Parser = struct {
         if (!isSeq(rules)) return self.fail("rules must be a vector of rule forms");
         const items = try self.elems(rules);
         var out: std.ArrayList(ir.Rule) = .empty;
+        // The arity of each name, from its first rule.
+        var arities: Arities = .empty;
         for (items, 0..) |x, i| {
             self.clause_index = i;
             if (x.kind() != .persistent_vector) return self.fail("rule form is [(name args...) clauses...]");
             const parts = try self.elems(x);
             if (parts.len < 2 or parts[0].kind() != .list) return self.fail("rule form is [(name args...) clauses...]");
             const head = try self.elems(parts[0]);
-            if (head.len == 0 or self.symName(head[0]) == null) return self.fail("rule name must be a symbol");
+            if (head.len == 0 or self.symName(head[0]) == null) return self.failFmt("a rule head starts with the rule's name, a symbol: {f}", .{self.shown(parts[0])});
             const name = head[0].asSymbolId();
             var vars: std.ArrayList(Var) = .empty;
             var required: usize = 0;
@@ -751,47 +771,50 @@ const Parser = struct {
                 if (h.kind() == .persistent_vector) {
                     if (j != 0) return self.fail("required variables must come first in a rule head");
                     for (try self.elems(h)) |r| {
-                        if (!self.isVarSym(r)) return self.fail("rule head takes variables");
+                        if (!self.isVarSym(r)) return self.failFmt("a rule head takes variables, not {f}", .{self.shown(r)});
                         try vars.append(self.arena, try self.varOf(r.asSymbolId()));
                     }
                     required = vars.items.len;
                 } else {
-                    if (!self.isVarSym(h)) return self.fail("rule head takes variables");
+                    if (!self.isVarSym(h)) return self.failFmt("a rule head takes variables, not {f}", .{self.shown(h)});
                     try vars.append(self.arena, try self.varOf(h.asSymbolId()));
                 }
             }
             for (vars.items, 0..) |v, j| {
-                if (ir.containsVar(vars.items[j + 1 ..], v)) return self.fail("duplicate variable in rule head");
+                if (ir.containsVar(vars.items[j + 1 ..], v)) return self.failFmt("{s} appears twice in the head of rule {s}", .{ self.varName(v), self.interner.symbolName(name) });
             }
-            for (out.items) |prev| {
-                if (prev.name == name and (prev.head.len != vars.items.len or prev.required != required)) return self.fail("rules with one name must share an arity");
-            }
+            const first = try arities.getOrPut(self.arena, name);
+            if (!first.found_existing) first.value_ptr.* = .{ .head = vars.items.len, .required = required };
+            const prev = first.value_ptr.*;
+            if (prev.head != vars.items.len or prev.required != required) return self.failFmt("rule {s} takes {d} argument{s}, {d} of them required, and here {d}, {d} required; rules with one name share an arity", .{ self.interner.symbolName(name), prev.head, plural(prev.head), prev.required, vars.items.len, required });
             self.rule_body = true;
             const body = try self.parseClauses(parts[1..], false);
             try out.append(self.arena, .{ .name = name, .required = required, .head = try vars.toOwnedSlice(self.arena), .body = body });
         }
         for (out.items, 0..) |r, i| {
             self.clause_index = i;
-            try self.checkCalls(out.items, r.body);
+            try self.checkCalls(&arities, r.body);
         }
-        // Group the bodies of one rule: `RuleSet.byName` is one slice.
-        // The sort is stable, so bodies keep their source order.
+        // Sort by name: the rules of one name are one run, which
+        // `RuleSet.byName` finds by binary search. The sort is stable,
+        // so bodies keep their source order.
         std.mem.sort(ir.Rule, out.items, {}, ruleNameLess);
         return out.toOwnedSlice(self.arena);
     }
 
+    const Arities = std.AutoHashMapUnmanaged(u32, struct { head: usize, required: usize });
+
     /// Every call in `body` to a rule of the set passes as many
     /// arguments as its head has.
-    fn checkCalls(self: *Parser, rules: []const ir.Rule, body: []const Clause) Error!void {
+    fn checkCalls(self: *Parser, arities: *const Arities, body: []const Clause) Error!void {
         try stack.check();
         for (body) |c| switch (c) {
-            .rule => |call| for (rules) |def| {
-                if (def.name != call.name) continue;
-                if (def.head.len != call.args.len) return self.fail("a rule is called with the wrong number of arguments");
-                break;
+            .rule => |call| {
+                const n = (arities.get(call.name) orelse continue).head;
+                if (n != call.args.len) return self.failFmt("rule {s} takes {d} argument{s}, and a call passes {d}", .{ self.interner.symbolName(call.name), n, plural(n), call.args.len });
             },
-            .not => |n| try self.checkCalls(rules, n.body),
-            .@"or" => |o| for (o.branches) |br| try self.checkCalls(rules, br),
+            .not => |n| try self.checkCalls(arities, n.body),
+            .@"or" => |o| for (o.branches) |br| try self.checkCalls(arities, br),
             else => {},
         };
     }
@@ -902,9 +925,9 @@ fn CacheOf(comptime T: type, comptime parseFn: anytype) type {
 /// `=` over query values with lists and vectors told apart at every
 /// depth, and floats by their bits: `[?e :a (:b 1)]` and `[?e :a [:b
 /// 1]]` are equal as data but parse to different clauses, as do `0.0`
-/// and `-0.0`. A set element or a map key that is itself a collection
-/// or a float is matched against the other value's own elements and
-/// keys the same way. Anything else compares by `=`.
+/// and `-0.0`. A set element or a map key is matched against the
+/// other value's element or key `=` to it the same way. Anything else
+/// compares by `=`.
 fn sameShape(a: Value, b: Value) error{StackOverflow}!bool {
     try stack.check();
     if (a.kind() != b.kind()) return false;
@@ -937,18 +960,12 @@ fn sameShape(a: Value, b: Value) error{StackOverflow}!bool {
         },
         .persistent_set => {
             if (champ.setCount(a) != champ.setCount(b)) return false;
+            // A set holds no two `=` elements: the one `b` holds that
+            // is `=` to `x` is the only candidate.
             var it = champ.setIter(a);
-            elems: while (it.next()) |x| {
-                switch (x.kind()) {
-                    .float, .persistent_vector, .list, .persistent_map, .persistent_set => {},
-                    else => {
-                        if (!champ.setContains(b, x, &dispatch.hashValue, &dispatch.equal)) return false;
-                        continue;
-                    },
-                }
-                var jt = champ.setIter(b);
-                while (jt.next()) |y| if (try sameShape(x, y)) continue :elems;
-                return false;
+            while (it.next()) |x| {
+                const y = champ.setGet(b, x, &dispatch.hashValue, &dispatch.equal) orelse return false;
+                if (!try sameShape(x, y)) return false;
             }
             return true;
         },
@@ -1173,7 +1190,7 @@ test "map form, scalar/collection/tuple find, default :in, errors carry clause i
     const q5 = b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{ b.sym("?e"), b.sym("bogus") }) });
     try testing.expectError(error.QuerySyntax, parse(testing.allocator, &interner, q5, &diag));
     try testing.expectEqual(@as(?usize, 1), diag.clause);
-    try testing.expectEqualStrings("unknown symbol in data pattern", diag.message);
+    try testing.expectEqualStrings("bogus in a data pattern is no variable; a position takes ?x, _ or a constant", diag.message);
 
     // or branches with different vars: the message names the variable
     // and the branch, and the clause index is kept.
@@ -1255,7 +1272,7 @@ test "map form, scalar/collection/tuple find, default :in, errors carry clause i
     // A variable twice in one tuple binding.
     const q8 = b.vec(&.{ b.kw("find"), b.sym("?x"), b.kw("where"), b.vec(&.{ b.lst(&.{ b.sym("f"), b.int(1) }), b.vec(&.{ b.sym("?x"), b.sym("?x") }) }) });
     try testing.expectError(error.QuerySyntax, parse(testing.allocator, &interner, q8, &diag));
-    try testing.expectEqualStrings("duplicate variable in tuple binding", diag.message);
+    try testing.expectEqualStrings("?x appears twice in a tuple binding", diag.message);
 }
 
 test "rules parse with required groups and arity checks; caches hit by identity and structure" {

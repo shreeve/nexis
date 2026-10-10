@@ -59,6 +59,7 @@ const relation = @import("../relation.zig");
 const ir = @import("ir.zig");
 const plan_mod = @import("plan.zig");
 const rules_mod = @import("rules.zig");
+const parse_mod = @import("parse.zig");
 const marshal = @import("../marshal.zig");
 const pull_mod = @import("../pull.zig");
 const fulltext = @import("../fulltext.zig");
@@ -79,17 +80,19 @@ const Plan = plan_mod.Plan;
 const Step = plan_mod.Step;
 const Scan = plan_mod.Scan;
 
-/// Calls a user function: `call` by VM symbol, `apply` by the value a
-/// variable in function position holds. `args` are VM values built in
-/// the query's result heap; the result is the VM value the function
-/// returned, which a predicate tests and drops. `keep` turns a result
-/// the pipeline binds or aggregates into the value it holds, kept
-/// reachable for the query's life; `root` keeps reachable a heap value
-/// the pipeline builds itself and holds across later calls. A host
-/// whose calls never collect leaves both null.
+/// Calls user functions: `resolve` turns a function symbol into the
+/// value it names, once per query and before any row runs, raising
+/// what an unbound name raises; `apply` calls a function value, one a
+/// symbol named or one a variable in function position holds. `args`
+/// are VM values built in the query's result heap; the result is the
+/// VM value the function returned, which a predicate tests and drops.
+/// `keep` turns a result the pipeline binds or aggregates into the
+/// value it holds, kept reachable for the query's life; `root` keeps
+/// reachable a heap value the pipeline builds itself and holds across
+/// later calls. A host whose calls never collect leaves both null.
 pub const CallHook = struct {
     ctx: *anyopaque,
-    call: *const fn (ctx: *anyopaque, sym: u32, args: []const Value) anyerror!Value,
+    resolve: *const fn (ctx: *anyopaque, sym: u32) anyerror!Value,
     apply: *const fn (ctx: *anyopaque, f: Value, args: []const Value) anyerror!Value,
     keep: ?*const fn (ctx: *anyopaque, v: Value) anyerror!Value = null,
     root: ?*const fn (ctx: *anyopaque, v: Value) anyerror!void = null,
@@ -109,11 +112,13 @@ pub const Exec = struct {
     heap: *Heap,
     interner: *Interner,
     hook: ?CallHook,
-    /// Where an `UnknownAttribute` in an input leaves its name.
-    diag: ?*Diag = null,
+    /// Where a failure leaves what it names.
+    diag: *Diag,
     /// The inputs, positional to `:in`: where a pull pattern bound by
     /// `:in` is found.
     args: []const Value = &.{},
+    /// The plan's variable table, for messages naming a variable.
+    names: []const ir.VarInfo = &.{},
     /// The random source of `sample` and `rand`, made on first use.
     prng: ?std.Random.DefaultPrng = null,
     /// The constant-prefix scans run so far, reused by a later pattern
@@ -121,7 +126,9 @@ pub const Exec = struct {
     scans: std.ArrayList(Scanned) = .empty,
     /// The pull find elements' resolved patterns, by find position
     /// (`preparePulls`).
-    pulls: ?[]?pull_mod.Prepared = null,
+    pulls: []?pull_mod.Prepared = &.{},
+    /// The value each function symbol names (`resolveFns`).
+    fns: std.AutoHashMapUnmanaged(u32, Value) = .empty,
 
     /// Run `p` from `input`, which binds at least `p.input`. A parked
     /// relation (`plan.Park`) keeps the columns it set aside, and its
@@ -170,17 +177,11 @@ pub const Exec = struct {
         };
     }
 
-    /// The cell of a datom value read from `read`: ids as `int`,
-    /// keywords as VM keyword ids, uuids as text.
-    pub fn valCell(self: *Exec, read: *Read, v: key.Val) !Cell {
-        return marshal.cellOf(read, self.arena, v);
-    }
-
     fn datomCells(self: *Exec, read: *Read, d: datom_mod.Datom) ![5]Cell {
         return .{
             .{ .int = @intCast(d.e) },
             .{ .int = d.a },
-            try self.valCell(read, d.v),
+            try marshal.cellOf(read, self.arena, d.v),
             .{ .int = @intCast(key.txEntity(d.t)) },
             .{ .boolean = d.added },
         };
@@ -453,7 +454,45 @@ pub const Exec = struct {
 
     fn callUser(self: *Exec, sym: u32, cells: []const Cell) anyerror!Value {
         const hook = self.hook orelse return error.NoHook;
-        return hook.call(hook.ctx, sym, try self.argValues(cells));
+        return hook.apply(hook.ctx, try self.fnOf(sym), try self.argValues(cells));
+    }
+
+    /// The value the function symbol `sym` names, resolved once.
+    fn fnOf(self: *Exec, sym: u32) anyerror!Value {
+        const hook = self.hook orelse return error.NoHook;
+        const gop = try self.fns.getOrPut(self.arena, sym);
+        if (!gop.found_existing) gop.value_ptr.* = hook.resolve(hook.ctx, sym) catch |err| {
+            self.fns.removeByPtr(gop.key_ptr);
+            return err;
+        };
+        return gop.value_ptr.*;
+    }
+
+    /// Resolve every function symbol `p` calls, its sub-plans' and rule
+    /// bodies' included, and every custom aggregate of `query`, before
+    /// any row runs: an unbound name throws whether or not a row
+    /// reaches its clause (NEXTOMIC.md §5).
+    pub fn resolveFns(self: *Exec, query: *const Ir, p: *const Plan) anyerror!void {
+        for (query.find) |f| if (f == .agg and f.agg.op == .custom) {
+            _ = try self.fnOf(f.agg.sym);
+        };
+        try self.resolvePlan(p);
+    }
+
+    fn resolvePlan(self: *Exec, p: *const Plan) anyerror!void {
+        try stack.check();
+        for (p.steps) |*s| switch (s.*) {
+            .pred => |pr| if (pr.call.f == .user) {
+                _ = try self.fnOf(pr.call.f.user);
+            },
+            .bind => |b| if (b.call.f == .user) {
+                _ = try self.fnOf(b.call.f.user);
+            },
+            .not => |n| try self.resolvePlan(n.sub),
+            .@"or" => |o| for (o.branches) |br| try self.resolvePlan(br),
+            .fix => |f| for (f.instances) |inst| for (inst.bodies) |body| try self.resolvePlan(body.plan),
+            .scan, .match, .source => {},
+        };
     }
 
     /// Apply the value in `f`'s column of `row`, a function bound
@@ -490,7 +529,7 @@ pub const Exec = struct {
         switch (b) {
             .lt, .le, .gt, .ge => {
                 for (args[0 .. args.len - 1], args[1..]) |x, y| {
-                    const o = x.compare(y, self.interner) orelse return self.wrongType("{s} compares values of one kind, not {s} and {s}", .{ predName(b), cellPhrase(x), cellPhrase(y) });
+                    const o = x.compare(y, self.interner) orelse return self.wrongType("{s} compares values of one kind, not {s} and {s}", .{ b.name(), cellPhrase(x), cellPhrase(y) });
                     const ok = switch (b) {
                         .lt => o == .lt,
                         .le => o != .gt,
@@ -510,7 +549,7 @@ pub const Exec = struct {
                 for (args[1..]) |y| if (!args[0].eql(y)) return true;
                 return false;
             },
-            .missing => return (try self.firstValue(call_args[0].src, args[1], args[2])) == null,
+            .missing => return (try self.firstValue(.missing, call_args[0].src, args[1], args[2])) == null,
             .ground, .get_else, .get_some, .tuple, .untuple, .fulltext => unreachable,
         }
     }
@@ -524,10 +563,10 @@ pub const Exec = struct {
     fn fulltextHits(self: *Exec, src: ?ir.Src, attr: Cell, needle: Cell) anyerror![]const []const Cell {
         const read = try self.readOf(src);
         if (needle != .str) return self.wrongType("fulltext searches for a string, not {s}", .{cellPhrase(needle)});
-        const at = try self.attrNamed(read, attr);
+        const at = try self.attrNamed(.fulltext, read, attr);
         const a = at.id;
         if (!at.fulltext) {
-            if (self.diag) |d| d.* = .{ .message = "attribute is not :db/fulltext", .attr = self.interner.keywordValue(attr.keyword) };
+            self.diag.* = .{ .message = "attribute is not :db/fulltext", .attr = self.interner.keywordValue(attr.keyword) };
             return error.TxData;
         }
         const tokens = try fulltext.tokens(self.arena, needle.str);
@@ -563,31 +602,31 @@ pub const Exec = struct {
     }
 
     fn pair(self: *Exec, read: *Read, d: datom_mod.Datom) ![]const Cell {
-        return self.arena.dupe(Cell, &.{ .{ .int = @intCast(d.e) }, try self.valCell(read, d.v) });
+        return self.arena.dupe(Cell, &.{ .{ .int = @intCast(d.e) }, try marshal.cellOf(read, self.arena, d.v) });
     }
 
     fn unknownAttribute(self: *Exec, kw: u32) anyerror {
-        if (self.diag) |d| d.* = .{ .message = "unknown attribute", .attr = self.interner.keywordValue(kw) };
+        self.diag.* = .{ .message = "unknown attribute", .attr = self.interner.keywordValue(kw) };
         return error.UnknownAttribute;
     }
 
     /// The attribute a keyword cell names in `read`: `UnknownAttribute`
-    /// when there is none, `ValueType` for any other cell.
-    fn attrNamed(self: *Exec, read: *Read, attr: Cell) anyerror!schema_mod.Attr {
-        if (attr != .keyword) return error.ValueType;
+    /// when there is none, `ValueType` naming `op` for any other cell.
+    fn attrNamed(self: *Exec, op: ir.Builtin, read: *Read, attr: Cell) anyerror!schema_mod.Attr {
+        if (attr != .keyword) return self.wrongType("{s} names its attribute by keyword, not {s}", .{ op.name(), cellPhrase(attr) });
         const a = (try read.db.conn.idents.idOf(read.txn, attr.keyword)) orelse return self.unknownAttribute(attr.keyword);
         return (try read.attr(a)) orelse self.unknownAttribute(attr.keyword);
     }
 
     /// The first value of attribute `attr` (a keyword cell) on entity
     /// `e` in source `src`, or null.
-    fn firstValue(self: *Exec, src: ?ir.Src, e: Cell, attr: Cell) anyerror!?Cell {
+    fn firstValue(self: *Exec, op: ir.Builtin, src: ?ir.Src, e: Cell, attr: Cell) anyerror!?Cell {
         const read = try self.readOf(src);
-        const at = try self.attrNamed(read, attr);
+        const at = try self.attrNamed(op, read, attr);
         const eid = e.asEid() orelse return null;
         var it = try read.scan(self.arena, .eavt, .{ .e = eid, .a = at.id });
         const d = (try it.next()) orelse return null;
-        return try self.valCell(read, d.v);
+        return try marshal.cellOf(read, self.arena, d.v);
     }
 
     /// `get-else`: the attribute's value on the entity, else the
@@ -595,12 +634,12 @@ pub const Exec = struct {
     /// default binds nothing, so both are refused.
     fn getElse(self: *Exec, src: ?ir.Src, e: Cell, attr: Cell, default: Cell) anyerror!Cell {
         if (default == .nil) return self.syntax("get-else takes a default that is not nil");
-        if ((try self.attrNamed(try self.readOf(src), attr)).many()) return self.syntax("get-else takes a cardinality-one attribute");
-        return (try self.firstValue(src, e, attr)) orelse default;
+        if ((try self.attrNamed(.get_else, try self.readOf(src), attr)).many()) return self.syntax("get-else takes a cardinality-one attribute");
+        return (try self.firstValue(.get_else, src, e, attr)) orelse default;
     }
 
     fn syntax(self: *Exec, message: []const u8) error{QuerySyntax} {
-        if (self.diag) |d| d.* = .{ .message = message };
+        self.diag.* = .{ .message = message };
         return error.QuerySyntax;
     }
 
@@ -636,7 +675,7 @@ pub const Exec = struct {
                     // `[attr value]` for the first attribute the entity has, else nil.
                     .get_some => blk: {
                         for (cells[2..]) |attr| {
-                            const found = (try self.firstValue(b.call.args[0].src, cells[1], attr)) orelse continue;
+                            const found = (try self.firstValue(.get_some, b.call.args[0].src, cells[1], attr)) orelse continue;
                             break :blk .{ .tuple = try self.arena.dupe(Cell, &.{ attr, found }) };
                         }
                         break :blk .{ .cell = .nil };
@@ -663,6 +702,7 @@ pub const Exec = struct {
     /// Nil binds nothing (see the module contract); a result that is
     /// not the collection its binding form needs is `ValueType`.
     fn bindResult(self: *Exec, b: *const plan_mod.Bind, result: Result, row: []Cell, base: usize, out: *Relation) anyerror!void {
+        const origin: Origin = .{ .out = b.out, .f = b.call.f };
         switch (b.out) {
             .scalar => |v| {
                 const c: Cell = switch (result) {
@@ -674,7 +714,7 @@ pub const Exec = struct {
                 if (c == .nil) return;
                 if (put(out, row, base, v, c)) try out.append(row);
             },
-            .collection => |v| for (try self.elements(result)) |x| {
+            .collection => |v| for (try self.elements(origin, result)) |x| {
                 const c: Cell = switch (x) {
                     .cell => |y| y,
                     .tuple => |ts| .{ .vm = try self.keptVector(ts) },
@@ -683,8 +723,11 @@ pub const Exec = struct {
             },
             .tuple => |ts| {
                 const cells: []const Cell = switch (result) {
-                    .value => |x| if (x.isNil()) return else try self.valueCells(x),
-                    .cell => |x| if (x == .nil) return else try self.cellCells(x),
+                    .value, .cell => blk: {
+                        const c = resultCell(result);
+                        if (c == .nil) return;
+                        break :blk try self.cellsOf(origin, false, c);
+                    },
                     .tuple => |t| t,
                     .tuples => |rows| blk: {
                         const cs = try self.arena.alloc(Cell, rows.len);
@@ -692,35 +735,37 @@ pub const Exec = struct {
                         break :blk cs;
                     },
                 };
-                if (try fillTuple(out, ts, cells, row, base, false)) try out.append(row);
+                if (try self.fillTuple(origin, false, out, ts, cells, row, base)) try out.append(row);
             },
-            .relation => |ts| for (try self.elements(result)) |x| {
+            .relation => |ts| for (try self.elements(origin, result)) |x| {
                 const cells = switch (x) {
-                    .cell => |y| try self.cellCells(y),
+                    .cell => |y| if (y == .nil) continue else try self.cellsOf(origin, true, y),
                     .tuple => |t| t,
                 };
-                if (try fillTuple(out, ts, cells, row, base, false)) try out.append(row);
+                if (try self.fillTuple(origin, true, out, ts, cells, row, base)) try out.append(row);
             },
         }
     }
 
+    /// A one-value result as a cell.
+    fn resultCell(result: Result) Cell {
+        return switch (result) {
+            .value => |x| Cell.fromValue(x),
+            .cell => |x| x,
+            .tuple, .tuples => unreachable,
+        };
+    }
+
     /// The elements of a result that binds as a collection; nil has
     /// none.
-    fn elements(self: *Exec, result: Result) ![]const Elem {
+    fn elements(self: *Exec, origin: Origin, result: Result) ![]const Elem {
         switch (result) {
             .value, .cell => {
-                if (switch (result) {
-                    .value => |x| x.isNil(),
-                    .cell => |x| x == .nil,
-                    else => unreachable,
-                }) return &.{};
-                const cells = switch (result) {
-                    .value => |x| try self.valueCells(x),
-                    .cell => |x| try self.cellCells(x),
-                    else => unreachable,
-                };
+                const c = resultCell(result);
+                if (c == .nil) return &.{};
+                const cells = try self.cellsOf(origin, false, c);
                 const out = try self.arena.alloc(Elem, cells.len);
-                for (cells, out) |c, *e| e.* = .{ .cell = c };
+                for (cells, out) |x, *e| e.* = .{ .cell = x };
                 return out;
             },
             .tuple => |ts| {
@@ -736,21 +781,30 @@ pub const Exec = struct {
         }
     }
 
-    /// The elements of a collection value as cells; `ValueType` for
-    /// anything but a vector, list or set.
-    fn valueCells(self: *Exec, v: Value) ![]const Cell {
-        const items = (try marshal.collection(self.arena, v)) orelse return error.ValueType;
-        const out = try self.arena.alloc(Cell, items.len);
-        for (items, out) |x, *c| c.* = Cell.fromValue(x);
-        return out;
-    }
+    /// Where a value a binding form takes comes from, for a message: an
+    /// `:in` input (`f` null) or the result of a function clause.
+    const Origin = struct {
+        out: ir.Binding,
+        f: ?ir.FnRef,
+    };
 
-    /// The elements of a cell holding a collection value.
-    fn cellCells(self: *Exec, c: Cell) ![]const Cell {
-        return switch (c) {
-            .vm => |v| self.valueCells(v),
-            else => error.ValueType,
-        };
+    /// The elements of `c`, a cell holding a vector, list or set, or of
+    /// an element of it when `element`; `ValueType` naming the binding
+    /// form and where the value came from for anything else.
+    fn cellsOf(self: *Exec, origin: Origin, element: bool, c: Cell) ![]const Cell {
+        const items = switch (c) {
+            .vm => |v| try marshal.collection(self.arena, v),
+            else => null,
+        } orelse return self.wrongType("{f} takes {s}, and {s}{f} is {s}", .{
+            self.formText(origin.out),
+            if (element) "vectors, lists or sets as elements" else "a vector, list or set",
+            if (element) "an element of " else "",
+            self.originText(origin),
+            cellPhrase(c),
+        });
+        const out = try self.arena.alloc(Cell, items.len);
+        for (items, out) |x, *y| y.* = Cell.fromValue(x);
+        return out;
     }
 
     /// Tuples as a vector of vectors, kept reachable.
@@ -771,17 +825,79 @@ pub const Exec = struct {
     }
 
     /// Fill the tuple binding `ts` from `items`; false when a bound
-    /// variable disagrees with its element, or when `nil_binds` is
-    /// false and a variable's element is nil; `ValueType` when there
-    /// are fewer items than the binding names.
-    fn fillTuple(out: *const Relation, ts: []const ?Var, items: []const Cell, row: []Cell, base: usize, nil_binds: bool) !bool {
-        if (items.len < ts.len) return error.ValueType;
+    /// variable disagrees with its element, or when a variable's
+    /// element is nil and `origin` is a function's result (an input
+    /// binds nil); `ValueType` when there are fewer items than the
+    /// binding names.
+    fn fillTuple(self: *Exec, origin: Origin, element: bool, out: *const Relation, ts: []const ?Var, items: []const Cell, row: []Cell, base: usize) !bool {
+        if (items.len < ts.len) return self.wrongType("{f} takes {d} value{s}{s}, and {s}{f} holds {d}", .{
+            self.formText(origin.out),
+            ts.len,
+            parse_mod.plural(ts.len),
+            if (element) " per element" else "",
+            if (element) "an element of " else "",
+            self.originText(origin),
+            items.len,
+        });
         for (ts, items[0..ts.len]) |t, x| {
             const tv = t orelse continue;
-            if ((x == .nil and !nil_binds) or !put(out, row, base, tv, x)) return false;
+            if ((x == .nil and origin.f != null) or !put(out, row, base, tv, x)) return false;
         }
         return true;
     }
+
+    /// A variable's name, as the query wrote it.
+    fn varName(self: *const Exec, v: Var) []const u8 {
+        return if (v < self.names.len) self.interner.symbolName(self.names[v].sym) else "?";
+    }
+
+    fn formText(self: *const Exec, b: ir.Binding) FormText {
+        return .{ .ex = self, .b = b };
+    }
+
+    fn originText(self: *const Exec, o: Origin) OriginText {
+        return .{ .ex = self, .o = o };
+    }
+
+    /// A binding form as the query wrote it: `?x`, `[?x ...]`, `[?a _]`
+    /// or `[[?a ?b]]`.
+    const FormText = struct {
+        ex: *const Exec,
+        b: ir.Binding,
+
+        pub fn format(self: FormText, w: *std.Io.Writer) std.Io.Writer.Error!void {
+            switch (self.b) {
+                .scalar => |v| try w.writeAll(self.ex.varName(v)),
+                .collection => |v| try w.print("[{s} ...]", .{self.ex.varName(v)}),
+                .tuple, .relation => |ts| {
+                    if (self.b == .relation) try w.writeByte('[');
+                    try w.writeByte('[');
+                    for (ts, 0..) |t, i| {
+                        if (i > 0) try w.writeByte(' ');
+                        try w.writeAll(if (t) |v| self.ex.varName(v) else "_");
+                    }
+                    try w.writeByte(']');
+                    if (self.b == .relation) try w.writeByte(']');
+                },
+            }
+        }
+    };
+
+    /// Where a bound value came from: `the input` or `the result of (f
+    /// ...)`.
+    const OriginText = struct {
+        ex: *const Exec,
+        o: Origin,
+
+        pub fn format(self: OriginText, w: *std.Io.Writer) std.Io.Writer.Error!void {
+            const f = self.o.f orelse return w.writeAll("the input");
+            try w.print("the result of ({s} ...)", .{switch (f) {
+                .builtin => |b| b.name(),
+                .user => |sym| self.ex.interner.symbolName(sym),
+                .variable => |v| self.ex.varName(v),
+            }});
+        }
+    };
 
     // ── not, or, source ───────────────────────────────────────────
 
@@ -837,20 +953,20 @@ pub const Exec = struct {
                 },
                 .collection => |v| blk: {
                     var r = try Relation.init(self.arena, &.{v});
-                    for ((try marshal.collection(self.arena, a)) orelse return error.ValueType) |x| try r.append(&.{Cell.fromValue(x)});
+                    for (try self.cellsOf(.{ .out = .{ .collection = v }, .f = null }, false, Cell.fromValue(a))) |x| try r.append(&.{x});
                     break :blk try r.dedup();
                 },
-                .tuple => |ts| blk: {
-                    var r = try Relation.init(self.arena, try (ir.Binding{ .tuple = ts }).vars(self.arena));
+                .tuple, .relation => |ts| blk: {
+                    const origin: Origin = .{ .out = if (b == .tuple) .{ .tuple = ts } else .{ .relation = ts }, .f = null };
+                    var r = try Relation.init(self.arena, try origin.out.vars(self.arena));
                     const row = try self.arena.alloc(Cell, r.vars.len);
-                    if (try fillTuple(&r, ts, try self.valueCells(a), row, 0, true)) try r.append(row);
-                    break :blk r;
-                },
-                .relation => |ts| blk: {
-                    var r = try Relation.init(self.arena, try (ir.Binding{ .tuple = ts }).vars(self.arena));
-                    const row = try self.arena.alloc(Cell, r.vars.len);
-                    for ((try marshal.collection(self.arena, a)) orelse return error.ValueType) |x| {
-                        if (try fillTuple(&r, ts, try self.valueCells(x), row, 0, true)) try r.append(row);
+                    const items = try self.cellsOf(origin, false, Cell.fromValue(a));
+                    if (b == .tuple) {
+                        if (try self.fillTuple(origin, false, &r, ts, items, row, 0)) try r.append(row);
+                        break :blk r;
+                    }
+                    for (items) |x| {
+                        if (try self.fillTuple(origin, true, &r, ts, try self.cellsOf(origin, true, x), row, 0)) try r.append(row);
                     }
                     break :blk try r.dedup();
                 },
@@ -994,22 +1110,15 @@ pub const Exec = struct {
     }
 
     /// The entity an ident or lookup-ref input names in `read` (the
-    /// `marshal` contract), or null when there is none; the diagnostic
-    /// carries what a failing lookup ref named.
+    /// `marshal` contract), or null when there is none or `c` is
+    /// another cell.
     fn inputEntity(self: *Exec, read: *Read, c: Cell) anyerror!?u64 {
         const v: Value = switch (c) {
             .keyword => |kw| self.interner.keywordValue(kw),
             .vm => |v| v,
             else => return null,
         };
-        var fault: db_mod.Fault = .{};
-        return marshal.entity(read, self.arena, v, &fault) catch |err| {
-            if (self.diag) |d| d.* = switch (err) {
-                error.ValueType => .{ .attr = fault.attr, .given = fault.given, .value_type = fault.value_type },
-                else => .{ .message = fault.message orelse "unknown attribute", .attr = fault.attr },
-            };
-            return err;
-        };
+        return pull_mod.entityOf(read, self.arena, v, self.diag);
     }
 
     // ── find ──────────────────────────────────────────────────────
@@ -1085,52 +1194,46 @@ pub const Exec = struct {
     /// each a vector; a custom aggregate receives the vector of values.
     fn aggregate(self: *Exec, agg: ir.Agg, basis: *const Relation, col: usize, members: []const usize) anyerror!Cell {
         const op = agg.op;
+        if (op == .count) return .{ .int = @intCast(members.len) };
+        const cells = try self.arena.alloc(Cell, members.len);
+        for (members, cells) |m, *c| c.* = basis.cell(m, col);
         switch (op) {
-            .count => return .{ .int = @intCast(members.len) },
+            .count => unreachable,
             .count_distinct, .distinct, .sample => {
                 var seen = try Relation.init(self.arena, &.{0});
-                for (members) |m| try seen.append(&.{basis.cell(m, col)});
+                for (cells) |c| try seen.append(&.{c});
                 const d = try seen.dedup();
                 if (op == .count_distinct) return .{ .int = @intCast(d.rows) };
+                const distinct = try self.arena.alloc(Cell, d.rows);
+                for (distinct, 0..) |*c, i| c.* = d.cell(i, 0);
                 if (op == .sample) {
-                    const cells = try self.arena.alloc(Cell, d.rows);
-                    for (cells, 0..) |*c, i| c.* = d.cell(i, 0);
-                    self.random().shuffle(Cell, cells);
-                    return self.cellVector(cells[0..@min(cells.len, agg.n.?)]);
+                    self.random().shuffle(Cell, distinct);
+                    return self.cellVector(distinct[0..@min(distinct.len, agg.n.?)]);
                 }
                 var set = try champ.setEmpty(self.heap);
-                var i: usize = 0;
-                while (i < d.rows) : (i += 1) set = try champ.setConj(self.heap, set, try self.cellValue(d.cell(i, 0)), &dispatch.hashValue, &dispatch.equal);
+                for (distinct) |c| set = try champ.setConj(self.heap, set, try self.cellValue(c), &dispatch.hashValue, &dispatch.equal);
                 return .{ .vm = try self.kept(set) };
             },
             .rand => {
                 const n = std.math.cast(usize, agg.n.?) orelse return error.OutOfMemory;
-                const cells = try self.arena.alloc(Cell, if (members.len == 0) 0 else n);
-                for (cells) |*c| c.* = basis.cell(members[self.random().uintLessThan(usize, members.len)], col);
-                return self.cellVector(cells);
+                const picked = try self.arena.alloc(Cell, if (cells.len == 0) 0 else n);
+                for (picked) |*c| c.* = cells[self.random().uintLessThan(usize, cells.len)];
+                return self.cellVector(picked);
             },
             .min, .max => {
                 if (agg.n) |n| {
-                    const cells = try self.arena.alloc(Cell, members.len);
-                    for (members, cells) |m, *c| c.* = basis.cell(m, col);
                     std.mem.sort(Cell, cells, CellOrder{ .names = self.interner, .descending = op == .max }, CellOrder.less);
                     return self.cellVector(cells[0..@min(cells.len, n)]);
                 }
-                var best: ?Cell = null;
-                for (members) |m| {
-                    const c = basis.cell(m, col);
-                    if (best == null) {
-                        best = c;
-                        continue;
-                    }
-                    const o = c.orderBy(best.?, self.interner);
+                if (cells.len == 0) return .nil;
+                var best = cells[0];
+                for (cells[1..]) |c| {
+                    const o = c.orderBy(best, self.interner);
                     if ((op == .min and o == .lt) or (op == .max and o == .gt)) best = c;
                 }
-                return best orelse .nil;
+                return best;
             },
             .median => {
-                const cells = try self.arena.alloc(Cell, members.len);
-                for (members, cells) |m, *c| c.* = basis.cell(m, col);
                 std.mem.sort(Cell, cells, CellOrder{ .names = self.interner, .descending = false }, CellOrder.less);
                 if (cells.len == 0) return .nil;
                 if (cells.len % 2 == 1) return cells[cells.len / 2];
@@ -1139,23 +1242,23 @@ pub const Exec = struct {
                 return .{ .double = (lo + hi) / 2 };
             },
             .variance, .stddev => {
-                if (members.len == 0) return .nil;
+                if (cells.len == 0) return .nil;
                 var mean: f64 = 0;
-                for (members) |m| mean += try self.numberOf(op, basis.cell(m, col));
-                mean /= @floatFromInt(members.len);
+                for (cells) |c| mean += try self.numberOf(op, c);
+                mean /= @floatFromInt(cells.len);
                 var acc: f64 = 0;
-                for (members) |m| {
-                    const d = (try self.numberOf(op, basis.cell(m, col))) - mean;
+                for (cells) |c| {
+                    const d = (try self.numberOf(op, c)) - mean;
                     acc += d * d;
                 }
-                const variance = acc / @as(f64, @floatFromInt(members.len));
+                const variance = acc / @as(f64, @floatFromInt(cells.len));
                 return .{ .double = if (op == .variance) variance else @sqrt(variance) };
             },
             .custom => {
                 const hook = self.hook orelse return error.NoHook;
-                const vals = try self.arena.alloc(Value, members.len);
-                for (members, vals) |m, *v| v.* = try self.cellValue(basis.cell(m, col));
-                const result = try hook.call(hook.ctx, agg.sym, &.{try vector_mod.fromSlice(self.heap, vals)});
+                const vals = try self.arena.alloc(Value, cells.len);
+                for (cells, vals) |c, *v| v.* = try self.cellValue(c);
+                const result = try hook.apply(hook.ctx, try self.fnOf(agg.sym), &.{try vector_mod.fromSlice(self.heap, vals)});
                 return Cell.fromValue(try self.keptResult(result));
             },
             .sum, .avg => {
@@ -1164,7 +1267,7 @@ pub const Exec = struct {
                 var is_float = false;
                 // Integers past i64 (inputs, function results), summed exactly.
                 var big: ?Value = null;
-                for (members) |m| switch (basis.cell(m, col)) {
+                for (cells) |c| switch (c) {
                     .int => |n| isum += n,
                     .double => |d| {
                         is_float = true;
@@ -1174,10 +1277,10 @@ pub const Exec = struct {
                         if (v.kind() != .bignum) return self.wrongType("{s} takes numbers, not {s}", .{ op.name(), cellPhrase(.{ .vm = v }) });
                         big = if (big) |acc| try bignum.add(self.heap, acc, v) else v;
                     },
-                    else => |c| return self.wrongType("{s} takes numbers, not {s}", .{ op.name(), cellPhrase(c) }),
+                    else => return self.wrongType("{s} takes numbers, not {s}", .{ op.name(), cellPhrase(c) }),
                 };
                 const total = fsum + @as(f64, @floatFromInt(isum)) + if (big) |v| bignum.toF64(v) else 0;
-                if (op == .avg) return .{ .double = total / @as(f64, @floatFromInt(members.len)) };
+                if (op == .avg) return .{ .double = total / @as(f64, @floatFromInt(cells.len)) };
                 if (is_float) return .{ .double = total };
                 var exact = try bignum.fromI128(self.heap, isum);
                 if (big) |v| exact = try bignum.add(self.heap, exact, v);
@@ -1198,19 +1301,8 @@ pub const Exec = struct {
 
     /// `ValueType`, with the reason in the diagnostic.
     fn wrongType(self: *Exec, comptime fmt: []const u8, args: anytype) error{ValueType} {
-        if (self.diag) |d| d.set(null, fmt, args);
+        self.diag.set(null, fmt, args);
         return error.ValueType;
-    }
-
-    /// A comparison predicate as a query writes it.
-    fn predName(b: ir.Builtin) []const u8 {
-        return switch (b) {
-            .lt => "<",
-            .le => "<=",
-            .gt => ">",
-            .ge => ">=",
-            else => @tagName(b),
-        };
     }
 
     /// A cell's kind with its article, for a message: "a string".
@@ -1257,7 +1349,7 @@ pub const Exec = struct {
             .scalar, .tuple => rows_in.len > 1,
             .relation, .collection => false,
         };
-        const rows = try self.pullColumns(query, if (first) rows_in[0..1] else rows_in);
+        const rows = try self.pullColumns(if (first) rows_in[0..1] else rows_in);
         if (query.keys) |keys| return self.rowMaps(keys, rows);
         switch (query.find_spec) {
             .relation => {
@@ -1292,8 +1384,6 @@ pub const Exec = struct {
     /// before any user function has run; a syntax error leaves its
     /// reason in the diagnostic.
     pub fn preparePulls(self: *Exec, query: *const Ir) anyerror!void {
-        var scratch: Diag = .{};
-        const diag = self.diag orelse &scratch;
         const prepared = try self.arena.alloc(?pull_mod.Prepared, query.find.len);
         for (query.find, prepared) |f, *p| {
             if (f != .pull) {
@@ -1304,7 +1394,7 @@ pub const Exec = struct {
                 .value => |v| v,
                 .input => |v| inputOf(query, self.args, v),
             };
-            p.* = try pull_mod.Prepared.prepare(self.arena, try self.readOf(f.pull.src), self.heap, self.interner, pattern, diag);
+            p.* = try pull_mod.Prepared.prepare(self.arena, try self.readOf(f.pull.src), self.heap, self.interner, pattern, self.diag);
         }
         self.pulls = prepared;
     }
@@ -1314,16 +1404,14 @@ pub const Exec = struct {
     /// lookup ref, resolved in the pull's source (nil for an entity
     /// with no datoms, or a reference that names nothing); any other
     /// cell is `ValueType`.
-    fn pullColumns(self: *Exec, query: *const Ir, rows: []const []const Cell) anyerror![]const []const Cell {
-        if (self.pulls == null) try self.preparePulls(query);
-        const prepared = self.pulls.?;
-        for (prepared) |p| {
+    fn pullColumns(self: *Exec, rows: []const []const Cell) anyerror![]const []const Cell {
+        for (self.pulls) |p| {
             if (p != null) break;
         } else return rows;
         const out = try self.arena.alloc([]const Cell, rows.len);
         for (rows, out) |row, *o| {
             const cells = try self.arena.dupe(Cell, row);
-            for (prepared, cells) |*p, *c| {
+            for (self.pulls, cells) |*p, *c| {
                 const pr = &(p.* orelse continue);
                 const e = c.asEid() orelse switch (c.*) {
                     .keyword, .vm => try self.inputEntity(pr.puller.read, c.*),

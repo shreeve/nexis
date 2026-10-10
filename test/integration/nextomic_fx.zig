@@ -214,7 +214,13 @@ pub const Fx = struct {
     }
 
     pub fn hook(self: *Fx) query.CallHook {
-        return .{ .ctx = @ptrCast(self), .call = &hookCall, .apply = &hookApply };
+        return .{ .ctx = @ptrCast(self), .resolve = &hookResolve, .apply = &hookApply };
+    }
+
+    /// A function symbol stands for itself: `hookApply` calls it.
+    pub fn hookResolve(ctx: *anyopaque, sym_id: u32) anyerror!Value {
+        const self: *Fx = @ptrCast(@alignCast(ctx));
+        return self.interner().symbolValue(sym_id);
     }
 
     /// A value in function position: a symbol names one of the

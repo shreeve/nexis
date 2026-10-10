@@ -36,7 +36,7 @@ bits 1–2; bit 0 stays `has_meta`.
 
 | Shape | Name | Body | Meaning |
 |---|---|---|---|
-| 0 | lazy | `{ result: Value, op: u16, state: u8, argc: u8, _: u32, _: u64, args: [argc]Value }`, 32 + 16·argc B | `op` 0 is a `lazy-seq` body (`args[0]`, any callable, called with no arguments); every other op is a producer (`src/seq.zig`) whose state is `args`. `state` is 0 unrealized, 1 forwarding (`result` is the lazy block the body returned, §4), 2 realized (`result` is nil or a non-empty seq) |
+| 0 | lazy | `{ result: Value, op: u16, state: u8, argc: u8, _: u32, _: u64, args: [argc]Value }`, 32 + 16·argc B | `op` 0 is a `lazy-seq` body (`args[0]`, any callable, called with no arguments); every other op is a producer (`src/seq.zig`) whose state is `args`. `state` is 0 unrealized, 1 forwarding (`result` is the lazy block the body returned, §4), 2 realized (`result` is nil or a non-empty seq), 3 running (the body is running; `result` holds the chunk a producer fills, §4) |
 | 1 | cons | `{ first: Value, more: Value }`, 32 B | `more` is nil, a list (any subkind) or a lazy seq |
 | 2 | chunked cons | `{ more: Value, count: u32, cap: u32, _: u64, items: [cap]Value }`, 32 + 16·cap B; the offset of its first element in tag bits 32..63 | the chunk's elements from the offset on, then `more`. Its `rest` inside the chunk is the same block at the next offset and allocates nothing. A fresh one is zero-filled, so unwritten slots are nil; a producer fills it in place and closes it with its count and `more` |
 
@@ -53,8 +53,8 @@ empty list and never another lazy block, as Clojure caches
 cons's first element, a chunk's elements from the offset on (stepped
 inline in the caller's loop), follows a realized or forwarding block
 to its result, walks a list through `list.Cursor` once it reaches one,
-and stops with `error.Unrealized` at a block whose body has not run,
-leaving that block for the walker to realize (§4) before it steps
+and stops with `error.Unrealized` at a block whose body has not run
+or is running, leaving that block for the walker to realize (§4) before it steps
 again.
 
 ---
@@ -90,8 +90,9 @@ in hand, where running code may collect and errors are ordinary
    below it, so a seq built by a deep nesting of functions realizes
    with native recursion as deep, and past the guard it raises the
    catchable `:stack-overflow` (`docs/VM.md` §13.1).
-3. The block's step runs: op 0 calls the `lazy-seq` body's function
-   with no arguments; any other op runs its producer (§7).
+3. The block's step runs, the block marked running while it does: op
+   0 calls the `lazy-seq` body's function with no arguments; any other
+   op runs its producer (§7).
 4. **Forwarding.** While the step returns another lazy block whose
    body has not run, the current block forwards to it (state 1,
    `result` the block it forwards to, its own arguments cleared) and
@@ -124,10 +125,17 @@ that uses a cleared local other than as a seq fails anew (a
 seq at the block in every case, as babashka does
 (`CLOJURE-REVIEW.md`).
 
-**Re-entrance.** A body that forces its own block before it returns
-(`(def t (lazy-seq (seq t)))`) runs again inside itself until the stack
-guard raises `:stack-overflow` (Clojure: `StackOverflowError`). A body
-that only refers to its block works, because `cons` and the producers
+**Re-entrance.** A body that forces its own block before it returns,
+directly or through a block that forwards to it (`(def t (lazy-seq
+(seq t)))`), reaches a running block, and that `force` raises the
+catchable `:stack-overflow` at once. A body that lets it through ends
+the seq at its block, as any throw does. A step is never run inside
+itself: a producer keeps its place and the chunk it fills in its
+block, which a second run would overwrite. Clojure runs the body
+again inside itself: one that forces its own seq under a flag, only
+on its first call, has its elements computed twice and caches the
+outer run's, and one that always does ends in `StackOverflowError`.
+A body that only refers to its block works, because `cons` and the producers
 do not force their argument: `(def s (lazy-seq (cons 1 s)))` is
 `(1 1 1 ...)`.
 
@@ -227,7 +235,10 @@ unrooted nodes. A lazy block they meet is realized through
   callers' unrooted nodes are safe, and calls the closure
   `nexis.core/realize-caught`, `(fn [s] (try [true (#%force s)] (catch
   any e [false e])))`. A throw is caught inside it, so nothing unwinds
-  past the native that was comparing.
+  past the native that was comparing. The VM checks the answer rather
+  than trust it, since a program can rebind the Var: `[false x]` is a
+  throw of `x`; otherwise the seq is the block's own result once the
+  block is realized, and a block left unrealized is `:kind-mismatch`.
 - A failure (a caught value, or an error the barrier cannot catch) is
   parked on the VM (`parked_realize`, a root while it is parked; the
   first wins, and later isolated realizations fail at once) and counts
@@ -464,6 +475,9 @@ it splices (`coll:concat`, `docs/VM.md` §10.8).
   compares keys and hashes none, so `(assoc {} s 1)`, `frequencies`
   and `group-by` leave a lazy key unrealized there until something
   hashes or prints the map.
+- **A body that forces its own block** raises `:stack-overflow` at
+  once (§4), even when it would force it only once; Clojure runs it
+  again inside itself.
 - `counted?` of a range is false (Clojure's `LongRange` is counted);
   `realized?` of a cons or a chunked cons is true (Clojure's throws).
 - **A datom form and a lookup ref are vectors** to Nextomic, so a lazy
@@ -486,8 +500,10 @@ with a transducer (`(into to xform from)`) and `sequence` with one are
 Clojure 1.12's (`src/stdlib/core.nx`), and so are the transducer
 arities: `(map f)`, `(filter p)`, `(remove p)`, `(keep f)`, `(take n)`,
 `(take-while p)`, `(drop n)`, `(drop-while p)`, `(map-indexed f)`,
-`(keep-indexed f)`, `(partition-all n)`, `(partition-by f)`, `(mapcat
-f)`, `(interpose sep)`, `(distinct)` and `(dedupe)`. The ones whose
+`(keep-indexed f)`, `(partition-all n)`, `(partitionv-all n)`,
+`(partition-by f)`, `(mapcat f)`, `(interpose sep)`, `(take-nth n)`,
+`(replace smap)`, `(random-sample prob)`, `(distinct)` and `(dedupe)`.
+The ones whose
 other arities are natives reach the `xf-` function of their name in
 `core.nx`; a stateful one keeps its state in volatiles, one per
 application of the transducer to a reducing function. A reduction

@@ -12,13 +12,10 @@
 //!   - Rows are not deduplicated on append; `dedup` makes the relation
 //!     a set. Row equality is cell-wise `Cell.eql`; `Cell.hash` agrees
 //!     with it.
-//!   - `sort` orders rows by `Cell.order` column by column, so two
-//!     relations over the same variables with the same row set compare
-//!     equal row by row after sorting.
 //!   - A relation is not changed once built: `without`, `rowsAt`,
 //!     `beside` and `join` lend its columns to the relations they make
 //!     rather than copying them, so only the builder of a relation
-//!     appends to it or sorts it.
+//!     appends to it.
 
 const std = @import("std");
 const value = @import("../value.zig");
@@ -328,14 +325,6 @@ pub const Relation = struct {
         for (self.cols, map) |*c, sc| try c.append(self.arena, src.cell(row, sc));
     }
 
-    /// Append row `row` of `src`, whose columns are this relation's
-    /// columns in the same order.
-    pub fn copyRow(self: *Relation, src: *const Relation, row: usize) !void {
-        std.debug.assert(src.cols.len == self.cols.len);
-        try self.grow();
-        for (self.cols, 0..) |*c, i| try c.append(self.arena, src.cell(row, i));
-    }
-
     /// Column indexes in `src` of this relation's variables.
     pub fn mapFrom(self: *const Relation, src: *const Relation) ![]usize {
         const map = try self.arena.alloc(usize, self.vars.len);
@@ -473,14 +462,7 @@ pub const Relation = struct {
 
     /// A copy with duplicate rows removed, first occurrence kept.
     pub fn dedup(self: *const Relation) !Relation {
-        var out = try init(self.arena, self.vars);
-        var seen: RowSet = .{ .rel = &out };
-        var i: usize = 0;
-        while (i < self.rows) : (i += 1) {
-            try out.copyRow(self, i);
-            if (!try seen.insert(self.arena, out.rows - 1)) try out.dropLast();
-        }
-        return out;
+        return self.project(self.vars, true);
     }
 
     fn dropLast(self: *Relation) !void {
@@ -733,52 +715,6 @@ pub const Relation = struct {
             starts[i] += 1;
         }
     }
-
-    /// Sort rows lexicographically by `Cell.order` over the columns in
-    /// order. In place.
-    pub fn sort(self: *Relation) !void {
-        const perm = try self.arena.alloc(usize, self.rows);
-        for (perm, 0..) |*p, i| p.* = i;
-        const ctx = SortCtx{ .rel = self };
-        std.mem.sort(usize, perm, ctx, SortCtx.lessThan);
-        for (self.cols) |*c| {
-            switch (c.*) {
-                .int => |*x| {
-                    const copy = try self.arena.dupe(i64, x.items);
-                    for (perm, 0..) |p, i| x.items[i] = copy[p];
-                },
-                .cell => |*x| {
-                    const copy = try self.arena.dupe(Cell, x.items);
-                    for (perm, 0..) |p, i| x.items[i] = copy[p];
-                },
-            }
-        }
-    }
-
-    const SortCtx = struct {
-        rel: *const Relation,
-        fn lessThan(ctx: SortCtx, a: usize, b: usize) bool {
-            for (ctx.rel.cols) |*c| {
-                switch (c.get(a).order(c.get(b))) {
-                    .lt => return true,
-                    .gt => return false,
-                    .eq => {},
-                }
-            }
-            return false;
-        }
-    };
-
-    /// Do two relations over the same variables (same order) hold the
-    /// same rows in the same order?
-    pub fn eqlRows(self: *const Relation, other: *const Relation) bool {
-        if (self.rows != other.rows or self.vars.len != other.vars.len) return false;
-        var i: usize = 0;
-        while (i < self.rows) : (i += 1) {
-            if (!self.rowsEql(i, other, i)) return false;
-        }
-        return true;
-    }
 };
 
 /// A growing set of rows: a relation plus a hash index over it, for
@@ -872,7 +808,7 @@ test "column widens from int to cell" {
     try testing.expect(c.get(2).eql(.{ .str = "x" }));
 }
 
-test "dedup, project, difference, sort" {
+test "dedup, project, difference" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -898,15 +834,6 @@ test "dedup, project, difference, sort" {
     const diff = try r.difference(&s, &.{0});
     try testing.expectEqual(@as(usize, 1), diff.rows);
     try testing.expect(diff.cell(0, 0).eql(.{ .int = 2 }));
-
-    var sorted = try r.dedup();
-    try sorted.sort();
-    try testing.expect(sorted.cell(0, 0).eql(.{ .int = 1 }) and sorted.cell(0, 1).eql(.{ .str = "a" }));
-    try testing.expect(sorted.cell(1, 0).eql(.{ .int = 1 }) and sorted.cell(1, 1).eql(.{ .str = "c" }));
-    try testing.expect(sorted.cell(2, 0).eql(.{ .int = 2 }));
-    var again = try r.dedup();
-    try again.sort();
-    try testing.expect(sorted.eqlRows(&again));
 }
 
 test "viewAs collapses repeated variables" {
@@ -966,15 +893,13 @@ test "hash join on shared vars and cross product" {
         &.{ .{ .int = 40 }, .{ .int = 3 } },
         &.{ .{ .int = 50 }, .{ .int = 7 } },
     });
-    var j = try people.join(&ages, &.{});
+    const j = try people.join(&ages, &.{});
     try testing.expectEqualSlices(Var, &.{ 0, 1, 2 }, j.vars);
     try testing.expectEqual(@as(usize, 3), j.rows);
     // Rows in `people` order, the matches of a row in `ages` order.
     try testing.expect(j.cell(0, 2).eql(.{ .int = 30 }));
     try testing.expect(j.cell(1, 2).eql(.{ .int = 31 }));
     try testing.expect(j.cell(2, 2).eql(.{ .int = 40 }));
-    try j.sort();
-    try testing.expect(j.cell(0, 2).eql(.{ .int = 30 }));
     try testing.expect(j.cell(2, 1).eql(.{ .str = "cy" }));
 
     const flags = try rel(arena, &.{5}, &.{ &.{.{ .boolean = true }}, &.{.{ .boolean = false }} });

@@ -57,7 +57,7 @@ complete from the start; `core.clj`'s two-stage bootstrap (a trivial
 
 `ATransientMap.ensureEditable` checks ownership on every operation, and
 `persistent!` ends it. nexis transients check an owner token on every
-operation and freeze on `persistent!` (§3.5). As in Clojure, an
+operation and freeze on `persistent!` (`docs/TRANSIENT.md` §5). As in Clojure, an
 operation edits the nodes the transient owns in place and copies a
 shared node once; the token lives in the node header's hash field,
 which an internal node does not use (`docs/TRANSIENT.md`).
@@ -183,7 +183,6 @@ are the map for someone who knows Clojure.
 | Construct | Clojure | nexis | Why |
 |---|---|---|---|
 | Radix integer | `2r101`, `16rFF` | only `0x` and `0b` prefixes | a smaller grammar |
-| `+42` | the integer 42 | a symbol | no signed-variant tokens |
 | Ratio `22/7` | a Ratio | `:bad-number-literal` | no rationals (§23 #10) |
 | `42N` | a BigInt | `42`; any integer literal reads as an integer, and one beyond i64 is a bignum | one integer domain (§23 #10) |
 | `3.14M` | a BigDecimal | `:bad-number-literal` | no decimals |
@@ -191,7 +190,7 @@ are the map for someone who knows Clojure.
 | `1.` | `1.0` | `:bad-number-literal` | a real has digits on both sides of the dot |
 | `1abc`, `1-2` | "Invalid number" | `:bad-number-literal` for the whole token | a number token ends where a symbol would |
 | `\o377` | an octal char | unsupported | `\uHHHH` and `\u{...}` cover it |
-| String escapes | `\b \f`, octal, `\uHHHH` | `\n \t \r \\ \" \uHHHH \u{HEX}` | a narrow set; `\u{HEX}` names any scalar in one escape (§23 #26) |
+| String escapes | `\b \f`, octal, `\uHHHH` | Clojure's, and `\u{HEX}` | `\u{HEX}` names any scalar in one escape (§23 #26) |
 | `#:ns{:a 1}`, `::k` | namespaced map, auto-resolved keyword | parse error | no current namespace at read time |
 | `#?(...)` | reader conditional | parse error | one target (PLAN §4) |
 | `#inst`, `#uuid` | tagged literals | parse error; `nexis.time/parse` reads an instant's text | PLAN §4, §24 #3 |
@@ -215,12 +214,14 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | inexact `(/ a b)` of integers | a Ratio | an f64; exact quotients stay integers | §23 #10 |
 | `(long x)` | throws beyond 64 bits; NaN is 0 | never rejects a size (`(long 1e30)` is a bignum); NaN is 0, as in Clojure, and an infinity is `:invalid-argument`; `int`, `short` and `byte` check Java's ranges and make NaN 0, as Clojure's do; `float` checks the float range and returns the f64 unrounded; `bigint` and `biginteger` are `long`, since an integer of any size is one kind | `docs/SEMANTICS.md` §2.2, `docs/STDLIB.md` §2 |
 | the seq of a map, set, string, or of a list `sort` or `keys` builds | walked one element at a time | a vector's view past three elements, so `map` over it takes 32 at a time | `docs/LAZY.md` §9 |
-| a lazy seq a local holds | let go as it is walked (locals clearing) | let go as it is walked: a local's slot is cleared at its last move, the last time it is passed to a call or moved by `let` or `recur`; a last read in place (an `if` test), a local a closure captures (Clojure clears a `^:once` body's) and the argument of a native that walks to the end without consuming it (`sort`, `sort-by`, `set`, `zipmap`'s values) keep it | `docs/LAZY.md` §9, `docs/COMPILER.md` §4.9 |
+| a lazy seq a local holds | let go as it is walked (locals clearing) | let go as it is walked, but for the cases `docs/LAZY.md` §9 lists (a last read in place, a local a closure captures, a native that walks without consuming) | `docs/LAZY.md` §9, `docs/COMPILER.md` §4.9 |
 | `(apply f (range))` | can stay lazy | does not end: `apply` realizes its last argument | `docs/LAZY.md` §9 |
 | `(str (map inc [1]))` | `"clojure.lang.LazySeq@..."` | `"(2)"` | `docs/LAZY.md` §9 |
+| `compare` of two strings | UTF-16 code-unit order (`String.compareTo`) | code-point order, the order of their UTF-8 bytes, which matches nexis's code-point string indexes; the two differ between U+E000–U+FFFF and the supplementary planes: `(compare "\uffff" "😀")` is 10178 in Clojure, −1 in nexis | `docs/SORTED.md` §6 |
 | a lazy key of a map of up to eight entries (`assoc`, `frequencies`, `group-by`) | left unrealized: the array map compares and hashes nothing | realized when the map takes it, its throw raised by that call, as a hash set's in both | `docs/LAZY.md` §9 |
 | a lazy seq nested in a value `=` or `hash` compares, whose body makes much garbage | collected while the body runs | nothing is collected until the body returns (it realizes in isolation, under `gc_hold`), so memory grows with the body's garbage | `docs/LAZY.md` §9 |
 | a `lazy-seq` body that throws, walked again | `LazySeq.force` calls the body again, a `^:once` fn whose captured locals it had read are cleared: a body that reads its seq first (every core sequence function's) ends the seq there, one that reads no captured local runs again whole, one that uses a cleared local otherwise throws a `NullPointerException` | ends the seq at the block in every case, as babashka; `realized?` false until that walk, as both | `docs/LAZY.md` §4 |
+| a lazy body that forces its own seq before it returns (`(map f v)` whose `f` walks the seq it is producing) | runs the body again inside itself: a body that does so once, under a flag, computes its elements twice; one that always does ends in `StackOverflowError` | the inner walk raises `:stack-overflow` at once, which ends the seq at the block unless the body catches it | `docs/LAZY.md` §4 |
 | a `sequence` step that throws, walked again | goes on from the advanced source and transducer, dropping the chunk it was filling: `(3 4)` for a `(comp (map f) (take 4))` over `(range 10)` whose `f` throws once at 2 | ends the seq at the block: `()` | `docs/LAZY.md` §9 |
 | `(empty record)` | throws | `{}`: a record is a map to collection functions | `docs/PROTOCOLS.md` |
 | `extend-type`, `extend-protocol` | a class | a kind keyword (`:fixnum`, `:string`, `:vector`, `:any`), `nil`, a record name, or a common Clojure class name standing for its kinds (`String`, `Long`, `Object` as `:any`) | `docs/PROTOCOLS.md` |
@@ -234,7 +235,7 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | `clojure.edn/read-string` | the EDN reader: no reader sugar, tagged literals through `:readers` and `:default` | `nexis.edn/read-string`, the nexis reader with `{:eof nil}`: `'x`, `@x` and `#()` read as the forms they stand for, and a tagged literal is a `:reader-error` whatever `:readers` holds (there are none, PLAN §4); nothing is evaluated | `docs/STDLIB.md` §4 |
 | `(eval form)` | binds `*ns*` | compiles in the current namespace as the REPL does; a compile error is the catchable map `{:error :compile-error :message sentence :form form :kind name}` | `docs/MACROEXPAND.md` |
 | `(macroexpand form)` | with `&env` | no lexical environment; subforms never expand | `docs/MACROEXPAND.md` |
-| `(meta f)`, `(with-meta 'sym m)` | metadata on fns and symbols | nil; `:no-metadata-on-immediate` | `docs/SEMANTICS.md` §7 |
+| `(with-meta inc m)`, `(with-meta 'sym m)` | metadata on native fns and symbols | `:kind-mismatch`; `:no-metadata-on-immediate` (a `fn` carries metadata) | `docs/SEMANTICS.md` §7 |
 | `(meta #'f)` | `:name`, `:ns`, `:arglists`, `:line`, `:column`, `:file` | `:name`, `:ns` (the namespace's name symbol), `:arglists` for a `defn` or `defmacro`, and what the definition carries; no `:line`, `:column` or `:file` | `docs/MACROEXPAND.md` §10 |
 | a `defn` calling itself | through the Var `#'f`: once `f` is redefined, the earlier function's recursive calls reach the new one | through its own name (`defn` names its fn): the earlier function keeps calling itself, and `(#'f ...)` is the call through the Var | `docs/COMPILER.md` §4.3, §5.5 |
 | `volatile!`, `vswap!`, `vreset!` | a volatile box | an atom (`atom?` is true) | `docs/ATOM.md` |
@@ -255,7 +256,7 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | `(System/getenv)`, `(System/getenv name)` | static methods | `nexis.sys/getenv`; bytes that are not UTF-8 read as U+FFFD | `docs/STDLIB.md` §11 |
 | `clojure.java.shell/sh` | `:in` a string, bytes, a stream, a reader or a file; `:in-enc`, `:out-enc` (`:bytes`) | `nexis.shell/sh`, also required as `clojure.java.shell`: `:in` a string, no encodings (`:invalid-argument`); a signal's `:exit` is 128 plus its number, as Java's | `docs/STDLIB.md` §11 |
 | instants | `java.util.Date` and `java.time.Instant` extend `Inst`, printed `#inst "..."` | `nexis.time.Instant`, a record of epoch milliseconds that extends `Inst`, printed `#nexis.time.Instant{:ms n}`; `nexis.time` parses and formats ISO-8601 in UTC; an Instant is not `compare`-able | `docs/STDLIB.md` §8, §12 |
-| `clojure.data.json` | keys and keyword values written by `name`; non-ASCII and `/` escaped by default; unknown options ignored | `nexis.json`, also required as `clojure.data.json`: a keyword written whole (`"person/name"`); nothing escaped past JSON's need unless `:escape-unicode` or `:escape-slash`; an unknown option is `:invalid-argument`; an Instant written as its ISO-8601 text; malformed text is `{:error :json-error :message :line :column}` | `docs/STDLIB.md` §13 |
+| `clojure.data.json` | keys and keyword values written by `name`; non-ASCII and `/` escaped by default; unknown options ignored | `nexis.json`, also required as `clojure.data.json`: a keyword written whole (`"person/name"`); nothing escaped past JSON's need and U+2028/U+2029 unless `:escape-unicode` or `:escape-slash`; an unknown option is `:invalid-argument`; an Instant written as its ISO-8601 text; malformed text is `{:error :json-error :message :json-line :json-column}`, placed as any error | `docs/STDLIB.md` §13 |
 | `(list? (seq [1 2]))`, and of `rest`, `(cons 1 ())`, `keys`, `sort` | false: each is a seq class of its own (`ChunkedSeq`, `Cons`, `KeySeq`, `ArraySeq`), and `list?` holds of a `PersistentList` only | true: a realized seq is a list, there being no seq kinds beside the list and the lazy seq (a vector's seq is a view of it); false of a lazy seq (`map`, `range`, a `cons` onto one) | `docs/LIST.md` §1 |
 | `(map-entry? [:a 1])` | false: a map entry is a `MapEntry` | true: a map's entries are two-element vectors | `docs/STDLIB.md` §8 |
 | `(float x)` | a 32-bit float | the f64 itself, after Java's range check | `docs/SEMANTICS.md` §2.2 |

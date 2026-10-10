@@ -114,7 +114,7 @@ without cloning the Value. Identity equality; GC leaf; prints
 The body holds `protocol_id` and `method_name_id` (the method's
 keyword id). `defprotocol` makes one per method and binds it as the
 method Var's root. Identity equality; GC leaf; prints
-`#<protocol-fn proto=P method=M>` with the numeric ids.
+`#<protocol-fn NAME>`, the method's name (STDLIB.md §5).
 
 A protocol fn is callable anywhere a fn is: in call position and
 through `VM.callValue`, so it works as an argument to `map`, `apply`,
