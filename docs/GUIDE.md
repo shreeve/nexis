@@ -61,7 +61,7 @@ The surface is Clojure's, read by the same rules:
   `#(+ % %2)`, `#_` discards, `^:private` and `^{...}` metadata.
 - Special forms and the core macros: `def`, `if`, `do`, `let`, `fn`,
   `loop`/`recur`, `try`/`catch`/`finally`, `defn`, `defmacro` with
-  syntax-quote and auto-gensyms, `cond`, `case`, `condp`, `->`, `->>`,
+  syntax-quote, auto-gensyms, `&form` and `&env`, `cond`, `case`, `condp`, `->`, `->>`,
   `cond->`, `some->`, `as->`, `doto`, `when-let`, `if-some`, `for`,
   `doseq`, `dotimes`, `letfn`, `binding`.
 - Destructuring everywhere a binding appears, including keyword
