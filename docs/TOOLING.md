@@ -263,18 +263,18 @@ build; `test/golden/cli/multi-arity.disasm` pins one. `test/golden/cli/sum10.dis
 pins the listing of `test/examples/pins/sum10.nx`:
 
 ```
-routine <top> (test/examples/pins/sum10.nx:4:1) slots=6 arity=0 upvalues=0
-  0000  var:load-var        s1  v0=nexis.core/println  ; 4:2
-  0001  mov:load-const      s3  c0=0  ; 5:13
-  0002  mov:load-const      s4  c0=0  ; 5:19
-  0003  cmp:lt.sc+if-false  s5  s3  c1=10  ; 6:9
-  0004  jump:if-false       s5  j0009  ; 6:5
-  0005  math:add.ss         s4  s4  s3  ; 7:22
-  0006  math:add.sc+lt.sc+if-true  s3  s3  c2=1  ; 7:14
-  0007  cmp:lt.sc+if-true   s5  s3  c1=10  ; 6:9
-  0008  jump:if-true        s5  j0005  ; 6:5
-  0009  mov:move-clear      s2  s4  -  ; 8:7
-  0010  call:call           s1  #1  s0  ; 4:1
+routine <top> (test/examples/pins/sum10.nx:5:1) slots=6 arity=0 upvalues=0
+  0000  var:load-var        s1  v0=nexis.core/println  ; 5:2
+  0001  mov:load-const      s3  c0=0  ; 6:13
+  0002  mov:load-const      s4  c0=0  ; 6:19
+  0003  cmp:lt.sc+if-false  s5  s3  c1=10  ; 7:9
+  0004  jump:if-false       s5  j0009  ; 7:5
+  0005  math:add.ss         s4  s4  s3  ; 8:22
+  0006  math:add.sc+lt.sc+if-true  s3  s3  c2=1  ; 8:14
+  0007  cmp:lt.sc+if-true   s5  s3  c1=10  ; 7:9
+  0008  jump:if-true        s5  j0005  ; 7:5
+  0009  mov:move-clear      s2  s4  -  ; 9:7
+  0010  call:call           s1  #1  s0  ; 5:1
   0011  call:return.s       s0  -  -
 ```
 
@@ -301,8 +301,8 @@ clears its slot (COMPILER.md §4.9).
   space within 60 bytes and followed by ` ...` and, for a collection,
   its item count when longer (`c0=[0 1 2 ... 22 ...(5000 items)`); a
   var its namespace-qualified name (`v0=nexis.core/println`). Operand B of `call:call`,
-  `call:tailcall`, `call:self` and every `coll:*` is a raw immediate
-  (VM.md §4.5) and prints as `#n`. The wide field prints as what it names: a jump
+  `call:self` and every `coll:*` is a raw immediate (VM.md §4.5) and
+  prints as `#n`. The wide field prints as what it names: a jump
   or `try-exit` target as its pc (`j0009`), `mov:load-const`'s
   constant and a `var:*` Var as a `c` or `v` operand would,
   `try-enter`'s try as `#n<catch j0012 finally j0015>`, and
@@ -319,8 +319,10 @@ clears its slot (COMPILER.md §4.9).
 Macro expansion, `(ns ...)` and `(require ...)` take effect while the
 file compiles, but no form runs, so a macro that calls a function the
 same file defines cannot expand under `disasm`. The opcode names are
-tables in `src/disasm.zig`; a test walks every variant enum
-`src/vm.zig` defines and fails when one lacks a name.
+the tags of the group and variant enums in `src/vm.zig`, `_` spelled
+`-` and a trailing `_` dropped, and what each operand is, an immediate
+or a wide field, is what verification proves (`Routine.shapeOf`, VM.md
+§5).
 
 ### 3. Test runner (`src/stdlib/test.nx`, the `nexis.test` namespace)
 

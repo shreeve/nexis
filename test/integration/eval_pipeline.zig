@@ -8672,6 +8672,33 @@ test "a user macro named like a core macro is the namespace's own" {
 }
 
 // =============================================================================
+// The barrier `=` and `hash` realize through (docs/LAZY.md §6)
+// =============================================================================
+
+test "a rebound realize-caught is refused, not trusted, by = and hash" {
+    // An answer that is not [false thrown] and leaves the block
+    // unrealized is :kind-mismatch, never an index into a non-vector
+    // or a walk that waits forever.
+    try expectOutputProgram(
+        \\(alter-var-root #'nexis.core/realize-caught (constantly (fn [s] 7)))
+        \\(try (count {(map inc [1]) 1}) (catch :kind-mismatch e :refused))
+    , ":refused");
+    try expectOutputProgram(
+        \\(alter-var-root #'nexis.core/realize-caught (constantly (fn [s] [true 42])))
+        \\(try (count {(map inc [1]) 1}) (catch :kind-mismatch e :refused))
+    , ":refused");
+    // A barrier that realizes the block answers with the block's own
+    // seq, whatever it returns beside it.
+    try expectOutputProgram(
+        \\(alter-var-root #'nexis.core/realize-caught (constantly (fn [s] (doall s) [true 42])))
+        \\(count {(map inc [1]) 1 '(2) 3 42 4})
+    , "2");
+    try expectOutputProgram(
+        \\(alter-var-root #'nexis.core/realize-caught (constantly (fn [s] [false :boom])))
+        \\(try (count {(map inc [1]) 1}) (catch any e e))
+    , ":boom");
+}
+
 // Natives' rooting under the collector (GC.md §11.5)
 // =============================================================================
 

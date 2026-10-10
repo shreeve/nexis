@@ -235,7 +235,10 @@ unrooted nodes. A lazy block they meet is realized through
   callers' unrooted nodes are safe, and calls the closure
   `nexis.core/realize-caught`, `(fn [s] (try [true (#%force s)] (catch
   any e [false e])))`. A throw is caught inside it, so nothing unwinds
-  past the native that was comparing.
+  past the native that was comparing. The VM checks the answer rather
+  than trust it, since a program can rebind the Var: `[false x]` is a
+  throw of `x`; otherwise the seq is the block's own result once the
+  block is realized, and a block left unrealized is `:kind-mismatch`.
 - A failure (a caught value, or an error the barrier cannot catch) is
   parked on the VM (`parked_realize`, a root while it is parked; the
   first wins, and later isolated realizations fail at once) and counts

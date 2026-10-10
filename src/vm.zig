@@ -20,14 +20,7 @@
 
 const std = @import("std");
 const value_mod = @import("value.zig");
-/// The VM owns the `Heap` every runtime value lives on: rest-arg
-/// lists, the collections `coll:*` builds, closures and upvalue
-/// cells, and everything the natives and the compiler allocate
-/// through `ensureHeap` / `registry.heap`.
 const heap_mod = @import("heap.zig");
-/// The collector. The VM is its host (VM.md §9, GC.md §3): it
-/// enumerates the roots, traces closures and cells, and decides
-/// when a cycle is due.
 const gc_mod = @import("gc.zig");
 const bignum_mod = @import("bignum.zig");
 const list_mod = @import("coll/list.zig");
@@ -36,12 +29,7 @@ const vector_mod = @import("coll/vector.zig");
 const champ_mod = @import("coll/champ.zig");
 const sorted_mod = @import("coll/sorted.zig");
 const transient_mod = @import("coll/transient.zig");
-/// Canonical `hashValue` + `equal` entry points for map and set
-/// construction.
 const dispatch_mod = @import("dispatch.zig");
-/// One shared `Interner` per VM keeps symbol and keyword identity
-/// consistent between the compiler, the macroexpander and runtime
-/// values.
 const intern_mod = @import("intern.zig");
 const string_mod = @import("string.zig");
 const protocol_mod = @import("protocol.zig");
@@ -53,40 +41,21 @@ const builtin = @import("builtin");
 const Value = value_mod.Value;
 
 // =============================================================================
-// Instruction encoding (VM.md §3 + §4)
-//
-// Instruction: 64 bits
-//   [kind:4][group:6][variant:6][opA:16][opB:16][opC:16]
-//
-// Each operand is 16 bits: [kind:4][index:12]. An instruction that
-// names a pc or a table entry reads B and C together as one 32-bit
-// field (`Inst.wide`), so no routine is bounded by an operand width.
-//
-// Packed structs keep the Zig layout byte-exact across platforms.
+// Instruction encoding (VM.md §3, §4): an instruction is 64 bits,
+// [kind:4][group:6][variant:6][opA:16][opB:16][opC:16], an operand
+// [kind:4][index:12], and B and C read together are the wide field.
 // =============================================================================
 
+/// An operand's kind (VM.md §4); `intern` and `durable` are reserved,
+/// and any other bit pattern is `BytecodeCorruption`.
 pub const OpKind = enum(u4) {
-    /// S — frame-local slot.
     slot = 0,
-    /// C — routine's constant pool.
     constant = 1,
-    /// V — namespace Var (`routine.var_table[i]`).
     var_ = 2,
-    /// U — closure upvalue (`frame.upvalues[i]`).
     upvalue = 3,
-    /// I — intern id (keyword/symbol). No opcode resolves it;
-    /// `resolve` raises `UnimplementedOpcode`.
     intern = 4,
-    // 5 unassigned: a pc is a wide field, not an operand.
-    /// E — durable ref literal. No opcode resolves it;
-    /// `resolve` raises `UnimplementedOpcode`.
     durable = 6,
-    // 7..14 unassigned.
-    /// Sentinel for "no operand".
     unused = 15,
-    /// Non-exhaustive marker: bytecode may carry operand kinds
-    /// this VM doesn't recognize. Dispatch code
-    /// catches those via `_` prong and surfaces BytecodeCorruption.
     _,
 };
 
@@ -102,27 +71,24 @@ pub const Operand = packed struct(u16) {
     pub fn constant(i: u12) Operand {
         return .{ .kind = .constant, .index = i };
     }
-
     pub fn upvalue(i: u12) Operand {
         return .{ .kind = .upvalue, .index = i };
     }
-
-    /// V-kind operand referencing `routine.var_table[i]`.
     pub fn varRef(i: u12) Operand {
         return .{ .kind = .var_, .index = i };
     }
 };
 
-/// Instruction kind (VM.md §3): `primary` is the one format; any
-/// other value is `BytecodeCorruption`.
+/// `primary` is the one format; any other kind is `BytecodeCorruption`.
 pub const InstKind = enum(u4) {
     primary = 0,
     _,
 };
 
-/// Opcode group (6 bits). Full taxonomy per VM.md §10. `transient`, `hash`, `tx`, `io` and `simd` have no
-/// implemented variants; dispatching them raises
-/// `UnimplementedOpcode`.
+/// The opcode groups and each group's variants (VM.md §10, whose tables
+/// say what each does). `transient`, `hash`, `tx`, `io` and `simd`
+/// have no variants: an instruction in one traps `UnimplementedOpcode`,
+/// as do the reserved `call:tailcall`, `math:pow` and `ctrl:halt`.
 pub const Group = enum(u6) {
     jump = 0,
     cmp = 1,
@@ -141,177 +107,25 @@ pub const Group = enum(u6) {
     _,
 };
 
-/// Variants for the `mov` group.
-pub const Mov = enum(u6) {
-    move = 0,
-    load_const = 1,
-    load_nil = 2,
-    load_true = 3,
-    load_false = 4,
-    /// `mov:move-clear A=dst B=slot`: `mov:move` of a slot the
-    /// compiler found dead after it, which the move leaves nil
-    /// (VM.md §10.1, COMPILER.md §4.9).
-    move_clear = 5,
-    _,
-};
+pub const Mov = enum(u6) { move = 0, load_const = 1, load_nil = 2, load_true = 3, load_false = 4, move_clear = 5, _ };
 
-/// Variants for the `call` group.
-pub const Call = enum(u6) {
-    call = 0,
-    tailcall = 1,
-    @"return" = 2,
-    return_nil = 3,
-    /// `call:self A=window B=argc C=dst`: call the frame's own closure
-    /// with the arguments in `slot[A..A + argc]` (VM.md §10.2).
-    self_ = 4,
-    /// `call:lookup A=dst B=target C=key`: `(key target)`, the key a
-    /// keyword or symbol constant (VM.md §10.2).
-    lookup = 5,
-    /// `call:lookup-or A=dst B=slot C=key`: `(key target default)`,
-    /// the target in `slot[B]` and the default in `slot[B + 1]`.
-    lookup_or = 6,
-    _,
-};
+pub const Call = enum(u6) { call = 0, tailcall = 1, @"return" = 2, return_nil = 3, self_ = 4, lookup = 5, lookup_or = 6, _ };
 
-/// Variants for the `closure` group. Per VM.md §10.5.
-pub const Closure_ = enum(u6) {
-    make = 0,
-    box_local = 1,
-    new_cell = 2,
-    init_cell = 3,
-    get_cell = 4,
-    _,
-};
+pub const Closure_ = enum(u6) { make = 0, box_local = 1, new_cell = 2, init_cell = 3, get_cell = 4, _ };
 
-/// Variants for the `jump` group. Per VM.md §10.6.
-/// `if-true` pairs with `if-false` so the compiler can choose
-/// whichever produces shorter code per branch direction.
-pub const Jump = enum(u6) {
-    jmp = 0,
-    if_true = 1,
-    if_false = 2,
-    _,
-};
+pub const Jump = enum(u6) { jmp = 0, if_true = 1, if_false = 2, _ };
 
-/// Variants for the `ctrl` group. Per VM.md §10.9 and the §12
-/// try/catch/throw spec.
-///
-/// `halt` variant (5) is unused — the top-level `call:return`
-/// path halts the VM. Uncaught throw halts via
-/// `VmError.UncaughtThrow`.
-pub const CtrlOp = enum(u6) {
-    /// `ctrl:try-enter A=binding_slot W=try` — push a handler for
-    /// `routine.tries[W]`. binding_slot is where the thrown value is
-    /// stored when the catch fires.
-    try_enter = 0,
-    /// `ctrl:try-exit W=post_pc` — pop the current
-    /// handler/cleanup (must belong to this frame) and jump to
-    /// post_pc. If the popped handler has a finally_pc, the VM
-    /// redirects through the finally body with a saved post_pc
-    /// continuation.
-    try_exit = 1,
-    /// `ctrl:finally-exit` — pop the finally continuation and
-    /// dispatch on it (`.normal` → resume at post_pc,
-    /// `.throwing` → continue unwinding).
-    finally_exit = 2,
-    /// `ctrl:throw A=value_operand B=unused C=unused` — throw
-    /// the resolved value. A may be any operand kind (slot,
-    /// constant, var). Walks the handler stack; if a try
-    /// handler matches, replaces it with a cleanup handler
-    /// (this prevents the catch body from being re-caught by
-    /// its own handler),
-    /// binds the thrown value, and jumps to catch_pc. If no
-    /// handler matches in any frame, halts with
-    /// `VmError.UncaughtThrow`.
-    throw_ = 3,
-    /// Reserved.
-    halt_ = 5,
-    _,
-};
+/// Variant 4 is unassigned.
+pub const CtrlOp = enum(u6) { try_enter = 0, try_exit = 1, finally_exit = 2, throw_ = 3, halt_ = 5, _ };
 
-/// Variants for the `coll` group. Per VM.md §10.8. `list`
-/// and `concat` are the runtime substrate for syntax-quote's
-/// `(#%list ...)` / `(#%concat ...)` output. Every variant takes
-/// a slot-block (A=base, B=argc, C=dst) and builds a value via
-/// `VM.heap`.
-pub const CollOp = enum(u6) {
-    /// `coll:list A=arg_base B=argc C=dst` — build a list from
-    /// argc consecutive slots starting at A. Empty list (argc=0)
-    /// is the canonical empty value per `list_mod.empty(heap)`.
-    list = 0,
-    /// `coll:concat A=arg_base B=argc C=dst` — each arg slot
-    /// holds a seqable (nil, list, vector, map or set); result is
-    /// the list of their elements left to right, a map
-    /// contributing `[k v]` entries. Empty concat (argc=0) returns
-    /// the empty list. Any other kind traps `KindMismatch`.
-    concat = 1,
-    /// `coll:vector A=arg_base B=argc C=dst` —
-    /// build a persistent vector from argc consecutive slots.
-    /// Empty vector (argc=0) via `vector_mod.empty(heap)`.
-    /// Allocates via `vector_mod.fromSlice` for argc>0.
-    vector = 2,
-    /// `coll:map A=arg_base B=argc C=dst` — build
-    /// a persistent map from argc slots interpreted as flat
-    /// k,v,k,v,... pairs. argc MUST be even
-    /// (BytecodeCorruption otherwise — compiler guarantees
-    /// this). Duplicate keys: later wins (Clojure semantics).
-    /// Hash + equality come from dispatch.hashValue +
-    /// dispatch.equal.
-    map = 3,
-    /// `coll:set A=arg_base B=argc C=dst` — build
-    /// a persistent set from argc slot values. Duplicates
-    /// collapse (set semantics). Same hash/eq machinery as
-    /// `coll:map`.
-    set = 4,
-    _,
-};
+pub const CollOp = enum(u6) { list = 0, concat = 1, vector = 2, map = 3, set = 4, _ };
 
-/// Variants for the `var` group. Per VM.md §10.7.
-pub const VarOp = enum(u6) {
-    /// Load the Var's binding in force, else its root, into a slot.
-    /// Traps :unbound-var.
-    load_var = 0,
-    /// Set the Var's root to the value of operand A and mark it
-    /// bound; writes no slot. `def` is `store-var` then
-    /// `var-object` (VM.md §10.7).
-    store_var = 1,
-    /// Load the Var object itself (not its value) into a slot.
-    /// Does NOT trap on unbound — taking a reference to an
-    /// unbound Var is legal.
-    var_object = 2,
-    _,
-};
+pub const VarOp = enum(u6) { load_var = 0, store_var = 1, var_object = 2, _ };
 
-/// Variants for the `cmp` group. Per VM.md §10.4
-/// (comparisons live in their own group, NOT in `math`, to keep
-/// the arithmetic ISA clean). All five dispatch through
-/// `numCompare`.
-pub const Cmp = enum(u6) {
-    lt = 0,
-    lte = 1,
-    gt = 2,
-    gte = 3,
-    eq_num = 4,
-    _,
-};
+/// The variants share their numbers with `NumCmp`.
+pub const Cmp = enum(u6) { lt = 0, lte = 1, gt = 2, gte = 3, eq_num = 4, _ };
 
-/// Variants for the `math` group. Per VM.md §10.3.
-/// Every variant except `pow` dispatches through the numeric
-/// tower; `pow` raises `UnimplementedOpcode`. A variant outside
-/// this enum raises `BytecodeCorruption` ("known opcode, not
-/// wired" and "unrecognized bit pattern" are distinct errors).
-pub const Math = enum(u6) {
-    add = 0,
-    sub = 1,
-    mul = 2,
-    div = 3,
-    idiv = 4,
-    mod = 5,
-    pow = 6,
-    neg = 7,
-    abs = 8,
-    _,
-};
+pub const Math = enum(u6) { add = 0, sub = 1, mul = 2, div = 3, idiv = 4, mod = 5, pow = 6, neg = 7, abs = 8, _ };
 
 /// A quickened variant (VM.md §10.10): a hot opcode specialized to
 /// the operand kinds `quicken` found it with, so its fast handler
@@ -534,22 +348,13 @@ comptime {
 }
 
 // =============================================================================
-// Routine (VM.md §5)
-//
-// Routine is a plain Zig struct referenced by `*const Routine`
-// from constant pools and closures; it is not a heap Value.
+// Routine (VM.md §5): a plain struct, not a heap value
 // =============================================================================
 
-/// Source of one upvalue cell when constructing a closure.
-/// (Per VM.md §6 capture descriptor sources.)
+/// Where one upvalue cell of a closure comes from (VM.md §6): the cell
+/// in a slot of the frame making it, or one of the frame's own.
 pub const CaptureSource = union(enum) {
-    /// Read raw `*UpvalCell` pointer from `caller.slot[index]`.
-    /// The slot must hold a cell pointer (a previous
-    /// `closure:box-local` or `closure:new-cell` populated it).
     local_cell_slot: u12,
-    /// Copy raw cell pointer from `caller.upvalues[index]`. Used
-    /// when an inner closure transitively captures something its
-    /// enclosing closure already captured.
     inherited_upvalue: u12,
 };
 
@@ -639,61 +444,24 @@ pub const SourceInfo = struct {
     }
 };
 
+/// The fields are VM.md §5's table.
 pub const Routine = struct {
-    /// Bytecode instructions.
     code: []const Inst,
-    /// The constant pool: `c` operands address its first 4096
-    /// entries, `mov:load-const` any of them.
     consts: []const Value,
-    /// Capture-descriptor table, indexed by `closure:make`'s wide
-    /// field (VM.md §5).
     capture_descs: []const CaptureDescriptor = &.{},
-    /// The routine's `try` forms, indexed by `ctrl:try-enter`'s wide
-    /// field.
     tries: []const Try = &.{},
-    /// Slot count. The frame reserves this many `Value` slots on
-    /// invocation.
     slot_count: u16,
-    /// Number of FIXED arguments this routine accepts. For a
-    /// non-variadic routine, `call:call` must pass exactly
-    /// `fixed_arity` args; mismatch raises `:arity-mismatch`.
-    /// For a variadic routine
-    /// (`variadic = true`), `call:call` must pass at least
-    /// `fixed_arity` args and the rest are packed into a list
-    /// installed at `slot[fixed_arity]` by the VM at call
-    /// time (per VM.md §6).
     fixed_arity: u16 = 0,
-    /// If true, this routine takes a rest parameter at slot
-    /// `fixed_arity`. The VM packs any excess args into a list
-    /// at call time. `(fn* [a b & r] body)` lowers to
-    /// `fixed_arity = 2, variadic = true`.
+    /// A rest parameter at slot `fixed_arity`.
     variadic: bool = false,
-    /// The arity table of the multi-arity `fn` this routine is a
-    /// clause of; null for a routine with one arity.
     arities: ?*const Arities = null,
-    /// Number of upvalue cells the routine's body expects in
-    /// its callee frame. Validated against the constructed
-    /// closure's upvalue array length at `call:call` time and
-    /// against `closure:make`'s descriptor source count at
-    /// closure-construction time.
     upvalue_count: u16 = 0,
-    /// Per-routine Var table. The V operand index
-    /// resolves through this table (analogous to `consts`
-    /// for Values, capture_descs for closure construction).
-    /// The compiler (compileSymbol fall-through) interns
-    /// each referenced Var in the VM's Namespace and records
-    /// the *Var here. Resolution is O(1) at runtime.
     var_table: []const *Var = &.{},
-    /// Human-readable name for diagnostics. Non-owning.
     name: []const u8 = "<anonymous>",
-    /// PC → source span table, run-length encoded and ascending by
-    /// pc; empty for a routine built from hand-written Tiny or
-    /// bytecode. Never consulted while instructions execute: the
+    /// Ascending by pc, empty for a routine built by hand; only the
     /// error path and the disassembler read it.
     spans: []const SpanEntry = &.{},
-    /// The span of the form the routine was lowered from.
     origin: ?SourceSpan = null,
-    /// The source the spans index into.
     source: ?*const SourceInfo = null,
 
     /// Prove the routine, the other members of its arity table, and
@@ -1094,53 +862,31 @@ pub const ArityPhrase = struct {
 /// the instruction.
 pub const VerifyFailure = struct { routine: *const Routine, pc: u32 };
 
-/// A Var holds a mutable cell of a Value with stable identity
-/// across rebinds (matches Clojure's `def` semantics: `(def x 5)`
-/// then `(def x 10)` does NOT create a new Var; the same Var
-/// object's root is updated). Per VM.md §10.7.
-///
-/// Allocation: a Var lives in VM.runtime_arena for the VM's
-/// life and the Value payload is the raw `*Var`, not a
-/// `HeapHeader`-prefixed heap object. Vars are immortal by
-/// design (a namespace never removes one), so the collector
-/// does not sweep them; it reaches their `root`, `meta` and
-/// `thread_value` through the namespace walk (GC.md §3).
-///
-/// `bound`: false until the first `(def name val)` runs. Loads
-/// via `var:load-var` trap `:unbound-var` in that case. This
-/// is what makes forward references work — `(defn f [] (g))`
-/// compiles when g doesn't exist yet (g's Var is interned
-/// unbound), and only traps if f is called before g is bound.
+/// A namespace's mutable binding of a name (VM.md §10.7): `def` of
+/// the name again updates the same Var, so code compiled against it
+/// sees the new root, and a forward reference compiles against a Var
+/// still unbound, which traps `:unbound-var` only if read before its
+/// `def`. A Var lives in `VM.runtime_arena` for the VM's life and the
+/// Value is the raw `*Var`: Vars are immortal, and the collector reaches
+/// their values through the namespaces (GC.md §3).
 pub const Var = struct {
-    /// Symbol name (the Var's identity). The Namespace that
-    /// owns this Var owns the name's backing storage.
+    /// The name, owned by the Var's namespace.
     name: []const u8,
-    /// The owning Namespace's name, for printing `#'ns/name`; empty
-    /// for a Var of a bare Namespace.
+    /// The namespace's name, for `#'ns/name`; empty for a bare
+    /// `Namespace`.
     ns: []const u8 = "",
-    /// Current root value. Read by `var:load-var` / V-operand
-    /// resolve. Written by `var:store-var`.
     root: Value = value_mod.nilValue(),
-    /// True once `def` has set the root. Distinguishes
-    /// "intentionally nil" from "never bound".
+    /// Set once `def` has set the root: a nil root may be bound.
     bound: bool = false,
-    /// True when this Var was created by `(defmacro ...)`.
-    /// The expander dispatches
-    /// macro Vars (compile-time evaluation of the macro fn)
-    /// instead of compiling `(my-macro ...)` as an ordinary
-    /// call. Set ONLY by the expander's defmacro handler;
-    /// regular `def` never sets it.
+    /// Set by `defmacro` alone: the expander calls the Var's value at
+    /// compile time (MACROEXPAND.md §1.2).
     macro: bool = false,
-    /// The metadata map, or nil: `^meta` on the name, a docstring
-    /// and an attribute map land here through `reset-meta!`.
+    /// The metadata map, or nil.
     meta: Value = value_mod.nilValue(),
-    /// True once the Var's metadata has carried `:dynamic true`
-    /// (`(def ^:dynamic *x* ...)`); only a dynamic Var can be
-    /// rebound by `binding`. Never cleared.
+    /// Set once the metadata has carried `:dynamic true`, never cleared
+    /// (VM.md §6.5).
     dynamic: bool = false,
-    /// The binding in force when `thread_bound` is true: what a
-    /// load returns instead of `root`. Pushed by `binding`
-    /// (`VM.pushBindings`), written by `set!`, restored by the pop.
+    /// The binding in force when `thread_bound` (VM.md §6.5).
     thread_value: Value = value_mod.nilValue(),
     thread_bound: bool = false,
 
@@ -1153,115 +899,66 @@ pub const Var = struct {
     }
 };
 
-/// A namespace mapping symbol names to `*Var`. A VM holds one
-/// or more namespaces through `NamespaceRegistry`; a bare
-/// `Namespace` without a registry is the single-namespace form
-/// the tests use.
-///
-/// Lifetime: Var structs themselves live in VM.runtime_arena
-/// and are freed wholesale at `VM.deinit`. The HashMap's
-/// internal storage uses the same allocator the VM uses for
-/// its other ArrayLists (VM.allocator); freed in
-/// `Namespace.deinit`.
+/// Names to Vars (STDLIB.md §8). A VM's namespaces live in its
+/// `NamespaceRegistry`; a bare `Namespace` with no registry is the one
+/// namespace of a VM built by hand. The Vars and names live in
+/// `var_allocator` (the VM's runtime arena), the maps in
+/// `map_allocator`.
 pub const Namespace = struct {
-    /// Namespace name. Empty for ad-hoc single-ns usage (tests
-    /// that construct a Namespace directly without going through
-    /// `NamespaceRegistry`). When non-empty, this is the
-    /// canonical name (e.g., "nexis.core", "user", "my.app").
+    /// Empty for a bare namespace.
     name: []const u8 = "",
-    /// Auto-refer fallback. When `lookup` doesn't
-    /// find a Var by name in this namespace, it walks the
-    /// parent chain. Used to thread `nexis.core` into every
-    /// user-defined namespace (`nexis.core` is auto-referred
-    /// from every new namespace).
-    /// `intern` does NOT walk parent — forward references
-    /// always land in the current namespace, never silently
-    /// shadowing parent Vars.
+    /// Where `lookup` goes for a name this namespace does not hold:
+    /// `nexis.core`, referred into every namespace. `intern` never
+    /// goes there, so a forward reference lands here.
     parent: ?*Namespace = null,
-    /// Back-link to the owning registry. Lets
-    /// arbitrary cross-namespace qualified lookups (`other/x`
-    /// where `other` is not an ancestor) resolve directly via
-    /// `registry.lookupNs(name)`. Null for ad-hoc namespaces
-    /// constructed without going through `NamespaceRegistry`.
+    /// The registry, which resolves `other/x` for any namespace;
+    /// null for a bare one.
     registry: ?*NamespaceRegistry = null,
-    /// Per-namespace alias table. Maps alias name
-    /// (e.g., "m") to the canonical namespace name (e.g.,
-    /// "my.app"). Populated by `(require '[my.app :as m])` in
-    /// the CURRENT namespace. Qualified symbol resolution
-    /// (`compileQualifiedSymbol`) checks aliases BEFORE
-    /// treating the prefix as a literal namespace name. Aliases
-    /// are namespace-local (not inherited via auto-refer).
+    /// `(require '[my.app :as m])`'s aliases, this namespace's own:
+    /// alias name to namespace name.
     aliases: std.StringHashMapUnmanaged([]const u8) = .empty,
-    /// Backs the hash maps' internal storage.
     map_allocator: std.mem.Allocator,
-    /// Backs the Var struct allocations. Lifetime = VM lifetime.
     var_allocator: std.mem.Allocator,
     vars: std.StringHashMapUnmanaged(*Var) = .empty,
 
-    pub fn init(
-        map_allocator: std.mem.Allocator,
-        var_allocator: std.mem.Allocator,
-    ) Namespace {
-        return .{
-            .map_allocator = map_allocator,
-            .var_allocator = var_allocator,
-        };
+    pub fn init(map_allocator: std.mem.Allocator, var_allocator: std.mem.Allocator) Namespace {
+        return .{ .map_allocator = map_allocator, .var_allocator = var_allocator };
     }
 
     pub fn deinit(self: *Namespace) void {
-        // Var structs are arena-owned; freed wholesale at
-        // VM.deinit. Only the hash map's internal storage
-        // belongs to us here.
         self.vars.deinit(self.map_allocator);
         self.aliases.deinit(self.map_allocator);
         self.* = undefined;
     }
 
-    /// Register an alias `alias_name → target_ns_name`
-    /// in this namespace's alias table. Used by
-    /// `(require '[my.ns :as alias])`. Replaces any existing
-    /// binding for `alias_name`. Both strings are duped into
-    /// var_allocator (stable for the namespace's lifetime)
-    /// since the caller's slices may live in a per-form arena
-    /// that dies before the next lookup.
+    /// Map `alias_name` to `target_ns_name`, replacing any earlier
+    /// alias of the name; both are copied, since a caller's may live
+    /// in a per-form arena.
     pub fn putAlias(self: *Namespace, alias_name: []const u8, target_ns_name: []const u8) !void {
         const owned_alias = try self.var_allocator.dupe(u8, alias_name);
         const owned_target = try self.var_allocator.dupe(u8, target_ns_name);
         try self.aliases.put(self.map_allocator, owned_alias, owned_target);
     }
 
-    /// Resolve an alias name. Returns the target
-    /// namespace name if `name` is registered as an alias in
-    /// this namespace, else null.
+    /// The namespace name `name` is an alias of here, if it is one.
     pub fn lookupAlias(self: *const Namespace, name: []const u8) ?[]const u8 {
         return self.aliases.get(name);
     }
 
-    /// Look up an existing Var. Returns null if no Var was
-    /// ever interned under `name` in this namespace OR in any
-    /// auto-referred parent.
+    /// The Var of `name` here or, failing that, in `parent`.
     pub fn lookup(self: *const Namespace, name: []const u8) ?*Var {
         if (self.vars.get(name)) |v| return v;
         if (self.parent) |p| return p.lookup(name);
         return null;
     }
 
-    /// Local-only lookup. Does NOT walk parent.
-    /// Used by interner-style fall-through where a forward-
-    /// reference Var should ONLY land in the current
-    /// namespace, never in a referred-in parent.
+    /// The Var of `name` here alone.
     pub fn lookupLocal(self: *const Namespace, name: []const u8) ?*Var {
         return self.vars.get(name);
     }
 
-    /// Get or create a Var for `name`. Newly-created Vars are
-    /// unbound (root = nil, bound = false). The compiler uses
-    /// this for forward references.
-    ///
-    /// The name is duped into `var_allocator` so callers can
-    /// pass slices from transient arenas (e.g., a per-form
-    /// reader arena that dies after `(require ...)` loads a
-    /// file); loader-driven interning depends on this dupe.
+    /// The Var of `name` here, made unbound when there is none; the
+    /// name is copied, since a caller's may live in a per-form arena.
     pub fn intern(self: *Namespace, name: []const u8) !*Var {
         if (self.vars.get(name)) |v| return v;
         const owned_name = try self.var_allocator.dupe(u8, name);
@@ -1272,111 +969,57 @@ pub const Namespace = struct {
     }
 };
 
-/// Multi-namespace registry. Owns
-/// a map from canonical namespace name to `*Namespace`, plus
-/// pointers to the conventional `nexis.core` (auto-referred by
-/// every new namespace) and the `current` namespace (where
-/// `def`/`defn`/`defmacro` install).
-///
-/// Lifetime: Namespaces are arena-allocated (typically into
-/// `VM.runtime_arena`); the registry's HashMap uses
-/// `map_allocator` for its own internal storage and is
-/// `deinit`-ed by the registry's owner.
+/// A VM's namespaces by name, with `nexis.core`, referred into every
+/// namespace, and the current one, where `def` installs (STDLIB.md §8).
+/// The namespaces live in `var_allocator`, the map in `map_allocator`.
 pub const NamespaceRegistry = struct {
     map_allocator: std.mem.Allocator,
-    /// Allocator for Namespace structs + their Var children.
-    /// Typically `VM.runtime_arena.allocator()`.
     var_allocator: std.mem.Allocator,
-    /// Map of canonical ns name → namespace pointer.
-    map: std.StringHashMap(*Namespace) = undefined,
-    /// Auto-referred fallback for every new namespace.
+    map: std.StringHashMapUnmanaged(*Namespace) = .empty,
     core: *Namespace = undefined,
-    /// Where `def`/`defn`/`defmacro` install.
     current: *Namespace = undefined,
-    /// Heap reachable from the compile.zig Form-lowering path
-    /// via `namespace.registry.heap`. Used by `LowerCtx.heap` to
-    /// allocate string-literal Values (Tiny.literal carriers).
-    /// `VM.ensureRegistry` populates this from `VM.ensureHeap()`.
-    /// Ad-hoc test harnesses that init a registry without a VM
-    /// can leave it null; `.string` Forms then raise
-    /// `UnsupportedFeature`. The registry is the channel that
-    /// carries the heap to the compiler; there is no bundled
-    /// compile-context struct.
+    /// The heap the compiler lowers string and bignum literals onto
+    /// (`VM.ensureRegistry` sets it); with none, a `.string` form is
+    /// `UnsupportedFeature`.
     heap: ?*heap_mod.Heap = null,
     /// The VM that owns this registry (`VM.ensureRegistry` sets it):
     /// the expander reaches it through a namespace to give a macro's
     /// sub-VM the registries of the VM it compiles for (§9.1).
     vm: ?*VM = null,
 
-    /// Two-phase init: caller stores the empty registry FIRST,
-    /// then calls `setupDefaults` on the stable pointer.
-    /// Single-phase init would be unsafe: `ns.registry = self`
-    /// would capture a local `self` pointer that dangles once
-    /// the registry is copied into its final home.
-    pub fn initEmpty(
-        map_allocator: std.mem.Allocator,
-        var_allocator: std.mem.Allocator,
-    ) NamespaceRegistry {
-        return .{
-            .map_allocator = map_allocator,
-            .var_allocator = var_allocator,
-            .map = std.StringHashMap(*Namespace).init(map_allocator),
-            .core = undefined,
-            .current = undefined,
-            .heap = null,
-            .vm = null,
-        };
+    /// An empty registry; `setupDefaults` fills it once it is where it
+    /// stays, since each namespace points back at it.
+    pub fn initEmpty(map_allocator: std.mem.Allocator, var_allocator: std.mem.Allocator) NamespaceRegistry {
+        return .{ .map_allocator = map_allocator, .var_allocator = var_allocator };
     }
 
-    /// Populate the conventional `nexis.core` (auto-referred)
-    /// and `user` (default current) namespaces. Must be called
-    /// on a STABLE pointer (i.e., after the registry has been
-    /// stored in its final location) because each namespace
-    /// captures `self` as its back-pointer.
+    /// `nexis.core` and `user`, the current namespace.
     pub fn setupDefaults(self: *NamespaceRegistry) !void {
         self.core = try self.makeNamespace("nexis.core", null);
         self.current = try self.makeNamespace("user", self.core);
     }
 
     pub fn deinit(self: *NamespaceRegistry) void {
-        // Namespace structs + their Vars live in `var_allocator`
-        // (typically an arena); freed wholesale by the arena's
-        // owner. We only own the outer HashMap + the per-
-        // namespace `vars` HashMap storage (which uses
-        // `map_allocator`).
-        var it = self.map.iterator();
-        while (it.next()) |entry| {
-            entry.value_ptr.*.deinit();
-        }
-        self.map.deinit();
+        var it = self.map.valueIterator();
+        while (it.next()) |ns| ns.*.deinit();
+        self.map.deinit(self.map_allocator);
         self.* = undefined;
     }
 
-    /// Get an existing namespace by name, or create + register
-    /// a new one (with `parent` as its auto-referred fallback).
-    /// `name` must be a stable slice (typically a string literal
-    /// or arena-owned; the registry holds the slice by reference).
-    pub fn getOrCreate(
-        self: *NamespaceRegistry,
-        name: []const u8,
-        parent: ?*Namespace,
-    ) !*Namespace {
+    /// The namespace `name`, made with `parent` when there is none.
+    pub fn getOrCreate(self: *NamespaceRegistry, name: []const u8, parent: ?*Namespace) !*Namespace {
         if (self.map.get(name)) |existing| return existing;
         return try self.makeNamespace(name, parent);
     }
 
-    /// Look up a namespace by name. Returns null if missing.
     pub fn lookupNs(self: *const NamespaceRegistry, name: []const u8) ?*Namespace {
         return self.map.get(name);
     }
 
-    /// Switch the current namespace pointer. If the named ns
-    /// doesn't exist yet, create it with `core` as its parent
-    /// (matches Clojure's `(ns NAME)` semantics for first-time
-    /// declarations).
+    /// Make `name` current, as Clojure's `(ns NAME)`: a new one refers
+    /// `nexis.core`.
     pub fn switchTo(self: *NamespaceRegistry, name: []const u8) !void {
-        const ns = try self.getOrCreate(name, self.core);
-        self.current = ns;
+        self.current = try self.getOrCreate(name, self.core);
     }
 
     /// Set the root of `nexis.core/*ns*`, once `core.nx` defines it,
@@ -1390,57 +1033,33 @@ pub const NamespaceRegistry = struct {
         v.root = try interner.internSymbolValue(self.current.name);
     }
 
-    fn makeNamespace(
-        self: *NamespaceRegistry,
-        name: []const u8,
-        parent: ?*Namespace,
-    ) !*Namespace {
-        // Dupe the name into stable storage
-        // (var_allocator, typically vm.runtime_arena). The caller's
-        // `name` slice may be in a per-form reader arena that
-        // dies after the load completes; the registry map key
-        // + Namespace.name field must outlive that.
+    /// The name is copied, since a caller's may live in a per-form
+    /// arena.
+    fn makeNamespace(self: *NamespaceRegistry, name: []const u8, parent: ?*Namespace) !*Namespace {
         const owned_name = try self.var_allocator.dupe(u8, name);
         const ns = try self.var_allocator.create(Namespace);
         ns.* = Namespace.init(self.map_allocator, self.var_allocator);
         ns.name = owned_name;
         ns.parent = parent;
         ns.registry = self;
-        try self.map.put(owned_name, ns);
+        try self.map.put(self.map_allocator, owned_name, ns);
         return ns;
     }
 };
 
-/// Captured-binding cell: one Value plus an `initialized` flag
-/// (per VM.md §6). Created by `closure:box-local` and
-/// `closure:new-cell`, filled by `closure:init-cell`.
-///
-/// A cell is the body of a heap block of kind `cell_internal`
-/// (VALUE.md §2.3): the `.cell_internal` Value a slot holds and
-/// the `*UpvalCell` a closure or frame holds both name that
-/// block. The collector traces a cell by its value through
-/// `VM.gcTrace`; a cell is reachable from the slot that boxed
-/// it, from every closure that captured it and from every frame
-/// running such a closure.
+/// A captured binding's cell (VM.md §6), the body of a `cell_internal`
+/// block: the `.cell_internal` Value a slot holds and the `*UpvalCell`
+/// a closure or frame holds name the same block.
 pub const UpvalCell = struct {
     value: Value,
     initialized: bool,
 };
 
-/// Runtime closure object: a routine + its upvalue cells.
-/// Per VALUE.md kind 24 = `function`.
-///
-/// **Representation**: the body of a heap block of kind
-/// `function` whose tail holds the cell pointers; `upvalues`
-/// points into that tail, which is safe because the collector
-/// never moves a block. `Value.payload` is the block's
-/// `*HeapHeader`, as for every heap kind (HEAP.md §1). The
-/// collector traces a closure by its cells and by the heap
-/// constants of its routine (`VM.gcTrace`).
+/// A closure (VM.md §6), the body of a `function` block whose tail
+/// holds the cell pointers `upvalues` names: the collector never moves
+/// a block.
 pub const Closure = struct {
     routine: *const Routine,
-    /// One cell per upvalue, filled by `closure:make` from the
-    /// capture descriptor's sources.
     upvalues: []const *UpvalCell,
 };
 
@@ -1449,18 +1068,12 @@ inline fn cellHeader(cell: *UpvalCell) *heap_mod.HeapHeader {
     return @ptrFromInt(@intFromPtr(cell) - @sizeOf(heap_mod.HeapHeader));
 }
 
-/// Static descriptor for a host-Zig function exposed as a
-/// first-class Value.
-/// Descriptors live in STATIC storage (one `const NativeFn`
-/// per fn); the Value just packs a pointer to the descriptor.
-/// No heap allocation, no GC concern, immortal lifetime.
-///
-/// Arity semantics:
-///   - `min_arity`: minimum acceptable argc.
-///   - `max_arity`: null = unbounded (variadic); else max argc.
+/// A Zig function as a value: a `.native_fn` Value is a pointer to its
+/// static descriptor, which nothing frees or collects.
 pub const NativeFn = struct {
     name: []const u8,
     min_arity: u16,
+    /// Null for no upper bound.
     max_arity: ?u16,
     call: *const fn (vm: *VM, args: []const Value) VmError!Value,
     /// A leaf never re-enters the VM and never compares, hashes or
@@ -1469,11 +1082,12 @@ pub const NativeFn = struct {
     /// place, unrooted, and skips the stack guard and the overflow
     /// check (VM.md §6).
     leaf: bool = false,
-    /// What a call that is not a leaf call runs instead of `call`: the
-    /// full body of a leaf whose leaf body refuses some receivers with
-    /// `VmError.NeedsReentry` (`nth` of a lazy seq, which may run
-    /// code). A leaf call site re-issues such a call through the
-    /// general path, arguments copied and rooted (VM.md §6).
+    /// A leaf's full body, which a call that is not a leaf call runs
+    /// instead of `call`, when its leaf body refuses some receivers
+    /// with `VmError.NeedsReentry` (`nth` of a lazy seq, which may run
+    /// code): a leaf call site re-issues such a call through the
+    /// general path, arguments copied and rooted (VM.md §6). Null on a
+    /// native that is not a leaf.
     general: ?*const fn (vm: *VM, args: []const Value) VmError!Value = null,
     /// The native walks its last argument to the end, or until it is
     /// done with it, and keeps the walk rooted itself (`SeqIter.cursor`):
@@ -1482,6 +1096,11 @@ pub const NativeFn = struct {
     /// held by the caller's block while the walk realizes the rest
     /// (docs/GC.md §11.5).
     consumes: bool = false,
+
+    /// Whether the native takes `argc` arguments.
+    pub inline fn takes(self: *const NativeFn, argc: usize) bool {
+        return argc >= self.min_arity and argc <= (self.max_arity orelse argc);
+    }
 };
 
 /// What realizing a lazy seq takes, which `src/seq.zig` implements
@@ -1563,79 +1182,33 @@ pub fn pathArg(v: Value) VmError![]const u8 {
 }
 
 // =============================================================================
-// Frame (VM.md §7)
-//
-// Each frame is a window into the VM's shared `stack` ArrayList,
-// `base_slot..base_slot + slot_count`. The range-call ABI (VM.md
-// §6) windows the callee's slots over the caller's
-// `[call_base + 1 .. call_base + 1 + argc]` region, so arguments
-// are never copied.
-//
-// Discipline:
-//   - Never hold a `[]Value` slice into `vm.stack.items` across an
-//     operation that might grow `stack`; ArrayList reallocation
-//     invalidates it. Use `slotPtr()` for one-shot access, or
-//     snapshot the frame's `base_slot` into a local.
-//   - Never hold a `*Frame` across `pushFrame`, for the same
-//     reason. Helpers that take a frame pointer are one-shot.
+// Frame (VM.md §7): a window on the one backing stack, so a slice of
+// `vm.stack.items` or a `*Frame` is one-shot, invalid once the stack
+// or the frames grow. A callee's window may end below a caller's, so
+// each frame records the stack length its pop restores: the extent
+// the frames beneath it need.
 // =============================================================================
-
-// Backing-stack extent invariant
-//
-// Frames window into one backing stack and a callee's window
-// (`base_slot .. base_slot + slot_count`) may end BELOW a wider
-// caller's or grandparent's window, so no single frame's extent
-// says how long the stack must be. The rule is per frame:
-//
-//   - On entry to a frame, `entry_stack_len` records
-//     `stack.items.len` as it was before the frame's window was
-//     grown into it: the extent every frame beneath it requires.
-//     `stack.items.len` is then `max(entry_stack_len,
-//     base_slot + slot_count)`.
-//   - On return, and on unwind, popping a frame restores
-//     `stack.items.len` to that frame's `entry_stack_len`. An
-//     unwind that pops several frames restores the lowest popped
-//     frame's value, which is the extent the handler's frame set
-//     requires.
-//
-// The top-level frame is never popped, so the harnesses that
-// retarget `frames.items[0]` in place only have to keep the stack
-// at least `slot_count` long.
 
 pub const Frame = struct {
     routine: *const Routine,
-    /// Index into `vm.stack.items` where this frame's slot 0 lives.
-    /// Frame's slot[i] is `vm.stack.items[base_slot + i]`, for `i`
-    /// below `routine.slot_count`.
+    /// Slot `i` is `vm.stack.items[base_slot + i]`.
     base_slot: u32,
-    /// `stack.items.len` at the moment this frame was pushed: the
-    /// extent the frames beneath it require. Popping this frame,
-    /// by return or by unwind, restores the stack to this length.
+    /// The stack length before the frame's window grew it, which its
+    /// pop, by return or unwind, restores.
     entry_stack_len: u32,
-    /// Bytecode offset of the next instruction to execute. Under a
-    /// frame it called, the caller's return point: `call:return`
-    /// resumes the caller there (VM.md §6).
+    /// The next instruction; under a frame it called, its return point.
     pc: u32 = 0,
-    /// Where to write this frame's return value into the CALLER's
-    /// slot space when `call:return` runs. Top-level frame ignores
-    /// this; non-top-level frames receive it from `call:call`.
+    /// The caller's slot the return writes.
     return_dst: u16 = 0,
-    /// Upvalue array sourced from the executing closure. Empty
-    /// for the top-level frame and for empty-capture closures;
-    /// otherwise the array `closure:make` built, installed by
-    /// `call:call`.
+    /// The closure's cells; empty for the top-level frame.
     upvalues: []const *UpvalCell = &.{},
-    /// The closure this frame runs, nil for the top-level frame:
-    /// a root that keeps the closure block (and with it the
-    /// `upvalues` array in its tail) alive for the frame's life.
+    /// The closure the frame runs, nil for the top-level frame: a root
+    /// that keeps its block, cells and routine alive.
     closure: Value = value_mod.nilValue(),
-    /// When non-null, this frame
-    /// was pushed by `VM.callValue` (a host-Zig fn re-entering
-    /// the VM). When `call:return` fires for this frame, it
-    /// writes the return value into `host_result.value`, sets
-    /// `host_result.done = true`, pops the frame, and returns
-    /// WITHOUT writing into a caller slot (callValue's caller
-    /// isn't a regular routine — it's host code).
+    /// For a frame `callValue`, `runRoutine` or a `Callback` pushed:
+    /// the cell its return writes instead of a caller's slot. The
+    /// return pops the frame, but for a batch's, which starts the next
+    /// element in it (VM.md §6).
     host_result: ?*HostCallResult = null,
 
     // A cache line: a call writes one, and a frame's address is its
@@ -1645,9 +1218,7 @@ pub const Frame = struct {
     }
 };
 
-/// Result cell for `VM.callValue`.
-/// The synthetic frame's `call:return` handler writes into this
-/// instead of into a caller's slot.
+/// The cell a host's frame returns into (`Frame.host_result`).
 pub const HostCallResult = struct {
     done: bool = false,
     value: Value = value_mod.nilValue(),
@@ -1727,55 +1298,47 @@ pub const CompilerHooks = struct {
     pub const Loaded = struct { value: Value, end: usize };
 };
 
-/// One entry per `defrecord`.
-/// Names are owned by the registry (duped on registration).
+/// A `defrecord` type (PROTOCOLS.md §3.1), its names owned by the VM.
 pub const RecordTypeEntry = struct {
     id: u32,
     ns_name: []const u8,
     type_name: []const u8,
-    /// Declared field keyword names (interned strings).
     field_names: []const []const u8,
 };
 
-/// One entry per `defprotocol`.
-/// Methods table is indexed by method-name-id (interned symbol
-/// id). Each method's impls map keys on DispatchKey (record
-/// type_id for records, kind tag for built-in kinds — see
-/// `DispatchKey.ofValue`).
+/// A `defprotocol` (PROTOCOLS.md §3), its names owned by the VM.
 pub const ProtocolEntry = struct {
     id: u32,
     ns_name: []const u8,
     name: []const u8,
     methods: std.ArrayList(ProtocolMethod) = .empty,
+
+    /// The method named by the interned id `name_id`.
+    pub fn method(self: *ProtocolEntry, name_id: u32) ?*ProtocolMethod {
+        for (self.methods.items) |*m| if (m.name_id == name_id) return m;
+        return null;
+    }
 };
 
 pub const ProtocolMethod = struct {
-    /// The method's name, an interned keyword id (matches
-    /// ProtocolFnBody.method_name_id).
+    /// The interned keyword id of the name, and the name for reports.
     name_id: u32,
-    /// Short copy of the method name string (owned by VM allocator)
-    /// so error messages can reach the user without a re-intern.
     name: []const u8,
-    /// Method impls keyed by DispatchKey. The Value is callable
-    /// (closure / native_fn / etc.) and receives the protocol
-    /// receiver as its first arg.
+    /// The callable each dispatch key extends the method with, called
+    /// with the receiver first; `default_impl` is `extend-protocol` on
+    /// `:any`'s.
     impls: std.AutoHashMapUnmanaged(DispatchKey, Value) = .empty,
-    /// Fallback impl used when no DispatchKey matches. Set by
-    /// `#%extend-default-impl` (`extend-protocol` on `:any`).
     default_impl: ?Value = null,
 };
 
-/// Inline-method spec passed to `registerProtocol`. Owned by the
-/// caller (slices duped on registration).
+/// A method `registerProtocol` declares; the VM copies the name.
 pub const ProtocolMethodSpec = struct {
     name_id: u32,
     name: []const u8,
 };
 
-/// DispatchKey: how protocol-fn dispatch finds an impl. For
-/// records, we key on `(:record, type_id)`. For built-in kinds
-/// we key on `(:builtin, kind_byte)`, with the integer tower one
-/// key (`canonical`). PROTOCOLS.md §3.2.
+/// What protocol dispatch finds an impl by (PROTOCOLS.md §3.2): a
+/// record's type id, or a built-in kind, the integer tower one kind.
 pub const DispatchKey = struct {
     tag: Tag,
     id: u32,
@@ -1790,9 +1353,7 @@ pub const DispatchKey = struct {
         return canonical(.{ .tag = .builtin, .id = @backingInt(v.kind()) });
     }
 
-    /// The integer tower is one type (SEMANTICS §2.2): a bignum
-    /// dispatches on the fixnum's key, so an impl for either integer
-    /// kind covers every integer whatever its representation.
+    /// A bignum dispatches on the fixnum's key (SEMANTICS §2.2).
     pub fn canonical(key: DispatchKey) DispatchKey {
         if (key.tag == .builtin and key.id == @backingInt(value_mod.Kind.bignum)) {
             return .{ .tag = .builtin, .id = @backingInt(value_mod.Kind.fixnum) };
@@ -1802,274 +1363,97 @@ pub const DispatchKey = struct {
 };
 
 pub const VmError = error{
-    /// Known opcode / group / variant / operand kind that this VM
-    /// does not implement (the
-    /// `transient`/`hash`/`tx`/`io`/`simd` groups, `call:tailcall`,
-    /// `math:pow`, `ctrl:halt`, intern/durable operands).
-    /// Distinct from corruption — the encoding IS a recognized
-    /// shape.
+    // Not catchable: compiler bugs and corrupt bytecode, most refused
+    // by verification (§5).
     UnimplementedOpcode,
-    /// Operand or wide-field index out of range for what it names
-    /// (e.g., constant index >= routine.consts.len, slot index >=
-    /// frame.slots.len, a jump target past the code).
     OperandOutOfRange,
-    /// Operand's kind byte is not valid in this context — e.g.,
-    /// `resolve` called on an `.unused` operand, or `store`
-    /// called with a non-`.slot` destination. Distinct from
-    /// OperandOutOfRange (which is about the index) and from
-    /// BytecodeCorruption (which is about totally unrecognized
-    /// encoding).
     InvalidOperandKind,
-    /// Bytecode exhausted without an explicit `return`. There is
-    /// no implicit `return nil` at code-end.
     BytecodeExhausted,
-    /// Unknown opcode group / variant / operand kind bit pattern
-    /// (NOT in any recognized enum space). Indicates
-    /// bytecode corruption or bytecode from a nexis VM
-    /// that this VM doesn't understand.
     BytecodeCorruption,
-    /// An opcode or native received an operand of a kind it does
-    /// not accept (a non-number to `math:add`, a non-integer index
-    /// to a vector called as a function). Mirrors the
-    /// `:kind-mismatch` user-visible error kind from VM.md §13;
-    /// reusing that taxonomy keeps a parallel "type-error"
-    /// category from drifting in.
-    KindMismatch,
-    /// A count or identifier the runtime produces does not fit in
-    /// a fixnum. Arithmetic never raises it: an integer result
-    /// that leaves the i48 range promotes to a bignum.
-    ArithmeticOverflow,
-    /// `/`, `quot`, `rem` or `mod` with a zero divisor, integer or
-    /// float; a NaN operand of `/` is its result instead.
-    DivideByZero,
-    /// A call passed a number of arguments its callee does not
-    /// take: a closure's routine, a native's descriptor, a
-    /// collection or keyword called as a function (VM.md §13
-    /// `:arity-mismatch` row). Distinct from the compile-time
-    /// `RecurArityMismatch` (COMPILER.md §4.4).
-    ArityMismatch,
-    /// A call's callee is none of the callable kinds (VM.md §6;
-    /// §13 `:not-callable` row).
-    NotCallable,
-    /// `call:call` references a `call_base` slot such that
-    /// `slot[A + argc]` exceeds the frame's slot count. Per
-    /// VM.md §13 (not catchable). Indicates a
-    /// compiler bug — call block was not allocated within the
-    /// routine's `slot_count`.
     CallBlockOutOfRange,
-    /// `closure:make` capture descriptor's source count does not
-    /// match the child routine's `upvalue_count`. Indicates a
-    /// compiler bug.
     CaptureCountMismatch,
-    /// Allocator failure during runtime allocation (Closure,
-    /// UpvalCell, stack growth, frame push). Surfaced as a
-    /// generic OutOfMemory carrying no context.
-    OutOfMemory,
-    /// `U` operand index exceeds the current frame's
-    /// `upvalues.len`, OR a `closure:make` `inherited_upvalue`
-    /// descriptor source exceeds it. Per VM.md §13 (not
-    /// catchable).
     UpvalueOutOfRange,
-    /// An opcode that requires an `UpvalCell*` in a slot (e.g.,
-    /// `closure:get-cell`, `closure:make` `local_cell_slot`
-    /// source) found a different Value kind in the slot. Per
-    /// VM.md §13 (not catchable).
     ExpectedCell,
-    /// `closure:box-local` invoked on a slot that already holds
-    /// an `UpvalCell*` (double-box), OR `closure:init-cell` on
-    /// an already-initialized cell. Per VM.md §13 (not
-    /// catchable). Indicates a
-    /// compiler bug — should never reach the runtime.
     InvalidCellState,
-    /// `closure:get-cell` (or U-operand resolve) read a cell
-    /// whose `initialized = false` — a placeholder cell that
-    /// has not yet been filled in. Per VM.md §13 (not
-    /// catchable). Indicates a
-    /// `closure:init-cell` was emitted out of order or skipped
-    /// entirely.
     UninitializedCell,
-
-    /// A throw, from `ctrl:throw` or from a native through
-    /// `throwValue`, found no handler on the handler stack. The
-    /// VM halts and the thrown value is left in
-    /// `VM.unhandled_throw` for the host to report.
-    UncaughtThrow,
-    /// Handler stack is in an invalid state —
-    /// `ctrl:try-exit` referenced a handler that doesn't
-    /// belong to the current frame, or popping found nothing.
-    /// Indicates compiler bug, not user error.
     InvalidHandlerState,
-    /// Indexed access on a collection (e.g.,
-    /// `(nth coll n)`) used an out-of-bounds index. Mapped to
-    /// `:index-out-of-bounds` by the catchable-error
-    /// translation table.
+    OutOfMemory,
+    // Catchable (`vmErrorToKeywordName`).
+    KindMismatch,
+    ArithmeticOverflow,
+    DivideByZero,
+    ArityMismatch,
+    NotCallable,
     IndexOutOfBounds,
-    /// db engine error (file open failure, missing
-    /// tree, MVCC conflict, etc.). Mapped to `:db-error`.
     DbError,
-    /// Operation attempted on a Connection that
-    /// was already closed (via `db/close` or VM teardown).
-    /// Mapped to `:db-closed`.
     DbClosed,
-    /// Arg expected to be a `durable_ref` Value
-    /// was not. Mapped to `:invalid-durable-ref`.
     InvalidDurableRef,
-    /// Codec encode/decode failed (unserializable
-    /// value, corrupt bytes, version mismatch). Mapped to
-    /// `:codec-failed`.
     CodecFailed,
-    /// tx op attempted on a transaction that was
-    /// already committed or aborted. Mapped to `:tx-closed`.
     TxClosed,
-    /// `(db/deref x)` / `@x` invoked on a Value
-    /// whose kind isn't a durable_ref or Var. Mapped to
-    /// `:not-derefable`.
     NotDerefable,
-    /// INTERNAL control-flow
-    /// signal. NOT user-visible, NOT catchable. Raised when a
-    /// throw propagated past a `VM.callValue` synthetic frame
-    /// (i.e., control transferred to a handler installed BELOW
-    /// the callValue entry point). Native fns + HOFs that
-    /// invoke `callValue` must propagate this unchanged so the
-    /// outer handler's frame-rewind happens correctly. The run
-    /// loop catches it and continues dispatch (PC + frame state
-    /// have already been adjusted by unwindThrow).
-    ControlTransferred,
-    /// A leaf native's leaf body refusing a receiver it could only
-    /// handle by running code (`nth` of a lazy seq): the call site
-    /// re-issues the call through the general path, which runs
-    /// `NativeFn.general` (VM.md §6). Never escapes a call site.
-    NeedsReentry,
-    /// V-operand resolve (or `var:load-var`) read a Var whose
-    /// `bound = false` — the Var was interned (e.g., by a
-    /// forward reference in another `defn`) but no `def` has
-    /// set its root yet. Per VM.md §13 `:unbound-var`.
-    /// Recoverable error (user can `def`
-    /// the var and retry).
     UnboundVar,
-    /// `binding` or `set!` on a Var not marked `^:dynamic`
-    /// (`:not-dynamic`).
     NotDynamic,
-    /// `set!` on a dynamic Var with no binding in force
-    /// (`:no-thread-binding`).
     NoThreadBinding,
-    /// A mutating op on an
-    /// atom (`swap!`/`reset!`/`compare-and-set!`/`swap-vals!`)
-    /// was attempted while ANOTHER mutating op on the same
-    /// atom is still in flight. The single-threaded VM cannot
-    /// retry a `swap!`-style CAS loop, so this is reported as a
-    /// catchable error instead of being silently allowed.
-    /// Mapped to `:atom-re-entry`. See ATOM.md §4.4.
     AtomReEntry,
-    /// A transient was used after `persistent!` froze it
-    /// (TRANSIENT.md §6).
     TransientUsedAfterPersistent,
-    /// Malformed UTF-8
-    /// byte sequence encountered during codepoint iteration of
-    /// a `.string` Value. Storage is byte-blob; the reader and
-    /// codec validate on construction, but a corrupt-codec or
-    /// fuzz path could produce one. Mapped to `:utf8-error`.
     Utf8Error,
-    /// Argument is the right kind but an invalid value for
-    /// the operation — e.g., empty delimiter for split, empty
-    /// match for replace. Distinct from KindMismatch (which is
-    /// for wrong-kind args). Mapped to `:invalid-argument`.
     InvalidArgument,
-    /// Generic I/O failure for
-    /// `slurp`/`spit`/`print`/`println`/`prn` — permissions,
-    /// disk full, write failure, vm.io == null, etc. Mapped to
-    /// `:io-error`.
     IoError,
-    /// Target path does not exist (slurp on a
-    /// missing file). Mapped to `:file-not-found`.
     FileNotFound,
-    /// Path argument is structurally invalid (empty
-    /// string, contains a NUL byte, etc.). Distinct from
-    /// `:io-error` because the issue is at the language boundary,
-    /// not in the filesystem. Mapped to `:invalid-path`.
     InvalidPath,
-    /// Record-introspection ops expected a record
-    /// receiver but got something else. Mapped to `:not-a-record`.
     NotARecord,
-    /// Protocol-fn dispatch could
-    /// not find an impl for the receiver's dispatch key (no
-    /// matching record / built-in kind impl, no Any default).
-    /// Mapped to `:no-protocol-impl`.
     NoProtocolImpl,
-    /// Tried to extend a protocol that does not
-    /// have a method with the given name. Mapped to
-    /// `:no-protocol-method`.
     NoProtocolMethod,
-    /// Recursion ran out of room: a call would push frame number
-    /// `VM.max_frames`, or a native re-entering the VM found the
-    /// native stack below the guard's limit (§13.1). Mapped to
-    /// `:stack-overflow`.
     StackOverflow,
+    // Control signals (§12). A throw no handler takes, its value in
+    // `VM.unhandled_throw`.
+    UncaughtThrow,
+    /// A native's throw was caught below it: frames and pc are at the
+    /// handler, and every native between returns this unchanged so the
+    /// loop resumes there.
+    ControlTransferred,
+    /// A leaf body refusing a receiver it could handle only by running
+    /// code: its call site re-issues the call through the general path
+    /// (§6). Never escapes a call site.
+    NeedsReentry,
 };
 
 // =============================================================================
-// Try / catch / throw machinery
+// Try / catch / throw (VM.md §12)
 // =============================================================================
 
-/// What kind of frame-bound exception handler this is.
-pub const HandlerKind = enum {
-    /// A `(try body (catch any x handler))` is active —
-    /// catch_pc + binding_slot are valid; throw routes here.
-    try_,
-    /// The catch body of a fired try is running. Keeps the
-    /// handler's bookkeeping (its `finally_pc`) for the catch
-    /// body's `try-exit` while making sure a throw from inside
-    /// the catch body is not caught by the same handler again.
-    cleanup,
-};
+/// `try_` while a `try` body runs; `cleanup` while its catch body runs,
+/// keeping its finally for the catch's `try-exit` and passing a throw
+/// from the catch body on.
+pub const HandlerKind = enum { try_, cleanup };
 
-/// Per-handler state stored on `VM.handlers`: one VM-wide stack
-/// keyed by `frame_index` rather than a list per frame. Frame
-/// indices stay valid across `frames.append` reallocations
-/// because frames only pop from the top.
+/// A handler on `VM.handlers`, one stack for the VM keyed by frame
+/// index, which stays valid since frames pop only from the top.
 pub const Handler = struct {
     kind: HandlerKind,
-    /// Index into `VM.frames`. Identifies which frame this
-    /// handler belongs to; on `ctrl:try-exit` the popped
-    /// handler's frame_index MUST match the current frame.
     frame_index: usize,
-    /// PC of the catch entry (valid only when kind == .try_).
-    /// Throw routes control here, after binding the thrown
-    /// value into `binding_slot`.
+    /// `try_` alone: where a throw goes, and the slot that takes it.
     catch_pc: u32,
-    /// Slot into which the thrown value is stored when the
-    /// catch fires. Valid only when kind == .try_.
     binding_slot: u12,
-    /// PC of the finally entry. null when the try has no finally
-    /// clause. Both .try_ and .cleanup handlers carry this so
-    /// unwind through either kind runs the finally.
     finally_pc: ?u32 = null,
-    /// `finally_stack.items.len` when the try was entered. Every
-    /// continuation above it belongs to a finally body running inside
-    /// this try, which a throw this handler takes abandons.
+    /// `finally_stack`'s length when the try was entered: the
+    /// continuations above it are of finally bodies inside the try,
+    /// which a throw it takes abandons.
     finally_depth: usize,
-    /// On the `.cleanup` a catch leaves: the origin of the throw the
-    /// catch is handling (`VM.origins`), so rethrowing it keeps it.
+    /// On a `cleanup`: the origin of the throw its catch handles
+    /// (`VM.origins`), which a rethrow keeps.
     origin: ?u32 = null,
 };
 
-/// Tagged continuation for finally bodies. When a try-exit / catch-exit / throw-unwind
-/// path needs to run a finally, it pushes a continuation onto
-/// `VM.finally_stack` describing what to do AFTER the finally
-/// finishes.
+/// What a finally body goes on to: the pc after its `try`, or a throw
+/// it resumes.
 pub const FinallyReason = union(enum) {
-    /// Finally was reached via normal/caught exit. Resume at
-    /// `post_pc` after the finally body completes.
     normal: u32,
-    /// Finally was reached during throw-unwind. The thrown
-    /// value must continue propagating after the finally
-    /// completes.
     throwing: Value,
 };
 
 pub const FinallyContinuation = struct {
-    /// Frame the originating handler belonged to. Used as a
-    /// sanity check at finally-exit time.
+    /// The frame of the handler, which `finally-exit` checks.
     frame_index: usize,
     reason: FinallyReason,
     /// With `.throwing`: the origin of the throw the finally resumes.
@@ -2141,7 +1525,7 @@ pub const Callback = struct {
     /// The calls `each`, `fold` or `foldRange` makes in one pass of the
     /// chain, in the callee's frame (VM.md §6, "Batched calls").
     const Batch = struct {
-        kind: Kind,
+        step: Step,
         /// The element running, from 0 (once the pass is over, how many
         /// ran), and how many the pass runs.
         i: usize,
@@ -2153,20 +1537,15 @@ pub const Callback = struct {
         /// `fold_range`: the element running, and the step to the next
         /// (0 for a repeat).
         x: Value = undefined,
-        step: i64 = 0,
+        by: i64 = 0,
 
-        const Kind = enum { each, fold, fold_range };
-
-        /// What a return does with the value, by kind and, for `each`,
-        /// by where the results go.
+        /// What a return does with the value: `each`'s by where the
+        /// results go.
         const Step = enum { each_slots, each_roots, fold, fold_range };
 
-        fn stepFor(b: *const Batch) Step {
-            return switch (b.kind) {
-                .each => if (b.out == .slots) .each_slots else .each_roots,
-                .fold => .fold,
-                .fold_range => .fold_range,
-            };
+        /// A fold's first element.
+        fn head(b: Batch) Value {
+            return if (b.step == .fold_range) b.x else b.items[0];
         }
     };
 
@@ -2185,13 +1564,6 @@ pub const Callback = struct {
                 .slots => |p| VM.storeWords(&p[i], v),
                 .roots => |base| vm.roots.items[base + i] = v,
             }
-        }
-
-        inline fn from(self: Out, i: usize) Out {
-            return switch (self) {
-                .slots => |p| .{ .slots = p + i },
-                .roots => |base| .{ .roots = base + i },
-            };
         }
     };
 
@@ -2226,7 +1598,7 @@ pub const Callback = struct {
         switch (self.mode) {
             .leaf => return self.callLeaf(asNativeFn(self.callee), if (by_value) &args else args),
             .lookup => if (lookupInPlace(self.callee, args[0], value_mod.nilValue())) |v| return v,
-            .closure => if (self.vm.frames.items.len == self.depth and self.vm.stack.items.len == self.base) {
+            .closure => if (self.ready()) {
                 // The arguments go where the window begins, past the
                 // stack's end, within the capacity the first call made,
                 // a word at a time, as the callee's handlers read them
@@ -2240,32 +1612,41 @@ pub const Callback = struct {
                 try self.vm.callPrepared(self);
                 return self.result.get();
             },
-            .unprepared => return self.prepare(if (by_value) &args else args),
+            .unprepared => return self.firstCall(if (by_value) &args else args),
             .general => {},
         }
-        return self.vm.callValue(self.callee, if (by_value) &args else args);
+        return self.vm.callGeneral(self.callee, if (by_value) &args else args);
+    }
+
+    /// The first call, out of line: a loop of calls keeps no test of
+    /// the mode but `callWith`'s switch.
+    fn firstCall(self: *Callback, args: []const Value) VmError!Value {
+        try self.prepare();
+        return self.callWith(args.len, args);
     }
 
     /// How many locals `callPrepared` nils in one run.
     const nil_run = 4;
 
-    /// The first call: choose the mode, then make the call.
-    fn prepare(self: *Callback, args: []const Value) VmError!Value {
+    /// Decide the mode before the first call, at the depth and stack
+    /// length every call from here finds: a leaf within its arity, a
+    /// keyword or symbol of one argument, a closure the count enters at
+    /// a fixed arity, whose frame is built here, or the general call.
+    fn prepare(self: *Callback) VmError!void {
         const vm = self.vm;
         self.mode = .general;
         switch (self.callee.kind()) {
             .native_fn => {
                 const native = asNativeFn(self.callee);
-                if (native.leaf and self.argc >= native.min_arity and self.argc <= (native.max_arity orelse self.argc)) self.mode = .leaf;
+                if (native.leaf and native.takes(self.argc)) self.mode = .leaf;
             },
             .keyword, .symbol => if (self.argc == 1) {
                 self.mode = .lookup;
             },
-            .function => closure: {
+            .function => {
                 const closure = VM.asClosure(self.callee);
-                // The member the count picks: every call has the count.
-                const routine = closure.routine.memberFor(self.argc) orelse break :closure;
-                if (routine.slot_count < self.argc) break :closure;
+                const routine = closure.routine.memberFor(self.argc) orelse return;
+                if (routine.slot_count < self.argc) return;
                 // Every later call starts at this depth of the native
                 // stack, so the guard's answer holds for them all
                 // (§13.1).
@@ -2273,15 +1654,12 @@ pub const Callback = struct {
                 const depth = vm.frames.items.len;
                 const base = vm.stack.items.len;
                 const window_end = base + routine.slot_count;
-                if (depth >= vm.max_frames) break :closure;
+                if (depth >= vm.max_frames) return;
                 vm.frames.ensureUnusedCapacity(vm.allocator, 1) catch return VmError.OutOfMemory;
                 // Room for the locals `callPrepared` nils four at once.
                 const reach = @max(window_end, base + self.argc + nil_run);
                 vm.stack.ensureTotalCapacity(vm.allocator, reach) catch return VmError.OutOfMemory;
-                if (VM.track_high_water) {
-                    vm.frame_high_water = @max(vm.frame_high_water, depth + 1);
-                    vm.stack_high_water = @max(vm.stack_high_water, window_end);
-                }
+                vm.noteHighWater(depth + 1, window_end);
                 self.depth = depth;
                 self.base = base;
                 self.locals = base + self.argc;
@@ -2289,31 +1667,17 @@ pub const Callback = struct {
                 self.window_end = window_end;
                 self.first = routine.code[0];
                 self.first_handler = VM.fast_table[VM.opIndex(self.first)];
-                self.frame = .{
-                    .routine = routine,
-                    .base_slot = @intCast(base),
-                    .entry_stack_len = @intCast(base),
-                    .upvalues = closure.upvalues,
-                    .closure = self.callee,
-                    .host_result = &self.result,
-                };
+                self.frame = VM.calleeFrame(self.callee, routine, base, base, .{ .host_result = &self.result });
                 self.mode = .closure;
             },
             else => {},
         }
-        return self.callWith(args.len, args);
     }
 
     /// A leaf native's call, in place while no cycle is due, else (or
-    /// when it asks to re-enter) `callValue`'s.
+    /// when it asks to re-enter) the general call.
     inline fn callLeaf(self: *Callback, native: *const NativeFn, args: []const Value) VmError!Value {
-        if (!self.vm.gcDue()) {
-            if (native.call(self.vm, args)) |r| {
-                countNative(native);
-                return r;
-            } else |err| if (err != VmError.NeedsReentry) return err;
-        }
-        return self.vm.callValue(self.callee, args);
+        return self.vm.callNativeLeaf(native, args, self.callee);
     }
 
     /// Whether a closure's call can take the prepared frame now: the
@@ -2333,89 +1697,65 @@ pub const Callback = struct {
     /// results, errors and rooting.
     pub fn each(self: *Callback, items: []const Value, out: Out) VmError!void {
         std.debug.assert(self.argc == 1);
-        var i: usize = 0;
-        if (self.mode == .unprepared and items.len > 0) {
-            out.put(self.vm, 0, try self.call1(items[0]));
-            i = 1;
-        }
-        if (i < items.len and self.ready()) {
-            self.batch = .{ .kind = .each, .i = 0, .n = items.len - i, .items = items.ptr + i, .out = out.from(i) };
-            VM.storeWords(&self.window()[0], items[i]);
+        if (items.len == 0) return;
+        if (self.mode == .unprepared) try self.prepare();
+        if (self.ready()) {
+            self.batch = .{ .step = if (out == .slots) .each_slots else .each_roots, .i = 0, .n = items.len, .items = items.ptr, .out = out };
+            VM.storeWords(&self.window()[0], items[0]);
             return self.vm.callBatch(self);
         }
-        // A leaf takes its argument where it lies, with no mode to
-        // test per element.
+        // A leaf takes its argument where it lies, the mode tested once.
         if (self.mode == .leaf) {
             const native = asNativeFn(self.callee);
-            while (i < items.len) : (i += 1) out.put(self.vm, i, try self.callLeaf(native, items[i..][0..1]));
-        } else while (i < items.len) : (i += 1) out.put(self.vm, i, try self.call1(items[i]));
+            for (items, 0..) |*x, i| out.put(self.vm, i, try self.callLeaf(native, x[0..1]));
+        } else for (items, 0..) |x, i| out.put(self.vm, i, try self.call1(x));
     }
 
     /// `acc = callee(acc, items[i])` for each element in turn, `argc`
     /// 2, as `each` makes the calls, stopping after a result that is a
     /// record, which may be `reduced`.
-    pub fn fold(self: *Callback, acc: Value, items: []const Value) VmError!Folded {
+    /// Inline: its one caller, `reduce`, keeps the loop of a leaf's
+    /// calls in its own frame.
+    pub inline fn fold(self: *Callback, acc: Value, items: []const Value) VmError!Folded {
+        return self.foldOver(acc, .{ .step = .fold, .i = 0, .n = items.len, .items = items.ptr }, .fold);
+    }
+
+    /// `fold` over the `n` fixnums from `x` by `by`, or over `n` times
+    /// `x` when `by` is 0: an unrealized range or repeat, whose elements
+    /// are computed, not read. The caller vouches that every element is
+    /// a fixnum when `by` is not 0.
+    pub fn foldRange(self: *Callback, acc: Value, x: Value, by: i64, n: usize) VmError!Folded {
+        return self.foldOver(acc, .{ .step = .fold_range, .i = 0, .n = n, .x = x, .by = by }, .fold_range);
+    }
+
+    inline fn foldOver(self: *Callback, acc: Value, batch: Batch, comptime step: Batch.Step) VmError!Folded {
         std.debug.assert(self.argc == 2);
-        var a = acc;
-        var i: usize = 0;
-        if (self.mode == .unprepared and items.len > 0) {
-            a = try self.call2(a, items[0]);
-            i = 1;
-            if (a.kind() == .record) return .{ .acc = a, .used = i };
-        }
-        if (i < items.len and self.ready()) {
-            self.batch = .{ .kind = .fold, .i = 0, .n = items.len - i, .items = items.ptr + i };
+        if (batch.n == 0) return .{ .acc = acc, .used = 0 };
+        if (self.mode == .unprepared) try self.prepare();
+        if (self.ready()) {
+            self.batch = batch;
             const w = self.window();
-            VM.storeWords(&w[0], a);
-            VM.storeWords(&w[1], items[i]);
+            VM.storeWords(&w[0], acc);
+            VM.storeWords(&w[1], batch.head());
             try self.vm.callBatch(self);
-            return .{ .acc = VM.loadWords(&self.result.value), .used = i + self.batch.i };
+            return .{ .acc = VM.loadWords(&self.result.value), .used = self.batch.i };
         }
         const leaf: ?*const NativeFn = if (self.mode == .leaf) asNativeFn(self.callee) else null;
-        while (i < items.len) {
-            a = if (leaf) |native| try self.callLeaf(native, &.{ a, items[i] }) else try self.call2(a, items[i]);
-            i += 1;
-            if (a.kind() == .record) break;
-        }
-        return .{ .acc = a, .used = i };
-    }
-
-    /// `fold` over the `n` fixnums from `x` by `step`, or over `n`
-    /// times `x` when `step` is 0: an unrealized range or repeat,
-    /// whose elements are computed, not read. The caller vouches that
-    /// every element is a fixnum when `step` is not 0.
-    pub fn foldRange(self: *Callback, acc: Value, x: Value, step: i64, n: usize) VmError!Folded {
-        std.debug.assert(self.argc == 2);
         var a = acc;
-        var e = x;
+        var e = batch.head();
         var i: usize = 0;
-        if (self.mode == .unprepared and n > 0) {
-            a = try self.call2(a, e);
-            i = 1;
-            if (a.kind() == .record or i == n) return .{ .acc = a, .used = i };
-            e = rangeNext(e, step);
-        }
-        if (i < n and self.ready()) {
-            self.batch = .{ .kind = .fold_range, .i = 0, .n = n - i, .x = e, .step = step };
-            const w = self.window();
-            VM.storeWords(&w[0], a);
-            VM.storeWords(&w[1], e);
-            try self.vm.callBatch(self);
-            return .{ .acc = VM.loadWords(&self.result.value), .used = i + self.batch.i };
-        }
-        while (i < n) {
-            a = try self.call2(a, e);
+        while (true) {
+            a = if (leaf) |native| try self.callLeaf(native, &.{ a, e }) else try self.call2(a, e);
             i += 1;
-            if (a.kind() == .record or i == n) break;
-            e = rangeNext(e, step);
+            if (a.kind() == .record or i == batch.n) return .{ .acc = a, .used = i };
+            e = if (step == .fold) batch.items[i] else rangeNext(e, batch.by);
         }
-        return .{ .acc = a, .used = i };
     }
 
-    /// The element after `x` in a range of step `step`: a fixnum's
+    /// The element after `x` in a range of step `by`: a fixnum's
     /// payload is its value, and a repeat's step is 0.
-    inline fn rangeNext(x: Value, step: i64) Value {
-        return .{ .tag = x.tag, .payload = x.payload +% @as(u64, @bitCast(step)) };
+    inline fn rangeNext(x: Value, by: i64) Value {
+        return .{ .tag = x.tag, .payload = x.payload +% @as(u64, @bitCast(by)) };
     }
 };
 
@@ -2450,228 +1790,122 @@ pub const RootScope = struct {
 
 pub const VM = struct {
     allocator: std.mem.Allocator,
-    /// Backing slot storage shared across all frames. Per-frame
-    /// access uses `frame.base_slot + slot_index` indirection.
+    /// The backing stack every frame windows (§7).
     stack: std.ArrayList(Value) = .empty,
-    /// Frame chain. The top-level routine is frame 0;
-    /// `call:call` appends; `call:return` pops.
+    /// The frame chain, the top-level frame at 0.
     frames: std.ArrayList(Frame) = .empty,
-    /// Runtime allocation arena for `Var` and `Namespace` objects
-    /// and everything else that lives exactly as long as the VM
-    /// (VM-owned allocation outside the collected heap). Freed
-    /// wholesale in `deinit`.
+    /// What lives as long as the VM outside the heap: Vars, namespaces.
     runtime_arena: std.heap.ArenaAllocator,
-    /// The collected heap: every runtime value, closure and cell.
-    /// Backed by `allocator`, so a sweep returns memory; freed
-    /// block by block in `deinit`. Initialized lazily on first use
-    /// so programs that never construct a value pay nothing.
+    /// The collected heap (§9), made on first use.
     heap: ?heap_mod.Heap = null,
-    /// A heap this VM allocates on instead of its own: the
-    /// compile-time sub-VMs (the expander's macro calls, the `defmacro`
-    /// evaluation) share the heap of the VM whose Vars they read
-    /// and write, so a value a macro stores into a Var outlives the
-    /// sub-VM. Not owned; never freed here. A VM with a borrowed
-    /// heap never collects (`gc_enabled`): it cannot enumerate the
-    /// owner's roots.
+    /// The owner's heap a macro's sub-VM allocates on (§9.1), so what a
+    /// macro stores in a Var outlives it; a VM over one never collects.
     borrowed_heap: ?*heap_mod.Heap = null,
-    /// Whether this VM runs the collector at its safe points
-    /// (VM.md §9). False for the compile-time sub-VMs.
     gc_enabled: bool = true,
-    /// The trigger (GC.md §7): a cycle is due at a safe point once
-    /// `heap.allocated_since_collect` reaches `gc_next_at`, which
-    /// each cycle resets to the larger of `gc_threshold` and
-    /// `gc_growth_percent` percent of the bytes that survived. The
-    /// defaults come from `GcPolicy`; `NEXIS_GC_STRESS` in the
-    /// environment selects `GcPolicy.stress` for every VM.
+    /// The trigger (GC.md §7): a cycle is due once the heap has
+    /// allocated `gc_next_at` bytes since the last, which each cycle
+    /// sets from `gc_threshold` and `gc_growth_percent` of what
+    /// survived (`GcPolicy`).
     gc_threshold: usize = GcPolicy.default.threshold,
     gc_growth_percent: usize = GcPolicy.default.growth_percent,
     gc_next_at: usize = GcPolicy.default.threshold,
-    /// Cycles run so far; tests read it to prove a collection
-    /// happened.
     gc_cycles: usize = 0,
-    /// While nonzero, no cycle is due: a lazy block is being realized
-    /// in isolation under `=` or `hash`, whose callers hold unrooted
-    /// nodes (docs/LAZY.md §6).
+    /// While nonzero no cycle is due: a lazy block is being realized in
+    /// isolation under `=` or `hash` (LAZY.md §6).
     gc_hold: u32 = 0,
-    /// The failure of an isolated realization, kept until the native
-    /// call or opcode that compared or hashed raises it
-    /// (`checkDeepData`), or drops it when it fails for another reason
-    /// (`dropSpoils`); a root while it is kept. The first failure
-    /// wins, and later isolated realizations fail at once.
+    /// The failure of an isolated realization, a root until the call
+    /// that compared or hashed raises it (`checkDeepData`) or drops it
+    /// (`dropSpoils`); the first wins (LAZY.md §6).
     parked_realize: ?ParkedRealize = null,
-    /// The spoil count when `parked_realize` was parked: a call whose
-    /// snapshot is at most this parked it.
+    /// The spoil count it was parked at.
     parked_at: u64 = 0,
-    /// The collector's gray worklist, kept between cycles so each
-    /// cycle reuses the capacity the last one grew (GC.md §4).
+    /// The collector's gray worklist, its capacity kept between cycles
+    /// (GC.md §4).
     gc_gray: std.ArrayList(*heap_mod.HeapHeader) = .empty,
-    /// The routines whose constants this cycle has marked, so the
-    /// many closures over one large routine walk its pool once
-    /// (`markRoutineConsts`); emptied at each cycle's start, its
-    /// capacity kept.
+    /// The large routines whose constants this cycle has marked
+    /// (`markClauseConsts`).
     gc_routines: std.AutoHashMapUnmanaged(*const Routine, void) = .empty,
-    /// The root stack (GC.md §3): values a native holds in Zig
-    /// locals across a call back into the VM. `callValue` pushes a
-    /// native callee's arguments for the call's duration; a native
-    /// that accumulates results across callbacks pushes them
-    /// through a `RootScope`.
+    /// The root stack (GC.md §3, §11.5): what natives hold across a
+    /// call back into the VM (`RootScope`).
     roots: std.ArrayList(Value) = .empty,
-    /// The dynamic-binding stack (VM.md §6.5): one `DynSave` per
-    /// Var a `binding` frame rebound, holding what the Var's thread
-    /// binding was before, and one `dyn_frames` entry per frame
-    /// with the index its saves start at.
+    /// The dynamic bindings (§6.5): the binding each rebinding replaced,
+    /// and where each `binding` frame's saves start.
     dyn_saves: std.ArrayList(DynSave) = .empty,
     dyn_frames: std.ArrayList(u32) = .empty,
-    /// Single-namespace slot for Vars. Lazy-initialized on first
-    /// access (no cost for programs that don't use Vars). Var
-    /// structs allocate from `runtime_arena`; the HashMap's
-    /// internal storage uses `allocator`. Used only when no
-    /// `registry` exists (ad-hoc test harnesses).
+    /// The one namespace of a VM with no registry, built by hand.
     namespace: ?Namespace = null,
-    /// Multi-namespace registry. When non-null, the
-    /// CURRENT namespace is `registry.current` (which may differ
-    /// across REPL evaluations or file forms via `(ns NAME)`).
-    /// `ensureNamespace()` returns `registry.current` when the
-    /// registry exists; otherwise it falls back to the
-    /// single `namespace` field.
     registry: ?NamespaceRegistry = null,
     /// Shuts down every db connection on the VM's heap at teardown
-    /// (`db.shutdownHeap`); set by the first `db/open`, so vm.zig
+    /// (`db.shutdownHeap`); set by the first `db/open`, so this file
     /// needs no import of db.zig.
     db_close_callback: ?*const fn (*heap_mod.Heap) void = null,
-    /// Open Nextomic connections (`nextomic/connect` appends; VM
-    /// teardown destroys each through `nextomic_close_callback`). The
-    /// nextomic natives own the cast, so vm.zig needs no import.
+    /// Open Nextomic connections and the natives' Nextomic state,
+    /// closed at `deinit` through the callbacks their natives set; the
+    /// natives own the casts, so this file needs no import.
     nextomic_connections: std.ArrayList(*anyopaque) = .empty,
     nextomic_close_callback: ?*const fn (*anyopaque) void = null,
-    /// The nextomic natives' per-VM state (parsed-query caches and
-    /// finished `with` scopes), created on first use, marked by every
-    /// collection through `nextomic_query_mark` and destroyed at
-    /// teardown through `nextomic_query_close`. The natives own the cast.
+    /// Parsed-query caches and finished `with` scopes, marked by every
+    /// cycle through `nextomic_query_mark`.
     nextomic_query_state: ?*anyopaque = null,
     nextomic_query_close: ?*const fn (*anyopaque) void = null,
     nextomic_query_mark: ?*const fn (*anyopaque, *gc_mod.Collector) void = null,
-    /// The `std.Io` handle for the natives that reach the
-    /// outside world: printing, `slurp`/`spit`, reading stdin, and
-    /// opening a store (which creates the path's parent
-    /// directories; emdb does not). Set by the CLI's `Runtime.init`
-    /// right after `VM.init`; left null in ad-hoc test harnesses,
-    /// where printing and reading stdin raise `:io-error` and file
-    /// access falls back to the process-wide single-threaded I/O.
+    /// The natives' way to the outside world, which the CLI sets; null
+    /// in a test harness, where printing raises `:io-error`.
     io: ?std.Io = null,
-
-    /// The VM whose registries this one uses instead of its own
-    /// (§9.1): a macro's sub-VM runs against the namespaces, record
-    /// types, protocols and store connections of the VM it compiles
-    /// for, so an id or a name means the same in both. Always a VM
-    /// with no owner of its own; it outlives this one.
+    /// The VM whose registries a macro's sub-VM uses (§9.1); it has no
+    /// owner of its own and outlives this one.
     owner: ?*VM = null,
-
-    /// Per-VM record-type registry, empty until the first
-    /// `registerRecordType`. Each
-    /// `defrecord` allocates a new RecordTypeEntry; the
-    /// returned dense u32 id is used as `RecordBody.type_id`.
-    /// PROTOCOLS.md §3.
+    /// The `defrecord` and `defprotocol` registries (PROTOCOLS.md §3),
+    /// by dense id.
     record_registry: std.ArrayList(RecordTypeEntry) = .empty,
-
-    /// Per-VM protocol registry.
-    /// Each `defprotocol` adds an entry; `extend-protocol` /
-    /// inline `defrecord` impls mutate `methods[*].impls`. See
-    /// PROTOCOLS.md §3.
     protocol_registry: std.ArrayList(ProtocolEntry) = .empty,
-    /// Global try-handler stack.
-    /// Push on `ctrl:try-enter`, pop on `ctrl:try-exit`,
-    /// walk on `ctrl:throw`. Each Handler is keyed by
-    /// `frame_index` so throw-unwind can identify which frame
-    /// it belongs to.
+    /// The handlers and pending finally continuations (§12).
     handlers: std.ArrayList(Handler) = .empty,
-    /// Finally continuation stack. Pushed by
-    /// try-exit (when the popped handler has a finally) and by
-    /// throw-unwind (when a finally must run before the throw
-    /// continues). Popped by finally-exit.
     finally_stack: std.ArrayList(FinallyContinuation) = .empty,
-    /// The payload of the throw that halted the VM with
-    /// `VmError.UncaughtThrow`; the host prints it alongside the
-    /// error.
+    /// The value of the throw that left a run as `UncaughtThrow`.
     unhandled_throw: ?Value = null,
-    /// The frame chain at the moment an error left `run`, innermost
-    /// first; each entry names the routine and the instruction it was
-    /// executing. Rebuilt on every failing run.
+    /// Where the last failing run failed (§13), and with what: a host
+    /// that learns of a failure indirectly (a `require` while a form
+    /// compiled) names it from here.
     error_trace: std.ArrayList(TraceFrame) = .empty,
-    /// The error `error_trace` was recorded for, so a host that
-    /// learns of the failure indirectly (a `require` whose file
-    /// failed while a form was being compiled) can still name it.
     traced_error: ?VmError = null,
-    /// Shared Interner for symbol/keyword Value construction,
-    /// initialized on first access. Backed by `self.allocator`
-    /// (not `runtime_arena`) because its hash maps need realloc
-    /// and free.
     interner: ?intern_mod.Interner = null,
-    /// An interner this VM reads and writes instead of its own: a
-    /// macro sub-VM shares the compile-time interner so the keyword
-    /// and symbol ids in its arguments resolve. Not owned; never
-    /// freed here.
+    /// The compile-time interner a macro's sub-VM shares (§9.1).
     borrowed_interner: ?*intern_mod.Interner = null,
-    /// Compile-time services a native reaches at run time
-    /// (`macroexpand-1`, `read-string`). Installed by whoever boots
-    /// the runtime around this VM; a bare VM has none and those
-    /// natives throw `:no-compiler`.
+    /// What `eval`, `read-string` and `macroexpand-1` reach; with none
+    /// they throw `:no-compiler`.
     compiler_hooks: ?CompilerHooks = null,
-    /// The record type `reduced` wraps a value in, registered on
-    /// first use (`ensureReducedType`).
     reduced_type_id: ?u32 = null,
-    /// Where the top-level `call:return` stores the returned Value on
-    /// halt.
+    /// The value the top-level frame returned, and whether it has.
     result: Value = value_mod.nilValue(),
     halted: bool = false,
-    /// The `depth` of the innermost `loop` running: the dispatch
-    /// chain leaves when the frame chain is back to it (`running`).
+    /// The depth of the innermost `loop` running (`running`).
     loop_depth: usize = 0,
-    /// High-water marks for the backing stack and frame stack, kept
-    /// by builds with runtime safety (`track_high_water`): the tests
-    /// read them to assert that long-running iteration runs in bounded
-    /// stack space (VM.md §11 constant-stack guarantee). Updated
-    /// wherever a frame is pushed, so comparing pre/post run-loop
-    /// values gives a true maximum, not just the final size (a buggy
-    /// implementation could grow and shrink, leaving final size equal
-    /// but high-water inflated). A release build leaves them at
-    /// their start and keeps the stores off every call.
+    /// The most frames and stack slots a run has had, kept in safe
+    /// builds alone (`track_high_water`), where tests prove a `recur`
+    /// loop runs in constant space (§11).
     stack_high_water: usize = 0,
     frame_high_water: usize = 0,
-    /// The deepest frame chain a program may build. A call that
-    /// would push past it raises `StackOverflow`, so runaway
-    /// recursion is a catchable `:stack-overflow` instead of memory
-    /// growing until the process dies (§13).
+    /// The deepest frame chain and the most run loops nested on the
+    /// native stack before `StackOverflow` (§13, §13.1).
     max_frames: usize = default_max_frames,
-    /// The most run loops that may nest on the native stack, one per
-    /// call back into the VM from a native (`apply`, `map`, a
-    /// protocol impl) that is still running. A call that would nest
-    /// one more raises `StackOverflow` before the recursion has
-    /// committed much native stack (§13.1).
     max_nested_runs: usize = default_max_nested_runs,
-    /// The run loops nested now.
     nested_runs: usize = 0,
-    /// What the most recent runtime error was about, for the host's
-    /// report: `f takes 1 argument, got 0`, `+ expects numbers, got
-    /// a string`. Set where the VM raises the error, empty when the
-    /// raise site has nothing to add (natives raise without one);
-    /// cleared when a run starts and when a handler takes the error
-    /// as a value (its `:message`), so it never describes an earlier
-    /// error.
+    /// The last runtime error's sentence (§13), in `detail_buf`; empty
+    /// when the raise site had none, cleared when a run starts and when
+    /// a handler takes the error.
     error_detail: []const u8 = "",
     detail_buf: [160]u8 = undefined,
-    /// The last place an error value was located at (`placeOf`).
+    /// The last place `placeOf` found.
     place_cache: struct { text: []const u8 = "", pos: u32 = 0, place: SourceInfo.LineCol = .{ .line = 0, .col = 0 } } = .{},
-    /// The origins of the throws handlers are holding, innermost last;
-    /// a `.cleanup` handler or a `.throwing` continuation names its
-    /// entry by index. Entries no live record names are dropped before
-    /// the next one is pushed.
+    /// The origins of the throws handlers hold (§12), by index.
     origins: std.ArrayList(ThrowOrigin) = .empty,
-    /// The origin of the throw that left `run` uncaught, for
-    /// `recordErrorTrace`.
+    /// The origin of the throw that left a run uncaught.
     escaped_origin: ?u32 = null,
+    /// `ErrorKey`s as keywords, interned on first use (`errorKey`).
+    error_keys: [6]?Value = @splat(null),
 
-    pub const track_high_water = std.debug.runtime_safety;
+    pub const track_high_water = builtin.optimize.runtimeSafety();
     pub const default_max_frames = 1 << 20;
     pub const default_max_nested_runs = 100_000;
     /// A trace keeps this many innermost frames and
@@ -2803,6 +2037,10 @@ pub const VM = struct {
                 self.allocator,
                 self.runtime_arena.allocator(),
             );
+            errdefer {
+                self.registry.?.deinit();
+                self.registry = null;
+            }
             // Populate AFTER storage so back-pointers are stable.
             try self.registry.?.setupDefaults();
             // Make the VM heap reachable from the registry so
@@ -3180,13 +2418,8 @@ pub const VM = struct {
         impl: Value,
     ) !void {
         const proto = self.protocolById(protocol_id) orelse return error.NoProtocolMethod;
-        for (proto.methods.items) |*method| {
-            if (method.name_id == method_name_id) {
-                try method.impls.put(self.home().allocator, key.canonical(), impl);
-                return;
-            }
-        }
-        return error.NoProtocolMethod;
+        const method = proto.method(method_name_id) orelse return error.NoProtocolMethod;
+        try method.impls.put(self.home().allocator, key.canonical(), impl);
     }
 
     /// Call the protocol fn `callee` with `args`: find the impl for
@@ -3201,16 +2434,7 @@ pub const VM = struct {
         const protocol_id = protocol_mod.protocolFnProtocolId(callee);
         const method_name_id = protocol_mod.protocolFnMethodNameId(callee);
         const proto = self.protocolById(protocol_id) orelse return VmError.NoProtocolImpl;
-
-        // Find the method by name_id.
-        var method_ptr: ?*ProtocolMethod = null;
-        for (proto.methods.items) |*m| {
-            if (m.name_id == method_name_id) {
-                method_ptr = m;
-                break;
-            }
-        }
-        const method = method_ptr orelse return VmError.NoProtocolMethod;
+        const method = proto.method(method_name_id) orelse return VmError.NoProtocolMethod;
         if (args.len == 0) return self.arityError(method.name, 1, null, 0);
 
         // Look up impl by dispatch key (receiver is args[0]).
@@ -3259,42 +2483,37 @@ pub const VM = struct {
         return @constCast(body.upvalues);
     }
 
-    /// Call `callee` with `args` from host code running inside the
-    /// VM: how natives (`map`, `reduce`, `apply`, `swap!`, ...) call
-    /// the functions they are given. Any callable works: a closure,
-    /// a native, a protocol fn, a keyword, symbol or collection used
-    /// as a lookup.
-    ///
-    /// **Args lifetime**: `args` is borrowed for the duration of the
-    /// call and must not point into `vm.stack`.
-    ///
-    /// **Throw propagation**: if the callee throws and no handler
-    /// inside the callee catches it, control transfers to a handler
-    /// installed below the `callValue` entry point, and `callValue`
-    /// returns `VmError.ControlTransferred`, an internal signal the
-    /// calling native must propagate unchanged. The run loop beneath
-    /// catches it and continues dispatch (frames and pc already
-    /// adjusted by `unwindThrow`).
-    ///
-    /// **Rooting**: a closure receives `args` in its own slots; any
-    /// other callee's `args` are pushed on the root stack for the
-    /// call, so a native reached this way holds rooted arguments
-    /// exactly as one reached by `call:call` holds them in the
-    /// caller's slots. Values a native derives and keeps across a
-    /// nested `callValue` are its own to root (`RootScope`; GC.md §11.5).
+    /// Call any callable with `args` from a native (VM.md §6, "Native
+    /// re-entry"). `args`, which must not point into `vm.stack`, are
+    /// rooted for the call: in a closure's window, else on the root
+    /// stack; what the native keeps across the call is its own to root
+    /// (GC.md §11.5). A throw caught below the call is
+    /// `ControlTransferred`, which the native returns unchanged.
     pub fn callValue(self: *VM, callee: Value, args: []const Value) VmError!Value {
         if (callee.kind() == .native_fn) {
             const native = asNativeFn(callee);
-            // A leaf allocates and cannot collect, so a native calling
-            // one per element takes the rooted path below whenever a
-            // cycle is due.
-            if (native.leaf and args.len >= native.min_arity and args.len <= (native.max_arity orelse args.len) and !self.gcDue()) {
-                if (native.call(self, args)) |r| {
-                    countNative(native);
-                    return r;
-                } else |err| if (err != VmError.NeedsReentry) return err;
-            }
+            if (native.leaf and native.takes(args.len)) return self.callNativeLeaf(native, args, callee);
         }
+        return self.callGeneral(callee, args);
+    }
+
+    /// A leaf's call on `args` as they lie, unrooted, while no cycle is
+    /// due (§6): once one is, since a leaf allocates and cannot collect,
+    /// and when the leaf body refuses the receiver (`NeedsReentry`), the
+    /// call goes the general way, rooted, past a safe point.
+    inline fn callNativeLeaf(self: *VM, native: *const NativeFn, args: []const Value, callee: Value) VmError!Value {
+        if (!self.gcDue()) {
+            if (native.call(self, args)) |r| {
+                countNative(native);
+                return r;
+            } else |err| if (err != VmError.NeedsReentry) return err;
+        }
+        return self.callGeneral(callee, args);
+    }
+
+    /// `callValue` past its leaf call: a closure entered and run by the
+    /// loop, anything else called with its arguments rooted.
+    fn callGeneral(self: *VM, callee: Value, args: []const Value) VmError!Value {
         try self.checkNesting();
         if (callee.kind() != .function) {
             const scope = self.rootScope();
@@ -3345,8 +2564,9 @@ pub const VM = struct {
     /// would under `loop`. The loop's first pass is entered here at
     /// the callee's first instruction, after the safe point `loop`'s
     /// entry is: the frame is the one it would run, so the pass needs
-    /// no test, and a pass that ends without an error has returned.
-    /// Only an error goes on to the loop, which takes it as its own
+    /// no test. A pass that ends without an error has returned, or a
+    /// throw went past the frame, which leaves the cell's `done` unset;
+    /// only an error goes on to the loop, which takes it as its own
     /// pass would. The value is read from the cell by the caller, a
     /// word at a time as the return wrote it.
     fn callPrepared(self: *VM, cb: *Callback) VmError!void {
@@ -3387,7 +2607,7 @@ pub const VM = struct {
     /// the return of the one before (`batchNext`). Without a return of
     /// the last, a throw went past the native.
     fn callBatch(self: *VM, cb: *Callback) VmError!void {
-        cb.result.step = switch (cb.batch.stepFor()) {
+        cb.result.step = switch (cb.batch.step) {
             inline else => |step| batchNext(step),
         };
         defer cb.result.step = null;
@@ -3406,7 +2626,7 @@ pub const VM = struct {
     inline fn batchStep(self: *VM, frame: *Frame, hr: *HostCallResult, comptime step: Callback.Batch.Step) bool {
         const cb: *Callback = @fieldParentPtr("result", hr);
         const b = &cb.batch;
-        std.debug.assert(b.stepFor() == step and self.frames.items.len == cb.depth + 1 and frame == &self.frames.items[cb.depth]);
+        std.debug.assert(b.step == step and self.frames.items.len == cb.depth + 1 and frame == &self.frames.items[cb.depth]);
         std.debug.assert(frame.routine == cb.frame.routine and frame.base_slot == cb.frame.base_slot and frame.entry_stack_len == cb.frame.entry_stack_len);
         // The value may sit in the window's slots, which the next
         // element's arguments overwrite.
@@ -3427,7 +2647,7 @@ pub const VM = struct {
                 storeWords(&w[1], b.items[i]);
             },
             .fold_range => {
-                b.x = Callback.rangeNext(b.x, b.step);
+                b.x = Callback.rangeNext(b.x, b.by);
                 storeWords(&w[0], r);
                 storeWords(&w[1], b.x);
             },
@@ -3450,10 +2670,7 @@ pub const VM = struct {
         const result = switch (callee.kind()) {
             .native_fn => blk: {
                 const native = asNativeFn(callee);
-                const max: ?usize = if (native.max_arity) |m| m else null;
-                if (args.len < native.min_arity or args.len > (max orelse args.len)) {
-                    return self.arityError(native.name, native.min_arity, max, args.len);
-                }
+                if (!native.takes(args.len)) return self.arityError(native.name, native.min_arity, if (native.max_arity) |m| m else null, args.len);
                 countNative(native);
                 break :blk try (native.general orelse native.call)(self, args);
             },
@@ -3525,7 +2742,10 @@ pub const VM = struct {
     /// cycle runs while the body does, and its throw is caught by the
     /// barrier `nexis.core/realize-caught`, a closure, and parked with
     /// any error the barrier cannot catch. Null on a failure, at once
-    /// while one is parked.
+    /// while one is parked. The barrier's answer is checked, not
+    /// trusted, since a program can rebind its Var: `[false thrown]`
+    /// parks the throw, else the seq is the block's own once it is
+    /// realized, and anything else is `KindMismatch`.
     fn realizeIsolated(ctx: *anyopaque, lz: Value) ?Value {
         const self: *VM = @ptrCast(@alignCast(ctx));
         if (self.parked_realize != null) return null;
@@ -3537,9 +2757,11 @@ pub const VM = struct {
         self.gc_hold += 1;
         defer self.gc_hold -= 1;
         const r = self.callValue(barrier, &.{lz}) catch |err| return self.park(.{ .err = err });
-        // `[true seq]` or `[false thrown]`.
-        if (vector_mod.nth(r, 0).isTruthy()) return vector_mod.nth(r, 1);
-        return self.park(.{ .thrown = vector_mod.nth(r, 1) });
+        if (r.kind() == .persistent_vector and vector_mod.count(r) == 2 and vector_mod.nth(r, 0).isFalsy()) {
+            return self.park(.{ .thrown = vector_mod.nth(r, 1) });
+        }
+        if (lazy_mod.state(lz) == .realized) return lazy_mod.result(lz);
+        return self.park(.{ .err = VmError.KindMismatch });
     }
 
     /// Park `failure`, which the caller counts as a spoil next.
@@ -3629,18 +2851,30 @@ pub const VM = struct {
         // `callValue` and ends at the window.
         const extent = @max(entry_stack_len, window_end);
         if (self.stack.items.len > extent) self.stack.shrinkRetainingCapacity(extent);
-        if (track_high_water) self.stack_high_water = @max(self.stack_high_water, self.stack.items.len);
+        self.frames.appendAssumeCapacity(calleeFrame(callee, routine, base, entry_stack_len, link));
+        self.noteHighWater(self.frames.items.len, self.stack.items.len);
+    }
 
-        self.frames.appendAssumeCapacity(.{
+    /// The frame of a call of the closure `callee` entering `routine`
+    /// with its window at `base`.
+    inline fn calleeFrame(callee: Value, routine: *const Routine, base: usize, entry_stack_len: usize, link: Link) Frame {
+        return .{
             .routine = routine,
             .base_slot = @intCast(base),
             .entry_stack_len = @intCast(entry_stack_len),
             .return_dst = link.return_dst,
-            .upvalues = closure.upvalues,
+            .upvalues = asClosure(callee).upvalues,
             .closure = callee,
             .host_result = link.host_result,
-        });
-        if (track_high_water) self.frame_high_water = @max(self.frame_high_water, self.frames.items.len);
+        };
+    }
+
+    /// The high-water marks (§11) past a push to `frames` frames and a
+    /// stack `stack` long, in builds that keep them.
+    inline fn noteHighWater(self: *VM, frames: usize, stack: usize) void {
+        if (!track_high_water) return;
+        self.frame_high_water = @max(self.frame_high_water, frames);
+        self.stack_high_water = @max(self.stack_high_water, stack);
     }
 
     /// `enterClosure` for the common call, a closure called with a
@@ -3660,7 +2894,6 @@ pub const VM = struct {
     /// `argc` arguments, the fixed arity of `routine`, the member of its
     /// table it enters.
     inline fn pushDirect(self: *VM, callee: Value, routine: *const Routine, base: usize, argc: usize, link: Link) ?*Frame {
-        const closure = asClosure(callee);
         const depth = self.frames.items.len;
         if (depth >= self.max_frames or depth == self.frames.capacity) return null;
         const args_end = base + argc;
@@ -3670,20 +2903,9 @@ pub const VM = struct {
         if (window_end > entry_stack_len) self.stack.items.len = window_end;
         nilSlots(self.stack.items[args_end..window_end]);
         self.frames.items.len = depth + 1;
-        if (track_high_water) {
-            self.stack_high_water = @max(self.stack_high_water, self.stack.items.len);
-            self.frame_high_water = @max(self.frame_high_water, depth + 1);
-        }
+        self.noteHighWater(depth + 1, self.stack.items.len);
         const frame = &self.frames.items[depth];
-        frame.* = .{
-            .routine = routine,
-            .base_slot = @intCast(base),
-            .entry_stack_len = @intCast(entry_stack_len),
-            .return_dst = link.return_dst,
-            .upvalues = closure.upvalues,
-            .closure = callee,
-            .host_result = link.host_result,
-        };
+        frame.* = calleeFrame(callee, routine, base, entry_stack_len, link);
         return frame;
     }
 
@@ -3835,26 +3057,9 @@ pub const VM = struct {
         return &self.frames.items[self.frames.items.len - 1];
     }
 
-    /// Resolve a slot operand to a pointer into the backing stack.
-    /// Returns `OperandOutOfRange` if the slot index exceeds the
-    /// current frame's `slot_count`. **Single-shot use only**: the
-    /// returned pointer is invalidated by any `stack.append` /
-    /// `stack.appendNTimes`.
-    ///
-    /// The bound is the frame's `slot_count`, which catches bad
-    /// bytecode: call:call produces overlapping frame windows where
-    /// `stack.items.len > base_slot + slot_count` for the caller even
-    /// after the callee has been popped, so the logical bound is what
-    /// defines a frame's visible slot range. That the stack covers
-    /// the current frame's window is the frame discipline's invariant
-    /// (§7), asserted, not tested.
-    fn slotPtr(self: *VM, slot_index: u12) VmError!*Value {
-        return self.slotPtrIn(self.currentFrame(), slot_index);
-    }
-
-    /// `slotPtr` against `frame`, the current frame a caller has
-    /// already fetched: the hot handlers resolve every operand
-    /// through one frame pointer instead of re-deriving it.
+    /// Slot `slot_index` of `frame`, `OperandOutOfRange` past the
+    /// frame's `slot_count`, which bounds what the frame sees of the
+    /// stack it shares (§7). One-shot: growing the stack moves it.
     inline fn slotPtrIn(self: *VM, frame: *const Frame, slot_index: u12) VmError!*Value {
         if (slot_index >= frame.routine.slot_count) return VmError.OperandOutOfRange;
         return self.slotAt(frame, slot_index);
@@ -3868,21 +3073,8 @@ pub const VM = struct {
         return &self.stack.items.ptr[absolute];
     }
 
-    /// Resolve an operand to a `Value` (read side).
-    ///
-    /// For `.upvalue` operands:
-    /// `U` is the **cell-contents** operand kind. `resolve(u:N)`
-    /// reads the current frame's `upvalues[N]` (a `*UpvalCell`),
-    /// validates it's `initialized = true`, and returns the
-    /// cell's value. Closure construction needs RAW cell pointers
-    /// (not contents) and does NOT go through `resolve()` — it
-    /// reads `frame.upvalues[u]` directly via a dedicated path
-    /// in `execClosureMake`. Do not conflate the two.
-    fn resolve(self: *VM, op: Operand) VmError!Value {
-        return self.resolveIn(self.currentFrame(), op);
-    }
-
-    /// `resolve` against `frame`, the current frame.
+    /// The value operand `op` reads in `frame` (VM.md §4): a `u` operand
+    /// reads its cell's contents, never the cell.
     inline fn resolveIn(self: *VM, frame: *const Frame, op: Operand) VmError!Value {
         var tmp: Value = undefined;
         return (try self.operandPtr(frame, op, &tmp)).*;
@@ -3950,7 +3142,7 @@ pub const VM = struct {
     /// later from the 16-byte one, so a value whose reader is a handler
     /// on the dispatch's chain (a callee, a return) is stored a word at
     /// a time (§8).
-    const wide_stores = builtin.cpu.arch == .x86_64;
+    const wide_stores = builtin.target.cpu.arch == .x86_64;
 
     /// `storeWords`, as one 16-byte store on x86-64 (`wide_stores`).
     inline fn storeWide(dst: *Value, v: Value) void {
@@ -3989,8 +3181,9 @@ pub const VM = struct {
         @memcpy(dst, src);
     }
 
-    /// `copyRun` of key, value pairs, each stored as one 32-byte entry
-    /// on x86-64, the width a map's constructor reads it.
+    /// `copyRun` of key, value pairs, each stored as one 32-byte vector
+    /// on x86-64, the width a map's constructor reads it (two 16-byte
+    /// stores on a target without AVX, the release's `x86_64_v2`).
     fn copyEntries(dst: []Value, src: []const Value) void {
         if (!wide_stores) return copyRun(dst, src);
         var i: usize = 0;
@@ -4003,17 +3196,17 @@ pub const VM = struct {
         if (i < dst.len) copyWide(&dst[i], &src[i]);
     }
 
-    /// Slot `op` of `frame`, an operand verification proved a slot
-    /// inside the frame (§5).
     /// A fact verification proved (§5), asserted by debug and safe
     /// builds and not assumed by a release build: assumed, a bound
     /// through the frame's routine changes the fast handlers' code, and
     /// the counting loop ran half as many cycles again (docs/PERF.md
     /// §3.21).
     inline fn proved(ok: bool) void {
-        if (std.debug.runtime_safety) std.debug.assert(ok);
+        if (comptime builtin.optimize.runtimeSafety()) std.debug.assert(ok);
     }
 
+    /// Slot `op` of `frame`, an operand verification proved a slot
+    /// inside the frame (§5).
     inline fn verifiedSlot(self: *VM, frame: *const Frame, op: Operand) *Value {
         proved(op.kind == .slot and op.index < frame.routine.slot_count);
         return self.slotAt(frame, op.index);
@@ -4076,31 +3269,9 @@ pub const VM = struct {
         };
     }
 
-    /// Write a `Value` into a destination operand.
-    ///
-    /// Only `.slot` is a valid destination for the generic store
-    /// path. Other kinds split into two categories per VM.md §13:
-    ///
-    ///   - `.upvalue`: a recognized destination kind with no
-    ///     store path (nothing writes through cells via U).
-    ///     Returns `UnimplementedOpcode`.
-    ///   - `.constant`, `.intern`, `.durable`: read-only
-    ///     operand kinds; writing to them is invalid in this
-    ///     opcode context, NOT "not wired." Surface
-    ///     `InvalidOperandKind` per VM.md §13's not-catchable
-    ///     table.
-    ///   - `.var_`: var writes go through `var:store-var` (a
-    ///     dedicated opcode), not the generic store path. Generic
-    ///     store with a `.var_` destination is a handler bug.
-    ///     Surface `InvalidOperandKind`.
-    ///   - `.unused`: invalid in any context with a destination
-    ///     operand.
-    fn store(self: *VM, op: Operand, v: Value) VmError!void {
-        return self.storeIn(self.currentFrame(), op, v);
-    }
-
-    /// `store` against `frame`, the current frame: a slot in range
-    /// inline, every other case out of line.
+    /// Store `v` through the destination `op` of `frame`: a slot, as
+    /// VM.md §4 allows; a slot in range inline, every other case out
+    /// of line.
     inline fn storeIn(self: *VM, frame: *const Frame, op: Operand, v: Value) VmError!void {
         if (op.kind == .slot and op.index < frame.routine.slot_count) {
             self.slotAt(frame, op.index).* = v;
@@ -4213,7 +3384,7 @@ pub const VM = struct {
     /// returns how many entries it wrote.
     fn captureTrace(self: *VM, out: []TraceFrame) usize {
         const frames = self.frames.items;
-        const lowest: usize = if (frames[0].routine == &idle_routine) 1 else 0;
+        const lowest = self.lowestLiveFrame();
         const depth = frames.len - lowest;
         const elided = if (depth > trace_capacity) depth - (trace_innermost + trace_outermost) else 0;
         var n: usize = 0;
@@ -4226,9 +3397,7 @@ pub const VM = struct {
                 i -= elided - 1;
                 continue;
             }
-            const f = frames[i];
-            const pc: u32 = if (f.pc > 0) f.pc - 1 else 0;
-            out[n] = .{ .name = f.routine.name, .pc = pc, .span = f.routine.spanAt(pc), .source = f.routine.source };
+            out[n] = traceFrameOf(frames[i]);
             n += 1;
         }
         return n;
@@ -4241,11 +3410,13 @@ pub const VM = struct {
     /// standing and `recordErrorTrace` sees them). `err` is the runtime
     /// error the value was translated from, if any; its detail is
     /// `error_detail`.
-    fn originFor(self: *VM, value: Value, err: ?VmError) VmError!?u32 {
+    /// The origin is for the report only: with no memory to record it
+    /// the throw goes on without one.
+    fn originFor(self: *VM, value: Value, err: ?VmError) ?u32 {
         if (err == null) if (self.rethrownOrigin(value)) |o| return o;
         if (self.findThrowTarget() == null) return null;
         self.dropUnreferencedOrigins();
-        const o = self.origins.addOne(self.allocator) catch return VmError.OutOfMemory;
+        const o = self.origins.addOne(self.allocator) catch return null;
         o.* = .{ .value = value, .err = err };
         const detail = self.error_detail[0..@min(self.error_detail.len, o.detail_buf.len)];
         @memcpy(o.detail_buf[0..detail.len], detail);
@@ -4340,7 +3511,7 @@ pub const VM = struct {
         if (self.findThrowTarget() == null) return err;
         const tag = self.ensureInterner().internKeywordValue(kw_name) catch return err;
         const payload = self.errorValue(tag, self.error_detail, self.raiseSite());
-        const origin = try self.originFor(payload, err);
+        const origin = self.originFor(payload, err);
         self.error_detail = "";
         try self.unwindThrow(payload, origin);
     }
@@ -4358,7 +3529,7 @@ pub const VM = struct {
     }
 
     fn buildErrorMap(self: *VM, tag: Value, detail: []const u8, at: ?TraceFrame) !Value {
-        var m = try self.putKey(try champ_mod.mapEmpty(self.ensureHeap()), "error", tag);
+        var m = try self.putKey(try champ_mod.mapEmpty(self.ensureHeap()), .@"error", tag);
         var words: [96]u8 = undefined;
         const message = if (detail.len > 0) detail else blk: {
             const name = self.ensureInterner().keywordName(tag.asKeywordId());
@@ -4371,7 +3542,7 @@ pub const VM = struct {
             for (name[0..n], words[0..n]) |c, *w| w.* = if (c == '-' or c == '/') ' ' else c;
             break :blk words[0..n];
         };
-        m = try self.putKey(m, "message", try string_mod.fromBytes(self.ensureHeap(), message));
+        m = try self.putKey(m, .message, try string_mod.fromBytes(self.ensureHeap(), message));
         return self.addPlace(m, at);
     }
 
@@ -4380,37 +3551,30 @@ pub const VM = struct {
     fn addPlace(self: *VM, map: Value, at: ?TraceFrame) !Value {
         const frame = at orelse return map;
         const heap = self.ensureHeap();
-        var m = try self.putKey(map, "fn", try string_mod.fromBytes(heap, frame.name));
+        var m = try self.putKey(map, .@"fn", try string_mod.fromBytes(heap, frame.name));
         const source = frame.source orelse return m;
-        m = try self.putKey(m, "file", try string_mod.fromBytes(heap, source.path));
+        m = try self.putKey(m, .file, try string_mod.fromBytes(heap, source.path));
         const span = frame.span orelse return m;
         const place = self.placeOf(source, span.pos);
-        m = try self.putKey(m, "line", value_mod.fromFixnum(place.line).?);
-        return self.putKey(m, "column", value_mod.fromFixnum(place.col).?);
+        m = try self.putKey(m, .line, value_mod.fromFixnum(place.line).?);
+        return self.putKey(m, .column, value_mod.fromFixnum(place.col).?);
     }
 
-    /// `v` without the place keys `addPlace` gives an error map, for
-    /// a report that shows the place itself; `v` as it is when it is
-    /// not such a map (one with `:error`, `:fn` and `:file`) or memory
-    /// is exhausted.
-    pub fn withoutPlace(self: *VM, v: Value) Value {
-        if (v.kind() != .persistent_map) return v;
-        for ([_][]const u8{ "error", "fn", "file" }) |key| {
-            const k = self.ensureInterner().internKeywordValue(key) catch return v;
-            if (champ_mod.mapGet(v, k, &dispatch_mod.hashValue, &dispatch_mod.equal) == .absent) return v;
-        }
-        var m = v;
-        for ([_][]const u8{ "fn", "file", "line", "column" }) |key| {
-            const k = self.ensureInterner().internKeywordValue(key) catch return v;
-            m = champ_mod.mapDissoc(self.ensureHeap(), m, k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch return v;
-        }
-        return m;
+    /// The keys of an error map (§13).
+    pub const ErrorKey = enum { @"error", message, @"fn", file, line, column };
+
+    /// The keyword `key` names, interned once: a handler taking errors
+    /// in a loop builds a map at each.
+    fn errorKey(self: *VM, key: ErrorKey) !Value {
+        const slot = &self.error_keys[@backingInt(key)];
+        if (slot.* == null) slot.* = try self.ensureInterner().internKeywordValue(@tagName(key));
+        return slot.*.?;
     }
 
-    /// `m` with the keyword named `key` mapped to `v`.
-    fn putKey(self: *VM, m: Value, key: []const u8, v: Value) !Value {
-        const k = try self.ensureInterner().internKeywordValue(key);
-        return champ_mod.mapAssoc(self.ensureHeap(), m, k, v, &dispatch_mod.hashValue, &dispatch_mod.equal);
+    /// `m` with the error-map key `key` mapped to `v`: what a native
+    /// building an error map of its own (`throwErrorMap`) adds with.
+    pub fn putKey(self: *VM, m: Value, key: ErrorKey, v: Value) !Value {
+        return champ_mod.mapAssoc(self.ensureHeap(), m, try self.errorKey(key), v, &dispatch_mod.hashValue, &dispatch_mod.equal);
     }
 
     /// `throwValue` of an error map a native built (`{:error tag
@@ -4431,7 +3595,7 @@ pub const VM = struct {
     /// is the program's. Null outside any run.
     pub fn raiseSite(self: *VM) ?TraceFrame {
         const frames = self.frames.items;
-        const lowest: usize = if (frames[0].routine == &idle_routine) 1 else 0;
+        const lowest = self.lowestLiveFrame();
         if (frames.len == lowest) return null;
         var i = frames.len;
         const at = while (i > lowest) {
@@ -4439,8 +3603,19 @@ pub const VM = struct {
             const source = frames[i].routine.source orelse break i;
             if (!source.library) break i;
         } else frames.len - 1;
-        const f = frames[at];
-        const pc: u32 = if (f.pc > 0) f.pc - 1 else 0;
+        return traceFrameOf(frames[at]);
+    }
+
+    /// The index of the outermost frame a run stands on: past a top
+    /// frame parked on `idle_routine`, which is part of none.
+    fn lowestLiveFrame(self: *const VM) usize {
+        return @intFromBool(self.frames.items[0].routine == &idle_routine);
+    }
+
+    /// `f` in a trace: the instruction it was executing, the one before
+    /// its `pc` (§8), and that instruction's span.
+    fn traceFrameOf(f: Frame) TraceFrame {
+        const pc: u32 = f.pc -| 1;
         return .{ .name = f.routine.name, .pc = pc, .span = f.routine.spanAt(pc), .source = f.routine.source };
     }
 
@@ -4456,28 +3631,9 @@ pub const VM = struct {
     }
 
     // -------------------------------------------------------------------------
-    // Dispatch (VM.md §8)
-    //
-    // Threaded code: a handler runs its instruction, fetches the next
-    // one itself and tail-calls that instruction's handler through
-    // `fast_table`, indexed by group and variant together, so an
-    // instruction costs one indirect branch and the native stack does
-    // not grow with the instructions run. A handler returns only to
-    // leave the chain: with an error, which `loop` translates or
-    // passes on, or once `running` says the loop's frame has returned.
-    // Every handler has the one signature `@call(.always_tail, ...)`
-    // requires of caller and callee, and returns a `Status`, the
-    // error it leaves with as a word, not an error union.
-    //
-    // Two tables. `op_table` holds every opcode's general handler,
-    // which takes every case and raises every trap. `fast_table` is
-    // `op_table` with the hot opcodes' fast handlers over it: a fast
-    // handler takes the common case with no call but its tail call
-    // and no stack frame, and hands every other case, before it has
-    // changed anything, to the general handler through `op_table`.
-    // Reaching it through a table indexed at run time is what keeps
-    // the optimizer from inlining the general handler, and its frame,
-    // back into the fast one.
+    // Dispatch (VM.md §8): threaded code through two tables, each
+    // handler fetching its successor and tail-calling it, and returning
+    // only to leave the chain, its error as a `Status`.
     // -------------------------------------------------------------------------
 
     const OpHandler = *const fn (*VM, *Frame, Inst, usize) callconv(handler_cc) Status;
@@ -4489,7 +3645,7 @@ pub const VM = struct {
     /// saving the caller's first, and a part out of line keeps its own
     /// across a native's call in the registers the native saves. On
     /// arm64 every handler fits AAPCS64's scratch registers.
-    const handler_cc: std.lang.CallingConvention = if (builtin.cpu.arch == .x86_64) .{ .x86_64_preserve_none = .{} } else .auto;
+    const handler_cc: std.lang.CallingConvention = if (builtin.target.cpu.arch == .x86_64) .{ .x86_64_preserve_none = .{} } else .auto;
 
     /// What a handler returns: `ok` when the chain ends with no error,
     /// else the error it ends with, by its number. Its own type rather
@@ -4548,14 +3704,15 @@ pub const VM = struct {
             for (0..64) |v| t[@as(u12, @backingInt(g)) | @as(u12, v) << 6] = &opUnimplemented;
         }
         t[opcode(.mov, Mov.move)] = &opMove;
-        t[opcode(.mov, Mov.move_clear)] = &opMoveClear;
-        t[opcode(.mov, Mov.load_const)] = &opLoadConst;
-        t[opcode(.mov, Mov.load_nil)] = loadHandler(value_mod.nilValue());
-        t[opcode(.mov, Mov.load_true)] = loadHandler(value_mod.fromBool(true));
-        t[opcode(.mov, Mov.load_false)] = loadHandler(value_mod.fromBool(false));
-        t[opcode(.jump, Jump.jmp)] = &opJmp;
-        t[opcode(.jump, Jump.if_false)] = &opIfFalse;
-        t[opcode(.jump, Jump.if_true)] = &opIfTrue;
+        // Verification leaves these no case but their fast handler's.
+        t[opcode(.mov, Mov.move_clear)] = &fastMoveClear;
+        t[opcode(.mov, Mov.load_const)] = &fastLoadConst;
+        t[opcode(.mov, Mov.load_nil)] = fastLoad(value_mod.nilValue());
+        t[opcode(.mov, Mov.load_true)] = fastLoad(value_mod.fromBool(true));
+        t[opcode(.mov, Mov.load_false)] = fastLoad(value_mod.fromBool(false));
+        t[opcode(.jump, Jump.jmp)] = &fastJmp;
+        t[opcode(.jump, Jump.if_false)] = branchHandler(false);
+        t[opcode(.jump, Jump.if_true)] = branchHandler(true);
         for (std.meta.tags(NumCmp)) |c| t[opcode(.cmp, c)] = cmpHandler(c);
         t[opcode(.var_, VarOp.load_var)] = &opLoadVar;
         t[opcode(.closure, Closure_.get_cell)] = &opGetCell;
@@ -4564,7 +3721,7 @@ pub const VM = struct {
         t[opcode(.call, Call.lookup)] = &opLookup;
         t[opcode(.call, Call.lookup_or)] = &opLookup;
         t[opcode(.call, Call.@"return")] = &opReturn;
-        t[opcode(.call, Call.return_nil)] = &opReturnNil;
+        t[opcode(.call, Call.return_nil)] = &opReturn;
         t[opcode(.call, Call.tailcall)] = &opUnimplemented;
         for (0..4096) |op| {
             if (Quick.of(op) != null) t[op] = &opQuickened;
@@ -4578,12 +3735,6 @@ pub const VM = struct {
         @setEvalBranchQuota(20_000);
         var t = op_table;
         t[opcode(.mov, Mov.move)] = &fastMove;
-        t[opcode(.mov, Mov.move_clear)] = &fastMoveClear;
-        t[opcode(.mov, Mov.load_const)] = &fastLoadConst;
-        t[opcode(.mov, Mov.load_nil)] = fastLoad(value_mod.nilValue());
-        t[opcode(.mov, Mov.load_true)] = fastLoad(value_mod.fromBool(true));
-        t[opcode(.mov, Mov.load_false)] = fastLoad(value_mod.fromBool(false));
-        t[opcode(.jump, Jump.jmp)] = &fastJmp;
         t[opcode(.jump, Jump.if_false)] = fastBranch(false);
         t[opcode(.jump, Jump.if_true)] = fastBranch(true);
         for (std.meta.tags(NumCmp)) |c| t[opcode(.cmp, c)] = fastCmp(c);
@@ -4666,18 +3817,18 @@ pub const VM = struct {
         return self.next(self.currentFrame());
     }
 
-    /// How a fast handler hands its instruction to a part of its own
-    /// kept out of line, one that calls out and so needs a stack frame
-    /// (em `src/runtime.zig` `outOfLine`): a call in return position
-    /// never inlined, which a release build makes a tail call; inlined,
-    /// the part's frame would be the fast handler's. A debug build
-    /// makes a tail call only when told to.
     /// The fast handlers' section and alignment: together, apart from
     /// the rest of the code, each on a cache line of its own, so code
     /// growing elsewhere does not move them against each other.
     const hot_section = if (builtin.target.os.tag.isDarwin()) "__TEXT,__text_hot,regular,pure_instructions" else ".text.hot";
     const hot_align = 64;
 
+    /// How a fast handler hands its instruction to a part of its own
+    /// kept out of line, one that calls out and so needs a stack frame
+    /// (em `src/runtime.zig` `outOfLine`): a call in return position
+    /// never inlined, which a release build makes a tail call; inlined,
+    /// the part's frame would be the fast handler's. A debug build
+    /// makes a tail call only when told to.
     const out_of_line: std.lang.CallModifier = if (builtin.optimize == .debug) .always_tail else .never_inline;
 
     /// A fast handler's way out: `inst`'s general handler, which takes
@@ -4730,7 +3881,7 @@ pub const VM = struct {
 
     fn opClosure(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         frame.pc = @intCast(pc);
-        self.execClosure(inst) catch |e| return .of(e);
+        self.execClosure(frame, inst) catch |e| return .of(e);
         return self.nextSafe(frame);
     }
 
@@ -4758,58 +3909,17 @@ pub const VM = struct {
         return self.next(frame);
     }
 
-    /// The value is read before B is cleared, so A = B is a move.
-    fn opMoveClear(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
-        frame.pc = @intCast(pc);
-        if (inst.a.kind != .slot or inst.b.kind != .slot) return .of(VmError.InvalidOperandKind);
-        const dst = self.slotPtrIn(frame, inst.a.index) catch |e| return .of(e);
-        const src = self.slotPtrIn(frame, inst.b.index) catch |e| return .of(e);
-        const v = src.*;
-        src.* = value_mod.nilValue();
-        dst.* = v;
-        return self.next(frame);
-    }
-
-    /// `mov:load-nil`, `mov:load-true`, `mov:load-false`.
-    fn loadHandler(comptime v: Value) OpHandler {
+    /// `jump:if-true` (`when`) and `jump:if-false`.
+    fn branchHandler(comptime when: bool) OpHandler {
         return &struct {
             fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
                 frame.pc = @intCast(pc);
-                self.storeIn(frame, inst.a, v) catch |e| return .of(e);
+                var tmp: Value = undefined;
+                const v = self.operandPtr(frame, inst.a, &tmp) catch |e| return .of(e);
+                if (v.isTruthy() == when) applyJump(frame, inst.wide()) catch |e| return .of(e);
                 return self.next(frame);
             }
         }.run;
-    }
-
-    fn opLoadConst(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
-        frame.pc = @intCast(pc);
-        const consts = frame.routine.consts;
-        const i = inst.wide();
-        if (i >= consts.len) return .of(VmError.OperandOutOfRange);
-        self.storeIn(frame, inst.a, consts[i]) catch |e| return .of(e);
-        return self.next(frame);
-    }
-
-    fn opJmp(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
-        frame.pc = @intCast(pc);
-        applyJump(frame, inst.wide()) catch |e| return .of(e);
-        return self.next(frame);
-    }
-
-    fn opIfFalse(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
-        frame.pc = @intCast(pc);
-        var tmp: Value = undefined;
-        const v = self.operandPtr(frame, inst.a, &tmp) catch |e| return .of(e);
-        if (v.isFalsy()) applyJump(frame, inst.wide()) catch |e| return .of(e);
-        return self.next(frame);
-    }
-
-    fn opIfTrue(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
-        frame.pc = @intCast(pc);
-        var tmp: Value = undefined;
-        const v = self.operandPtr(frame, inst.a, &tmp) catch |e| return .of(e);
-        if (v.isTruthy()) applyJump(frame, inst.wide()) catch |e| return .of(e);
-        return self.next(frame);
     }
 
     fn opGetCell(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
@@ -4938,19 +4048,12 @@ pub const VM = struct {
         return self.nextSafe(caller);
     }
 
+    /// `call:return` and `call:return-nil`. The value is read before
+    /// the frame pops, which frees its slots.
     fn opReturn(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         frame.pc = @intCast(pc);
-        // Read the value while the callee frame is still active;
-        // popping first would invalidate the slot.
-        const v = self.resolveIn(frame, inst.a) catch |e| return .of(e);
+        const v = if (inst.variant == @backingInt(Call.return_nil)) value_mod.nilValue() else self.resolveIn(frame, inst.a) catch |e| return .of(e);
         self.returnValue(v) catch |e| return .of(e);
-        if (!self.running()) return .ok;
-        return self.next(self.currentFrame());
-    }
-
-    fn opReturnNil(self: *VM, frame: *Frame, _: Inst, pc: usize) callconv(handler_cc) Status {
-        frame.pc = @intCast(pc);
-        self.returnValue(value_mod.nilValue()) catch |e| return .of(e);
         if (!self.running()) return .ok;
         return self.next(self.currentFrame());
     }
@@ -5190,11 +4293,15 @@ pub const VM = struct {
         const callee_frame = self.pushDirect(callee, routine, base, argc, .{
             .return_dst = inst.c.index,
         }) orelse return self.general(frame, inst, pc);
-        // The caller's place, for a trace through the callee and for
-        // its return.
+        return self.enterFirst(frame, pc, callee_frame, routine);
+    }
+
+    /// The fast call's way into the frame it pushed: the caller's `pc`
+    /// set, for a trace through the callee and for its return, and the
+    /// callee's first instruction fetched through the routine in hand
+    /// rather than the frame just written.
+    inline fn enterFirst(self: *VM, frame: *Frame, pc: usize, callee_frame: *Frame, routine: *const Routine) Status {
         frame.pc = @intCast(pc);
-        // The callee's first instruction, through the routine in hand
-        // rather than the frame just written.
         const first = routine.code[0];
         if (counting) opcode_counts[opIndex(first)] += 1;
         return @call(.always_tail, fast_table[opIndex(first)], .{ self, callee_frame, first, 1 });
@@ -5216,10 +4323,7 @@ pub const VM = struct {
         const callee_frame = self.pushDirect(callee, routine, base, argc, .{
             .return_dst = inst.c.index,
         }) orelse return self.general(frame, inst, pc);
-        frame.pc = @intCast(pc);
-        const first = routine.code[0];
-        if (counting) opcode_counts[opIndex(first)] += 1;
-        return @call(.always_tail, fast_table[opIndex(first)], .{ self, callee_frame, first, 1 });
+        return self.enterFirst(frame, pc, callee_frame, routine);
     }
 
     /// `fastCall` of a leaf native within its arity, on its arguments
@@ -5229,7 +4333,7 @@ pub const VM = struct {
         const native = asNativeFn(self.verifiedSlot(frame, inst.a).*);
         if (!native.leaf) return @call(out_of_line, callBuffered, .{ self, frame, inst, pc });
         const argc: u32 = inst.b.index;
-        if (argc < native.min_arity or argc > (native.max_arity orelse argc)) return self.general(frame, inst, pc);
+        if (!native.takes(argc)) return self.general(frame, inst, pc);
         const base: usize = @as(usize, frame.base_slot) + inst.a.index + 1;
         frame.pc = @intCast(pc);
         const result = native.call(self, self.stack.items[base..][0..argc]) catch |err| switch (err) {
@@ -5247,9 +4351,10 @@ pub const VM = struct {
     /// whose slots keep them rooted.
     fn callBuffered(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         const native = asNativeFn(self.verifiedSlot(frame, inst.a).*);
+        // Only a leaf has a general body (`NativeFn.general`).
+        std.debug.assert(native.general == null);
         const argc: u32 = inst.b.index;
-        const max: usize = native.max_arity orelse max_native_args;
-        if (argc < native.min_arity or argc > max or argc > max_native_args) return self.general(frame, inst, pc);
+        if (!native.takes(argc) or argc > max_native_args) return self.general(frame, inst, pc);
         const base: usize = @as(usize, frame.base_slot) + inst.a.index + 1;
         frame.pc = @intCast(pc);
         // On arm64 a whole buffer copies inline where the stack's
@@ -5396,16 +4501,9 @@ pub const VM = struct {
     // Group `call` (VM.md §10.2)
     // -------------------------------------------------------------------------
 
-    /// `call:call A=call_base B=argc C=result_slot` — range-call
-    /// ABI per VM.md §6. Caller has staged `slot[A] = callee` and
-    /// `slot[A+1 .. A+1+argc] = args`. A closure callee gets a frame
-    /// windowed over the arguments; its return lands in `slot[C]` and
-    /// the caller resumes at the instruction following this one. Any
-    /// other callee runs to completion here and its value lands in
-    /// `slot[C]` at once.
+    /// `call:call A=base B=argc C=dst` (VM.md §6): a closure gets a frame
+    /// over its arguments, any other callee runs to completion here.
     fn execCallCall(self: *VM, caller: *Frame, inst: Inst) VmError!void {
-        // A and C are slot operands; B is a raw-index immediate
-        // (§4.5).
         if (inst.a.kind != .slot or inst.c.kind != .slot) return VmError.InvalidOperandKind;
         const call_base: u32 = inst.a.index;
         const argc: u32 = inst.b.index;
@@ -5428,7 +4526,7 @@ pub const VM = struct {
         }
         // The arguments are copied off the stack: the callee may
         // re-enter the VM and grow it. The slots keep them rooted.
-        var buf: [8]Value = undefined;
+        var buf: [max_native_args]Value = undefined;
         const args: []Value = if (argc <= buf.len)
             buf[0..argc]
         else
@@ -5441,7 +4539,7 @@ pub const VM = struct {
         // never reads a block after its call (`COMPILER.md` §4.4), so
         // it keeps nothing it held alive until a later call reuses it.
         nilSlots(self.stack.items[args_base - 1 ..][0 .. argc + 1]);
-        storeResult(try self.slotPtr(result_dst), &result);
+        storeResult(try self.slotPtrIn(self.currentFrame(), result_dst), &result);
     }
 
     /// Push `frame`. The caller has already grown the stack into
@@ -5454,10 +4552,7 @@ pub const VM = struct {
         errdefer self.stack.shrinkRetainingCapacity(frame.entry_stack_len);
         if (self.frames.items.len >= self.max_frames) return VmError.StackOverflow;
         self.frames.append(self.allocator, frame) catch return VmError.OutOfMemory;
-        if (track_high_water) {
-            self.frame_high_water = @max(self.frame_high_water, self.frames.items.len);
-            self.stack_high_water = @max(self.stack_high_water, self.stack.items.len);
-        }
+        self.noteHighWater(self.frames.items.len, self.stack.items.len);
     }
 
     /// Pop the top frame and restore the stack to the length it
@@ -5469,13 +4564,10 @@ pub const VM = struct {
         return frame;
     }
 
-    /// Complete the current frame with `return_value`. A frame
-    /// pushed by `callValue` hands the value to its host result
-    /// cell; the top-level frame halts the VM with it; any other
-    /// frame is popped and the value lands in the caller's
-    /// `return_dst` slot, where the caller resumes at its own `pc`.
-    /// Frame metadata is validated before anything is mutated so
-    /// a corrupt frame surfaces an error, not a half-popped VM.
+    /// The current frame's return of `return_value` (§6): into its
+    /// host's cell, the halt of the top-level frame, or the caller's
+    /// slot, the frame popped. A corrupt frame is refused before
+    /// anything changes.
     fn returnValue(self: *VM, return_value: Value) VmError!void {
         const n = self.frames.items.len;
         const callee = &self.frames.items[n - 1];
@@ -5485,7 +4577,7 @@ pub const VM = struct {
             // `pc` the caller's fetch goes on from, past the safe point.
             if (hr.step != null) {
                 const cb: *Callback = @fieldParentPtr("result", hr);
-                const going = switch (cb.batch.stepFor()) {
+                const going = switch (cb.batch.step) {
                     inline else => |step| self.batchStep(callee, hr, step),
                 };
                 if (going) {
@@ -5515,185 +4607,88 @@ pub const VM = struct {
     // Group `closure` (VM.md §10.5)
     // -------------------------------------------------------------------------
 
-    fn execClosure(self: *VM, inst: Inst) VmError!void {
+    fn execClosure(self: *VM, frame: *const Frame, inst: Inst) VmError!void {
         const variant: Closure_ = @fromBackingInt(@intCast(inst.variant));
         switch (variant) {
-            .make => try self.execClosureMake(inst),
-            .box_local => try self.execClosureBoxLocal(inst),
+            .make => try self.execClosureMake(frame, inst),
+            .box_local => try self.execClosureBoxLocal(frame, inst),
             // `op_table` routes `get-cell` to `opGetCell`.
             .get_cell => unreachable,
-            .new_cell => try self.execClosureNewCell(inst),
-            .init_cell => try self.execClosureInitCell(inst),
+            .new_cell => try self.execClosureNewCell(frame, inst),
+            .init_cell => try self.execClosureInitCell(frame, inst),
             _ => return VmError.BytecodeCorruption,
         }
     }
 
-    /// `closure:box-local A=slot _ _` — wrap slot[A]'s current
-    /// value into a fresh, initialized UpvalCell. Replaces
-    /// slot[A] with the cell-internal Value pointing at the cell.
-    /// Per VM.md §6.
-    ///
-    /// Errors:
-    ///   - InvalidCellState if slot[A] already holds a cell
-    ///     pointer (double-box). Indicates compiler bug.
-    fn execClosureBoxLocal(self: *VM, inst: Inst) VmError!void {
+    /// `closure:box-local A`: `slot[A]`'s value into a fresh cell, in
+    /// its place. Allocating a cell leaves `vm.stack` as it is.
+    fn execClosureBoxLocal(self: *VM, frame: *const Frame, inst: Inst) VmError!void {
         if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
-        const ptr = try self.slotPtr(inst.a.index);
-        const current = ptr.*;
-        if (current.kind() == value_mod.Kind.cell_internal) {
-            return VmError.InvalidCellState;
-        }
-        const cell_value = self.allocCell(current, true) catch return VmError.OutOfMemory;
-        // allocCell touches the heap, not `vm.stack`, so `ptr` is
-        // still valid.
-        ptr.* = cell_value;
+        const ptr = try self.slotPtrIn(frame, inst.a.index);
+        if (ptr.kind() == .cell_internal) return VmError.InvalidCellState;
+        ptr.* = self.allocCell(ptr.*, true) catch return VmError.OutOfMemory;
     }
 
-    /// `closure:get-cell A=dst_slot B=cell_slot _` — read the
-    /// contents of an UpvalCell whose pointer lives in slot[B];
-    /// write to slot[A]. Used by same-frame reads of a boxed
-    /// local.
-    ///
-    /// Errors:
-    ///   - ExpectedCell if slot[B] doesn't hold a cell pointer.
-    ///   - UninitializedCell if cell.initialized = false.
+    /// `closure:get-cell A B`: the contents of the cell in `slot[B]`.
     fn execClosureGetCell(self: *VM, frame: *const Frame, inst: Inst) VmError!void {
         if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
         if (inst.b.kind != .slot) return VmError.InvalidOperandKind;
-        const cell_v = (try self.slotPtrIn(frame, inst.b.index)).*;
-        const cell = try VM.asCell(cell_v);
+        const cell = try VM.asCell((try self.slotPtrIn(frame, inst.b.index)).*);
         if (!cell.initialized) return VmError.UninitializedCell;
         try self.storeIn(frame, inst.a, cell.value);
     }
 
-    /// `closure:new-cell A=slot _ _` — allocate an
-    /// uninitialized UpvalCell, store its cell-internal Value
-    /// at slot[A]. Used by `letfn*` lowering and
-    /// named `fn*` self-reference to allocate placeholder
-    /// cells that subsequent `closure:make` instructions
-    /// capture (raw cell pointer copied), and that
-    /// `closure:init-cell` later fills in with the constructed
-    /// closure value.
-    ///
-    /// Per VM.md §6. The cell starts with
-    /// `initialized = false`; reading it via U-operand or
-    /// `closure:get-cell` before init traps `UninitializedCell`.
-    fn execClosureNewCell(self: *VM, inst: Inst) VmError!void {
+    /// `closure:new-cell A`: a placeholder cell, `init-cell` to fill.
+    fn execClosureNewCell(self: *VM, frame: *const Frame, inst: Inst) VmError!void {
         if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
-        // Initial value doesn't matter (it'll be overwritten by
-        // init-cell before any read). Use nil as a sentinel
-        // recognizable in dumps.
         const cell_v = self.allocCell(value_mod.nilValue(), false) catch return VmError.OutOfMemory;
-        try self.store(inst.a, cell_v);
+        try self.storeIn(frame, inst.a, cell_v);
     }
 
-    /// `closure:init-cell A=cell_slot B=value_op _` — fill an
-    /// uninitialized cell with a value, flip `initialized = true`.
-    /// Used by `letfn*` and named `fn*` lowerings to
-    /// finalize placeholder cells with the constructed closure
-    /// value, after `closure:make` has constructed the closure
-    /// (which captured the still-uninitialized cell).
-    ///
-    /// Per VM.md §6.
-    ///
-    /// Errors:
-    ///   - ExpectedCell if slot[A] doesn't hold a cell pointer.
-    ///   - InvalidCellState if the cell is already initialized
-    ///     (double-init). Indicates compiler bug.
-    fn execClosureInitCell(self: *VM, inst: Inst) VmError!void {
+    /// `closure:init-cell A B`: `resolve(B)` into the placeholder cell
+    /// in `slot[A]`. The cell is checked before B is read, so a cell
+    /// filled twice is `InvalidCellState` whatever B is.
+    fn execClosureInitCell(self: *VM, frame: *const Frame, inst: Inst) VmError!void {
         if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
-        // Validate destination cell state BEFORE resolving B:
-        // the destination contract is the
-        // primary contract of init-cell. Reading a malformed
-        // source operand before checking the cell would surface
-        // the wrong error (e.g., UninitializedCell on the
-        // source upvalue instead of InvalidCellState on the
-        // already-initialized destination).
-        const cell_v = (try self.slotPtr(inst.a.index)).*;
-        const cell = try VM.asCell(cell_v);
+        const cell = try VM.asCell((try self.slotPtrIn(frame, inst.a.index)).*);
         if (cell.initialized) return VmError.InvalidCellState;
-        // B may be any operand kind that resolve() accepts.
-        const value = try self.resolve(inst.b);
-        cell.value = value;
+        cell.value = try self.resolveIn(frame, inst.b);
         cell.initialized = true;
     }
 
-    /// `closure:make A=result_slot W=capture_descriptor` per VM.md
-    /// §6: a closure over the descriptor's routine.
-    fn execClosureMake(self: *VM, inst: Inst) VmError!void {
+    /// `closure:make A W`: a closure over descriptor W's routine, its
+    /// cells copied from the descriptor's sources (VM.md §6). Nothing
+    /// allocates between the block and its cells, so the block is
+    /// whole before a safe point can see it.
+    fn execClosureMake(self: *VM, frame: *const Frame, inst: Inst) VmError!void {
         if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
-        const frame = self.currentFrame();
         const cap_idx = inst.wide();
         if (cap_idx >= frame.routine.capture_descs.len) return VmError.OperandOutOfRange;
         const desc = frame.routine.capture_descs[cap_idx];
-        const child_routine = desc.routine;
-
-        // Source count must match child routine's expectation.
-        if (desc.sources.len != child_routine.upvalue_count) {
-            return VmError.CaptureCountMismatch;
-        }
-
-        // Allocate the closure block, then fill its cell array
-        // from the capture sources in descriptor order:
-        //   .local_cell_slot(s): slot[s] must hold a cell-
-        //     internal Value (boxed by prior closure:box-local).
-        //   .inherited_upvalue(u): caller's frame.upvalues[u]
-        //     is already a *UpvalCell pointer — copy directly.
-        // Nothing allocates between the two steps, so the block is
-        // complete before a safe point can see it.
-        const closure_v = self.allocClosure(child_routine, desc.sources.len) catch
-            return VmError.OutOfMemory;
+        if (desc.sources.len != desc.routine.upvalue_count) return VmError.CaptureCountMismatch;
+        const closure_v = self.allocClosure(desc.routine, desc.sources.len) catch return VmError.OutOfMemory;
         const upvalues = closureUpvaluesMut(closure_v);
-        for (desc.sources, 0..) |source, i| {
-            upvalues[i] = switch (source) {
-                .local_cell_slot => |s| blk: {
-                    const cell_v = (try self.slotPtr(s)).*;
-                    // Must be a cell pointer (the
-                    // `ExpectedCell` trap). The compiler's
-                    // capture pre-analysis guarantees this in
-                    // well-formed bytecode; malformed bytecode
-                    // (e.g., descriptor source referencing an
-                    // un-boxed slot) traps here.
-                    break :blk try VM.asCell(cell_v);
-                },
-                .inherited_upvalue => |u| blk: {
-                    if (u >= frame.upvalues.len) return VmError.UpvalueOutOfRange;
-                    // Direct raw-cell access — NOT via
-                    // resolve(u), which would deref to
-                    // cell-contents (raw-vs-contents
-                    // distinction).
-                    break :blk frame.upvalues[u];
-                },
-            };
-        }
-
-        try self.store(inst.a, closure_v);
+        for (desc.sources, upvalues) |source, *cell| cell.* = switch (source) {
+            .local_cell_slot => |slot| try VM.asCell((try self.slotPtrIn(frame, slot)).*),
+            // The cell itself, not its contents as a `u` operand reads.
+            .inherited_upvalue => |u| if (u < frame.upvalues.len) frame.upvalues[u] else return VmError.UpvalueOutOfRange,
+        };
+        try self.storeIn(frame, inst.a, closure_v);
     }
 
     // -------------------------------------------------------------------------
     // Group `jump` (VM.md §10.6)
-    //
-    // The target is an absolute instruction index in the current
-    // routine, carried in the wide field; a conditional jump's test
-    // is operand A.
     // -------------------------------------------------------------------------
 
-    /// Move the frame to `pc`, which must lie inside its routine's
-    /// code: a target at the end would exhaust the code on the next
-    /// fetch, and the compiler's unpatched placeholder target
-    /// (`maxInt(u32)`) fails here instead of running.
+    /// Move the frame to `pc`, inside its code: the compiler's unpatched
+    /// placeholder, `maxInt(u32)`, fails here.
     fn applyJump(frame: *Frame, pc: u32) VmError!void {
         if (pc >= frame.routine.code.len) return VmError.OperandOutOfRange;
         frame.pc = pc;
     }
 
     // -------------------------------------------------------------------------
-    // Group `math` (VM.md §10.3)
-    //
-    // Every variant except `pow` goes through the numeric tower
-    // (`numAdd` … `numAbs`), which handles fixnum, bignum and float
-    // operands, promotion and contagion; a promoted result lives on
-    // the VM's heap.
+    // Group `math` (VM.md §10.3): the numeric tower below
     // -------------------------------------------------------------------------
 
     fn execMath(self: *VM, frame: *Frame, inst: Inst) VmError!void {
@@ -5812,30 +4807,12 @@ pub const VM = struct {
         try self.storeIn(frame, inst.a, VM.varToValue(try wideVar(frame, inst)));
     }
 
-    // -------------------------------------------------------------
-    // Group `coll` (VM.md §10.8) — collection construction
-    // -------------------------------------------------------------
-    //
-    // Operand convention (range ABI, mirrors call:call):
-    //   A = slot   — first arg slot (must be `.slot` kind)
-    //   B = raw    — argc (raw u12 immediate, kind ignored per §4.5)
-    //   C = slot   — destination slot
-    //
-    // Every variant allocates via `self.ensureHeap()`. `Heap.alloc`
-    // never collects (a cycle runs only at the safe point between
-    // instructions, VM.md §9), so partial results need no rooting
-    // during construction.
+    // -------------------------------------------------------------------------
+    // Group `coll` (VM.md §10.8)
+    // -------------------------------------------------------------------------
 
-    /// `coll:<op> A=arg_base B=argc C=dst`: build a collection from
-    /// the `argc` values in `slot[A ..]` and store it in `slot[C]`.
-    /// `list` and `vector` keep the order, `map` takes flat key,
-    /// value pairs (a later duplicate key wins; an odd count is
-    /// corrupt bytecode), `set` drops duplicates, and `concat` joins
-    /// the elements of seqables (nil, list, vector, map entries,
-    /// set) into a list, so `~@` splices whatever a seq function
-    /// returns. The arguments are read as one slice of the stack:
-    /// `Heap.alloc` never touches `vm.stack`, so the slice outlives
-    /// every allocation here.
+    /// `coll:<op> A=base B=argc C=dst`. `Heap.alloc` never collects
+    /// (§9), so what the construction allocates needs no rooting.
     fn execColl(self: *VM, inst: Inst) VmError!void {
         const variant: CollOp = @fromBackingInt(@intCast(inst.variant));
         if (inst.a.kind != .slot or inst.c.kind != .slot) return VmError.InvalidOperandKind;
@@ -5929,13 +4906,9 @@ pub const VM = struct {
         }
     }
 
-    // -------------------------------------------------------------
-    // Group `ctrl` (VM.md §10.9) — try / catch / finally / throw
-    // -------------------------------------------------------------
-    //
-    // Per VM.md §12. User-thrown values and the recoverable
-    // VM-detected errors (translated by `vmErrorToKeywordName`)
-    // are catchable; non-recoverable errors bubble out of `run`.
+    // -------------------------------------------------------------------------
+    // Group `ctrl` (VM.md §10.9, §12)
+    // -------------------------------------------------------------------------
 
     fn execCtrl(self: *VM, inst: Inst) VmError!void {
         const variant: CtrlOp = @fromBackingInt(@intCast(inst.variant));
@@ -5949,16 +4922,18 @@ pub const VM = struct {
         }
     }
 
-    /// `ctrl:try-enter A=binding_slot W=try` — push a handler for
-    /// `routine.tries[W]` onto the global handler stack: its catch
-    /// and finally pcs are absolute within the current routine, and
-    /// binding_slot is where the thrown value will be stored.
+    /// `ctrl:try-enter A=binding W=try`: a `try_` handler for
+    /// `routine.tries[W]`.
     fn execCtrlTryEnter(self: *VM, inst: Inst) VmError!void {
         if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
         const frame_index = self.frames.items.len - 1;
         const tries = self.frames.items[frame_index].routine.tries;
         const i = inst.wide();
         if (i >= tries.len) return VmError.OperandOutOfRange;
+        // A continuation is pushed only as a handler pops, so this is
+        // room for every one a throw may need: a throw allocates
+        // nothing a handler cannot do without (§12, §13).
+        try self.finally_stack.ensureTotalCapacity(self.allocator, self.handlers.items.len + 1 + self.finally_stack.items.len);
         try self.handlers.append(self.allocator, .{
             .kind = .try_,
             .frame_index = frame_index,
@@ -5969,14 +4944,8 @@ pub const VM = struct {
         });
     }
 
-    /// `ctrl:try-exit W=post_pc` — pop the current handler (must
-    /// belong to this frame).
-    ///
-    /// Jumps directly to post_pc, unless the popped handler had
-    /// a finally: then push a
-    /// `.normal(post_pc)` FinallyContinuation and jump to
-    /// finally_pc instead. The finally-exit opcode pops the
-    /// continuation and jumps to post_pc.
+    /// `ctrl:try-exit W=post_pc`: pop this frame's handler and go to
+    /// `post_pc`, through its finally when it has one.
     fn execCtrlTryExit(self: *VM, inst: Inst) VmError!void {
         const post_pc = inst.wide();
 
@@ -5997,8 +4966,7 @@ pub const VM = struct {
         }
     }
 
-    /// `ctrl:finally-exit` — pop the topmost
-    /// FinallyContinuation and dispatch on its reason.
+    /// `ctrl:finally-exit`: go on as the innermost continuation says.
     fn execCtrlFinallyExit(self: *VM, _: Inst) VmError!void {
         if (self.finally_stack.items.len == 0) return VmError.InvalidHandlerState;
         const cont = self.finally_stack.pop().?;
@@ -6015,36 +4983,14 @@ pub const VM = struct {
         }
     }
 
-    /// `ctrl:throw A=value_operand B=unused C=unused` — throw
-    /// the resolved value. Walks the handler stack top-to-bottom
-    /// looking for a `.try_` handler. If found:
-    ///   1. Replace the handler with a `.cleanup` (so the catch
-    ///      body's own throw isn't re-caught by the same
-    ///      handler).
-    ///   2. Unwind frames above the handler's frame_index,
-    ///      restoring the stack to the lowest popped frame's
-    ///      entry length.
-    ///   3. Store the thrown value into binding_slot.
-    ///   4. Jump to catch_pc.
-    ///
-    /// If no `.try_` handler exists anywhere, stores the thrown
-    /// value into `VM.unhandled_throw` and returns
-    /// `VmError.UncaughtThrow`.
     fn execCtrlThrow(self: *VM, inst: Inst) VmError!void {
-        const value = try self.resolve(inst.a);
-        try self.unwindThrow(value, try self.originFor(value, null));
+        const value = try self.resolveIn(self.currentFrame(), inst.a);
+        try self.unwindThrow(value, self.originFor(value, null));
     }
 
-    /// Walk the handler stack top-down looking for the topmost
-    /// handler that catches a throw:
-    ///   - `.try_` handlers catch (jump to catch_pc).
-    ///   - `.cleanup` handlers do NOT catch but DO run their
-    ///     finally (jump to finally_pc with .throwing
-    ///     continuation).
-    ///   - `.cleanup` with no finally is just bookkeeping —
-    ///     skip it.
-    /// Returns the index of the matching handler in
-    /// `self.handlers`, or null if nothing matches.
+    /// The innermost handler a throw goes to: a `try_`, which catches,
+    /// or a `cleanup` with a finally, which runs it first; null when
+    /// none is in force.
     fn findThrowTarget(self: *VM) ?usize {
         var i: usize = self.handlers.items.len;
         while (i > 0) {
@@ -6058,16 +5004,11 @@ pub const VM = struct {
         return null;
     }
 
-    /// Throw `value` from native code exactly as `(throw value)`
-    /// does from bytecode. When a handler catches it the frames
-    /// and pc are already positioned at the handler and the result
-    /// is `ControlTransferred`, which the caller returns unchanged
-    /// so the run loop resumes there. With no handler anywhere the
-    /// result is `UncaughtThrow` and `unhandled_throw` holds the
-    /// value.
+    /// Throw `value` from a native as `ctrl:throw` does (§12): the
+    /// native returns what this returns, `ControlTransferred` when a
+    /// handler took it, `UncaughtThrow` when none is in force.
     pub fn throwValue(self: *VM, value: Value) VmError {
-        const origin = self.originFor(value, null) catch |err| return err;
-        self.unwindThrow(value, origin) catch |err| return err;
+        self.unwindThrow(value, self.originFor(value, null)) catch |err| return err;
         return VmError.ControlTransferred;
     }
 
@@ -6082,45 +5023,25 @@ pub const VM = struct {
         return self.throwValue(self.errorValue(kw, "", self.raiseSite()));
     }
 
-    /// Common throw-unwind logic. Used by `execCtrlThrow`,
-    /// `throwValue` and by `finally-exit`'s `.throwing`
-    /// continuation.
+    /// The throw of `value`, from `ctrl:throw`, a native or a finally
+    /// resuming one (§12): every handler, continuation and frame above
+    /// the handler that takes it goes, each popped frame restoring its
+    /// stack length; a `try_` becomes the `cleanup` its catch body runs
+    /// under, with the value in its slot, and a `cleanup` runs its
+    /// finally, which resumes the throw.
     fn unwindThrow(self: *VM, value: Value, origin: ?u32) VmError!void {
         const handler_idx = self.findThrowTarget() orelse {
-            // No matching handler anywhere — uncaught.
             self.unhandled_throw = value;
             self.escaped_origin = origin;
             return VmError.UncaughtThrow;
         };
         const matched = self.handlers.items[handler_idx];
-
-        // Discard any handlers above the matched one (cleanup
-        // records from inner scopes that we passed over —
-        // they're unreachable since their try is
-        // unwinding through us).
         self.handlers.shrinkRetainingCapacity(handler_idx);
-        // Likewise the continuations of finally bodies the throw
-        // leaves mid-run, the one it was thrown from included.
         self.finally_stack.shrinkRetainingCapacity(matched.finally_depth);
-
-        // Pop every frame above the handler's. A throw bypasses
-        // the callers' return slots: the frames are only popped,
-        // and each pop restores the stack length its frame
-        // recorded on entry, so the lowest pop leaves the extent
-        // the handler's frame set requires.
         while (self.frames.items.len - 1 > matched.frame_index) _ = self.popFrame();
-
         const frame = self.currentFrame();
-
         switch (matched.kind) {
             .try_ => {
-                // Push a cleanup handler in place of the original
-                // try.
-                // This protects the catch body from being re-caught
-                // by its own handler and gives the catch body's
-                // `try-exit` something to pop. The cleanup INHERITS
-                // the try's finally_pc so a throw inside the catch
-                // body still runs the finally.
                 try self.handlers.append(self.allocator, .{
                     .kind = .cleanup,
                     .frame_index = matched.frame_index,
@@ -6130,21 +5051,11 @@ pub const VM = struct {
                     .finally_depth = matched.finally_depth,
                     .origin = origin,
                 });
-
-                // Store thrown value into the handler's binding_slot.
-                if (matched.binding_slot >= frame.routine.slot_count) {
-                    return VmError.InvalidHandlerState;
-                }
-                const ptr = try self.slotPtr(matched.binding_slot);
-                ptr.* = value;
-
-                // Jump to catch entry.
+                if (matched.binding_slot >= frame.routine.slot_count) return VmError.InvalidHandlerState;
+                self.slotAt(frame, matched.binding_slot).* = value;
                 frame.pc = matched.catch_pc;
             },
             .cleanup => {
-                // The popped record was a cleanup with finally.
-                // Push a .throwing continuation so the finally
-                // resumes the throw after completion.
                 const fpc = matched.finally_pc orelse return VmError.InvalidHandlerState;
                 try self.finally_stack.append(self.allocator, .{
                     .frame_index = matched.frame_index,
@@ -6157,44 +5068,12 @@ pub const VM = struct {
     }
 };
 
-/// Stable taxonomy mapping recoverable VmError
-/// variants to user-visible keyword names. Per VM.md §13's
-/// catchable table.
-///
-/// Returns null for unrecoverable errors — bytecode
-/// corruption, OOM, handler-state malformation, etc. Those
-/// propagate to the caller unchanged.
+/// The keyword name of a catchable error (VM.md §13): its tag in
+/// kebab case, `KindMismatch` as `kind-mismatch`. Null for the rest,
+/// compiler bugs, corrupt bytecode, memory and the control signals,
+/// which leave a run as they are.
 pub fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
     return switch (err) {
-        // Recoverable per VM.md §13.
-        VmError.KindMismatch => "kind-mismatch",
-        VmError.ArityMismatch => "arity-mismatch",
-        VmError.NotCallable => "not-callable",
-        VmError.UnboundVar => "unbound-var",
-        VmError.NotDynamic => "not-dynamic",
-        VmError.NoThreadBinding => "no-thread-binding",
-        VmError.ArithmeticOverflow => "arithmetic-overflow",
-        VmError.DivideByZero => "divide-by-zero",
-        VmError.IndexOutOfBounds => "index-out-of-bounds",
-        VmError.DbError => "db-error",
-        VmError.DbClosed => "db-closed",
-        VmError.InvalidDurableRef => "invalid-durable-ref",
-        VmError.CodecFailed => "codec-failed",
-        VmError.TxClosed => "tx-closed",
-        VmError.NotDerefable => "not-derefable",
-        VmError.AtomReEntry => "atom-re-entry",
-        VmError.TransientUsedAfterPersistent => "transient-used-after-persistent",
-        VmError.Utf8Error => "utf8-error",
-        VmError.InvalidArgument => "invalid-argument",
-        VmError.IoError => "io-error",
-        VmError.FileNotFound => "file-not-found",
-        VmError.InvalidPath => "invalid-path",
-        VmError.NotARecord => "not-a-record",
-        VmError.NoProtocolImpl => "no-protocol-impl",
-        VmError.NoProtocolMethod => "no-protocol-method",
-        VmError.StackOverflow => "stack-overflow",
-        // Unrecoverable: bytecode corruption / VM-internal /
-        // OOM / already-a-user-throw / unimplemented.
         VmError.UncaughtThrow,
         VmError.BytecodeCorruption,
         VmError.BytecodeExhausted,
@@ -6212,7 +5091,20 @@ pub fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
         VmError.ControlTransferred,
         VmError.NeedsReentry,
         => null,
+        inline else => |e| comptime kebab(@errorName(e)),
     };
+}
+
+/// `name` in kebab case: a `-` before each upper-case letter but the
+/// first, every letter lower case.
+fn kebab(comptime name: []const u8) []const u8 {
+    @setEvalBranchQuota(10_000);
+    var out: []const u8 = "";
+    for (name, 0..) |c, i| {
+        if (i > 0 and std.ascii.isUpper(c)) out = out ++ "-";
+        out = out ++ .{std.ascii.toLower(c)};
+    }
+    return out;
 }
 
 // =============================================================================
@@ -6366,7 +5258,6 @@ pub fn kindPhrase(k: value_mod.Kind) []const u8 {
         .persistent_vector => "a vector",
         .function, .native_fn, .protocol_fn => "a function",
         .var_ => "a var",
-        .error_ => "an error",
         .atom => "an atom",
         .db_write_txn => "a db write transaction",
         .db_read_txn => "a db read transaction",
@@ -6769,263 +5660,117 @@ fn extremumIsFirst(want_max: bool, a: value_mod.Value, b: value_mod.Value) VmErr
     return try integerOrder(a, b) == (if (want_max) std.math.Order.gt else std.math.Order.lt);
 }
 // =============================================================================
-// Convenience helpers for hand-assembling bytecode in tests.
+// Hand-assembled bytecode: one encoder per instruction the compiler
+// emits (VM.md §10), for the compiler and the tests.
 // =============================================================================
 
-pub fn makeRoutine(
-    code: []const Inst,
-    consts: []const Value,
-    slot_count: u16,
-    name: []const u8,
-) Routine {
-    return .{
-        .code = code,
-        .consts = consts,
-        .slot_count = slot_count,
-        .name = name,
-    };
+pub fn makeRoutine(code: []const Inst, consts: []const Value, slot_count: u16, name: []const u8) Routine {
+    return .{ .code = code, .consts = consts, .slot_count = slot_count, .name = name };
 }
 
-/// Encoding helpers. Every opcode the compiler emits has a
-/// corresponding helper. Keeps hand-assembly readable.
 pub const asm_ = struct {
-    /// mov:load-const dst W   ; slot[dst] := consts[W]
-    pub fn loadConst(slot_dst: u12, const_src: u32) Inst {
-        return Inst.primaryWide(.mov, Mov.load_const, Operand.slot(slot_dst), const_src);
-    }
+    const s = Operand.slot;
+    const none = Operand.none;
 
-    pub fn move(slot_dst: u12, slot_src: u12) Inst {
-        return Inst.primary(.mov, Mov.move, Operand.slot(slot_dst), Operand.slot(slot_src), Operand.none);
+    pub fn loadConst(dst: u12, w: u32) Inst {
+        return Inst.primaryWide(.mov, Mov.load_const, s(dst), w);
     }
-
-    pub fn moveClear(slot_dst: u12, slot_src: u12) Inst {
-        return Inst.primary(.mov, Mov.move_clear, Operand.slot(slot_dst), Operand.slot(slot_src), Operand.none);
+    pub fn move(dst: u12, src: u12) Inst {
+        return Inst.primary(.mov, Mov.move, s(dst), s(src), none);
     }
-
-    pub fn loadNil(slot_dst: u12) Inst {
-        return Inst.primary(.mov, Mov.load_nil, Operand.slot(slot_dst), Operand.none, Operand.none);
+    /// `mov:move` from any operand kind `resolve` reads.
+    pub fn moveFrom(dst: u12, src: Operand) Inst {
+        return Inst.primary(.mov, Mov.move, s(dst), src, none);
     }
-
-    pub fn loadTrue(slot_dst: u12) Inst {
-        return Inst.primary(.mov, Mov.load_true, Operand.slot(slot_dst), Operand.none, Operand.none);
+    pub fn moveClear(dst: u12, src: u12) Inst {
+        return Inst.primary(.mov, Mov.move_clear, s(dst), s(src), none);
     }
-
-    pub fn loadFalse(slot_dst: u12) Inst {
-        return Inst.primary(.mov, Mov.load_false, Operand.slot(slot_dst), Operand.none, Operand.none);
+    pub fn loadNil(dst: u12) Inst {
+        return Inst.primary(.mov, Mov.load_nil, s(dst), none, none);
     }
-
-    pub fn returnSlot(slot_src: u12) Inst {
-        return Inst.primary(.call, Call.@"return", Operand.slot(slot_src), Operand.none, Operand.none);
+    pub fn loadTrue(dst: u12) Inst {
+        return Inst.primary(.mov, Mov.load_true, s(dst), none, none);
     }
-
+    pub fn loadFalse(dst: u12) Inst {
+        return Inst.primary(.mov, Mov.load_false, s(dst), none, none);
+    }
+    pub fn returnSlot(src: u12) Inst {
+        return Inst.primary(.call, Call.@"return", s(src), none, none);
+    }
     pub fn returnNil() Inst {
-        return Inst.primary(.call, Call.return_nil, Operand.none, Operand.none, Operand.none);
+        return Inst.primary(.call, Call.return_nil, none, none, none);
     }
-
-    /// math:add a b c   ;  slot[a] = resolve(b) + resolve(c)
-    /// `b` and `c` may be any kind that `resolve` accepts.
-    pub fn mathAdd(slot_dst: u12, lhs: Operand, rhs: Operand) Inst {
-        return Inst.primary(.math, Math.add, Operand.slot(slot_dst), lhs, rhs);
+    pub fn mathAdd(dst: u12, lhs: Operand, rhs: Operand) Inst {
+        return Inst.primary(.math, Math.add, s(dst), lhs, rhs);
     }
-
-    /// cmp:lt dst lhs rhs   ; slot[dst] := bool(resolve(lhs) < resolve(rhs))
-    /// Non-numeric operands trap :kind-mismatch.
-    pub fn cmpLt(slot_dst: u12, lhs: Operand, rhs: Operand) Inst {
-        return Inst.primary(.cmp, Cmp.lt, Operand.slot(slot_dst), lhs, rhs);
+    pub fn cmpLt(dst: u12, lhs: Operand, rhs: Operand) Inst {
+        return Inst.primary(.cmp, Cmp.lt, s(dst), lhs, rhs);
     }
-
-    /// var:load-var dst W  ; slot[dst] := var_table[W]'s value
-    /// in force; traps :unbound-var when it has none.
-    pub fn varLoadVar(slot_dst: u12, var_idx: u32) Inst {
-        return Inst.primaryWide(.var_, VarOp.load_var, Operand.slot(slot_dst), var_idx);
+    pub fn varLoadVar(dst: u12, w: u32) Inst {
+        return Inst.primaryWide(.var_, VarOp.load_var, s(dst), w);
     }
-
-    /// var:store-var value W   ; var_table[W].root := resolve(value),
-    /// marked bound.
-    pub fn varStoreVar(var_idx: u32, value: Operand) Inst {
-        return Inst.primaryWide(.var_, VarOp.store_var, value, var_idx);
+    pub fn varStoreVar(w: u32, value: Operand) Inst {
+        return Inst.primaryWide(.var_, VarOp.store_var, value, w);
     }
-
-    /// var:var-object dst W  ; slot[dst] := the Var object (an
-    /// unbound Var does not trap). `(var x)` / `#'x` lowers to this.
-    pub fn varVarObject(slot_dst: u12, var_idx: u32) Inst {
-        return Inst.primaryWide(.var_, VarOp.var_object, Operand.slot(slot_dst), var_idx);
+    pub fn varVarObject(dst: u12, w: u32) Inst {
+        return Inst.primaryWide(.var_, VarOp.var_object, s(dst), w);
     }
-
-    /// coll:list arg_base argc dst  ; slot[dst] := list from
-    /// argc consecutive slots starting at arg_base.
-    pub fn collList(arg_base: u12, argc: u12, dst: u12) Inst {
-        return Inst.primary(
-            .coll,
-            CollOp.list,
-            Operand.slot(arg_base),
-            Operand.slot(argc), // raw-index immediate per §4.5
-            Operand.slot(dst),
-        );
+    /// `coll:<op>` of the `argc` slots from `base`, the count an
+    /// immediate (VM.md §4.5).
+    pub fn coll(op: CollOp, base: u12, argc: u12, dst: u12) Inst {
+        return Inst.primary(.coll, op, s(base), s(argc), s(dst));
     }
-
-    /// coll:concat arg_base argc dst  ; slot[dst] := concat of
-    /// argc list values starting at arg_base.
-    pub fn collConcat(arg_base: u12, argc: u12, dst: u12) Inst {
-        return Inst.primary(
-            .coll,
-            CollOp.concat,
-            Operand.slot(arg_base),
-            Operand.slot(argc), // raw-index immediate per §4.5
-            Operand.slot(dst),
-        );
+    /// `coll(.vector, ...)`, as `compile.zig`'s tests spell it.
+    pub fn collVector(base: u12, argc: u12, dst: u12) Inst {
+        return coll(.vector, base, argc, dst);
     }
-
-    /// ctrl:try-enter binding_slot W   ; push a handler for the
-    /// routine's try W.
-    pub fn tryEnter(try_index: u32, binding_slot: u12) Inst {
-        return Inst.primaryWide(.ctrl, CtrlOp.try_enter, Operand.slot(binding_slot), try_index);
+    pub fn tryEnter(w: u32, binding: u12) Inst {
+        return Inst.primaryWide(.ctrl, CtrlOp.try_enter, s(binding), w);
     }
-
-    /// ctrl:try-exit W   ; pop handler, jump to post_pc W; if the
-    /// popped handler has finally, push `.normal(post_pc)`
-    /// continuation + jump to finally.
     pub fn tryExit(post_pc: u32) Inst {
-        return Inst.primaryWide(.ctrl, CtrlOp.try_exit, Operand.none, post_pc);
+        return Inst.primaryWide(.ctrl, CtrlOp.try_exit, none, post_pc);
     }
-
-    /// ctrl:finally-exit _ _ _   ; pop FinallyContinuation +
-    /// dispatch (.normal jumps post_pc, .throwing continues
-    /// unwind).
     pub fn finallyExit() Inst {
-        return Inst.primary(.ctrl, CtrlOp.finally_exit, Operand.none, Operand.none, Operand.none);
+        return Inst.primary(.ctrl, CtrlOp.finally_exit, none, none, none);
     }
-
-    /// ctrl:throw value_operand _ _   ; throw the resolved value.
-    /// Operand kind may be slot, constant, or var.
     pub fn throwOp(value: Operand) Inst {
-        return Inst.primary(.ctrl, CtrlOp.throw_, value, Operand.none, Operand.none);
+        return Inst.primary(.ctrl, CtrlOp.throw_, value, none, none);
     }
-
-    /// coll:vector arg_base argc dst  ; slot[dst] := vector
-    /// built from argc consecutive slot values.
-    pub fn collVector(arg_base: u12, argc: u12, dst: u12) Inst {
-        return Inst.primary(
-            .coll,
-            CollOp.vector,
-            Operand.slot(arg_base),
-            Operand.slot(argc), // raw-index immediate per §4.5
-            Operand.slot(dst),
-        );
+    pub fn jumpJmp(target: u32) Inst {
+        return Inst.primaryWide(.jump, Jump.jmp, none, target);
     }
-
-    /// coll:map arg_base argc dst  ; slot[dst] := persistent map
-    /// from argc/2 k,v pairs (argc MUST be even).
-    pub fn collMap(arg_base: u12, argc: u12, dst: u12) Inst {
-        return Inst.primary(
-            .coll,
-            CollOp.map,
-            Operand.slot(arg_base),
-            Operand.slot(argc), // raw-index immediate per §4.5
-            Operand.slot(dst),
-        );
+    pub fn jumpIfTrue(target: u32, test_op: Operand) Inst {
+        return Inst.primaryWide(.jump, Jump.if_true, test_op, target);
     }
-
-    /// coll:set arg_base argc dst  ; slot[dst] := persistent set
-    /// from argc slot values (duplicates collapse).
-    pub fn collSet(arg_base: u12, argc: u12, dst: u12) Inst {
-        return Inst.primary(
-            .coll,
-            CollOp.set,
-            Operand.slot(arg_base),
-            Operand.slot(argc), // raw-index immediate per §4.5
-            Operand.slot(dst),
-        );
+    pub fn jumpIfFalse(target: u32, test_op: Operand) Inst {
+        return Inst.primaryWide(.jump, Jump.if_false, test_op, target);
     }
-
-    /// jump:jmp W   ; pc := W, an absolute pc in the routine.
-    pub fn jumpJmp(target_pc: u32) Inst {
-        return Inst.primaryWide(.jump, Jump.jmp, Operand.none, target_pc);
+    pub fn closureMake(w: u32, dst: u12) Inst {
+        return Inst.primaryWide(.closure, Closure_.make, s(dst), w);
     }
-
-    /// jump:if-true test W   ; if truthy(resolve(test)) pc := W
-    pub fn jumpIfTrue(target_pc: u32, test_op: Operand) Inst {
-        return Inst.primaryWide(.jump, Jump.if_true, test_op, target_pc);
+    pub fn closureBoxLocal(slot: u12) Inst {
+        return Inst.primary(.closure, Closure_.box_local, s(slot), none, none);
     }
-
-    /// jump:if-false test W  ; if falsy(resolve(test)) pc := W
-    pub fn jumpIfFalse(target_pc: u32, test_op: Operand) Inst {
-        return Inst.primaryWide(.jump, Jump.if_false, test_op, target_pc);
+    pub fn closureGetCell(dst: u12, cell: u12) Inst {
+        return Inst.primary(.closure, Closure_.get_cell, s(dst), s(cell), none);
     }
-
-    /// `closure:make dst W` per VM.md §6: a closure built from
-    /// capture descriptor W into slot `dst`.
-    pub fn closureMake(cap_desc_index: u32, dst: u12) Inst {
-        return Inst.primaryWide(.closure, Closure_.make, Operand.slot(dst), cap_desc_index);
+    pub fn closureNewCell(slot: u12) Inst {
+        return Inst.primary(.closure, Closure_.new_cell, s(slot), none, none);
     }
-
-    /// `call:call A=call_base B=argc C=result_slot` per VM.md §6
-    /// range-call ABI. Caller has already
-    /// staged closure + args at `slot[A..A+1+argc]`.
-    /// call:self window argc dst  ; the frame's own closure called
-    /// with the `argc` arguments at `window`, its result into `dst`.
-    pub fn callSelf(window: u12, argc: u12, result_slot: u12) Inst {
-        return Inst.primary(.call, Call.self_, Operand.slot(window), Operand.slot(argc), Operand.slot(result_slot));
+    pub fn closureInitCell(cell: u12, value: Operand) Inst {
+        return Inst.primary(.closure, Closure_.init_cell, s(cell), value, none);
     }
-
-    /// call:lookup dst target key  ; slot[dst] := (key target), `key`
-    /// a keyword or symbol constant.
+    pub fn callCall(base: u12, argc: u12, dst: u12) Inst {
+        return Inst.primary(.call, Call.call, s(base), s(argc), s(dst));
+    }
+    pub fn callSelf(window: u12, argc: u12, dst: u12) Inst {
+        return Inst.primary(.call, Call.self_, s(window), s(argc), s(dst));
+    }
     pub fn callLookup(dst: u12, target: Operand, key: u12) Inst {
-        return Inst.primary(.call, Call.lookup, Operand.slot(dst), target, Operand.constant(key));
+        return Inst.primary(.call, Call.lookup, s(dst), target, Operand.constant(key));
     }
-
-    /// call:lookup-or dst pair key  ; slot[dst] := (key slot[pair]
-    /// slot[pair + 1]).
     pub fn callLookupOr(dst: u12, pair: u12, key: u12) Inst {
-        return Inst.primary(.call, Call.lookup_or, Operand.slot(dst), Operand.slot(pair), Operand.constant(key));
-    }
-
-    pub fn callCall(call_base: u12, argc: u12, result_slot: u12) Inst {
-        return Inst.primary(
-            .call,
-            Call.call,
-            Operand.slot(call_base),
-            Operand.slot(argc), // raw-index immediate per §4.5
-            Operand.slot(result_slot),
-        );
-    }
-
-    /// General `mov:move dst, src` where `src` may be any operand
-    /// kind that `resolve` accepts (slot / constant / upvalue).
-    /// Used by `compileSymbol` for upvalue reads:
-    /// `moveFrom(dst, Operand.upvalue(u))` lowers a captured-
-    /// binding read; `move(dst, slot_src)` is the slot-to-slot
-    /// case.
-    pub fn moveFrom(slot_dst: u12, src: Operand) Inst {
-        return Inst.primary(.mov, Mov.move, Operand.slot(slot_dst), src, Operand.none);
-    }
-
-    /// `closure:box-local A=slot` — wrap slot[A]'s current value
-    /// into a fresh `UpvalCell`, replacing slot[A] with the cell
-    /// pointer. Emission timing per COMPILER.md §6.1.
-    pub fn closureBoxLocal(slot_idx: u12) Inst {
-        return Inst.primary(.closure, Closure_.box_local, Operand.slot(slot_idx), Operand.none, Operand.none);
-    }
-
-    /// `closure:get-cell A=dst_slot B=cell_slot` — read the
-    /// contents of an `UpvalCell` whose pointer lives in slot[B];
-    /// write to slot[A]. Same-frame read of a boxed local.
-    pub fn closureGetCell(dst: u12, cell_slot: u12) Inst {
-        return Inst.primary(.closure, Closure_.get_cell, Operand.slot(dst), Operand.slot(cell_slot), Operand.none);
-    }
-
-    /// `closure:new-cell A=slot` — allocate an uninitialized
-    /// UpvalCell, store cell pointer at slot[A]. Placeholder
-    /// cell for letfn* / named fn*.
-    pub fn closureNewCell(slot_idx: u12) Inst {
-        return Inst.primary(.closure, Closure_.new_cell, Operand.slot(slot_idx), Operand.none, Operand.none);
-    }
-
-    /// `closure:init-cell A=cell_slot B=value_op` — fill
-    /// uninitialized cell at slot[A] with resolve(B); set
-    /// initialized=true. letfn* / named fn* finalize.
-    pub fn closureInitCell(cell_slot: u12, value: Operand) Inst {
-        return Inst.primary(.closure, Closure_.init_cell, Operand.slot(cell_slot), value, Operand.none);
+        return Inst.primary(.call, Call.lookup_or, s(dst), s(pair), Operand.constant(key));
     }
 };
 
@@ -7052,58 +5797,16 @@ test "Operand helpers build the right bits" {
     try testing.expectEqual(@as(u12, 42), c.index);
 }
 
-test "VM frames: stack and frames structures initialized correctly" {
-    // Pins the backing-stack model invariants: after VM.init,
-    // `stack.items.len == routine.slot_count`, `frames.items.len == 1`,
-    // and frame[0].base_slot == 0.
-    const routine = makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 5, "init-shape");
-
+test "VM frames: a VM starts on one frame over its routine's slots, nil" {
+    const routine = makeRoutine(&.{asm_.returnNil()}, &.{}, 5, "init-shape");
     var vm = try VM.init(testing.allocator, &routine);
     defer vm.deinit();
-
     try testing.expectEqual(@as(usize, 5), vm.stack.items.len);
     try testing.expectEqual(@as(usize, 1), vm.frames.items.len);
     try testing.expectEqual(@as(u32, 0), vm.frames.items[0].base_slot);
-    try testing.expectEqual(@as(u16, 5), vm.frames.items[0].routine.slot_count);
-    try testing.expectEqual(@as(u32, 0), vm.frames.items[0].pc);
-    // All slots default-initialized to nil.
-    for (vm.stack.items) |s| {
-        try testing.expect(s.kind() == .nil);
-    }
-}
-
-test "VM frames: slotPtr through backing stack with base_slot indirection" {
-    // Verify that slot access goes through base_slot, not a
-    // per-frame slice. With base_slot = 0 this is functionally
-    // equivalent to direct slice access; the test exists to
-    // pin the indirection so an "optimization" that stores a
-    // slice can't bypass it silently.
-    const consts = [_]Value{value_mod.fromFixnum(42).?};
-    var code = [_]Inst{
-        asm_.loadConst(0, 0), // s0 = 42
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &consts, 1, "slotptr");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-
-    // Manually verify slotPtr returns a pointer into vm.stack.items.
-    const ptr = try vm.slotPtr(0);
-    try testing.expectEqual(&vm.stack.items[0], ptr);
-
-    const result = try vm.run();
-    try testing.expectEqual(@as(i64, 42), result.asFixnum());
-    // After run, the slot still holds the value (via the same indirection).
-    try testing.expectEqual(@as(i64, 42), vm.stack.items[0].asFixnum());
-}
-
-test "VM frames: slotPtr out-of-range surfaces OperandOutOfRange" {
-    const routine = makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 3, "slotptr-oob");
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    try testing.expectError(VmError.OperandOutOfRange, vm.slotPtr(3));
-    try testing.expectError(VmError.OperandOutOfRange, vm.slotPtr(4095));
+    for (vm.stack.items) |v| try testing.expect(v.isNil());
+    try testing.expectEqual(&vm.stack.items[4], try vm.slotPtrIn(vm.currentFrame(), 4));
+    try testing.expectError(VmError.OperandOutOfRange, vm.slotPtrIn(vm.currentFrame(), 5));
 }
 
 /// One hand-assembled routine and what running it on a fresh VM
@@ -7113,6 +5816,10 @@ const RunCase = struct {
     code: []const Inst,
     consts: []const Value = &.{},
     tries: []const Try = &.{},
+    caps: []const CaptureDescriptor = &.{},
+    /// The Var table: a fresh Var each, with a root and a binding in
+    /// force where given.
+    vars: []const struct { root: ?Value = null, binding: ?Value = null } = &.{},
     slots: u16 = 1,
     want: union(enum) {
         /// The result, by `dispatch.equal`.
@@ -7121,7 +5828,13 @@ const RunCase = struct {
         decimal: []const u8,
         /// A list of these fixnums.
         list: []const i64,
+        /// A value of this kind: a closure, a cell.
+        kind: value_mod.Kind,
+        /// The Var at this index of the table.
+        var_at: usize,
         err: VmError,
+        /// An uncaught throw of this value.
+        thrown: Value,
     },
 };
 
@@ -7130,15 +5843,36 @@ fn expectRuns(cases: []const RunCase) !void {
         errdefer std.debug.print("run case \"{s}\" failed\n", .{case.name});
         var routine = makeRoutine(case.code, case.consts, case.slots, case.name);
         routine.tries = case.tries;
+        routine.capture_descs = case.caps;
         var vm = try VM.init(testing.allocator, &routine);
         defer vm.deinit();
+        var vars: [4]*Var = undefined;
+        for (case.vars, vars[0..case.vars.len], 0..) |init, *v, i| {
+            v.* = try vm.ensureNamespace().intern(&.{'a' + @as(u8, @intCast(i))});
+            if (init.root) |root| {
+                v.*.root = root;
+                v.*.bound = true;
+            }
+            if (init.binding) |b| {
+                v.*.thread_value = b;
+                v.*.thread_bound = true;
+            }
+        }
+        routine.var_table = vars[0..case.vars.len];
         switch (case.want) {
             .err => |e| {
                 try testing.expectError(e, vm.run());
                 continue;
             },
+            .thrown => |v| {
+                try testing.expectError(VmError.UncaughtThrow, vm.run());
+                try testing.expect(dispatch_mod.equal(v, vm.unhandled_throw.?));
+                continue;
+            },
             .value => |v| try testing.expect(dispatch_mod.equal(v, try vm.run())),
             .decimal => |d| try expectDecimal(d, try vm.run()),
+            .kind => |k| try testing.expectEqual(k, (try vm.run()).kind()),
+            .var_at => |i| try testing.expectEqual(vars[i], VM.asVar(try vm.run())),
             .list => |xs| {
                 var cur = try vm.run();
                 for (xs) |x| {
@@ -7165,6 +5899,11 @@ const kn = Operand.constant;
 
 fn raw(g: Group, variant: u6, a: Operand, b: Operand, c: Operand) Inst {
     return .{ .kind = .primary, .group = @backingInt(g), .variant = variant, .a = a, .b = b, .c = c };
+}
+
+/// The instruction of quickened variant `q` of group `g`.
+fn quickInst(g: Group, q: Quick, a: Operand, b: Operand, c: Operand) Inst {
+    return raw(g, Quick.variant(g, q).?, a, b, c);
 }
 
 test "SourceInfo.lineCol: columns count code points, past a byte-order mark" {
@@ -7203,14 +5942,14 @@ test "VM opcodes: mov, return and operand resolution" {
 
 test "VM opcodes: coll" {
     try expectRuns(comptime &[_]RunCase{
-        .{ .name = "empty list", .code = &.{ asm_.collList(0, 0, 0), asm_.returnSlot(0) }, .want = .{ .list = &.{} } },
-        .{ .name = "list of three", .code = &.{ asm_.loadConst(0, 0), asm_.loadConst(1, 1), asm_.loadConst(2, 2), asm_.collList(0, 3, 3), asm_.returnSlot(3) }, .consts = &.{ fx(1), fx(2), fx(3) }, .slots = 4, .want = .{ .list = &.{ 1, 2, 3 } } },
-        .{ .name = "empty concat", .code = &.{ asm_.collConcat(0, 0, 0), asm_.returnSlot(0) }, .want = .{ .list = &.{} } },
-        .{ .name = "concat (1 2) (3)", .code = &.{ asm_.loadConst(0, 0), asm_.loadConst(1, 1), asm_.loadConst(2, 2), asm_.collList(0, 2, 3), asm_.collList(2, 1, 4), asm_.collConcat(3, 2, 5), asm_.returnSlot(5) }, .consts = &.{ fx(1), fx(2), fx(3) }, .slots = 6, .want = .{ .list = &.{ 1, 2, 3 } } },
-        .{ .name = "concat (1 2) [3] nil", .code = &.{ asm_.loadConst(0, 0), asm_.loadConst(1, 1), asm_.loadConst(2, 2), asm_.collList(0, 2, 3), asm_.collVector(2, 1, 4), asm_.loadNil(5), asm_.collConcat(3, 3, 6), asm_.returnSlot(6) }, .consts = &.{ fx(1), fx(2), fx(3) }, .slots = 7, .want = .{ .list = &.{ 1, 2, 3 } } },
-        .{ .name = "concat of a non-seqable", .code = &.{ asm_.loadConst(0, 0), asm_.collConcat(0, 1, 1), asm_.returnSlot(1) }, .consts = &.{fx(99)}, .slots = 2, .want = .{ .err = VmError.KindMismatch } },
-        .{ .name = "odd map argc", .code = &.{ asm_.collMap(0, 1, 0), asm_.returnSlot(0) }, .want = .{ .err = VmError.BytecodeCorruption } },
-        .{ .name = "args past the frame", .code = &.{ asm_.collVector(0, 2, 0), asm_.returnSlot(0) }, .want = .{ .err = VmError.OperandOutOfRange } },
+        .{ .name = "empty list", .code = &.{ asm_.coll(.list, 0, 0, 0), asm_.returnSlot(0) }, .want = .{ .list = &.{} } },
+        .{ .name = "list of three", .code = &.{ asm_.loadConst(0, 0), asm_.loadConst(1, 1), asm_.loadConst(2, 2), asm_.coll(.list, 0, 3, 3), asm_.returnSlot(3) }, .consts = &.{ fx(1), fx(2), fx(3) }, .slots = 4, .want = .{ .list = &.{ 1, 2, 3 } } },
+        .{ .name = "empty concat", .code = &.{ asm_.coll(.concat, 0, 0, 0), asm_.returnSlot(0) }, .want = .{ .list = &.{} } },
+        .{ .name = "concat (1 2) (3)", .code = &.{ asm_.loadConst(0, 0), asm_.loadConst(1, 1), asm_.loadConst(2, 2), asm_.coll(.list, 0, 2, 3), asm_.coll(.list, 2, 1, 4), asm_.coll(.concat, 3, 2, 5), asm_.returnSlot(5) }, .consts = &.{ fx(1), fx(2), fx(3) }, .slots = 6, .want = .{ .list = &.{ 1, 2, 3 } } },
+        .{ .name = "concat (1 2) [3] nil", .code = &.{ asm_.loadConst(0, 0), asm_.loadConst(1, 1), asm_.loadConst(2, 2), asm_.coll(.list, 0, 2, 3), asm_.coll(.vector, 2, 1, 4), asm_.loadNil(5), asm_.coll(.concat, 3, 3, 6), asm_.returnSlot(6) }, .consts = &.{ fx(1), fx(2), fx(3) }, .slots = 7, .want = .{ .list = &.{ 1, 2, 3 } } },
+        .{ .name = "concat of a non-seqable", .code = &.{ asm_.loadConst(0, 0), asm_.coll(.concat, 0, 1, 1), asm_.returnSlot(1) }, .consts = &.{fx(99)}, .slots = 2, .want = .{ .err = VmError.KindMismatch } },
+        .{ .name = "odd map argc", .code = &.{ asm_.coll(.map, 0, 1, 0), asm_.returnSlot(0) }, .want = .{ .err = VmError.BytecodeCorruption } },
+        .{ .name = "args past the frame", .code = &.{ asm_.coll(.vector, 0, 2, 0), asm_.returnSlot(0) }, .want = .{ .err = VmError.OperandOutOfRange } },
     });
 }
 
@@ -7225,9 +5964,9 @@ test "VM opcodes: coll:map and coll:set keep the first key and the last value" {
     const c = try kw.internKeywordValue("c");
     const consts = [_]Value{ fx(1), a, fx(2), b, c, fx(3) };
     const code = [_]Inst{
-        asm_.loadConst(0, 0), asm_.loadConst(1, 1), asm_.loadConst(2, 2),  asm_.loadConst(3, 3),
-        asm_.loadConst(4, 0), asm_.loadConst(5, 4), asm_.collMap(0, 6, 6), asm_.loadConst(0, 5),
-        asm_.loadConst(1, 0), asm_.loadConst(2, 5), asm_.collSet(0, 3, 7), asm_.collVector(6, 2, 0),
+        asm_.loadConst(0, 0), asm_.loadConst(1, 1), asm_.loadConst(2, 2),     asm_.loadConst(3, 3),
+        asm_.loadConst(4, 0), asm_.loadConst(5, 4), asm_.coll(.map, 0, 6, 6), asm_.loadConst(0, 5),
+        asm_.loadConst(1, 0), asm_.loadConst(2, 5), asm_.coll(.set, 0, 3, 7), asm_.coll(.vector, 6, 2, 0),
         asm_.returnSlot(0),
     };
     const routine = makeRoutine(&code, &consts, 8, "coll-dupes");
@@ -7388,6 +6127,15 @@ test "VM dispatch: fixnum arithmetic that leaves i48 promotes" {
     });
 }
 
+test "vmErrorToKeywordName: a catchable error's tag in kebab case, null for the rest" {
+    try testing.expectEqualStrings("kind-mismatch", vmErrorToKeywordName(VmError.KindMismatch).?);
+    try testing.expectEqualStrings("utf8-error", vmErrorToKeywordName(VmError.Utf8Error).?);
+    try testing.expectEqualStrings("atom-re-entry", vmErrorToKeywordName(VmError.AtomReEntry).?);
+    try testing.expectEqualStrings("not-a-record", vmErrorToKeywordName(VmError.NotARecord).?);
+    try testing.expectEqualStrings("transient-used-after-persistent", vmErrorToKeywordName(VmError.TransientUsedAfterPersistent).?);
+    try testing.expect(vmErrorToKeywordName(VmError.OutOfMemory) == null);
+}
+
 test "VM dispatch: a handler's status carries every VmError and back" {
     inline for (@typeInfo(VmError).error_set.error_names.?) |name| {
         const err = @field(VmError, name);
@@ -7464,42 +6212,6 @@ test "VM dispatch: a quickened instruction runs as its base, every case and trap
     // non-number), run as written and quickened: the result, or the
     // error, its detail and the instruction it names, are the same.
     const values = [_]Value{ fx(0), fx(1), fx(-7), fx(7), fx(value_mod.fixnum_max), fx(value_mod.fixnum_min), fl(2.5), true_v, nil_v };
-    const Outcome = struct {
-        value: ?Value = null,
-        err: ?VmError = null,
-        detail: [96]u8 = undefined,
-        detail_len: usize = 0,
-        pc: u32 = 0,
-
-        fn of(code: []const Inst, consts: []const Value) !@This() {
-            const routine = makeRoutine(code, consts, 3, "q");
-            var vm = try VM.init(testing.allocator, &routine);
-            defer vm.deinit();
-            var out: @This() = .{};
-            const v = vm.run() catch |err| {
-                out.err = err;
-                out.detail_len = @min(vm.error_detail.len, out.detail.len);
-                @memcpy(out.detail[0..out.detail_len], vm.error_detail[0..out.detail_len]);
-                out.pc = vm.error_trace.items[0].pc;
-                return out;
-            };
-            // A bignum lives on the VM's heap: compare it as text.
-            out.value = if (v.isFixnum() or v.isFloat() or v.isBool()) v else blk: {
-                var w = std.Io.Writer.fixed(&out.detail);
-                try bignum_mod.formatDecimal(v, &w);
-                out.detail_len = w.buffered().len;
-                break :blk nil_v;
-            };
-            return out;
-        }
-
-        fn expectSame(a: @This(), b: @This()) !void {
-            try testing.expectEqual(a.err, b.err);
-            try testing.expectEqual(a.pc, b.pc);
-            try testing.expectEqualStrings(a.detail[0..a.detail_len], b.detail[0..b.detail_len]);
-            if (a.value) |v| try testing.expect(dispatch_mod.equal(v, b.value.?)) else try testing.expect(b.value == null);
-        }
-    };
     var quickened: usize = 0;
     // B and C slots, C a fixnum constant, B a fixnum constant.
     for (values) |x| for (values) |y| for ([_]u2{ 0, 1, 2 }) |layout| {
@@ -7524,12 +6236,12 @@ test "VM dispatch: a quickened instruction runs as its base, every case and trap
         };
         for (ops[0..k]) |body| {
             var code = [_]Inst{ asm_.loadConst(0, 0), asm_.loadConst(1, 1), body[0], body[1], body[2], asm_.loadConst(2, 2), asm_.returnSlot(2) };
-            const plain = try Outcome.of(&code, &consts);
+            const plain = try StepOutcome.of(&code, &consts);
             quicken(&code, &consts);
             try testing.expect(Quick.of(VM.opIndex(code[2])) != null);
             quickened += 1;
             errdefer std.debug.print("quickened {any} of {any} and {any}\n", .{ Quick.of(VM.opIndex(code[2])), x, y });
-            try Outcome.expectSame(plain, try Outcome.of(&code, &consts));
+            try StepOutcome.expectSame(plain, try StepOutcome.of(&code, &consts));
         }
     };
     try testing.expect(quickened > 1000);
@@ -7538,11 +6250,7 @@ test "VM dispatch: a quickened instruction runs as its base, every case and trap
 test "Routine.verify: a quickened instruction proves what its form promises" {
     const r = asm_.returnNil();
     const consts = [_]Value{ fx(1), fl(1.5) };
-    const quick = struct {
-        fn of(g: Group, q: Quick, a: Operand, b: Operand, c: Operand) Inst {
-            return raw(g, Quick.variant(g, q).?, a, b, c);
-        }
-    }.of;
+    const quick = quickInst;
     const add_ss: Quick = .{ .base = @backingInt(Math.add), .form = .slot_slot };
     const add_sc: Quick = .{ .base = @backingInt(Math.add), .form = .slot_fixnum };
     const lt_then: Quick = .{ .base = @backingInt(Cmp.lt), .form = .slot_slot, .then = .if_false };
@@ -7748,7 +6456,7 @@ test "VM dispatch: a counting loop runs through its step to each boundary" {
         const quick = try StepOutcome.of(&code, &consts);
         try StepOutcome.expectSame(plain, quick);
         var buf: [24]u8 = undefined;
-        const got = if (quick.value.?.isFixnum()) try std.fmt.bufPrint(&buf, "{d}", .{quick.value.?.asFixnum()}) else quick.detail[0..quick.detail_len];
+        const got = if (quick.value.?.isFixnum()) try std.mem.print(&buf, "{d}", .{quick.value.?.asFixnum()}) else quick.detail[0..quick.detail_len];
         try testing.expectEqualStrings(case.want, got);
     }
 }
@@ -7792,11 +6500,7 @@ test "VM dispatch: an error through a counting loop's step names its own instruc
 test "Routine.verify: a step proves the comparison it runs" {
     const r = asm_.returnNil();
     const consts = [_]Value{ fx(1), fl(1.5) };
-    const quick = struct {
-        fn of(g: Group, q: Quick, a: Operand, b: Operand, c: Operand) Inst {
-            return raw(g, Quick.variant(g, q).?, a, b, c);
-        }
-    }.of;
+    const quick = quickInst;
     const step: Quick = .{ .base = @backingInt(Math.add), .form = .slot_fixnum, .then = .if_true, .step = .{ .cmp = .lt, .form = .slot_slot } };
     const lt_ss: Quick = Quick.stepCmp(step).?;
     const gt: Quick = .{ .base = @backingInt(Cmp.gt), .form = .slot_slot, .then = .if_true };
@@ -7849,122 +6553,6 @@ test "VM jump: targets and constants past the 16-bit range" {
     try testing.expectEqual(@as(i64, 69_000), (try vm.run()).asFixnum());
 }
 
-// ---- ctrl group tests ---------------------------
-
-test "VM ctrl: try-enter pushes handler, try-exit pops it" {
-    // (try 42 (catch any _ 99)) — body returns 42, catch unused.
-    // Layout: slot 0 = result; slot 1 = catch binding (unused).
-    // Body returns 42 via mov; try-exit jumps past catch; catch
-    // would set 99 if reached.
-    var code = [_]Inst{
-        // PC 0: try-enter try 0 (catch=4), binding=1
-        asm_.tryEnter(0, 1),
-        // PC 1: body: load 42 into slot 0
-        // (We can't loadConst w/o consts; use loadNil and then
-        // a constant via consts pool.)
-        asm_.loadConst(0, 0),
-        // PC 2: try-exit -> jump to post at PC 6
-        asm_.tryExit(6),
-        // PC 3: jump (just padding; never reached)
-        asm_.jumpJmp(6),
-        // PC 4: catch entry — set slot 0 to constant index 1 (99)
-        asm_.loadConst(0, 1),
-        // PC 5: try-exit -> post at PC 6
-        asm_.tryExit(6),
-        // PC 6: return slot 0
-        asm_.returnSlot(0),
-    };
-    const consts = [_]Value{
-        value_mod.fromFixnum(42).?,
-        value_mod.fromFixnum(99).?,
-    };
-    var routine = makeRoutine(&code, &consts, 2, "try-normal");
-    routine.tries = &.{.{ .catch_pc = 4 }};
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const r = try vm.run();
-    try testing.expectEqual(@as(i64, 42), r.asFixnum());
-    // Handler stack empty after normal exit.
-    try testing.expectEqual(@as(usize, 0), vm.handlers.items.len);
-}
-
-test "VM ctrl: throw caught by current frame's try handler" {
-    // (try (throw 7) (catch any e e)) — should return 7.
-    var code = [_]Inst{
-        // PC 0: try-enter try 0 (catch=2), binding=1
-        asm_.tryEnter(0, 1),
-        // PC 1: throw constant 0 (= 7)
-        asm_.throwOp(Operand{ .kind = .constant, .index = 0 }),
-        // PC 2: catch entry — slot 1 was filled by throw with 7;
-        // move it to slot 0 (result), then try-exit to PC 4.
-        asm_.move(0, 1),
-        // PC 3: try-exit -> post at PC 4
-        asm_.tryExit(4),
-        // PC 4: return slot 0
-        asm_.returnSlot(0),
-    };
-    const consts = [_]Value{
-        value_mod.fromFixnum(7).?,
-    };
-    var routine = makeRoutine(&code, &consts, 2, "try-catch");
-    routine.tries = &.{.{ .catch_pc = 2 }};
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const r = try vm.run();
-    try testing.expectEqual(@as(i64, 7), r.asFixnum());
-    try testing.expectEqual(@as(usize, 0), vm.handlers.items.len);
-}
-
-test "VM ctrl: throw with no handler raises UncaughtThrow" {
-    // (throw 13) at top level — uncaught.
-    var code = [_]Inst{
-        asm_.throwOp(Operand{ .kind = .constant, .index = 0 }),
-        asm_.returnSlot(0), // unreached
-    };
-    const consts = [_]Value{
-        value_mod.fromFixnum(13).?,
-    };
-    const routine = makeRoutine(&code, &consts, 1, "uncaught");
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    try testing.expectError(VmError.UncaughtThrow, vm.run());
-    // Payload stored for diagnostics.
-    try testing.expect(vm.unhandled_throw != null);
-    try testing.expectEqual(@as(i64, 13), vm.unhandled_throw.?.asFixnum());
-}
-
-test "VM ctrl: throw inside catch body NOT re-caught by same handler" {
-    // (try (throw :a) (catch any e (throw :b)))
-    // The inner throw must NOT be caught by the same handler;
-    // it should propagate as UncaughtThrow (no outer try here).
-    // This is the "classic trap": the throw-handler replaces
-    // the try with cleanup so the catch body's own throw
-    // bypasses the same handler.
-    var code = [_]Inst{
-        // PC 0: try-enter try 0 (catch=2), binding=1
-        asm_.tryEnter(0, 1),
-        // PC 1: throw const 0 = :a (fixnum 1 for simplicity)
-        asm_.throwOp(Operand{ .kind = .constant, .index = 0 }),
-        // PC 2: catch entry — throw const 1 = :b
-        asm_.throwOp(Operand{ .kind = .constant, .index = 1 }),
-        // PC 3: try-exit (unreached if inner throw escapes)
-        asm_.tryExit(4),
-        // PC 4: return
-        asm_.returnSlot(0),
-    };
-    const consts = [_]Value{
-        value_mod.fromFixnum(1).?, // "a"
-        value_mod.fromFixnum(2).?, // "b"
-    };
-    var routine = makeRoutine(&code, &consts, 2, "catch-rethrow");
-    routine.tries = &.{.{ .catch_pc = 2 }};
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    try testing.expectError(VmError.UncaughtThrow, vm.run());
-    // Should be the SECOND throw (value 2), not the first.
-    try testing.expectEqual(@as(i64, 2), vm.unhandled_throw.?.asFixnum());
-}
-
 test "VM error detail: a sentence longer than the buffer is cut with an ellipsis, not dropped" {
     var vm = try VM.init(testing.allocator, &VM.idle_routine);
     defer vm.deinit();
@@ -7996,22 +6584,45 @@ test "VM error value: a map of tag, message and place; the bare keyword when mem
     try testing.expectEqualStrings("index out of bounds", string_mod.asBytes(message));
 }
 
-test "VM error value: a report drops the place a rethrown error map carries, and nothing else" {
-    var vm = try VM.init(testing.allocator, &VM.idle_routine);
+test "VM error value: a handler takes a runtime error when memory is exhausted, through a finally too" {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const a = failing.allocator();
+    var vm = try VM.init(a, &VM.idle_routine);
     defer vm.deinit();
-    const info = SourceInfo{ .path = "t.nx", .text = "(f)" };
-    const routine = Routine{ .code = &.{}, .consts = &.{}, .slot_count = 1, .name = "f", .source = &info, .spans = &.{.{ .pc = 0, .span = .{ .pos = 0, .len = 3 } }} };
-    const tag = try vm.ensureInterner().internKeywordValue("kind-mismatch");
-    const placed = vm.errorValue(tag, "", .{ .name = "f", .pc = 0, .span = routine.spanAt(0), .source = &info });
-    try testing.expectEqual(@as(usize, 6), champ_mod.mapCount(placed));
-    const bare = vm.withoutPlace(placed);
-    try testing.expectEqual(@as(usize, 2), champ_mod.mapCount(bare));
-    try testing.expectEqualStrings("kind-mismatch", try caughtTag(&vm, bare));
-    // A map of the program's own with a :line of its own keeps it.
-    const line_key = try vm.ensureInterner().internKeywordValue("line");
-    const own = try vm.putKey(try vm.putKey(try champ_mod.mapEmpty(vm.ensureHeap()), "error", tag), "line", fx(3));
-    try testing.expect(vm.withoutPlace(own).identicalTo(own));
-    try testing.expectEqual(@as(i64, 3), (try lookup(own, line_key, value_mod.nilValue())).asFixnum());
+    const it = vm.ensureInterner();
+    const k = try it.internKeywordValue("k");
+    _ = try it.internKeywordValue("kind-mismatch");
+    try vm.handlers.ensureTotalCapacity(a, 4);
+    // Two trys with a finally entered and left standing grow what
+    // a throw through them needs; none is thrown through yet.
+    const enter = [_]Inst{ asm_.tryEnter(0, 0), asm_.tryEnter(0, 0), asm_.returnNil() };
+    var warm = makeRoutine(&enter, &.{}, 1, "warm");
+    warm.tries = &.{.{ .catch_pc = 2, .finally_pc = 2 }};
+    try vm.retargetTop(&warm);
+    _ = try vm.run();
+    vm.resetAfterError();
+    // (try (try (+ :k 1) (catch any e (throw e)) (finally)) (catch any e e)),
+    // every allocation failing from the run on: the error map is the
+    // bare keyword, the throw has no origin to record, and the finally
+    // resumes it into the outer catch.
+    const code = [_]Inst{
+        asm_.tryEnter(0, 1),
+        asm_.tryEnter(1, 2),
+        asm_.mathAdd(3, kn(0), kn(1)),
+        asm_.tryExit(9),
+        asm_.throwOp(sl(2)), // 4: inner catch
+        asm_.finallyExit(), //  5: inner finally
+        asm_.move(3, 1), //     6: outer catch
+        asm_.tryExit(9),
+        asm_.returnNil(),
+        asm_.returnSlot(3), //  9
+    };
+    var routine = makeRoutine(&code, &.{ k, fx(1) }, 4, "oom");
+    routine.tries = &.{ .{ .catch_pc = 6 }, .{ .catch_pc = 4, .finally_pc = 5 } };
+    try vm.retargetTop(&routine);
+    failing.fail_index = failing.alloc_index;
+    defer failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqualStrings("kind-mismatch", try caughtTag(&vm, try vm.run()));
 }
 
 test "VM ctrl: a try's finally body runs after its catch; try-enter names a try of the routine" {
@@ -8029,7 +6640,7 @@ test "VM ctrl: a try's finally body runs after its catch; try-enter names a try 
                 asm_.returnNil(), //      5: unreached
                 asm_.loadConst(2, 1), //  6: finally
                 asm_.finallyExit(), //    7
-                asm_.collList(0, 3, 3), // 8
+                asm_.coll(.list, 0, 3, 3), // 8
                 asm_.returnSlot(3),
             },
             .consts = &.{ fx(7), fx(1) },
@@ -8038,6 +6649,12 @@ test "VM ctrl: a try's finally body runs after its catch; try-enter names a try 
             .want = .{ .list = &.{ 7, 7, 1 } },
         },
         .{ .name = "try index past the table", .code = &.{ asm_.tryEnter(1, 0), asm_.returnNil() }, .tries = &.{.{ .catch_pc = 1 }}, .want = .{ .err = VmError.OperandOutOfRange } },
+        // (try 42 (catch any _ 99)), (try (throw 7) (catch any e e)).
+        .{ .name = "try-exit with nothing thrown", .code = &.{ asm_.tryEnter(0, 1), asm_.loadConst(0, 0), asm_.tryExit(5), asm_.loadConst(0, 1), asm_.tryExit(5), asm_.returnSlot(0) }, .consts = &.{ fx(42), fx(99) }, .tries = &.{.{ .catch_pc = 3 }}, .slots = 2, .want = .{ .value = fx(42) } },
+        .{ .name = "a throw caught", .code = &.{ asm_.tryEnter(0, 1), asm_.throwOp(kn(0)), asm_.move(0, 1), asm_.tryExit(4), asm_.returnSlot(0) }, .consts = &.{fx(7)}, .tries = &.{.{ .catch_pc = 2 }}, .slots = 2, .want = .{ .value = fx(7) } },
+        .{ .name = "a throw with no handler", .code = &.{ asm_.throwOp(kn(0)), asm_.returnNil() }, .consts = &.{fx(13)}, .want = .{ .thrown = fx(13) } },
+        // The catch body's throw passes the handler that caught the first.
+        .{ .name = "a throw from the catch body", .code = &.{ asm_.tryEnter(0, 1), asm_.throwOp(kn(0)), asm_.throwOp(kn(1)), asm_.tryExit(4), asm_.returnNil() }, .consts = &.{ fx(1), fx(2) }, .tries = &.{.{ .catch_pc = 2 }}, .slots = 2, .want = .{ .thrown = fx(2) } },
     });
 }
 
@@ -8273,298 +6890,53 @@ test "callValue: keywords, maps, sets and vectors are invocable as lookups" {
     try testing.expectError(VmError.NotCallable, vm.callValue(fx(1), &.{fx(2)}));
 }
 
-test "VM math/cmp opcodes cover every wired variant" {
-    const consts = [_]Value{
-        fx(7),
-        fx(2),
-        fl(0.5),
-    };
-    var code = [_]Inst{
-        Inst.primary(.math, Math.sub, Operand.slot(0), Operand.constant(0), Operand.constant(1)), // 5
-        Inst.primary(.math, Math.mul, Operand.slot(1), Operand.slot(0), Operand.constant(1)), // 10
-        Inst.primary(.math, Math.div, Operand.slot(2), Operand.slot(1), Operand.constant(1)), // 5
-        Inst.primary(.math, Math.idiv, Operand.slot(3), Operand.constant(0), Operand.constant(1)), // 3
-        Inst.primary(.math, Math.mod, Operand.slot(4), Operand.constant(0), Operand.constant(1)), // 1
-        Inst.primary(.math, Math.neg, Operand.slot(5), Operand.slot(4), Operand.none), // -1
-        Inst.primary(.math, Math.abs, Operand.slot(6), Operand.slot(5), Operand.none), // 1
-        Inst.primary(.cmp, Cmp.lte, Operand.slot(7), Operand.slot(6), Operand.constant(1)), // true
-        Inst.primary(.cmp, Cmp.gt, Operand.slot(8), Operand.slot(6), Operand.constant(2)), // true
-        Inst.primary(.cmp, Cmp.gte, Operand.slot(9), Operand.constant(2), Operand.slot(6)), // false
-        Inst.primary(.cmp, Cmp.eq_num, Operand.slot(10), Operand.slot(2), Operand.slot(0)), // true
-        asm_.returnSlot(10),
-    };
-    const routine = makeRoutine(&code, &consts, 11, "math-cmp");
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expect(result.asBool());
-    try testing.expectEqual(@as(i64, 5), vm.stack.items[0].asFixnum());
-    try testing.expectEqual(@as(i64, 10), vm.stack.items[1].asFixnum());
-    try testing.expectEqual(@as(i64, 5), vm.stack.items[2].asFixnum());
-    try testing.expectEqual(@as(i64, 3), vm.stack.items[3].asFixnum());
-    try testing.expectEqual(@as(i64, 1), vm.stack.items[4].asFixnum());
-    try testing.expectEqual(@as(i64, -1), vm.stack.items[5].asFixnum());
-    try testing.expectEqual(@as(i64, 1), vm.stack.items[6].asFixnum());
-    try testing.expect(vm.stack.items[7].asBool());
-    try testing.expect(vm.stack.items[8].asBool());
-    try testing.expect(!vm.stack.items[9].asBool());
+test "VM opcodes: every math and cmp variant" {
+    const op = struct {
+        fn of(g: Group, variant: anytype, b: Operand, c: Operand) []const Inst {
+            return &.{ Inst.primary(g, variant, sl(0), b, c), asm_.returnSlot(0) };
+        }
+    }.of;
+    const none = Operand.none;
+    try expectRuns(comptime &[_]RunCase{
+        .{ .name = "sub", .code = op(.math, Math.sub, kn(0), kn(1)), .consts = &.{ fx(7), fx(2) }, .want = .{ .value = fx(5) } },
+        .{ .name = "mul", .code = op(.math, Math.mul, kn(0), kn(1)), .consts = &.{ fx(7), fx(2) }, .want = .{ .value = fx(14) } },
+        .{ .name = "div", .code = op(.math, Math.div, kn(0), kn(1)), .consts = &.{ fx(10), fx(2) }, .want = .{ .value = fx(5) } },
+        .{ .name = "idiv", .code = op(.math, Math.idiv, kn(0), kn(1)), .consts = &.{ fx(7), fx(2) }, .want = .{ .value = fx(3) } },
+        .{ .name = "mod", .code = op(.math, Math.mod, kn(0), kn(1)), .consts = &.{ fx(7), fx(2) }, .want = .{ .value = fx(1) } },
+        .{ .name = "neg", .code = op(.math, Math.neg, kn(0), none), .consts = &.{fx(1)}, .want = .{ .value = fx(-1) } },
+        .{ .name = "abs", .code = op(.math, Math.abs, kn(0), none), .consts = &.{fx(-1)}, .want = .{ .value = fx(1) } },
+        .{ .name = "lte", .code = op(.cmp, Cmp.lte, kn(0), kn(1)), .consts = &.{ fx(1), fx(2) }, .want = .{ .value = true_v } },
+        .{ .name = "gt", .code = op(.cmp, Cmp.gt, kn(0), kn(1)), .consts = &.{ fx(1), fl(0.5) }, .want = .{ .value = true_v } },
+        .{ .name = "gte", .code = op(.cmp, Cmp.gte, kn(0), kn(1)), .consts = &.{ fl(0.5), fx(1) }, .want = .{ .value = false_v } },
+        .{ .name = "eq-num", .code = op(.cmp, Cmp.eq_num, kn(0), kn(1)), .consts = &.{ fx(5), fl(5.0) }, .want = .{ .value = true_v } },
+    });
 }
 
-// ---- Var + Namespace + var:load-var tests ----
-
-test "VM var: Namespace.intern creates an unbound Var, lookup returns it" {
-    var vm = try VM.init(testing.allocator, &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "init"));
-    defer vm.deinit();
-    const ns = vm.ensureNamespace();
-    const v1 = try ns.intern("x");
-    try testing.expect(!v1.bound);
-    try testing.expect(v1.root.isNil());
-    // Re-intern returns the SAME Var (identity stable).
-    const v2 = try ns.intern("x");
-    try testing.expectEqual(v1, v2);
-    // Lookup of unknown returns null.
-    try testing.expect(ns.lookup("y") == null);
-}
-
-test "VM var: var:load-var returns var.root for bound var" {
-    var vm = try VM.init(
-        testing.allocator,
-        &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
-    );
-    defer vm.deinit();
-
-    // Intern + bind x = 42 in the VM's namespace.
-    const ns = vm.ensureNamespace();
-    const x = try ns.intern("x");
-    x.root = value_mod.fromFixnum(42).?;
-    x.bound = true;
-
-    // Build a routine that references x via var_table[0] and
-    // patch the VM's top frame to use it. Direct manipulation —
-    // tests-only API; the compiler sets this up through
-    // `Routine.var_table`.
-    const var_table = [_]*Var{x};
-    var code = [_]Inst{
-        asm_.varLoadVar(0, 0),
-        asm_.returnSlot(0),
-    };
-    const routine = Routine{
-        .code = &code,
-        .consts = &.{},
-        .slot_count = 1,
-        .var_table = &var_table,
-    };
-    try vm.retargetTop(&routine);
-    const result = try vm.run();
-    try testing.expect(result.isFixnum());
-    try testing.expectEqual(@as(i64, 42), result.asFixnum());
-}
-
-test "VM var: var:load-var on unbound Var traps :unbound-var" {
-    var vm = try VM.init(
-        testing.allocator,
-        &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
-    );
-    defer vm.deinit();
-
-    const ns = vm.ensureNamespace();
-    const x = try ns.intern("undefined-yet"); // never bound
-
-    const var_table = [_]*Var{x};
-    var code = [_]Inst{
-        asm_.varLoadVar(0, 0),
-        asm_.returnSlot(0),
-    };
-    const routine = Routine{
-        .code = &code,
-        .consts = &.{},
-        .slot_count = 1,
-        .var_table = &var_table,
-    };
-    try vm.retargetTop(&routine);
-    const res = vm.run();
-    try testing.expectError(VmError.UnboundVar, res);
-}
-
-test "VM var: a v operand reads the binding in force, else the root, else traps" {
+test "Namespace.intern makes an unbound Var once" {
     var vm = try VM.init(testing.allocator, &VM.idle_routine);
     defer vm.deinit();
     const ns = vm.ensureNamespace();
-    const rooted = try ns.intern("rooted");
-    rooted.root = fx(40);
-    rooted.bound = true;
-    const rebound = try ns.intern("rebound");
-    rebound.root = fx(1);
-    rebound.bound = true;
-    rebound.thread_value = fx(2);
-    rebound.thread_bound = true;
-    const unbound = try ns.intern("unbound");
-    const var_table = [_]*Var{ rooted, rebound, unbound };
-    // (+ rooted rebound), then the same through the general mov:move.
-    var code = [_]Inst{
-        asm_.mathAdd(0, Operand.varRef(0), Operand.varRef(1)),
-        asm_.returnSlot(0),
-    };
-    var routine = Routine{ .code = &code, .consts = &.{}, .slot_count = 1, .var_table = &var_table };
-    try vm.retargetTop(&routine);
-    try testing.expectEqual(@as(i64, 42), (try vm.run()).asFixnum());
-    code[0] = asm_.moveFrom(0, Operand.varRef(2));
-    try vm.retargetTop(&routine);
-    try testing.expectError(VmError.UnboundVar, vm.run());
-    vm.resetAfterError();
-    code[0] = asm_.moveFrom(0, Operand.varRef(3));
-    try vm.retargetTop(&routine);
-    try testing.expectError(VmError.OperandOutOfRange, vm.run());
-}
-
-test "VM var: var:load-var operand index out of range traps :operand-out-of-range" {
-    var vm = try VM.init(
-        testing.allocator,
-        &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
-    );
-    defer vm.deinit();
-
-    // Empty var_table, but instruction references index 5.
-    var code = [_]Inst{
-        asm_.varLoadVar(0, 5),
-        asm_.returnSlot(0),
-    };
-    const routine = Routine{
-        .code = &code,
-        .consts = &.{},
-        .slot_count = 1,
-        // var_table = default empty
-    };
-    try vm.retargetTop(&routine);
-    const res = vm.run();
-    try testing.expectError(VmError.OperandOutOfRange, res);
-}
-
-test "VM var: var:load-var into a non-slot destination traps :invalid-operand-kind" {
-    var vm = try VM.init(
-        testing.allocator,
-        &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
-    );
-    defer vm.deinit();
-
-    const x = try vm.ensureNamespace().intern("x");
-    const var_table = [_]*Var{x};
-    var code = [_]Inst{
-        Inst.primaryWide(.var_, VarOp.load_var, Operand.constant(0), 0),
-        asm_.returnNil(),
-    };
-    const routine = Routine{
-        .code = &code,
-        .consts = &.{},
-        .slot_count = 1,
-        .var_table = &var_table,
-    };
-    try vm.retargetTop(&routine);
-    const res = vm.run();
-    try testing.expectError(VmError.InvalidOperandKind, res);
-}
-
-// ---- var:store-var + var:var-object tests ----
-
-test "VM var store: var:store-var sets root and marks bound; var-object reads the Var" {
-    var vm = try VM.init(
-        testing.allocator,
-        &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
-    );
-    defer vm.deinit();
-
-    const ns = vm.ensureNamespace();
     const x = try ns.intern("x");
-    try testing.expect(!x.bound);
-
-    const var_table = [_]*Var{x};
-    const consts = [_]Value{value_mod.fromFixnum(42).?};
-    var code = [_]Inst{
-        asm_.varStoreVar(0, Operand.constant(0)), // x = 42
-        asm_.varVarObject(0, 0), //                 slot[0] = #'x
-        asm_.returnSlot(0),
-    };
-    const routine = Routine{
-        .code = &code,
-        .consts = &consts,
-        .slot_count = 1,
-        .var_table = &var_table,
-    };
-    try vm.retargetTop(&routine);
-
-    const result = try vm.run();
-    try testing.expect(result.kind() == .var_);
-    try testing.expectEqual(x, VM.asVar(result));
-    // Var state is now bound to 42.
-    try testing.expect(x.bound);
-    try testing.expectEqual(@as(i64, 42), x.root.asFixnum());
+    try testing.expect(!x.bound and x.current() == null);
+    try testing.expectEqual(x, try ns.intern("x"));
+    try testing.expect(ns.lookup("y") == null);
 }
 
-test "VM var store: var:store-var twice preserves Var identity (rebind in place)" {
-    var vm = try VM.init(
-        testing.allocator,
-        &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
-    );
-    defer vm.deinit();
-
-    const ns = vm.ensureNamespace();
-    const x = try ns.intern("x");
-
-    const var_table = [_]*Var{x};
-    const consts = [_]Value{
-        value_mod.fromFixnum(5).?,
-        value_mod.fromFixnum(10).?,
-    };
-    // Bind x=5, then x=10, then return the result of the second
-    // store-var. Same Var; root updated.
-    var code = [_]Inst{
-        asm_.varStoreVar(0, Operand.constant(0)), // x = 5
-        asm_.varStoreVar(0, Operand.constant(1)), // x = 10
-        asm_.varVarObject(0, 0),
-        asm_.returnSlot(0),
-    };
-    const routine = Routine{
-        .code = &code,
-        .consts = &consts,
-        .slot_count = 1,
-        .var_table = &var_table,
-    };
-    try vm.retargetTop(&routine);
-
-    const result = try vm.run();
-    try testing.expect(result.kind() == .var_);
-    try testing.expectEqual(x, VM.asVar(result));
-    try testing.expectEqual(@as(i64, 10), x.root.asFixnum());
-}
-
-test "VM var store: var:var-object returns the Var WITHOUT trapping on unbound" {
-    var vm = try VM.init(
-        testing.allocator,
-        &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
-    );
-    defer vm.deinit();
-
-    const ns = vm.ensureNamespace();
-    const x = try ns.intern("never-bound");
-    try testing.expect(!x.bound);
-
-    const var_table = [_]*Var{x};
-    var code = [_]Inst{
-        asm_.varVarObject(0, 0),
-        asm_.returnSlot(0),
-    };
-    const routine = Routine{
-        .code = &code,
-        .consts = &.{},
-        .slot_count = 1,
-        .var_table = &var_table,
-    };
-    try vm.retargetTop(&routine);
-
-    const result = try vm.run();
-    try testing.expect(result.kind() == .var_);
-    try testing.expectEqual(x, VM.asVar(result));
-    try testing.expect(!x.bound); // var-object did NOT bind it
+test "VM opcodes: var" {
+    const v = Operand.varRef;
+    try expectRuns(&[_]RunCase{
+        .{ .name = "load-var of a bound Var", .code = &.{ asm_.varLoadVar(0, 0), asm_.returnSlot(0) }, .vars = &.{.{ .root = fx(42) }}, .want = .{ .value = fx(42) } },
+        .{ .name = "load-var of an unbound Var", .code = &.{ asm_.varLoadVar(0, 0), asm_.returnSlot(0) }, .vars = &.{.{}}, .want = .{ .err = VmError.UnboundVar } },
+        .{ .name = "v operands read the binding in force, else the root", .code = &.{ asm_.mathAdd(0, v(0), v(1)), asm_.returnSlot(0) }, .vars = &.{ .{ .root = fx(40) }, .{ .root = fx(1), .binding = fx(2) } }, .want = .{ .value = fx(42) } },
+        .{ .name = "a v operand of an unbound Var", .code = &.{ asm_.moveFrom(0, v(0)), asm_.returnSlot(0) }, .vars = &.{.{}}, .want = .{ .err = VmError.UnboundVar } },
+        .{ .name = "store-var binds the root", .code = &.{ asm_.varStoreVar(0, kn(0)), asm_.varLoadVar(0, 0), asm_.returnSlot(0) }, .consts = &.{fx(42)}, .vars = &.{.{}}, .want = .{ .value = fx(42) } },
+        // A Var's identity holds across stores; `def` is store-var
+        // then var-object.
+        .{ .name = "store-var twice", .code = &.{ asm_.varStoreVar(0, kn(0)), asm_.varStoreVar(0, kn(1)), asm_.varLoadVar(0, 0), asm_.returnSlot(0) }, .consts = &.{ fx(5), fx(10) }, .vars = &.{.{}}, .want = .{ .value = fx(10) } },
+        .{ .name = "var-object after store-var", .code = &.{ asm_.varStoreVar(0, kn(0)), asm_.varVarObject(0, 0), asm_.returnSlot(0) }, .consts = &.{fx(42)}, .vars = &.{.{}}, .want = .{ .var_at = 0 } },
+        .{ .name = "var-object of an unbound Var", .code = &.{ asm_.varVarObject(0, 0), asm_.returnSlot(0) }, .vars = &.{.{}}, .want = .{ .var_at = 0 } },
+        .{ .name = "var-object binds nothing", .code = &.{ asm_.varVarObject(0, 0), asm_.varLoadVar(0, 0), asm_.returnSlot(0) }, .vars = &.{.{}}, .want = .{ .err = VmError.UnboundVar } },
+    });
 }
 
 test "VM jump: setWide back-patches a target and keeps the test operand" {
@@ -8575,737 +6947,59 @@ test "VM jump: setWide back-patches a target and keeps the test operand" {
     try testing.expectEqual(Group.jump, inst.groupOf());
 }
 
-// ---- closure + call tests ----
-
-test "VM closure call: closure:make produces a function-kind Value" {
-    // Hand-assemble: child routine returns nil. Parent routine
-    // makes a closure for it, returns the closure.
-    var child_code = [_]Inst{asm_.returnNil()};
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &.{},
-        .capture_descs = &.{},
-        .slot_count = 1,
-        .fixed_arity = 0,
-        .upvalue_count = 0,
-        .name = "child",
-    };
-    const parent_consts = [_]Value{};
-    const parent_caps = [_]CaptureDescriptor{.{ .routine = &child_routine, .sources = &.{} }};
-    var parent_code = [_]Inst{
-        asm_.closureMake(0, 0), // s0 = closure of capture descriptor 0 (empty)
-        asm_.returnSlot(0),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts,
-        .capture_descs = &parent_caps,
-        .slot_count = 1,
-        .fixed_arity = 0,
-        .upvalue_count = 0,
-        .name = "parent",
-    };
-
-    var vm = try VM.init(testing.allocator, &parent_routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expect(result.kind() == .function);
-    const c = VM.asClosure(result);
-    try testing.expectEqual(&child_routine, c.routine);
-    try testing.expectEqual(@as(usize, 0), c.upvalues.len);
+test "VM opcodes: closures, cells and calls" {
+    const ret42 = Routine{ .code = &.{ asm_.loadConst(0, 0), asm_.returnSlot(0) }, .consts = &.{fx(42)}, .slot_count = 1, .name = "ret42" };
+    const add1 = Routine{ .code = &.{ asm_.mathAdd(1, sl(0), kn(0)), asm_.returnSlot(1) }, .consts = &.{fx(1)}, .slot_count = 2, .fixed_arity = 1, .name = "add1" };
+    const add2 = Routine{ .code = &.{ asm_.mathAdd(2, sl(0), sl(1)), asm_.returnSlot(2) }, .consts = &.{}, .slot_count = 3, .fixed_arity = 2, .name = "add2" };
+    // Returns a local it never wrote.
+    const local = Routine{ .code = &.{asm_.returnSlot(2)}, .consts = &.{}, .slot_count = 3, .fixed_arity = 1, .name = "local" };
+    // Returns its one upvalue's contents.
+    const upval = Routine{ .code = &.{ asm_.moveFrom(0, Operand.upvalue(0)), asm_.returnSlot(0) }, .consts = &.{}, .slot_count = 1, .upvalue_count = 1, .name = "upval" };
+    const cell_of_s0 = [_]CaptureSource{.{ .local_cell_slot = 0 }};
+    const make = asm_.closureMake(0, 0);
+    try expectRuns(&[_]RunCase{
+        .{ .name = "closure:make", .code = &.{ make, asm_.returnSlot(0) }, .caps = &.{.{ .routine = &ret42, .sources = &.{} }}, .want = .{ .kind = .function } },
+        .{ .name = "a call of none", .code = &.{ make, asm_.callCall(0, 0, 0), asm_.returnSlot(0) }, .caps = &.{.{ .routine = &ret42, .sources = &.{} }}, .want = .{ .value = fx(42) } },
+        .{ .name = "a call of one", .code = &.{ make, asm_.loadConst(1, 0), asm_.callCall(0, 1, 2), asm_.returnSlot(2) }, .consts = &.{fx(5)}, .caps = &.{.{ .routine = &add1, .sources = &.{} }}, .slots = 3, .want = .{ .value = fx(6) } },
+        .{ .name = "a call of two", .code = &.{ make, asm_.loadConst(1, 0), asm_.loadConst(2, 1), asm_.callCall(0, 2, 3), asm_.returnSlot(3) }, .consts = &.{ fx(3), fx(4) }, .caps = &.{.{ .routine = &add2, .sources = &.{} }}, .slots = 4, .want = .{ .value = fx(7) } },
+        .{ .name = "one closure called twice", .code = &.{ make, asm_.loadConst(1, 0), asm_.callCall(0, 1, 4), asm_.loadConst(1, 1), asm_.callCall(0, 1, 5), asm_.mathAdd(6, sl(4), sl(5)), asm_.returnSlot(6) }, .consts = &.{ fx(5), fx(10) }, .caps = &.{.{ .routine = &add1, .sources = &.{} }}, .slots = 7, .want = .{ .value = fx(17) } },
+        .{ .name = "too few arguments", .code = &.{ make, asm_.loadConst(1, 0), asm_.callCall(0, 1, 2), asm_.returnSlot(2) }, .consts = &.{fx(1)}, .caps = &.{.{ .routine = &add2, .sources = &.{} }}, .slots = 3, .want = .{ .err = VmError.ArityMismatch } },
+        .{ .name = "too many arguments", .code = &.{ make, asm_.loadConst(1, 0), asm_.loadConst(2, 0), asm_.callCall(0, 2, 3), asm_.returnSlot(3) }, .consts = &.{fx(1)}, .caps = &.{.{ .routine = &add1, .sources = &.{} }}, .slots = 4, .want = .{ .err = VmError.ArityMismatch } },
+        // The callee's window overlaps the caller's slots 2 and 3.
+        .{ .name = "a callee's locals start nil", .code = &.{ asm_.loadConst(2, 0), asm_.loadConst(3, 0), make, asm_.loadConst(1, 0), asm_.callCall(0, 1, 4), asm_.returnSlot(4) }, .consts = &.{fx(99)}, .caps = &.{.{ .routine = &local, .sources = &.{} }}, .slots = 5, .want = .{ .value = nil_v } },
+        .{ .name = "box-local", .code = &.{ asm_.loadConst(0, 0), asm_.closureBoxLocal(0), asm_.returnSlot(0) }, .consts = &.{fx(42)}, .want = .{ .kind = .cell_internal } },
+        .{ .name = "box-local of a boxed slot", .code = &.{ asm_.loadConst(0, 0), asm_.closureBoxLocal(0), asm_.closureBoxLocal(0), asm_.returnSlot(0) }, .consts = &.{fx(7)}, .want = .{ .err = VmError.InvalidCellState } },
+        .{ .name = "get-cell", .code = &.{ asm_.loadConst(0, 0), asm_.closureBoxLocal(0), asm_.closureGetCell(1, 0), asm_.returnSlot(1) }, .consts = &.{fx(99)}, .slots = 2, .want = .{ .value = fx(99) } },
+        .{ .name = "get-cell of a value", .code = &.{ asm_.loadConst(0, 0), asm_.closureGetCell(1, 0), asm_.returnSlot(1) }, .consts = &.{fx(5)}, .slots = 2, .want = .{ .err = VmError.ExpectedCell } },
+        // A `u` operand reads a cell's contents, never the cell.
+        .{ .name = "a captured cell read through u", .code = &.{ asm_.loadConst(0, 0), asm_.closureBoxLocal(0), asm_.closureMake(0, 1), asm_.callCall(1, 0, 2), asm_.returnSlot(2) }, .consts = &.{fx(123)}, .caps = &.{.{ .routine = &upval, .sources = &cell_of_s0 }}, .slots = 3, .want = .{ .value = fx(123) } },
+        .{ .name = "new-cell", .code = &.{ asm_.closureNewCell(0), asm_.returnSlot(0) }, .want = .{ .kind = .cell_internal } },
+        .{ .name = "init-cell, then get-cell", .code = &.{ asm_.closureNewCell(0), asm_.closureInitCell(0, kn(0)), asm_.closureGetCell(1, 0), asm_.returnSlot(1) }, .consts = &.{fx(42)}, .slots = 2, .want = .{ .value = fx(42) } },
+        .{ .name = "init-cell of a filled cell", .code = &.{ asm_.closureNewCell(0), asm_.closureInitCell(0, kn(0)), asm_.closureInitCell(0, kn(0)), asm_.returnNil() }, .consts = &.{fx(1)}, .want = .{ .err = VmError.InvalidCellState } },
+        .{ .name = "init-cell of a value", .code = &.{ asm_.loadConst(0, 0), asm_.closureInitCell(0, kn(0)), asm_.returnNil() }, .consts = &.{fx(7)}, .want = .{ .err = VmError.ExpectedCell } },
+        // `(fn* f [] f)`: the closure captures the placeholder cell it
+        // fills, and calling it returns it.
+        .{ .name = "a closure over its own cell", .code = &.{ asm_.closureNewCell(0), asm_.closureMake(0, 1), asm_.closureInitCell(0, sl(1)), asm_.callCall(1, 0, 2), asm_.returnSlot(2) }, .caps = &.{.{ .routine = &upval, .sources = &cell_of_s0 }}, .slots = 3, .want = .{ .kind = .function } },
+    });
 }
 
-test "VM closure call: ((fn* [] 42)) — no-arg closure call returns its body value" {
-    // Child: load 42 into s0, return.
-    const child_consts = [_]Value{value_mod.fromFixnum(42).?};
-    var child_code = [_]Inst{
-        asm_.loadConst(0, 0),
-        asm_.returnSlot(0),
-    };
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &child_consts,
-        .slot_count = 1,
-    };
-    // Parent: closure:make → s0; call:call s0,0,s0; call:return s0.
-    // call_base = 0 (the closure slot); argc = 0; result_slot = 0.
-    // Note dst slot reuses s0 — the closure value is consumed by
-    // the call, then overwritten by the result. Legal per VM.md §6.
-    const parent_consts = [_]Value{};
-    const parent_caps = [_]CaptureDescriptor{.{ .routine = &child_routine, .sources = &.{} }};
-    var parent_code = [_]Inst{
-        asm_.closureMake(0, 0),
-        asm_.callCall(0, 0, 0),
-        asm_.returnSlot(0),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts,
-        .capture_descs = &parent_caps,
-        .slot_count = 1,
-    };
-
-    var vm = try VM.init(testing.allocator, &parent_routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expectEqual(@as(i64, 42), result.asFixnum());
-}
-
-test "VM closure call: ((fn* [x] (+ x 1)) 5) = 6 — single arg" {
-    // Child: math:add s1, s0, c0 (s0 = param x); return s1.
-    const child_consts = [_]Value{value_mod.fromFixnum(1).?};
-    var child_code = [_]Inst{
-        asm_.mathAdd(1, Operand.slot(0), Operand.constant(0)),
-        asm_.returnSlot(1),
-    };
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &child_consts,
-        .slot_count = 2,
-        .fixed_arity = 1,
-    };
-    // Parent: load fn into s0, load 5 into s1, call_base=s0 argc=1
-    // result=s2; return s2. slot_count = 3.
-    const parent_consts = [_]Value{
-        value_mod.fromFixnum(5).?,
-    };
-    const parent_caps = [_]CaptureDescriptor{.{ .routine = &child_routine, .sources = &.{} }};
-    var parent_code = [_]Inst{
-        asm_.closureMake(0, 0), // s0 = closure
-        asm_.loadConst(1, 0), //         s1 = 5 (the arg)
-        asm_.callCall(0, 1, 2), //       s2 = (closure 5)
-        asm_.returnSlot(2),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts,
-        .capture_descs = &parent_caps,
-        .slot_count = 3,
-    };
-
-    var vm = try VM.init(testing.allocator, &parent_routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expectEqual(@as(i64, 6), result.asFixnum());
-}
-
-test "VM closure call: ((fn* [x y] (+ x y)) 3 4) = 7 — two-arg call" {
-    // Child: math:add s2, s0, s1; return s2. slot_count=3, arity=2.
-    var child_code = [_]Inst{
-        asm_.mathAdd(2, Operand.slot(0), Operand.slot(1)),
-        asm_.returnSlot(2),
-    };
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &.{},
-        .slot_count = 3,
-        .fixed_arity = 2,
-    };
-    const parent_consts = [_]Value{
-        value_mod.fromFixnum(3).?,
-        value_mod.fromFixnum(4).?,
-    };
-    const parent_caps = [_]CaptureDescriptor{.{ .routine = &child_routine, .sources = &.{} }};
-    var parent_code = [_]Inst{
-        asm_.closureMake(0, 0), // s0 = closure
-        asm_.loadConst(1, 0), //         s1 = 3
-        asm_.loadConst(2, 1), //         s2 = 4
-        asm_.callCall(0, 2, 3), //       s3 = (closure 3 4)
-        asm_.returnSlot(3),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts,
-        .capture_descs = &parent_caps,
-        .slot_count = 4,
-    };
-
-    var vm = try VM.init(testing.allocator, &parent_routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expectEqual(@as(i64, 7), result.asFixnum());
-}
-
-test "VM closure call: arity mismatch — too few args traps :arity-mismatch" {
-    // Child expects 2 args; we pass 1.
-    var child_code = [_]Inst{asm_.returnNil()};
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &.{},
-        .slot_count = 2,
-        .fixed_arity = 2,
-    };
-    const parent_consts = [_]Value{
-        value_mod.fromFixnum(1).?,
-    };
-    const parent_caps = [_]CaptureDescriptor{.{ .routine = &child_routine, .sources = &.{} }};
-    var parent_code = [_]Inst{
-        asm_.closureMake(0, 0),
-        asm_.loadConst(1, 0),
-        asm_.callCall(0, 1, 2), // argc=1 but child expects 2
-        asm_.returnSlot(2),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts,
-        .capture_descs = &parent_caps,
-        .slot_count = 3,
-    };
-
-    var vm = try VM.init(testing.allocator, &parent_routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.ArityMismatch, res);
-}
-
-test "VM closure call: arity mismatch — too many args traps :arity-mismatch" {
-    var child_code = [_]Inst{asm_.returnNil()};
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &.{},
-        .slot_count = 1,
-        .fixed_arity = 1,
-    };
-    const parent_consts = [_]Value{
-        value_mod.fromFixnum(1).?,
-        value_mod.fromFixnum(2).?,
-    };
-    const parent_caps = [_]CaptureDescriptor{.{ .routine = &child_routine, .sources = &.{} }};
-    var parent_code = [_]Inst{
-        asm_.closureMake(0, 0),
-        asm_.loadConst(1, 0),
-        asm_.loadConst(2, 1),
-        asm_.callCall(0, 2, 3), // argc=2 but child expects 1
-        asm_.returnSlot(3),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts,
-        .capture_descs = &parent_caps,
-        .slot_count = 4,
-    };
-
-    var vm = try VM.init(testing.allocator, &parent_routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.ArityMismatch, res);
-}
-
-test "VM closure call: closure:make capture descriptor source-count mismatch traps" {
-    // Child expects 1 upvalue; descriptor has 0 sources.
-    var child_code = [_]Inst{asm_.returnNil()};
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &.{},
-        .slot_count = 1,
-        .fixed_arity = 0,
-        .upvalue_count = 1, // mismatch with descriptor below
-    };
-    const parent_consts = [_]Value{};
-    const parent_caps = [_]CaptureDescriptor{.{ .routine = &child_routine, .sources = &.{} }}; // 0 sources
-    var parent_code = [_]Inst{
-        asm_.closureMake(0, 0),
-        asm_.returnSlot(0),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts,
-        .capture_descs = &parent_caps,
-        .slot_count = 1,
-    };
-
-    var vm = try VM.init(testing.allocator, &parent_routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.CaptureCountMismatch, res);
-}
-
-test "VM closure call: callee local slots are nil-initialized even when stack overlaps caller high slots" {
-    // Child has slot_count=3 (slot 0 = arg, slots 1-2 are locals).
-    // Body returns slot 2 without writing it — should be nil.
-    var child_code = [_]Inst{asm_.returnSlot(2)};
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &.{},
-        .slot_count = 3,
-        .fixed_arity = 1,
-    };
-    // Parent: stuff non-nil into all of its high slots first to
-    // create the "overlap with caller's stale data" scenario.
-    const parent_consts = [_]Value{
-        value_mod.fromFixnum(7).?,
-        value_mod.fromFixnum(99).?, // poison value to detect leak
-    };
-    const parent_caps = [_]CaptureDescriptor{.{ .routine = &child_routine, .sources = &.{} }};
-    var parent_code = [_]Inst{
-        // Pre-poison high slots that will OVERLAP with callee locals.
-        asm_.loadConst(2, 1), // s2 = 99
-        asm_.loadConst(3, 1), // s3 = 99
-        asm_.closureMake(0, 0), // s0 = closure
-        asm_.loadConst(1, 0), //         s1 = 7 (the arg)
-        asm_.callCall(0, 1, 4), //       call_base=0, argc=1, result→s4
-        asm_.returnSlot(4),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts,
-        .capture_descs = &parent_caps,
-        .slot_count = 5,
-    };
-
-    var vm = try VM.init(testing.allocator, &parent_routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    // If the callee's slot 2 had leaked the parent's poisoned 99,
-    // we'd get a fixnum back. Nil-init means we get nil.
-    try testing.expect(result.kind() == .nil);
-}
-
-test "VM closure call: call:call with constant operand as A traps :invalid-operand-kind" {
-    // call:call requires A=slot (the call_base). A=constant is
-    // invalid.
-    const consts = [_]Value{};
-    const bad_call: Inst = .{
-        .kind = .primary,
-        .group = @backingInt(Group.call),
-        .variant = @backingInt(Call.call),
-        .a = Operand.constant(0), // illegal: must be slot
-        .b = Operand.slot(0),
-        .c = Operand.slot(0),
-    };
-    var code = [_]Inst{ bad_call, asm_.returnNil() };
-    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 1 };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.InvalidOperandKind, res);
-}
-
-test "VM closure call: call:call with constant operand as C traps :invalid-operand-kind" {
-    // call:call requires C=slot (the result). C=constant is invalid.
-    var child_code = [_]Inst{asm_.returnNil()};
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &.{},
-        .slot_count = 1,
-        .fixed_arity = 0,
-    };
-    const consts = [_]Value{};
-    const caps = [_]CaptureDescriptor{.{ .routine = &child_routine, .sources = &.{} }};
-    const bad_call: Inst = .{
-        .kind = .primary,
-        .group = @backingInt(Group.call),
-        .variant = @backingInt(Call.call),
-        .a = Operand.slot(0),
-        .b = Operand.slot(0),
-        .c = Operand.constant(0), // illegal: must be slot
-    };
-    var code = [_]Inst{
-        asm_.closureMake(0, 0),
-        bad_call,
-        asm_.returnNil(),
-    };
-    const routine = Routine{
-        .code = &code,
-        .consts = &consts,
-        .capture_descs = &caps,
-        .slot_count = 1,
-    };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.InvalidOperandKind, res);
-}
-
-test "VM closure call: closure:make with capture descriptor index out of range traps OperandOutOfRange" {
-    const consts = [_]Value{};
-    // No capture descriptors at all — index 0 is OOR.
-    var code = [_]Inst{
-        asm_.closureMake(0, 0),
-        asm_.returnSlot(0),
-    };
-    const routine = Routine{
-        .code = &code,
-        .consts = &consts,
-        .capture_descs = &.{}, // empty
-        .slot_count = 1,
-    };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.OperandOutOfRange, res);
-}
-
-// ---- cell operations + U-operand tests ----
-
-test "VM capture: closure:box-local wraps slot value into an UpvalCell" {
-    // Load 42 into s0, box it, then verify s0 holds a cell and
-    // the cell's value is 42.
-    const consts = [_]Value{value_mod.fromFixnum(42).?};
-    var code = [_]Inst{
-        asm_.loadConst(0, 0),
-        asm_.closureBoxLocal(0),
-        asm_.returnSlot(0), // return the cell value (we'll inspect via VM state, not result)
-    };
-    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 1 };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    // After box-local, the slot (now returned as result) is a cell-internal Value.
-    try testing.expect(result.kind() == value_mod.Kind.cell_internal);
-    const cell = try VM.asCell(result);
-    try testing.expect(cell.initialized);
-    try testing.expectEqual(@as(i64, 42), cell.value.asFixnum());
-}
-
-test "VM capture: closure:box-local on already-boxed slot traps :invalid-cell-state" {
-    const consts = [_]Value{value_mod.fromFixnum(7).?};
-    var code = [_]Inst{
-        asm_.loadConst(0, 0),
-        asm_.closureBoxLocal(0), // first box
-        asm_.closureBoxLocal(0), // second box — must trap
-        asm_.returnSlot(0),
-    };
-    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 1 };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.InvalidCellState, res);
-}
-
-test "VM capture: closure:get-cell reads cell contents back" {
-    const consts = [_]Value{value_mod.fromFixnum(99).?};
-    var code = [_]Inst{
-        asm_.loadConst(0, 0),
-        asm_.closureBoxLocal(0),
-        asm_.closureGetCell(1, 0), // s1 = *cell at s0
-        asm_.returnSlot(1),
-    };
-    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 2 };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expectEqual(@as(i64, 99), result.asFixnum());
-}
-
-test "VM capture: closure:get-cell on non-cell traps :expected-cell" {
-    const consts = [_]Value{value_mod.fromFixnum(5).?};
-    var code = [_]Inst{
-        asm_.loadConst(0, 0), // s0 = fixnum 5 (NOT a cell)
-        asm_.closureGetCell(1, 0),
-        asm_.returnSlot(1),
-    };
-    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 2 };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.ExpectedCell, res);
-}
-
-test "VM capture: mov:move with U-operand source resolves cell contents (no opcode needed)" {
-    // There is no dedicated closure:read-upval —
-    // resolve(u:N) deref's the cell. Test it via a hand-assembled
-    // single-frame routine where we manually populate frame.upvalues.
-    var child_code = [_]Inst{
-        asm_.moveFrom(0, Operand.upvalue(0)), // s0 = u:0 (deref)
-        asm_.returnSlot(0),
-    };
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &.{},
-        .slot_count = 1,
-        .fixed_arity = 0,
-        .upvalue_count = 1,
-    };
-
-    // Set up VM with a top-level routine that calls the child.
-    // We need closure:make to provide an upvalue, which means
-    // we need to first box a local. Use box + make + call.
-    var parent_consts_storage = [_]Value{
-        value_mod.fromFixnum(123).?,
-    };
-    const parent_caps = [_]CaptureDescriptor{
-        .{ .routine = &child_routine, .sources = &[_]CaptureSource{.{ .local_cell_slot = 0 }} },
-    };
-    var parent_code = [_]Inst{
-        asm_.loadConst(0, 0), //                 s0 = 123
-        asm_.closureBoxLocal(0), //              s0 = *cell{123}
-        asm_.closureMake(0, 1), //            s1 = closure capturing cell at s0
-        asm_.callCall(1, 0, 2), //               s2 = (child) — child returns 123 via U deref
-        asm_.returnSlot(2),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts_storage,
-        .capture_descs = &parent_caps,
-        .slot_count = 3,
-    };
-
-    var vm = try VM.init(testing.allocator, &parent_routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expectEqual(@as(i64, 123), result.asFixnum());
-}
-
-test "VM capture: U-operand out of range traps :upvalue-out-of-range" {
-    // Child routine has upvalue_count=0 but tries to read u:0.
-    var child_code = [_]Inst{
-        asm_.moveFrom(0, Operand.upvalue(0)),
-        asm_.returnSlot(0),
-    };
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &.{},
-        .slot_count = 1,
-        .fixed_arity = 0,
-        .upvalue_count = 0,
-    };
-
-    var parent_consts = [_]Value{};
-    const parent_caps = [_]CaptureDescriptor{.{ .routine = &child_routine, .sources = &.{} }};
-    var parent_code = [_]Inst{
-        asm_.closureMake(0, 0),
-        asm_.callCall(0, 0, 1),
-        asm_.returnSlot(1),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts,
-        .capture_descs = &parent_caps,
-        .slot_count = 2,
-    };
-
-    var vm = try VM.init(testing.allocator, &parent_routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.UpvalueOutOfRange, res);
-}
-
-test "VM capture: closure:make with local_cell_slot source populates closure.upvalues" {
-    // Standalone test of closure:make's descriptor execution
-    // (the closure-call tests all use empty descriptors).
-    // Box a slot, then closure:make with one
-    // local_cell_slot source. Verify closure.upvalues has the
-    // right cell.
-    var child_code = [_]Inst{asm_.returnNil()};
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &.{},
-        .slot_count = 1,
-        .fixed_arity = 0,
-        .upvalue_count = 1,
-    };
-    const consts = [_]Value{
-        value_mod.fromFixnum(42).?,
-    };
-    const caps = [_]CaptureDescriptor{
-        .{ .routine = &child_routine, .sources = &[_]CaptureSource{.{ .local_cell_slot = 0 }} },
-    };
-    var code = [_]Inst{
-        asm_.loadConst(0, 0), //         s0 = 42
-        asm_.closureBoxLocal(0), //      s0 = *cell{42}
-        asm_.closureMake(0, 1), //    s1 = closure with upvalue[0] = cell
-        asm_.returnSlot(1),
-    };
-    const routine = Routine{
-        .code = &code,
-        .consts = &consts,
-        .capture_descs = &caps,
-        .slot_count = 2,
-    };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expect(result.kind() == .function);
-    const closure = VM.asClosure(result);
-    try testing.expectEqual(@as(usize, 1), closure.upvalues.len);
-    try testing.expectEqual(@as(i64, 42), closure.upvalues[0].value.asFixnum());
-    try testing.expect(closure.upvalues[0].initialized);
-}
-
-// ---- placeholder cell tests ----
-
-test "VM cells: closure:new-cell creates uninitialized cell" {
-    var code = [_]Inst{
-        asm_.closureNewCell(0),
-        asm_.returnSlot(0),
-    };
-    const routine = Routine{ .code = &code, .consts = &.{}, .slot_count = 1 };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expect(result.kind() == value_mod.Kind.cell_internal);
-    const cell = try VM.asCell(result);
-    try testing.expect(!cell.initialized);
-}
-
-test "VM cells: U-operand resolve on uninitialized cell traps :uninitialized-cell" {
-    // Construct a closure with a single upvalue pointing to an
-    // uninitialized cell. Inner fn body tries to read it via
-    // u:0, which deref's the cell — should trap.
-    var child_code = [_]Inst{
-        asm_.moveFrom(0, Operand.upvalue(0)),
-        asm_.returnSlot(0),
-    };
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &.{},
-        .slot_count = 1,
-        .fixed_arity = 0,
-        .upvalue_count = 1,
-    };
-    var parent_consts = [_]Value{};
-    const parent_caps = [_]CaptureDescriptor{
-        .{ .routine = &child_routine, .sources = &[_]CaptureSource{.{ .local_cell_slot = 0 }} },
-    };
-    var parent_code = [_]Inst{
-        asm_.closureNewCell(0), //         s0 = uninit cell
-        asm_.closureMake(0, 1), //      s1 = closure capturing s0
-        asm_.callCall(1, 0, 2), //         call closure → child traps
-        asm_.returnSlot(2),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts,
-        .capture_descs = &parent_caps,
-        .slot_count = 3,
-    };
-
+test "VM cells: a u operand of a placeholder cell traps, quickened or not" {
+    var upval_code = [_]Inst{ asm_.moveFrom(0, Operand.upvalue(0)), asm_.returnSlot(0) };
+    const upval = Routine{ .code = &upval_code, .consts = &.{}, .slot_count = 1, .upvalue_count = 1, .name = "upval" };
+    const caps = [_]CaptureDescriptor{.{ .routine = &upval, .sources = &.{.{ .local_cell_slot = 0 }} }};
+    var routine = makeRoutine(&.{ asm_.closureNewCell(0), asm_.closureMake(0, 1), asm_.callCall(1, 0, 2), asm_.returnSlot(2) }, &.{}, 3, "top");
+    routine.capture_descs = &caps;
     // As written, then with the read quickened (`mov:move.u`, §10.10).
     for (0..2) |pass| {
         if (pass == 1) {
-            quicken(&child_code, &.{});
-            try testing.expect(Quick.of(VM.opIndex(child_code[0])).?.form == .upvalue);
+            quicken(&upval_code, &.{});
+            try testing.expect(Quick.of(VM.opIndex(upval_code[0])).?.form == .upvalue);
         }
-        var vm = try VM.init(testing.allocator, &parent_routine);
+        var vm = try VM.init(testing.allocator, &routine);
         defer vm.deinit();
         try testing.expectError(VmError.UninitializedCell, vm.run());
         try testing.expectEqual(@as(u32, 0), vm.error_trace.items[0].pc);
     }
-}
-
-test "VM cells: closure:init-cell flips initialized=true and stores value" {
-    const consts = [_]Value{value_mod.fromFixnum(42).?};
-    var code = [_]Inst{
-        asm_.closureNewCell(0), //                     s0 = uninit cell
-        asm_.closureInitCell(0, Operand.constant(0)), // init s0 with 42
-        asm_.closureGetCell(1, 0), //                  s1 = *s0 = 42
-        asm_.returnSlot(1),
-    };
-    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 2 };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expectEqual(@as(i64, 42), result.asFixnum());
-}
-
-test "VM cells: closure:init-cell on already-initialized cell traps :invalid-cell-state" {
-    const consts = [_]Value{value_mod.fromFixnum(1).?};
-    var code = [_]Inst{
-        asm_.closureNewCell(0),
-        asm_.closureInitCell(0, Operand.constant(0)), // first init OK
-        asm_.closureInitCell(0, Operand.constant(0)), // second init traps
-        asm_.returnNil(),
-    };
-    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 1 };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.InvalidCellState, res);
-}
-
-test "VM cells: closure:init-cell with non-slot A traps :invalid-operand-kind" {
-    // Validate destination operand kind before any reads or
-    // writes.
-    const consts = [_]Value{value_mod.fromFixnum(1).?};
-    var code = [_]Inst{
-        Inst.primary(
-            .closure,
-            Closure_.init_cell,
-            Operand.constant(0), // A=constant — invalid for init-cell dst
-            Operand.constant(0),
-            Operand.none,
-        ),
-        asm_.returnNil(),
-    };
-    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 1 };
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.InvalidOperandKind, res);
-}
-
-test "VM cells: closure:init-cell on non-cell traps :expected-cell" {
-    const consts = [_]Value{value_mod.fromFixnum(7).?};
-    var code = [_]Inst{
-        asm_.loadConst(0, 0), //                       s0 = 7 (fixnum, not a cell)
-        asm_.closureInitCell(0, Operand.constant(0)),
-        asm_.returnNil(),
-    };
-    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 1 };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.ExpectedCell, res);
-}
-
-test "VM cells: placeholder pattern — new-cell + make + init enables self-recursion" {
-    // End-to-end: build a closure that captures itself via the
-    // placeholder pattern. Closure body just returns its
-    // upvalue (the closure itself). Calling the closure
-    // returns ... the closure itself.
-    //
-    // (fn* foo [] foo) — when called, returns foo.
-    var child_code = [_]Inst{
-        asm_.moveFrom(0, Operand.upvalue(0)), // s0 = u:0 = closure
-        asm_.returnSlot(0),
-    };
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &.{},
-        .slot_count = 1,
-        .fixed_arity = 0,
-        .upvalue_count = 1,
-    };
-    var parent_consts = [_]Value{};
-    const parent_caps = [_]CaptureDescriptor{
-        .{ .routine = &child_routine, .sources = &[_]CaptureSource{.{ .local_cell_slot = 0 }} },
-    };
-    var parent_code = [_]Inst{
-        asm_.closureNewCell(0), //                       s0 = uninit cell
-        asm_.closureMake(0, 1), //                    s1 = closure capturing s0
-        asm_.closureInitCell(0, Operand.slot(1)), //     s0's cell = s1 (the closure)
-        asm_.callCall(1, 0, 2), //                       s2 = (closure) → returns closure
-        asm_.returnSlot(2),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts,
-        .capture_descs = &parent_caps,
-        .slot_count = 3,
-    };
-
-    var vm = try VM.init(testing.allocator, &parent_routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    // Result should be a closure (kind .function).
-    try testing.expect(result.kind() == .function);
-    // Specifically, it should be the SAME closure we constructed
-    // (same routine pointer).
-    const c = VM.asClosure(result);
-    try testing.expectEqual(&child_routine, c.routine);
 }
 
 test "VM dispatch: calls and closures under a collection every few kilobytes" {
@@ -9355,7 +7049,7 @@ test "VM mov:move-clear: the slot it reads roots the value no more" {
     for ([_]Inst{ asm_.move(2, 1), asm_.moveClear(2, 1) }, &live) |moved, *n| {
         const code = [_]Inst{
             asm_.loadConst(0, 1),
-            asm_.collVector(0, 1, 1),
+            asm_.coll(.vector, 0, 1, 1),
             moved,
             asm_.loadNil(2),
             asm_.loadConst(3, 0),
@@ -9455,10 +7149,15 @@ test "Routine.verify: the routines it refuses, each at its instruction" {
         .{ .name = "a lookup key neither keyword nor symbol", .code = &.{ asm_.callLookup(0, sl(0), 0), r }, .err = VmError.InvalidOperandKind, .pc = 0 },
         .{ .name = "a lookup key past the pool", .code = &.{ asm_.callLookup(0, sl(0), 1), r }, .keyed = true, .err = VmError.OperandOutOfRange, .pc = 0 },
         .{ .name = "a lookup's target and default past the frame", .code = &.{ asm_.callLookupOr(0, 1, 0), r }, .keyed = true, .err = VmError.OperandOutOfRange, .pc = 0 },
-        .{ .name = "a collection block past the frame", .code = &.{ asm_.collList(1, 2, 0), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
+        .{ .name = "a collection block past the frame", .code = &.{ asm_.coll(.list, 1, 2, 0), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
         .{ .name = "a try past the table", .code = &.{ asm_.tryEnter(1, 0), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
         .{ .name = "a catch past the code", .code = &.{ r, asm_.tryEnter(0, 0), r }, .err = VmError.OperandOutOfRange, .pc = 1 },
         .{ .name = "a capture count that is not the routine's", .code = &.{ asm_.closureMake(0, 0), r }, .caps = &counted_caps, .err = VmError.CaptureCountMismatch, .pc = 0 },
+        .{ .name = "a capture descriptor past the table", .code = &.{ asm_.closureMake(0, 0), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
+        .{ .name = "a call block's base not a slot", .code = &.{ Inst.primary(.call, Call.call, kn(0), sl(0), sl(0)), r }, .err = VmError.InvalidOperandKind, .pc = 0 },
+        .{ .name = "a call's result not a slot", .code = &.{ Inst.primary(.call, Call.call, sl(0), sl(0), kn(0)), r }, .err = VmError.InvalidOperandKind, .pc = 0 },
+        .{ .name = "a cell not a slot", .code = &.{ Inst.primary(.closure, Closure_.init_cell, kn(0), kn(0), Operand.none), r }, .err = VmError.InvalidOperandKind, .pc = 0 },
+        .{ .name = "a v operand past the table", .code = &.{ asm_.moveFrom(0, Operand.varRef(0)), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
         .{ .name = "a routine under it", .code = &.{ asm_.closureMake(0, 0), r }, .caps = &child_caps, .err = VmError.OperandOutOfRange, .where = "child", .pc = 0 },
     }) |case| {
         errdefer std.debug.print("verify case \"{s}\" failed\n", .{case.name});
@@ -10116,9 +7815,9 @@ test "Callback batches: a cycle at every element frees nothing a batch holds" {
     var vm = try VM.init(testing.allocator, &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "idle"));
     defer vm.deinit();
     // (fn [x] [x x]) and (fn [a x] [a x]): every call allocates.
-    const pair_code = [_]Inst{ asm_.move(1, 0), asm_.collVector(0, 2, 2), asm_.returnSlot(2) };
+    const pair_code = [_]Inst{ asm_.move(1, 0), asm_.coll(.vector, 0, 2, 2), asm_.returnSlot(2) };
     const pair = Routine{ .code = &pair_code, .consts = &.{}, .slot_count = 3, .fixed_arity = 1, .name = "pair" };
-    const nest_code = [_]Inst{ asm_.collVector(0, 2, 2), asm_.returnSlot(2) };
+    const nest_code = [_]Inst{ asm_.coll(.vector, 0, 2, 2), asm_.returnSlot(2) };
     const nest = Routine{ .code = &nest_code, .consts = &.{}, .slot_count = 3, .fixed_arity = 2, .name = "nest" };
     const pair_fn = try vm.allocClosure(&pair, 0);
     const nest_fn = try vm.allocClosure(&nest, 0);
@@ -10169,7 +7868,7 @@ test "Callback batches: the general return starts the next element in the same f
     const frames = vm.frames.items.len;
     const items = [_]Value{ fx(4), fx(5), fx(6) };
     var out: [3]Value = undefined;
-    cb.batch = .{ .kind = .each, .i = 0, .n = 3, .items = &items, .out = .{ .slots = &out } };
+    cb.batch = .{ .step = .each_slots, .i = 0, .n = 3, .items = &items, .out = .{ .slots = &out } };
     cb.result.step = VM.batchNext(.each_slots);
     cb.result.done = false;
     // The first element's frame, as `callPrepared` pushes it.
@@ -10423,7 +8122,7 @@ test "VM closure call: a call enters the member of the arity table its count pic
             code[n] = asm_.callCall(0, @intCast(argc), @intCast(9 + round));
             n += 1;
         }
-        code[n] = asm_.collList(9, 2, 9);
+        code[n] = asm_.coll(.list, 9, 2, 9);
         code[n + 1] = asm_.returnSlot(9);
         var top = makeRoutine(code[0 .. n + 2], &consts, 11, "top");
         top.capture_descs = &caps;
@@ -10601,7 +8300,7 @@ test "VM dispatch: a member's constants live while the member runs and allocates
             asm_.loadConst(1, 1),
             asm_.cmpLt(2, sl(1), kn(2)),
             asm_.jumpIfFalse(6, sl(2)),
-            asm_.collList(0, 1, 3),
+            asm_.coll(.list, 0, 1, 3),
             asm_.mathAdd(1, sl(1), kn(3)),
             asm_.jumpJmp(1),
             asm_.loadConst(4, 0),
@@ -10698,51 +8397,6 @@ test "Routine.verify: call:self names a fixed member of the routine's table, nev
         try testing.expectEqual(@as(u32, 1), failure.pc);
     }
 }
-test "VM closure call: same closure called twice — both invocations succeed" {
-    // Child returns its single arg incremented by 1.
-    const child_consts = [_]Value{value_mod.fromFixnum(1).?};
-    var child_code = [_]Inst{
-        asm_.mathAdd(1, Operand.slot(0), Operand.constant(0)),
-        asm_.returnSlot(1),
-    };
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &child_consts,
-        .slot_count = 2,
-        .fixed_arity = 1,
-    };
-    // Parent: make closure, call with 5 → s4. Reuse closure, call
-    // with 10 → s5. Add s4 + s5 → result.
-    const parent_consts = [_]Value{
-        value_mod.fromFixnum(5).?,
-        value_mod.fromFixnum(10).?,
-    };
-    const parent_caps = [_]CaptureDescriptor{.{ .routine = &child_routine, .sources = &.{} }};
-    var parent_code = [_]Inst{
-        asm_.closureMake(0, 0), // s0 = closure
-        asm_.loadConst(1, 0), //         s1 = 5
-        asm_.callCall(0, 1, 4), //       s4 = closure(5) = 6
-
-        // Reuse closure (s0 still holds it). Stage second call.
-        asm_.loadConst(1, 1), //         s1 = 10
-        asm_.callCall(0, 1, 5), //       s5 = closure(10) = 11
-
-        asm_.mathAdd(6, Operand.slot(4), Operand.slot(5)), // s6 = 6 + 11 = 17
-        asm_.returnSlot(6),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts,
-        .capture_descs = &parent_caps,
-        .slot_count = 7,
-    };
-
-    var vm = try VM.init(testing.allocator, &parent_routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expectEqual(@as(i64, 17), result.asFixnum());
-}
-
 test "registerRecordType and registerProtocol free exactly what they took when an allocation fails" {
     try testing.checkAllAllocationFailures(testing.allocator, registerTypeAndProtocol, .{});
 }
