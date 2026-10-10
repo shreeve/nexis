@@ -2535,18 +2535,10 @@ pub const VM = struct {
     /// registry exists; otherwise it falls back to the
     /// single `namespace` field.
     registry: ?NamespaceRegistry = null,
-    /// List of OPEN db Connections.
-    /// `db/open` appends; `db/close` removes; `VM.deinit` closes
-    /// any still-open as a safety net. Connections own OS
-    /// resources (mmap, file handle); they CANNOT live in
-    /// runtime_arena (which is freed wholesale).
-    /// Stored as `*anyopaque` to avoid a vm.zig → db.zig
-    /// dependency. db.zig owns the cast back to `*db.Connection`.
-    db_connections: std.ArrayList(*anyopaque) = .empty,
-    /// Closer callback. Set by db.zig the first
-    /// time a connection is registered, so VM.deinit can close
-    /// connections without importing db.
-    db_close_callback: ?*const fn (*anyopaque) void = null,
+    /// Shuts down every db connection on the VM's heap at teardown
+    /// (`db.shutdownHeap`); set by the first `db/open`, so vm.zig
+    /// needs no import of db.zig.
+    db_close_callback: ?*const fn (*heap_mod.Heap) void = null,
     /// Open Nextomic connections (`nextomic/connect` appends; VM
     /// teardown destroys each through `nextomic_close_callback`). The
     /// nextomic natives own the cast, so vm.zig needs no import.
@@ -2749,14 +2741,7 @@ pub const VM = struct {
         // Namespace structs themselves are arena-backed.
         if (self.registry) |*reg| reg.deinit();
         if (self.namespace) |*ns| ns.deinit();
-        // Close any still-open db Connections as a
-        // safety net (callers should explicitly `db/close`).
-        // Callback closes the emdb env AND destroys the
-        // Connection struct allocated via self.allocator.
-        if (self.db_close_callback) |close_fn| {
-            for (self.db_connections.items) |conn_ptr| close_fn(conn_ptr);
-        }
-        self.db_connections.deinit(self.allocator);
+        if (self.db_close_callback) |close_fn| if (self.heap) |*h| close_fn(h);
         if (self.nextomic_close_callback) |close_fn| {
             for (self.nextomic_connections.items) |conn_ptr| close_fn(conn_ptr);
         }

@@ -119,14 +119,14 @@ pub const Collector = struct {
     /// no heap allocation underneath, and the pointer kinds the VM or
     /// static storage owns (`native_fn`, `var_`, the db connection
     /// and transaction handles; `Heap.isBlockKind`) have no block to
-    /// mark: a transaction handle is flagged reached for the handle
-    /// sweep (GC.md §5), the rest are ignored. A Var's root, metadata
+    /// mark: a db connection or transaction handle is flagged reached
+    /// for the db sweep (GC.md §5), the rest are ignored. A Var's root, metadata
     /// and thread value are marked by the host's namespace walk, so
     /// skipping the `var_` Value loses nothing. Every other Value is
     /// dereferenced to its `*HeapHeader` and marked.
     pub fn markValue(self: *Collector, v: Value) void {
         if (!Heap.isBlockKind(v.kind())) {
-            if (v.kind() == .db_write_txn or v.kind() == .db_read_txn) db_mod.markHandle(v);
+            db_mod.mark(v);
             return;
         }
         std.debug.assert(v.payload != 0 and (v.payload & 0xF) == 0);
@@ -258,8 +258,9 @@ pub const Collector = struct {
     ///      host, draining the worklist after each: the transitive
     ///      closure, one root's at a time, so the worklist holds what
     ///      one root reaches and never every root at once.
-    ///   2. Sweep: end and free every db transaction handle of this
-    ///      heap no Value reached (`db.sweepHandles`), then free every
+    ///   2. Sweep: end and free every db transaction handle and closed
+    ///      connection of this heap no Value reached
+    ///      (`db.sweepHandles`), then free every
     ///      unmarked heap block.
     ///   3. Clear mark bits on survivors (handled inside sweepUnmarked).
     ///   4. Start a new allocation-counting window on the heap.

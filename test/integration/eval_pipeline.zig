@@ -8698,3 +8698,29 @@ test "a lazy body that forces its own block raises :stack-overflow and ends the 
 test "sequence with a transducer takes any number of colls" {
     try expectOutput("[(count (first (apply sequence (map vector) (repeat 40 [1])))) (apply sequence (map +) (repeat 34 [1 2]))]", "[40 (34 68)]");
 }
+
+test "db: a collection frees the closed connections nothing names" {
+    var store = try SeamStore.init("closed-conns");
+    defer store.deinit();
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const base = nx.db.connectionCount();
+    const steps = [_][]const u8{
+        \\(do (def kept (db/open "@STORE@"))
+        \\    (def r (db/ref kept :t "k"))
+        \\    (db/close kept)
+        \\    (dotimes [i 2000] (db/close (db/open "@STORE@"))))
+        ,
+        \\[(try (db/get-key r) (catch any e (:error e))) (db/close kept)]
+    };
+    var last = value_mod.nilValue();
+    for (steps) |step| {
+        const src = try store.source(step);
+        defer testing.allocator.free(src);
+        last = try program.run(src);
+        program.v.collectGarbage();
+        try testing.expect(nx.db.connectionCount() < base + 8);
+    }
+    try harness.expectResult(&program, steps[1], last, "[:db-closed nil]");
+}
