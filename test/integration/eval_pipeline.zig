@@ -8724,3 +8724,49 @@ test "macroexpand-1 says why a macro failed" {
 test "defmacro: a macro returning a native fn names its kind as every message does" {
     try expectMacroFailure("(defmacro m [] +)", "(m)", "a macro returned a function, which is not a form", "(m)");
 }
+
+/// What `evalSource` hands the REPL's callbacks: each printed value,
+/// realized as the REPL realizes it, and each failure.
+const ReplLike = struct {
+    program: *Program,
+    failures: usize = 0,
+
+    fn value(ctx: *anyopaque, v: value_mod.Value) anyerror!void {
+        const self: *ReplLike = @ptrCast(@alignCast(ctx));
+        self.program.v.realizeOutside(v) catch return error.RunFailed;
+    }
+
+    fn failure(ctx: *anyopaque, _: nx.loader.EvalError) anyerror!void {
+        const self: *ReplLike = @ptrCast(@alignCast(ctx));
+        self.failures += 1;
+        self.program.v.resetAfterError();
+    }
+};
+
+test "loader: an error realizing a printed value is placed at the form printed" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    var repl: ReplLike = .{ .program = &program };
+    const src = "1 (map inc \"a\")";
+    const info = vm.SourceInfo{ .path = "<test>", .text = src };
+    try testing.expectError(error.RunFailed, program.loader.evalSource(&info, .{ .allocator = program.arena.allocator(), .on_value = .{ .ctx = &repl, .call = &ReplLike.value } }));
+    const at = program.v.error_trace.items[0];
+    try testing.expectEqualStrings("(map inc \"a\")", src[at.span.?.pos..][0..at.span.?.len]);
+}
+
+test "loader: with on_failure, a form that fails at run time does not stop the forms after it" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    var repl: ReplLike = .{ .program = &program };
+    const src = "(defn f [x] (/ x 0)) (f 1) (map inc \"a\") (+ 1 2)";
+    const info = vm.SourceInfo{ .path = "<test>", .text = src };
+    const last = try program.loader.evalSource(&info, .{
+        .allocator = program.arena.allocator(),
+        .on_value = .{ .ctx = &repl, .call = &ReplLike.value },
+        .on_failure = .{ .ctx = &repl, .call = &ReplLike.failure },
+    });
+    try testing.expectEqual(@as(usize, 2), repl.failures);
+    try harness.expectResult(&program, src, last, "3");
+}

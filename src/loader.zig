@@ -100,6 +100,11 @@ pub const EvalOptions = struct {
     on_routine: ?Each(*const vm_mod.Routine) = null,
     /// Each form's value as it runs (the REPL prints it).
     on_value: ?Each(Value) = null,
+    /// A top-level form that failed at run time (`error.RunFailed`,
+    /// the VM holding the failure), after which the next form runs,
+    /// as Clojure's REPL goes on; without it the failure ends the
+    /// text.
+    on_failure: ?Each(EvalError) = null,
     /// The namespace the text must declare in its first form, `(ns
     /// NAME ...)` with `^meta` on the name allowed: a required file
     /// that declares another name, or none, is refused before any of
@@ -240,28 +245,38 @@ pub const Loader = struct {
             defer scratch.deinit();
             if (options.on_routine) |each| {
                 const routine = try self.compileForm(info, top, scratch.allocator(), options.allocator, decl);
-                each.call(each.ctx, routine) catch |err| return self.callbackFailure(err);
+                each.call(each.ctx, routine) catch |err| return self.callbackFailure(err, info, top);
                 continue;
             }
-            // A top-level `do` runs its forms one at a time, so an
-            // `ns`, `def` or `defmacro` among them is in force for
-            // the ones after it (MACROEXPAND.md §2b).
-            try pending.append(self.allocator, top);
-            while (pending.pop()) |form| {
-                const expanded = try self.expandTopLevel(info, form, scratch.allocator(), decl);
-                if (compile_mod.doForms(expanded)) |body| {
-                    if (decl) |d| try d.declareForm(expanded);
-                    last = nil;
-                    var i = body.len;
-                    while (i > 0) {
-                        i -= 1;
-                        try pending.append(self.allocator, body[i]);
+            const failed: EvalError = failed: {
+                // A top-level `do` runs its forms one at a time, so an
+                // `ns`, `def` or `defmacro` among them is in force for
+                // the ones after it (MACROEXPAND.md §2b).
+                try pending.append(self.allocator, top);
+                while (pending.pop()) |form| {
+                    const expanded = try self.expandTopLevel(info, form, scratch.allocator(), decl);
+                    if (compile_mod.doForms(expanded)) |body| {
+                        if (decl) |d| try d.declareForm(expanded);
+                        last = nil;
+                        var i = body.len;
+                        while (i > 0) {
+                            i -= 1;
+                            try pending.append(self.allocator, body[i]);
+                        }
+                        continue;
                     }
-                    continue;
+                    last = self.run(try self.compileForm(info, expanded, scratch.allocator(), options.allocator, decl)) catch |err| break :failed err;
                 }
-                last = try self.run(try self.compileForm(info, expanded, scratch.allocator(), options.allocator, decl));
-            }
-            if (options.on_value) |each| each.call(each.ctx, last) catch |err| return self.callbackFailure(err);
+                if (options.on_value) |each| each.call(each.ctx, last) catch |err| break :failed self.callbackFailure(err, info, top);
+                continue;
+            };
+            // A form that failed at run time ends the text, unless
+            // `on_failure` takes the failure and the next form runs.
+            const each = options.on_failure orelse return failed;
+            if (failed != error.RunFailed) return failed;
+            pending.clearRetainingCapacity();
+            last = nil;
+            each.call(each.ctx, failed) catch |err| return self.callbackFailure(err, info, top);
         }
         return last;
     }
@@ -354,14 +369,24 @@ pub const Loader = struct {
     }
 
     /// A failure of an `on_value` or `on_routine` callback (the REPL
-    /// or `-e` printing a value, `disasm` printing a routine): out of
-    /// memory as itself, a runtime error realizing the value to print
-    /// as one, anything else, such as a closed stdout, as a diagnostic
-    /// naming it, never a runtime error the VM did not have.
-    fn callbackFailure(self: *Loader, err: anyerror) EvalError {
+    /// or `-e` printing a value, `disasm` printing a routine) on the
+    /// value of `top`: out of memory as itself, a runtime error
+    /// realizing the value to print as one, placed at `top` when no
+    /// frame of the realization was (TOOLING.md §1), anything else,
+    /// such as a closed stdout, as a diagnostic naming it, never a
+    /// runtime error the VM did not have.
+    fn callbackFailure(self: *Loader, err: anyerror, info: *const vm_mod.SourceInfo, top: *const reader_mod.Form) EvalError {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         // Realizing a printed result failed (docs/LAZY.md §8).
-        if (err == error.RunFailed) return error.RunFailed;
+        if (err == error.RunFailed) {
+            if (self.vm.error_trace.items.len == 0) self.vm.error_trace.append(self.vm.allocator, .{
+                .name = "<top>",
+                .pc = 0,
+                .span = .{ .pos = top.origin.pos, .len = top.origin.len },
+                .source = info,
+            }) catch return error.OutOfMemory;
+            return error.RunFailed;
+        }
         self.diagnose(.{ .label = "" }, "cannot write the result: {s}", .{@errorName(err)}) catch return error.OutOfMemory;
         return error.Diagnosed;
     }
