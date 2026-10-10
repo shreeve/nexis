@@ -58,11 +58,11 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 244/244 steps succeeded; 1648/1648 tests passed
+Build Summary: 248/248 steps succeeded; 1512/1513 tests passed (1 skipped)
 ```
 
 With `../nexus` checked out the gate includes `parser-check`'s two
-steps; without it the count is 242 steps. Any output besides the
+steps; without it the count is 246 steps. Any output besides the
 summary tree is a failure. The largest binaries are `unit` (every
 inline test in `src/`) and `eval_pipeline` (the language corpus);
 `cli-unit` runs `src/cli.zig`'s own tests.

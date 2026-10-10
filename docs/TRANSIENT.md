@@ -4,7 +4,7 @@ The contract for the `.transient` heap kind (`src/coll/transient.zig`)
 and its language surface (`transient`, `persistent!` and the `!`
 operations in `src/stdlib.zig`). Kind number: `docs/VALUE.md` §2.2.
 Ownership compared with Clojure's:
-`CLOJURE-REVIEW.md` §1.2, §3.5.
+`CLOJURE-REVIEW.md` §1.2.
 
 ---
 
@@ -192,7 +192,7 @@ same transient.
 |---|---|
 | wrap | `transientFrom(heap, v)`, `persistentBang(t)` |
 | map (0) | `mapAssocBang`, `mapDissocBang`, `mapLocateBang` and `mapPutBang` (one lookup for a read then a store), `vectorConjUnderBang` (a vector inside the map's values, grown under its token, §4), `mapGetBang` (a `champ.MapLookup`), `mapCountBang` |
-| set (1) | `setConjBang`, `setDisjBang`, `setContainsBang`, `setCountBang` |
+| set (1) | `setConjBang`, `setDisjBang`, `setGetBang` (the element as the set holds it, or null), `setContainsBang`, `setCountBang` |
 | vector (2) | `vectorConjBang`, `vectorOpenTailBang` and `vectorCloseTailBang` (a native's builder: 32 slots opened past a full tail and written in place, then the tail's length, `vector.openTailInPlace`), `vectorAssocBang` (appends at `idx == count`), `vectorPopBang`, `vectorNthBang`, `vectorCountBang` |
 | GC | `trace(h, visitor)` |
 

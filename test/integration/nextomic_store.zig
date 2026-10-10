@@ -2784,7 +2784,7 @@ test "a file holding some of the trees, or the trees without their header, is Co
     for (tds, 0..) |td, i| {
         (try Store.open(testing.allocator, td.path.ptr, .{})).close();
         {
-            const file = try db_layer.StoreFile.acquire(td.path.ptr, .{ .allocator = testing.allocator });
+            const file = try db_layer.StoreFile.acquire(td.path.ptr, testing.allocator);
             defer file.release();
             const txn = try file.beginWrite(.{});
             errdefer txn.abort();
@@ -2805,7 +2805,7 @@ test "a store opens at this build's format alone and names any other" {
     (try Store.open(testing.allocator, td.path.ptr, .{})).close();
     for ([_]u16{ 1, 2, 4, format_version }) |f| {
         {
-            const file = try db_layer.StoreFile.acquire(td.path.ptr, .{ .allocator = testing.allocator });
+            const file = try db_layer.StoreFile.acquire(td.path.ptr, testing.allocator);
             defer file.release();
             const txn = try file.beginWrite(.{});
             errdefer txn.abort();
@@ -2916,7 +2916,7 @@ test "a db/* connection and a store of one file share one writer" {
     defer td.deinit();
     const store = try Store.open(testing.allocator, td.path.ptr, .{});
     defer store.close();
-    const file = try db_layer.StoreFile.acquire(td.path.ptr, .{ .allocator = testing.allocator });
+    const file = try db_layer.StoreFile.acquire(td.path.ptr, testing.allocator);
     defer file.release();
     try testing.expect(file == store.file);
     const kv = try file.beginWrite(.{});

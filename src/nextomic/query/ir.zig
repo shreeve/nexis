@@ -197,21 +197,15 @@ pub const AggOp = enum {
     /// with the vector of the group's values.
     custom,
 
+    /// The aggregate as a query names it: its tag, `_` as `-`.
     pub fn name(self: AggOp) []const u8 {
         return switch (self) {
-            .count => "count",
-            .sum => "sum",
-            .min => "min",
-            .max => "max",
-            .avg => "avg",
-            .median => "median",
-            .variance => "variance",
-            .stddev => "stddev",
-            .count_distinct => "count-distinct",
-            .distinct => "distinct",
-            .sample => "sample",
-            .rand => "rand",
-            .custom => "custom",
+            inline else => |op| comptime blk: {
+                var out = @tagName(op)[0..].*;
+                std.mem.replaceScalar(u8, &out, '_', '-');
+                const final = out;
+                break :blk &final;
+            },
         };
     }
 
@@ -329,8 +323,9 @@ pub const Rule = struct {
 
 /// A parsed `%` input. Rules have their own variable table; a call
 /// site renames them into the plan's. Invariants:
-///   - Rules with one name are contiguous in `rules`, in source order
-///     (`parse.zig` groups them), so `byName` is one slice.
+///   - `rules` is sorted by name, the rules of one name in source order
+///     (`parse.zig` sorts them stably), so `byName` is a binary search
+///     and the distinct names are the runs.
 ///   - A set with `arena_state` owns its rules and is freed by
 ///     `deinit`; one without (`no_rules`, or a set a test builds over
 ///     static rules) is not, and `deinit` is a no-op.
@@ -349,16 +344,12 @@ pub const RuleSet = struct {
 
     /// Every rule named `name`, or null.
     pub fn byName(self: *const RuleSet, name: u32) ?[]const Rule {
-        var lo: ?usize = null;
-        var hi: usize = 0;
-        for (self.rules, 0..) |r, i| {
-            if (r.name != name) continue;
-            std.debug.assert(lo == null or hi == i);
-            if (lo == null) lo = i;
-            hi = i + 1;
-        }
-        const start = lo orelse return null;
-        return self.rules[start..hi];
+        const lo, const hi = std.sort.equalRange(Rule, self.rules, name, orderName);
+        return if (lo == hi) null else self.rules[lo..hi];
+    }
+
+    fn orderName(name: u32, r: Rule) std.math.Order {
+        return std.math.order(name, r.name);
     }
 };
 
@@ -373,61 +364,76 @@ pub const no_rules: RuleSet = .{
 // Variable collection
 // =============================================================================
 
-/// Variables bound by evaluating `clauses` (patterns, function outputs,
-/// `or` join variables, rule arguments); not `not` bodies.
-pub fn boundVars(arena: Allocator, clauses: []const Clause, out: *std.ArrayList(Var)) !void {
-    try stack.check();
-    for (clauses) |c| switch (c) {
-        .pattern => |p| for (p.terms()) |t| {
-            if (t.asVar()) |v| try addVar(arena, out, v);
-        },
-        .pred => {},
-        .bind => |b| for (try b.out.vars(arena)) |v| try addVar(arena, out, v),
-        .not => {},
-        .@"or" => |o| {
-            if (o.join) |js| {
-                for (js) |v| try addVar(arena, out, v);
-            } else for (o.branches) |br| try boundVars(arena, br, out);
-        },
-        .rule => |r| for (r.args) |a| {
-            if (a == .variable) try addVar(arena, out, a.variable);
-        },
-        .source => |s| for (s.vars) |v| try addVar(arena, out, v),
-    };
-}
+/// An ordered set of variables with constant-time membership: what a
+/// walk of clauses collects, or the variables bound at a point of
+/// planning, in the order they were added.
+pub const VarSet = struct {
+    list: std.ArrayList(Var) = .empty,
+    members: std.AutoHashMapUnmanaged(Var, void) = .empty,
 
-/// Every variable mentioned anywhere in `clauses`, including predicate
-/// arguments and `not` bodies.
-pub fn allVars(arena: Allocator, clauses: []const Clause, out: *std.ArrayList(Var)) !void {
+    pub const empty: VarSet = .{};
+
+    pub fn init(arena: Allocator, vars: []const Var) !VarSet {
+        var out: VarSet = .{};
+        for (vars) |v| try out.add(arena, v);
+        return out;
+    }
+
+    pub fn items(self: *const VarSet) []const Var {
+        return self.list.items;
+    }
+
+    pub fn has(self: *const VarSet, v: Var) bool {
+        return self.members.contains(v);
+    }
+
+    pub fn clear(self: *VarSet) void {
+        self.list.clearRetainingCapacity();
+        self.members.clearRetainingCapacity();
+    }
+
+    pub fn add(self: *VarSet, arena: Allocator, v: Var) !void {
+        if ((try self.members.getOrPut(arena, v)).found_existing) return;
+        try self.list.append(arena, v);
+    }
+};
+
+/// What `collectVars` takes: `bound`, the variables evaluating the
+/// clauses binds (patterns, function outputs, `or` join variables,
+/// rule arguments; not predicate arguments or `not` bodies), or `all`,
+/// every variable the clauses mention.
+pub const Walk = enum { bound, all };
+
+pub fn collectVars(arena: Allocator, comptime walk: Walk, clauses: []const Clause, out: *VarSet) !void {
     try stack.check();
     for (clauses) |c| switch (c) {
         .pattern => |p| for (p.terms()) |t| {
-            if (t.asVar()) |v| try addVar(arena, out, v);
+            if (t.asVar()) |v| try out.add(arena, v);
         },
-        .pred => |call| try callVars(arena, call, out),
+        .pred => |call| if (walk == .all) try callVars(arena, call, out),
         .bind => |b| {
-            try callVars(arena, b.call, out);
-            for (try b.out.vars(arena)) |v| try addVar(arena, out, v);
+            if (walk == .all) try callVars(arena, b.call, out);
+            for (try b.out.vars(arena)) |v| try out.add(arena, v);
         },
-        .not => |n| {
-            if (n.join) |js| for (js) |v| try addVar(arena, out, v);
-            try allVars(arena, n.body, out);
+        .not => |n| if (walk == .all) {
+            if (n.join) |js| for (js) |v| try out.add(arena, v);
+            try collectVars(arena, walk, n.body, out);
         },
         .@"or" => |o| {
-            if (o.join) |js| for (js) |v| try addVar(arena, out, v);
-            for (o.branches) |br| try allVars(arena, br, out);
+            if (o.join) |js| for (js) |v| try out.add(arena, v);
+            if (walk == .all or o.join == null) for (o.branches) |br| try collectVars(arena, walk, br, out);
         },
         .rule => |r| for (r.args) |a| {
-            if (a == .variable) try addVar(arena, out, a.variable);
+            if (a == .variable) try out.add(arena, a.variable);
         },
-        .source => |s| for (s.vars) |v| try addVar(arena, out, v),
+        .source => |s| for (s.vars) |v| try out.add(arena, v),
     };
 }
 
-fn callVars(arena: Allocator, call: Call, out: *std.ArrayList(Var)) !void {
-    if (call.f == .variable) try addVar(arena, out, call.f.variable);
+fn callVars(arena: Allocator, call: Call, out: *VarSet) !void {
+    if (call.f == .variable) try out.add(arena, call.f.variable);
     for (call.args) |a| {
-        if (a == .variable) try addVar(arena, out, a.variable);
+        if (a == .variable) try out.add(arena, a.variable);
     }
 }
 
@@ -452,12 +458,12 @@ test "binding vars and var collection" {
         .{ .pred = .{ .f = .{ .builtin = .lt }, .args = &.{ .{ .variable = 1 }, .{ .constant = .{ .int = 3 } } } } },
         .{ .not = .{ .join = null, .body = &.{.{ .pattern = .{ .e = .{ .variable = 0 }, .a = .blank, .v = .{ .variable = 7 } } }} } },
     };
-    var bound: std.ArrayList(Var) = .empty;
-    try boundVars(arena, &clauses, &bound);
-    try std.testing.expectEqualSlices(Var, &.{ 0, 1 }, bound.items);
-    var all: std.ArrayList(Var) = .empty;
-    try allVars(arena, &clauses, &all);
-    try std.testing.expectEqualSlices(Var, &.{ 0, 1, 7 }, all.items);
+    var bound: VarSet = .{};
+    try collectVars(arena, .bound, &clauses, &bound);
+    try std.testing.expectEqualSlices(Var, &.{ 0, 1 }, bound.items());
+    var all: VarSet = .{};
+    try collectVars(arena, .all, &clauses, &all);
+    try std.testing.expectEqualSlices(Var, &.{ 0, 1, 7 }, all.items());
     try std.testing.expectEqual(Builtin.ne, Builtin.fromName("!=").?);
     try std.testing.expectEqual(AggOp.count_distinct, AggOp.fromName("count-distinct").?);
 }

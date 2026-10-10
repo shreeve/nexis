@@ -11,10 +11,5 @@
   on every exit; a throw keeps propagating. Returns body's value."
   [binding & body]
   `(let* [~(first binding) (nextomic/connect ~@(rest binding))]
-     (try
-       (let* [r# (do ~@body)]
-         (nextomic/release ~(first binding))
-         r#)
-       (catch any e#
-         (nextomic/release ~(first binding))
-         (throw e#)))))
+     (try (do ~@body)
+          (finally (nextomic/release ~(first binding))))))

@@ -249,7 +249,7 @@ pub const Store = struct {
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
-            .file = try db_layer.StoreFile.acquire(path, .{ .allocator = allocator }),
+            .file = try db_layer.StoreFile.acquire(path, allocator),
             .trees = undefined,
             .uuid = @splat(0),
         };

@@ -38,6 +38,7 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 const plan_mod = @import("plan.zig");
+const parse_mod = @import("parse.zig");
 const exec_mod = @import("exec.zig");
 const relation = @import("../relation.zig");
 const stack = @import("../../stack.zig");
@@ -72,10 +73,12 @@ const body_cost: u64 = 16;
 // =============================================================================
 
 pub const Info = struct {
-    /// Distinct rule names.
+    /// Distinct rule names, ascending: the runs of the sorted rule set.
     names: []const u32,
     /// Component id per name index.
     scc_of: []const usize,
+    /// Per component: the name indexes it holds.
+    members_of: []const []const usize,
     /// Per component: does it contain a cycle?
     recursive: []const bool,
     /// Per component: does one of its rules call another of its rules
@@ -83,8 +86,11 @@ pub const Info = struct {
     negated: []const bool,
 
     pub fn nameIndex(self: *const Info, name: u32) ?usize {
-        for (self.names, 0..) |n, i| if (n == name) return i;
-        return null;
+        return std.sort.binarySearch(u32, self.names, name, orderU32);
+    }
+
+    fn orderU32(a: u32, b: u32) std.math.Order {
+        return std.math.order(a, b);
     }
 
     pub fn isRecursive(self: *const Info, name: u32) bool {
@@ -93,11 +99,8 @@ pub const Info = struct {
     }
 
     /// Name indexes in the component of `name`.
-    pub fn members(self: *const Info, arena: Allocator, name: u32) ![]usize {
-        const i = self.nameIndex(name).?;
-        var out: std.ArrayList(usize) = .empty;
-        for (self.scc_of, 0..) |s, j| if (s == self.scc_of[i]) try out.append(arena, j);
-        return out.toOwnedSlice(arena);
+    pub fn members(self: *const Info, name: u32) []const usize {
+        return self.members_of[self.scc_of[self.nameIndex(name).?]];
     }
 };
 
@@ -105,28 +108,23 @@ pub const Info = struct {
 pub fn analyze(arena: Allocator, set: *const RuleSet) !Info {
     var names: std.ArrayList(u32) = .empty;
     for (set.rules) |r| {
-        var seen = false;
-        for (names.items) |n| if (n == r.name) {
-            seen = true;
-        };
-        if (!seen) try names.append(arena, r.name);
+        if (names.items.len == 0 or names.getLast() != r.name) try names.append(arena, r.name);
     }
     const n = names.items.len;
     const edges = try arena.alloc([]usize, n);
     const negative = try arena.alloc([]usize, n);
-    for (names.items, 0..) |name, i| {
+    for (names.items, edges, negative) |name, *e, *neg_edges| {
         var calls: std.ArrayList(Call) = .empty;
         for (set.byName(name).?) |r| try collectCalls(arena, r.body, false, &calls);
         var out: std.ArrayList(usize) = .empty;
         var neg: std.ArrayList(usize) = .empty;
         for (calls.items) |c| {
-            for (names.items, 0..) |m, j| if (m == c.name) {
-                try out.append(arena, j);
-                if (c.negated) try neg.append(arena, j);
-            };
+            const j = std.sort.binarySearch(u32, names.items, c.name, Info.orderU32) orelse continue;
+            try out.append(arena, j);
+            if (c.negated) try neg.append(arena, j);
         }
-        edges[i] = try out.toOwnedSlice(arena);
-        negative[i] = try neg.toOwnedSlice(arena);
+        e.* = try out.toOwnedSlice(arena);
+        neg_edges.* = try neg.toOwnedSlice(arena);
     }
 
     var t = Tarjan{
@@ -141,24 +139,29 @@ pub fn analyze(arena: Allocator, set: *const RuleSet) !Info {
     @memset(t.on_stack, false);
     for (0..n) |i| if (t.index[i] == null) try t.visit(i);
 
-    const recursive = try arena.alloc(bool, t.scc_count);
-    @memset(recursive, false);
-    for (0..n) |i| {
-        var members: usize = 0;
-        for (t.scc_of) |s| if (s == t.scc_of[i]) {
-            members += 1;
-        };
-        if (members > 1) recursive[t.scc_of[i]] = true;
-        for (edges[i]) |j| if (j == i) {
-            recursive[t.scc_of[i]] = true;
-        };
+    // Each component's members, in one pass over the names.
+    const counts = try arena.alloc(usize, t.scc_count);
+    @memset(counts, 0);
+    for (t.scc_of) |s| counts[s] += 1;
+    const members_of = try arena.alloc([]usize, t.scc_count);
+    for (members_of, counts) |*m, c| m.* = try arena.alloc(usize, c);
+    @memset(counts, 0);
+    for (t.scc_of, 0..) |s, i| {
+        members_of[s][counts[s]] = i;
+        counts[s] += 1;
     }
+
+    const recursive = try arena.alloc(bool, t.scc_count);
+    for (recursive, members_of) |*r, m| r.* = m.len > 1;
+    for (edges, 0..) |js, i| for (js) |j| {
+        if (j == i) recursive[t.scc_of[i]] = true;
+    };
     const negated = try arena.alloc(bool, t.scc_count);
     @memset(negated, false);
     for (negative, 0..) |js, i| for (js) |j| {
         if (t.scc_of[i] == t.scc_of[j]) negated[t.scc_of[i]] = true;
     };
-    return .{ .names = try names.toOwnedSlice(arena), .scc_of = t.scc_of, .recursive = recursive, .negated = negated };
+    return .{ .names = try names.toOwnedSlice(arena), .scc_of = t.scc_of, .members_of = members_of, .recursive = recursive, .negated = negated };
 }
 
 const Tarjan = struct {
@@ -242,8 +245,12 @@ fn collectRuleCalls(arena: Allocator, clauses: []const Clause, name: u32, out: *
 // =============================================================================
 
 fn defsOf(ctx: *Ctx, name: u32, args: []const ir.Arg) ![]const ir.Rule {
-    const defs = ctx.rules.byName(name) orelse return ctx.syntax("unknown rule");
-    if (defs[0].head.len != args.len) return ctx.syntax("a rule is called with the wrong number of arguments");
+    const rule = ctx.interner.symbolName(name);
+    const defs = ctx.rules.byName(name) orelse {
+        if (ctx.rules.rules.len == 0) return ctx.syntaxFmt("({s} ...) calls a rule, and :in binds no rule set (%)", .{rule});
+        return ctx.syntaxFmt("({s} ...) calls a rule the rule set does not define", .{rule});
+    };
+    if (defs[0].head.len != args.len) return ctx.syntaxFmt("rule {s} takes {d} argument{s}, and a call passes {d}", .{ rule, defs[0].head.len, parse_mod.plural(defs[0].head.len), args.len });
     return defs;
 }
 
@@ -274,7 +281,7 @@ pub fn callEstimate(ctx: *Ctx, name: u32, args: []const ir.Arg, src: ?ir.Src, bo
 pub fn planCall(ctx: *Ctx, name: u32, args: []const ir.Arg, src: ?ir.Src, bound: *Bound, steps: *std.ArrayList(Step), rows: *u64) Failure!void {
     const defs = try defsOf(ctx, name, args);
     ctx.rule_calls += 1;
-    if (ctx.rule_calls > max_calls) return ctx.syntax("rule calls expand past 10000 in one query; a rule body calling another rule more than once doubles the expansion per level");
+    if (ctx.rule_calls > max_calls) return ctx.syntaxFmt("rule calls expand past 10000 in one query, at a call to {s}; a rule body calling another rule more than once doubles the expansion per level", .{ctx.interner.symbolName(name)});
     const arg_vars = try ctx.arena.alloc(Var, args.len);
     for (args, arg_vars) |a, *v| {
         v.* = switch (a) {
@@ -285,11 +292,11 @@ pub fn planCall(ctx: *Ctx, name: u32, args: []const ir.Arg, src: ?ir.Src, bound:
                 try bound.add(ctx.arena, g.bind.out.scalar);
                 break :blk g.bind.out.scalar;
             },
-            .src => return ctx.syntax("$ cannot be a rule argument"),
+            .src => return ctx.syntaxFmt("a data source is no argument of rule {s}; prefix the call with it, ($src {s} ...)", .{ ctx.interner.symbolName(name), ctx.interner.symbolName(name) }),
         };
     }
     for (arg_vars[0..defs[0].required]) |v| {
-        if (!bound.has(v)) return ctx.syntax("a required rule argument is unbound");
+        if (!bound.has(v)) return ctx.syntaxFmt("{s} is a required argument of rule {s} and is unbound where the call runs", .{ ctx.varName(v), ctx.interner.symbolName(name) });
     }
 
     const info = try ctx.ruleInfo();
@@ -356,7 +363,7 @@ fn planFix(ctx: *Ctx, name: u32, arg_vars: []const Var, src: ?ir.Src, bound: *co
     // alone: a rule that depends on its own negation has no answer it
     // could reach.
     if (info.negated[info.scc_of[info.nameIndex(name).?]]) return ctx.syntaxFmt("{s} recurses through not; a rule cannot depend on the negation of itself", .{ctx.interner.symbolName(name)});
-    const members = try info.members(ctx.arena, name);
+    const members = info.members(name);
 
     var pushed: std.ArrayList(usize) = .empty;
     if (members.len == 1) {
@@ -439,7 +446,8 @@ fn unpushedRequired(ctx: *Ctx, inst: *const Instance, several: bool, required: u
 /// clause that names no source reads the call's.
 const Renamer = struct {
     ctx: *Ctx,
-    map: []?Var,
+    /// Rule variable to plan variable, for the variables met so far.
+    map: std.AutoHashMapUnmanaged(Var, Var) = .empty,
     scc: ?Scc,
     /// The call's data source; the body's default.
     src: ?ir.Src,
@@ -451,17 +459,15 @@ const Renamer = struct {
     };
 
     fn init(ctx: *Ctx, call_args: []const Var, def: ir.Rule, scc: ?Scc, src: ?ir.Src) !Renamer {
-        const map = try ctx.arena.alloc(?Var, ctx.rules.vars.len);
-        @memset(map, null);
-        for (def.head, call_args) |h, a| map[h] = a;
-        return .{ .ctx = ctx, .map = map, .scc = scc, .src = src };
+        var out: Renamer = .{ .ctx = ctx, .scc = scc, .src = src };
+        for (def.head, call_args) |h, a| try out.map.put(ctx.arena, h, a);
+        return out;
     }
 
     fn v(self: *Renamer, rv: Var) !Var {
-        if (self.map[rv]) |pv| return pv;
-        const pv = try self.ctx.freshVar(self.ctx.rules.vars[rv].sym);
-        self.map[rv] = pv;
-        return pv;
+        const gop = try self.map.getOrPut(self.ctx.arena, rv);
+        if (!gop.found_existing) gop.value_ptr.* = try self.ctx.freshVar(self.ctx.rules.vars[rv].sym);
+        return gop.value_ptr.*;
     }
 
     fn optVar(self: *Renamer, rv: ?Var) !?Var {
@@ -557,7 +563,7 @@ const Renamer = struct {
                                 try out.append(arena, g);
                                 break :blk g.bind.out.scalar;
                             },
-                            .src => return self.ctx.syntax("$ cannot be a rule argument"),
+                            .src => return self.ctx.syntaxFmt("a data source is no argument of rule {s}; prefix the call with it, ($src {s} ...)", .{ self.ctx.interner.symbolName(r.name), self.ctx.interner.symbolName(r.name) }),
                         };
                         const slot = try arena.create(plan_mod.SourceSlot);
                         slot.* = .{};
@@ -674,8 +680,7 @@ pub fn explainFixBodies(f: *const Fix, ctx: *const Ctx, lines: anytype, depth: u
     for (f.instances) |inst| {
         for (inst.bodies) |body| {
             var out: std.Io.Writer.Allocating = .init(ctx.arena);
-            var i: usize = 0;
-            while (i < depth) : (i += 1) try out.writer.writeAll("  ");
+            try plan_mod.indent(&out.writer, depth);
             try out.writer.print("{s} body {s}", .{ ctx.interner.symbolName(inst.name), if (body.sites.len == 0) "base" else "recursive" });
             try lines.append(ctx.arena, .{ .text = out.written() });
             try plan_mod.explainSub(body.plan, ctx, lines, depth + 1);
@@ -712,7 +717,7 @@ test "call graph: self loop, mutual recursion, acyclic" {
     try testing.expectEqual(info.scc_of[info.nameIndex(2).?], info.scc_of[info.nameIndex(3).?]);
     try testing.expect(!info.isRecursive(4));
     try testing.expect(!info.isRecursive(5));
-    try testing.expectEqual(@as(usize, 2), (try info.members(arena, 2)).len);
+    try testing.expectEqual(@as(usize, 2), info.members(2).len);
     // 3 calls 2 under `not` and 2 calls 3: not stratified; 1 is.
     try testing.expect(info.negated[info.scc_of[info.nameIndex(2).?]]);
     try testing.expect(!info.negated[info.scc_of[info.nameIndex(1).?]]);

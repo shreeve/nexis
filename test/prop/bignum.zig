@@ -45,6 +45,10 @@
 //!   A7. quotientF64 is IEEE division below 2^53, unchanged when both
 //!       operands are scaled by one wide factor, and exact in its
 //!       power-of-two scaling down to the subnormals.
+//!   A8. Long decimal text reads as `std`'s conversion reads it, around
+//!       the split threshold and at odd and even lengths.
+//!   A9. Reading grows subquadratically: 16x the digits cost well under
+//!       256x the time (release builds).
 
 const std = @import("std");
 const nx = @import("nexis");
@@ -581,4 +585,92 @@ test "A7: quotientF64 is the correctly rounded quotient at every scale" {
         const yd = std.math.ldexp(@as(f64, @floatFromInt(y)), e);
         if (!std.math.isInf(yd)) try std.testing.expectEqual(@as(f64, @floatFromInt(x)) / yd, try bignum.quotientF64(&heap, xv, try bignum.mul(&heap, yv, p)));
     }
+}
+
+/// `text` through `std`'s conversion, one multiply-add over the whole
+/// number per 19 digits: the reference `parseDecimal` must agree with,
+/// and the quadratic cost it avoids.
+fn parseByStd(heap: *Heap, text: []const u8) !Value {
+    const digits = if (text[0] == '-') text[1..] else text;
+    const buf = try std.testing.allocator.alloc(bignum.Limb, std.math.big.int.calcSetStringLimbCount(10, digits.len));
+    defer std.testing.allocator.free(buf);
+    var m: std.math.big.int.Mutable = .{ .limbs = buf, .len = 1, .positive = true };
+    try m.setString(10, text);
+    return bignum.fromLimbs(heap, !m.positive, @ptrCast(m.limbs[0..m.len]));
+}
+
+/// `n` random digits, a sign when `negative`, into a fresh slice:
+/// leading zeros and a long zero run in the middle when `zeros`.
+fn randDigits(r: std.Random, n: usize, negative: bool, zeros: bool) ![]u8 {
+    const text = try std.testing.allocator.alloc(u8, n + @intFromBool(negative));
+    if (negative) text[0] = '-';
+    const digits = text[@intFromBool(negative)..];
+    for (digits) |*c| c.* = '0' + r.uintLessThan(u8, 10);
+    if (zeros) {
+        @memset(digits[0..@min(n / 3, 50)], '0');
+        @memset(digits[n / 3 .. 2 * n / 3], '0');
+    }
+    return text;
+}
+
+test "A8: long decimal text reads as std's conversion reads it, around every split size" {
+    var heap = Heap.init(std.testing.allocator);
+    defer heap.deinit();
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 18);
+    const r = prng.random();
+    // Around the split threshold, twice and four times it, and odd
+    // lengths whose halves differ by a digit.
+    for ([_]usize{ 3999, 4000, 4001, 8000, 8001, 8002, 16_001, 16_003, 33_333, 60_001 }) |n| {
+        for ([_]bool{ false, true }) |zeros| {
+            const text = try randDigits(r, n, r.boolean(), zeros);
+            defer std.testing.allocator.free(text);
+            const got = (try bignum.parseDecimal(&heap, text)).?;
+            const want = try parseByStd(&heap, text);
+            try expectCanonical(got);
+            try std.testing.expect(dispatch.equal(got, want));
+            try std.testing.expectEqual(dispatch.hashValue(want), dispatch.hashValue(got));
+        }
+    }
+    // A one and a run of zeros: every low half is all zeros.
+    const ten_k = try std.testing.allocator.alloc(u8, 40_001);
+    defer std.testing.allocator.free(ten_k);
+    @memset(ten_k, '0');
+    ten_k[0] = '1';
+    var p = try bignum.fromI64(&heap, 1);
+    for (0..40_000 / 10) |_| p = try bignum.mul(&heap, p, try bignum.fromI64(&heap, 10_000_000_000));
+    try std.testing.expect(dispatch.equal((try bignum.parseDecimal(&heap, ten_k)).?, p));
+}
+
+/// The least thread CPU time of three parses of `text`, in nanoseconds.
+fn bestParseNanos(heap: *Heap, text: []const u8) !u64 {
+    var best: u64 = std.math.maxInt(u64);
+    for (0..3) |_| {
+        const start = std.Io.Clock.cpu_thread.now(std.testing.io);
+        _ = try bignum.parseDecimal(heap, text);
+        best = @min(best, @as(u64, @intCast(start.durationTo(std.Io.Clock.cpu_thread.now(std.testing.io)).nanoseconds)));
+    }
+    return best;
+}
+
+test "A9: reading a decimal integer grows subquadratically in its digits" {
+    // An unoptimized build times the checks of `std`'s limb loops, not
+    // the algorithm: the ratio is measured in release builds only.
+    if (@import("builtin").optimize == .debug) return error.SkipZigTest;
+    var heap = Heap.init(std.testing.allocator);
+    defer heap.deinit();
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 19);
+    const r = prng.random();
+    const small = try randDigits(r, 100_000, false, false);
+    defer std.testing.allocator.free(small);
+    const large = try randDigits(r, 800_000, false, false);
+    defer std.testing.allocator.free(large);
+    // Eight times the digits cost 64 times as long through a quadratic
+    // conversion and about 28 times through the split's Karatsuba
+    // products; the bound between leaves room for a loaded host's
+    // noise.
+    const ratio = @as(f64, @floatFromInt(try bestParseNanos(&heap, large))) / @as(f64, @floatFromInt(@max(try bestParseNanos(&heap, small), 1)));
+    std.testing.expect(ratio < 45) catch |err| {
+        std.debug.print("\n  100 000 digits to 800 000: {d:.1}x\n", .{ratio});
+        return err;
+    };
 }
