@@ -182,7 +182,7 @@ The pipeline and its one-way stage boundaries (PLAN §5, §28.4;
 |---|---|---|
 | Parser (`src/parser.zig`, generated from `nexis.grammar`; scanner `src/nexis.zig`) | source → `Sexp` with token spans | Tokenizing and the LALR(1) parse; drops `#_` and its form; a tag and its form as one `tagged` node. No normalization. |
 | Reader (`src/reader.zig`) | `Sexp` → `Form` | §3: typed atoms, spans, metadata merge, `anon_fn`, the `syntax-quote` marker, the `regex` datum and its validation, the `inst` and `uuid` datums, every reader error. |
-| Macroexpander (`src/expand.zig`) | `Form` → expanded `Form` | Macros to a fixpoint, `syntax-quote`, `anon_fn` → `fn*`, destructuring. A macro receives its arguments only; there is no `&form` or `&env` (PLAN §23 #34). `MACROEXPAND.md`. |
+| Macroexpander (`src/expand.zig`) | `Form` → expanded `Form` | Macros to a fixpoint, `syntax-quote`, `anon_fn` → `fn*`, destructuring. A macro receives the call (`&form`), the locals in scope (`&env`) and its arguments (PLAN §23 #34). `MACROEXPAND.md`. |
 | Compiler (`src/compile.zig`) | expanded `Form` → Tiny tree → bytecode | Resolves each symbol to a slot, capture, Var or special form in `lowerForm`; there is no separate resolver. `COMPILER.md`. |
 
 Syntax-quote expansion lives in the macroexpander so the reader holds no

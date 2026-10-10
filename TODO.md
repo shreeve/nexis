@@ -115,11 +115,6 @@ up. Every fix starts with its failing test (`AGENTS.md`).
 
 Each needs a PLAN amendment before code (`AGENTS.md`, authority order).
 
-11. **`&form` and `&env` in macros** (PLAN §23 #34, §24 #13). Approved
-    by the owner; `docs/FORM-ENV.md` is the design (Clojure's two
-    leading parameters, `&form` with its `:line`/`:column`, `&env` a map
-    of the locals in scope), its PLAN text and a four-commit plan with
-    the tests that prove it.
 12. **FileMan on Nextomic.** VistA's FileMan data gains Nextomic's time
     model: every fact kept, as-of reads, provenance on each change.
     `docs/FILEMAN-NEXTOMIC.md` has the mapping from `^DD`, the three

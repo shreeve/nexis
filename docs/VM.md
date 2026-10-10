@@ -923,14 +923,14 @@ target only when taken.
 | # | Name | Operands | Semantics |
 |---|---|---|---|
 | 0 | `var:load-var` | A=slot, W=Var index | `slot[A] :=` the Var's `thread_value` when a binding is in force (§6.5), else its root; `:unbound-var` when it has neither. The same as `mov:move A, vW` for W below 4096 |
-| 1 | `var:store-var` | A=any, W=Var index | The Var's root `:= resolve(A)`, marked bound. Redefining a name updates the same Var, so code compiled against it sees the new root |
+| 1 | `var:store-var` | A=any, W=Var index | The Var's root `:= resolve(A)`, marked bound, its macro flag cleared (a `def` over a macro makes it a function, as Clojure's `def` resets the Var's metadata). Redefining a name updates the same Var, so code compiled against it sees the new root |
 | 2 | `var:var-object` | A=slot, W=Var index | `slot[A] :=` the Var object; an unbound Var does not trap |
 
 W past the Var table is `OperandOutOfRange`. `(def x v)` is
 `store-var` then `var-object`, so it yields the Var.
 
 A `Var` carries `root`, `bound`, `meta`, `macro` (set by `defmacro`,
-`docs/MACROEXPAND.md` §1.2), `dynamic`, `thread_value` and
+`docs/MACROEXPAND.md` §1.2, cleared by `def`), `dynamic`, `thread_value` and
 `thread_bound`.
 
 #### 10.8 `coll`
@@ -1191,9 +1191,12 @@ the map can fail only for memory; then the value is the bare keyword,
 which every `catch` that takes the map also takes, so a handler still
 runs when the heap is exhausted: nothing else a throw does allocates,
 since `ctrl:try-enter` reserves the room for a finally's continuation
-and the throw's origin is dropped when it cannot be recorded (§12). The line of a place costs a scan of
-the source before it; the VM keeps the last place it computed, so a
-handler taking an error in a loop scans once.
+and the throw's origin is dropped when it cannot be recorded (§12). A
+place is found from the last place the VM found in the same text
+(`SourceInfo.lineColFrom`), scanning only the text between the two,
+so a handler taking errors in a loop, or the expansions of a file
+placing their `&form`s (`docs/MACROEXPAND.md` §1.3), scan the text
+about once.
 
 **Not catchable** (compiler bugs or corrupt bytecode; they leave the
 run):

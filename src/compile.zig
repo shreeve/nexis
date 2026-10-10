@@ -2736,6 +2736,7 @@ fn expandContext(allocator: std.mem.Allocator, interner: *intern_mod.Interner, o
         .load_callback = opts.load_callback,
         .value_heap = registryHeap(opts.namespace),
         .io = opts.io,
+        .source = opts.source,
     };
 }
 

@@ -29,7 +29,7 @@ differ, PLAN wins.
 | Polymorphism | protocols, records, multimethods | protocols, records, multimethods (§23 #8) |
 | Transactions | STM `dosync` | emdb read and write transactions, lexically scoped |
 | History | none built in | `db/snapshot`; Nextomic `as-of`, `since`, `history` (§23 #22) |
-| Macros | `&form`, `&env`, full `core.clj` | arguments only (§23 #34); host macros in Zig plus `core.nx` |
+| Macros | `&form`, `&env`, full `core.clj` | `&form`, `&env` (§23 #34); host macros in Zig plus `core.nx` |
 | Concurrency | threads, futures, `core.async` | one isolate, one thread (§23 #5) |
 
 ---
@@ -233,7 +233,10 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | `clojure.math` | doubles in and out; `floor` and `ceil` of a long give a double | `nexis.math`: the same functions over doubles, except that `floor` and `ceil` give an integer back unchanged (`(floor 3)` is `3`, Clojure's `3.0`), and `floor-div` of `Long/MIN_VALUE` by `-1` is `2^63`, a bignum, where Java's wraps to `Long/MIN_VALUE`, since every integer operator promotes (`docs/SEMANTICS.md` §2.2); the last bit of a transcendental result is the platform library's | `docs/TOOLING.md` §4 |
 | `clojure.edn/read-string` | the EDN reader: no reader sugar, tagged literals through `:readers` and `:default` | `nexis.edn/read-string`, the nexis reader with `{:eof nil}`: `'x`, `@x` and `#()` read as the forms they stand for; `#inst` and `#uuid` read, and any other tag is a `:reader-error` whatever `:readers` holds (PLAN §24 #3); nothing is evaluated | `docs/STDLIB.md` §4 |
 | `(eval form)` | binds `*ns*` | compiles in the current namespace as the REPL does; a compile error is the catchable map `{:error :compile-error :message sentence :form form :kind name}` | `docs/MACROEXPAND.md` |
-| `(macroexpand form)` | with `&env` | no lexical environment; subforms never expand | `docs/MACROEXPAND.md` |
+| `(macroexpand form)` | `&env` the compiler's locals when called while compiling, else nil | `&env` nil; `^meta` on the form dropped; subforms never expand | `docs/MACROEXPAND.md` §1.2 |
+| `&env`'s values | `LocalBinding` objects | each local's symbol, so `get`, `contains?`, `keys` and calling the map answer alike | `docs/MACROEXPAND.md` §1.3 |
+| `(meta x)` of a list a macro receives, `(meta '(a b))` | `{:line :column}` on every list read from a file | only `&form` carries its place; argument lists and quoted lists carry only their `^meta`, and a list a macro returns keeps no `:line` or `:column` | `docs/MACROEXPAND.md` §1.3 |
+| `^meta` on a macro call | in `(meta &form)` | a dropped hint | `docs/MACROEXPAND.md` §2b |
 | `(with-meta inc m)`, `(with-meta 'sym m)` | metadata on native fns and symbols | `:kind-mismatch`; `:no-metadata-on-immediate` (a `fn` carries metadata) | `docs/SEMANTICS.md` §7 |
 | `(meta #'f)` | `:name`, `:ns`, `:arglists`, `:line`, `:column`, `:file` | `:name`, `:ns` (the namespace's name symbol), `:arglists` for a `defn` or `defmacro`, and what the definition carries; no `:line`, `:column` or `:file` | `docs/MACROEXPAND.md` §10 |
 | `not` and `mod` at a call site | ordinary calls through the Var (neither has `:inline`), so `with-redefs` or `alter-var-root` of either reaches a compiled call | inlined, as `+`, `inc` and the comparisons (which have `:inline` in Clojure) are: a redefinition reaches `apply` and higher-order uses, not a compiled `(not x)` or `(mod a b)` | `docs/COMPILER.md` §4.3 |
