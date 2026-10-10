@@ -156,14 +156,18 @@ pub fn format(
         // have no source form, so readable output does not read
         // back. The codec refuses them as `:unserializable`.
         .atom => try writer.writeAll("#<atom>"),
-        // A protocol's name lives in the VM's protocol registry, which
-        // the printer is not given: a protocol prints its id, a
-        // protocol fn its method's name, a keyword the interner holds.
-        .protocol => try writer.print("#<protocol id={d}>", .{protocol_mod.protocolId(v)}),
-        .protocol_fn => if (interner) |it|
-            try writer.print("#<protocol-fn {s}>", .{it.keywordName(protocol_mod.protocolFnMethodNameId(v))})
-        else
-            try writer.print("#<protocol-fn proto={d} method={d}>", .{ protocol_mod.protocolFnProtocolId(v), protocol_mod.protocolFnMethodNameId(v) }),
+        // A protocol prints the `ns/Name` the interner holds, else its
+        // id; a protocol fn adds its method's name, else prints the
+        // method alone, or both ids without an interner.
+        .protocol => if (interner) |it| {
+            if (protocol_mod.nameOf(v, it)) |name| return writer.print("#<protocol {s}>", .{name});
+            try writer.print("#<protocol id={d}>", .{protocol_mod.protocolId(v)});
+        } else try writer.print("#<protocol id={d}>", .{protocol_mod.protocolId(v)}),
+        .protocol_fn => if (interner) |it| {
+            const method = it.keywordName(protocol_mod.protocolFnMethodNameId(v));
+            if (protocol_mod.nameOf(v, it)) |name| return writer.print("#<protocol-fn {s}/{s}>", .{ name, method });
+            try writer.print("#<protocol-fn {s}>", .{method});
+        } else try writer.print("#<protocol-fn proto={d} method={d}>", .{ protocol_mod.protocolFnProtocolId(v), protocol_mod.protocolFnMethodNameId(v) }),
         .durable_ref => try formatDurableRef(v, writer),
         .db_connection => try writer.writeAll("#<db-connection>"),
         // The path as a string literal, escaped, in both modes.
@@ -612,7 +616,7 @@ test "records: #ns.Type{...} in both modes once the interner names the type; opa
     try expectFormat(r, .display, &it, "#user.P{:x 1, :y a}");
 }
 
-test "a protocol fn prints its method's name, by its ids without an interner" {
+test "a protocol and its fn print the protocol's name, else the method's name or the ids" {
     var heap = heap_mod.Heap.init(testing.allocator);
     defer heap.deinit();
     var it = intern_mod.Interner.init(testing.allocator);
@@ -623,6 +627,9 @@ test "a protocol fn prints its method's name, by its ids without an interner" {
     var want: [64]u8 = undefined;
     try expectFormat(pfn, .readable, null, try std.mem.print(&want, "#<protocol-fn proto=2 method={d}>", .{name.asKeywordId()}));
     try expectFormat(try protocol_mod.makeProtocol(&heap, 2), .display, &it, "#<protocol id=2>");
+    try it.nameProtocol(2, "user", "Shape");
+    try expectFormat(pfn, .readable, &it, "#<protocol-fn user/Shape/area>");
+    try expectFormat(try protocol_mod.makeProtocol(&heap, 2), .display, &it, "#<protocol user/Shape>");
 }
 
 test "a durable ref prints its tree's odd bytes escaped and its key in hex" {

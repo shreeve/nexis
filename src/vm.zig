@@ -2421,6 +2421,7 @@ pub const VM = struct {
         for (method_specs) |spec| {
             methods.appendAssumeCapacity(.{ .name_id = spec.name_id, .name = try self.allocator.dupe(u8, spec.name) });
         }
+        try self.ensureInterner().nameProtocol(new_id, ns_name, protocol_name);
         try self.protocol_registry.append(self.allocator, .{
             .id = new_id,
             .ns_name = ns_dup,

@@ -5746,8 +5746,8 @@ test "defprotocol: registers protocol + method dispatchers" {
     try expectOutputProgram(
         \\(do
         \\  (defprotocol IFoo (bar [this y]))
-        \\  [(nexis.string/starts-with? (str IFoo) "#<protocol id=") (fn? bar)])
-    , "[true true]");
+        \\  [(str IFoo) (str bar) (fn? bar)])
+    , "[#<protocol user/IFoo> #<protocol-fn user/IFoo/bar> true]");
 }
 
 test "protocol dispatch with NO impl raises :no-protocol-impl" {

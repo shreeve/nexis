@@ -131,10 +131,6 @@ Each needs a PLAN amendment before code (`AGENTS.md`, authority order).
 Small items the revamp-3 streams (PRs 36–45) found across each other's
 files; each is a few lines.
 
-25. **A protocol prints as `#<protocol id=N>`.** `protocol.nameOf` reads
-    its name from the interner; `VM.registerProtocol` must call
-    `Interner.nameProtocol` and `src/format.zig` print through it
-    (PROTOCOLS.md §2, STDLIB.md §5).
 26. **`reset-meta!` cannot remove a library Var's `:doc`.** `meta`
     refills a missing doc; a "doc filled" flag on `Var` ends it.
 27. **Duplicates left between files:** `stdlib.zig`'s `isReduced`, its
