@@ -264,16 +264,7 @@ under `:error` (`docs/VM.md` §12).
 
 ### 10. Tests
 
-`src/atom.zig` tests the body layout, the accessors, the in-flight flag
-and the trace (a self-referential atom included).
-`test/integration/eval_pipeline.zig` runs the language surface through
-the whole pipeline: identity equality and atoms as map keys, each
-native, `deref` through `@a`, `deref` and `db/deref`, rollback of
-`swap!` and `swap-vals!` on a throw, re-entrancy through `reset!`,
-`swap!` and `compare-and-set!`, identity CAS, the type errors,
-`reset-vals!` and `volatile!`, and an atom nested in a `db/put!` value
-as `:unserializable`; validators on every mutator and on `atom` and
-`set-validator!`, watches through every mutator (one that changes the
-atom again, one that throws), the options and an atom's metadata, and
-a loop whose validator and watches allocate on every call, which
-`zig build test -Dgc-stress` runs with a collection every 4 KiB.
+`src/atom.zig` holds the unit tests (the body layout, the accessors, the
+in-flight flag and the trace); `test/integration/eval_pipeline.zig` runs the
+language surface through the whole pipeline, and `zig build test
+-Dgc-stress` runs it with a collection every 4 KiB.

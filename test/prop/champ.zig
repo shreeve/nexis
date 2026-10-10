@@ -1,6 +1,6 @@
 //! test/prop/champ.zig — randomized properties for the persistent map
 //! and set heap kinds (CHAMP): M1–M11 for maps, S1–S9 for sets, each
-//! described in CHAMP.md §12.2 and §12.4. The invariant they pin first
+//! described below (CHAMP.md §12). The invariant they pin first
 //! is `(= a b) ⇒ hash(a) = hash(b)` across both subkinds.
 
 const std = @import("std");
@@ -631,7 +631,7 @@ test "M11: equal ⇒ hashValue equal over 2000 random map pairs" {
 // =============================================================================
 // Persistent set property tests
 //
-// Properties (CHAMP.md §12.2 / §12.4 parallel):
+// Properties (CHAMP.md §12):
 //   S1. setFromElements + setContains round-trip; absent returns false.
 //   S2. Random conj/disj sequences preserve the element set (model
 //       vs. implementation).
