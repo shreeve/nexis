@@ -544,8 +544,12 @@ after numbers in the commit message.
    and short ids (`docs/PERF.md` §3.36; store format 3, which refuses
    every other). A pull of 10k entities is 4% slower cold on Linux for
    the variable-length entity; §6 "Store size" lists what is left.
-4. The open design question, an amendment first: `&form`/`&env`
-   (§24 #13). The owner orders it after the em and emdb work.
+4. Two designs the owner approved, each an amendment first:
+   `&form`/`&env` (`docs/FORM-ENV.md`, `TODO.md` #11) and `#inst` and
+   `#uuid` (`docs/INST-UUID.md`, `TODO.md` #22).
+5. `TODO.md`'s "Open from revamp 3" (#24–#29): the multimethod
+   registry, protocol names in print, duplicates left between files,
+   and the deferred test and doc pass.
 
 Rerun `bb bench/compare/run.clj --out DIR` (`docs/BENCH.md` §12)
 before and after any performance change; on the Apple host nexis

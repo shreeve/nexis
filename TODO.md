@@ -115,36 +115,56 @@ up. Every fix starts with its failing test (`AGENTS.md`).
 
 Each needs a PLAN amendment before code (`AGENTS.md`, authority order).
 
-11. **`&form` and `&env` in macros** (PLAN §23 #34, §24 #13). A macro
-    receives the call's Form (its span and metadata) and the map of
-    locals in scope. Deferred by the owner to the next revamp.
+11. **`&form` and `&env` in macros** (PLAN §23 #34, §24 #13). Approved
+    by the owner; `docs/FORM-ENV.md` is the design (Clojure's two
+    leading parameters, `&form` with its `:line`/`:column`, `&env` a map
+    of the locals in scope), its PLAN text and a four-commit plan with
+    the tests that prove it.
 12. **FileMan on Nextomic.** VistA's FileMan data gains Nextomic's time
     model: every fact kept, as-of reads, provenance on each change.
     `docs/FILEMAN-NEXTOMIC.md` has the mapping from `^DD`, the three
     ways to combine them (a temporal mirror first) and a first
     demonstration. The capture hook belongs to em's repository.
-22. **`#inst` literals** (PLAN §4, §24 #3). Instants are the record
-    `nexis.time.Instant` (`docs/STDLIB.md` §12), which prints as
-    `#nexis.time.Instant{:ms n}` and has no literal. Doing `#inst`
-    cleanly is more than the reader: (a) amend PLAN §4 to drop the
-    `#inst` row and §28 to say what `#inst "..."` reads as; reading it
-    as the form `(nexis.time/parse "...")`, as `#()` reads as the form
-    it stands for, needs no new Form variant, but `nexis.edn/read-string`
-    would then return a list, not an instant, so data does not round
-    trip; (b) so the reader, the printer (`#inst "2026-..."` for an
-    Instant, `src/format.zig`) and `nexis.edn` change together, with
-    a golden for each; (c) `compare` of two Instants
-    (`docs/SORTED.md` §6), so they sort; (d) Nextomic's marshal takes
-    an Instant where it takes an instant's long. (c) and (d) are worth
-    doing without the literal.
-23. **UUIDs are strings.** `random-uuid` returns the canonical text,
-    as Nextomic's `:db.type/uuid` takes and returns it (`docs/STDLIB.md`
-    §8, `docs/NEXTOMIC.md` §2). A UUID value would be a new value kind
-    (PLAN §23: the Form, the value layer, the codec's wire tags, `=`
-    and `hash`, the printer's `#uuid`), and it would break `uuid?` and
-    every program and store that holds the text. If a distinct type is
-    wanted, a record `nexis.uuid.UUID`, as `nexis.time.Instant` is, needs
-    no amendment; it waits on a use that the string cannot serve.
+22. **`#inst` and `#uuid`** (PLAN §4, §23 #25, §24 #3, §28). Approved by
+    the owner; `docs/INST-UUID.md` is the design: an immediate `inst`
+    kind (epoch milliseconds) and a heap `uuid` kind, the two tagged
+    literals and their round trip through `pr-str`, `read-string`,
+    `nexis.edn` and the codec, Nextomic's `:db.type/instant` and
+    `:db.type/uuid` taking and returning only the new kinds (stored
+    bytes unchanged), and a commit plan with its tests.
+
+## Open from revamp 3
+
+Small items the revamp-3 streams (PRs 36–45) found across each other's
+files; each is a few lines.
+
+24. **A multimethod is kept forever.** core.nx's global `multifns` atom
+    holds every multimethod; a fn carries metadata (SEMANTICS §7), so a
+    multifn can keep its state there and the atom can go.
+25. **A protocol prints as `#<protocol id=N>`.** `protocol.nameOf` reads
+    its name from the interner; `VM.registerProtocol` must call
+    `Interner.nameProtocol` and `src/format.zig` print through it
+    (PROTOCOLS.md §2, STDLIB.md §5).
+26. **`reset-meta!` cannot remove a library Var's `:doc`.** `meta`
+    refills a missing doc; a "doc filled" flag on `Var` ends it.
+27. **Duplicates left between files:** `stdlib.zig`'s `isReduced`, its
+    and `nextomic/transact.zig`'s map-entry walks (`seq.isReduced`,
+    `sorted.MapEntries`), `caseRun`/`categoryOf` (regex.zig's
+    `mapRun`/`category`), the LEB128 in `nextomic/datom.zig` (codec's),
+    the Nextomic docs table in `stdlib.zig` (`nextomic/natives.zig`
+    holds them), the sync mapping in `nextomic/natives.zig`
+    (`Durability.syncOverride`), and one random generator for the
+    query layer and `rand`.
+28. **Small error-map and comment rows:** `:nextomic/conflict` names its
+    attribute `:a` where the rest use `:attr`; `db.failureName` keeps
+    arms for codec errors that no longer exist; a fulltext needle with
+    an over-long token; the reserved `Kind` names `.error_` still used
+    in vm.zig and stdlib.zig.
+29. **The test and doc pass the revamp deferred:** `eval_pipeline`'s
+    superseded early cases and its fresh VM per case (31 s of the gate),
+    the duplicated pins, `docs/PERF.md`'s superseded tables, test
+    inventories in the docs, and the moved Nextomic suites'
+    `Heap.init(arena)` without `deinit`.
 
 ## Divergences by design, not bugs
 
