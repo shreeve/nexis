@@ -1741,7 +1741,7 @@ pub const DeclaredNames = struct {
         const name_form = if (items[1].datum == .with_meta) items[1].datum.with_meta.target else items[1];
         if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) return;
         const name = name_form.datum.symbol.name;
-        const plain = [_][]const u8{ "def", "defn", "defn-", "defonce", "defmacro" };
+        const plain = [_][]const u8{ "def", "defn", "defn-", "defonce", "defmacro", "defmulti", "deftest" };
         if (for (plain) |h| {
             if (std.mem.eql(u8, head, h)) break true;
         } else false) {

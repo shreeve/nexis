@@ -8774,3 +8774,8 @@ test "loader: with on_failure, a form that fails at run time does not stop the f
 test "letfn: a repeated name is its last binding, everywhere in the form, as in Clojure" {
     try expectOutput("[(letfn [(f [] 1) (f [] 2)] (f)) (letfn [(f [] 1) (g [] (f)) (f [] 2)] (g))]", "[2 2]");
 }
+
+test "loader: a defmulti or deftest a file defines later is a forward reference, as a defn is" {
+    try expectLoaded("(defn f [x] (area x)) (defmulti area :shape) (defmethod area :sq [m] 1) (f {:shape :sq})", "1");
+    try expectLoaded("(require '[nexis.test :refer [deftest]]) (defn g [] (fn? t)) (deftest t) (g)", "true");
+}

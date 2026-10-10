@@ -164,7 +164,7 @@ and a reused subform its own (MACROEXPAND.md §4b).
    namespace, then its parent chain (`user`'s parent is `nexis.core`).
 7. **Declared-later name**: a name the file or REPL line defines
    anywhere, at any depth (`def`, `defn`, `defn-`, `defonce`, `defmacro`,
-   `defrecord` and its derived names, `defprotocol` and its methods;
+   `defmulti`, `deftest`, `defrecord` and its derived names, `defprotocol` and its methods;
    `DeclaredNames`, collected before any form compiles), so a form
    may refer to a Var a later form defines.
 8. Otherwise `UnresolvedSymbol`, at the symbol's own span.
