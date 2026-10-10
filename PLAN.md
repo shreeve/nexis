@@ -261,7 +261,8 @@ Each item is a commitment; changing one takes an Amendment Log entry
     routine.
 22. **As-of reads exist.** `db/snapshot` and `with-snapshot` pin an
     emdb MVCC read; Nextomic's `as-of`, `since` and `history` read
-    tx-in-key history.
+    tx-in-key history, and `as-of` and `since` take a basis `t` or an
+    instant.
 23. **LMDB is emdb's ancestor; Datomic is the semantic reference for
     durable-as-value.** When a choice is ambiguous, ask first what
     LMDB, Datomic, Clojure and LuaJIT do.
@@ -1119,3 +1120,13 @@ entry stating the decision and its rationale.
   `docs/FORMS.md` §2, §3 and §5 are the authority; `docs/STDLIB.md` §4,
   `docs/SEMANTICS.md` §6.1, `docs/TOOLING.md` and `CLOJURE-REVIEW.md`
   carry it.
+
+- **2026-10-10 — `as-of` and `since` take an instant.** §23 #22:
+  Nextomic's `as-of` and `since` accept an `inst` as well as a basis
+  `t` or a transaction entity id, as Datomic's accept a `Date`. An
+  instant resolves to the `t` of the last transaction whose
+  `:db/txInstant` is at or before it (0 when every transaction is
+  later), by one seek in the current AVET tree of `:db/txInstant`;
+  any other kind stays `:kind-mismatch`. Reason: a program holds
+  wall-clock times, not transaction numbers. `docs/NEXTOMIC.md` §4, §7
+  and §12 are the authority; `TODO.md` #22 is closed.

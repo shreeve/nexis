@@ -653,7 +653,15 @@ Every operation on a db-value opens one read transaction, reads
 
 A time argument `T` is a transaction number `t` (what a report's `:tx`
 and its rows carry) or a transaction entity id `2^46 | t`; a negative
-`T` is the VM's `:invalid-argument`.
+`T` is the VM's `:invalid-argument`. `as-of` and `since` also take an
+`inst`, as Datomic's take a `Date`: it resolves to the `t` of the last
+transaction whose `:db/txInstant` is at or before it, or to 0 when
+every transaction is later, so `as-of` an instant before the first
+transaction is an empty history and `since` it shows every
+transaction. Instants never go back (a transaction's instant is no earlier than the one before), so the answer is one seek in
+the current AVET tree of `:db/txInstant` and one step back; among
+transactions of one instant the newest `t` wins. Any other kind is the
+VM's `:kind-mismatch`.
 
 **The fold** (`Store.FoldScan`). Walk the index's current tree and its
 history tree together from `setRange(prefix)` while the keys carry the
@@ -1195,7 +1203,7 @@ gives the place and the trace.
 | `:nextomic/cas` | a `:db.fn/cas` whose expectation failed | `:attr`, `:expected` and `:actual`, the last two nil for an absent value |
 | `:nextomic/query-syntax` | a query the parser or planner refuses, or an unbound function name | `:clause`, the index into `:where`, when inside a clause. The message names what is at fault: the symbol, section, source or binding it does not take, the variable bound twice, the rule a call names with its arity and the count the call passes. A scoping refusal names the variable at fault: a `:find` or `:with` variable nothing binds, the one an `or` branch mentions and another does not, the join variable an `or-join` branch or a rule body leaves unbound, the one a `not` body has that nothing outside binds, the argument, function-position, `not-join` or required `or-join` variable no clause ever binds |
 | `:nextomic/pull-syntax` | a bad pull pattern (from `pull`, `pull-many` or a find element) | `:clause`, the index of the spec; the message names the element, option or attribute at fault |
-| `:kind-mismatch`, `:invalid-argument`, `:arity-mismatch` | the VM's own errors for an argument of the wrong kind (a db-value where a connection belongs), an unknown index, `:sync` or `:durability` option or a negative `t`, or a wrong argument count | as every runtime error's (`docs/VM.md` §13) |
+| `:kind-mismatch`, `:invalid-argument`, `:arity-mismatch` | the VM's own errors for an argument of the wrong kind (a db-value where a connection belongs, anything but a `t`, an entity id or an `inst` as the time of `as-of` or `since`), an unknown index, `:sync` or `:durability` option or a negative `t`, or a wrong argument count | as every runtime error's (`docs/VM.md` §13) |
 | `:stack-overflow` | tx-data, a lookup ref (one whose value is a lookup ref, in tx-data or any read), a query or a pull pattern nested past the native stack guard | as every runtime error's |
 | `:db/*` | an engine failure, through `db.failureName` (`:db/key-too-large`, `:db/map-full`, `:db/read-only`, `:db/open-failed`, ...); a store whose bytes do not decode, or name an ident it lacks, or a page that fails the engine's check, is `:db/corrupted` | none; a store of another format names both formats in the message and its own as `:format` |
 
@@ -1372,5 +1380,5 @@ damaged page is `:db/corrupted` (§7), never a short scan.
 - **Values are the VM's.** A long is an integer in i64, a fixnum or a
   bignum by its size (§2.2); an instant is the `inst` kind and a uuid
   the `uuid` kind, as Datomic's are a `java.util.Date` and a
-  `java.util.UUID`. `as-of` takes a basis `t`, not an instant
-  (`TODO.md` #22).
+  `java.util.UUID`. `as-of` and `since` take a basis `t` or
+  an instant, as Datomic's take a `Date` (§4).

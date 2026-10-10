@@ -120,11 +120,6 @@ Each needs a PLAN amendment before code (`AGENTS.md`, authority order).
     `docs/FILEMAN-NEXTOMIC.md` has the mapping from `^DD`, the three
     ways to combine them (a temporal mirror first) and a first
     demonstration. The capture hook belongs to em's repository.
-22. **`as-of` of an instant.** Datomic's `(d/as-of db #inst "...")`
-    takes a `Date` and resolves it through the `:db/txInstant` index to
-    the last transaction at or before it; nexis's `as-of` and `since`
-    take a basis `t` only (`docs/NEXTOMIC.md` §4). The `inst` kind and
-    the AVET entries of `:db/txInstant` make it a small change.
 
 ## Open from revamp 3
 
