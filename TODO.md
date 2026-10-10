@@ -131,10 +131,8 @@ Each needs a PLAN amendment before code (`AGENTS.md`, authority order).
 Small items the revamp-3 streams (PRs 36–45) found across each other's
 files; each is a few lines.
 
-27. **Duplicates left between files:** the sync mapping
-    `SyncMode.of` in `nextomic/store.zig` (`Durability.syncOverride`;
-    two enums, so one must be renamed across both layers), and one
-    random generator for the query layer and `rand`.
+27. **Duplicates left between files:** one random generator for the
+    query layer and `rand`.
 28. **Small rows left:** a fulltext needle with an over-long token
     (`nextomic/fulltext.zig` drops it from the needle, so the search
     widens; a decision, not a deletion), and the reserved `Kind` name
