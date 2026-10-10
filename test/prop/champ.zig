@@ -1,7 +1,6 @@
 //! test/prop/champ.zig — randomized properties for the persistent map
-//! and set heap kinds (CHAMP): M1–M11 for maps, S1–S9 for sets, each
-//! described below (CHAMP.md §12). The invariant they pin first
-//! is `(= a b) ⇒ hash(a) = hash(b)` across both subkinds.
+//! and set heap kinds (CHAMP): M1–M11 for maps, S1–S9 for sets (CHAMP.md
+//! §12). The invariant they pin first is `(= a b) ⇒ hash(a) = hash(b)` across both subkinds.
 
 const std = @import("std");
 const nx = @import("nexis");
