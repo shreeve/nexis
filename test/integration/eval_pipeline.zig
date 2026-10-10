@@ -256,6 +256,12 @@ test "integration: def + Var lookup" {
     try expectOutput("(do (def x 42) x)", "42");
 }
 
+test "def: a def over a macro makes it a function, as Clojure's def resets the Var's metadata" {
+    try expectOutputProgram("(def x 1) (defmacro m [a] a) (def m (fn [a] (symbol? a))) [(m x) (:macro (meta #'m))]", "[false nil]");
+    try expectOutputProgram("(defmacro m [a] a) (defn m [a] [a]) (m 1)", "[1]");
+    try expectOutputProgram("(defmacro m [a] a) (defn m [a] [a]) (defmacro m [a] (list 'quote a)) (m x)", "x");
+}
+
 test "integration: defn" {
     try expectOutput("(do (defn inc [x] (+ x 1)) (inc 41))", "42");
 }

@@ -4791,12 +4791,14 @@ pub const VM = struct {
     }
 
     /// `var:store-var A=value W=var_index` — the Var's root
-    /// `:= resolve(A)`, marked bound. Redefining a name updates the
-    /// same Var, so code compiled against it sees the new root.
+    /// `:= resolve(A)`, marked bound and not a macro. Redefining a
+    /// name updates the same Var, so code compiled against it sees
+    /// the new root.
     fn execVarStoreVar(self: *VM, frame: *Frame, inst: Inst) VmError!void {
         const target = try wideVar(frame, inst);
         target.root = try self.resolveIn(frame, inst.a);
         target.bound = true;
+        target.macro = false;
     }
 
     /// `var:var-object A=dst_slot W=var_index` — the Var object

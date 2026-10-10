@@ -923,14 +923,14 @@ target only when taken.
 | # | Name | Operands | Semantics |
 |---|---|---|---|
 | 0 | `var:load-var` | A=slot, W=Var index | `slot[A] :=` the Var's `thread_value` when a binding is in force (§6.5), else its root; `:unbound-var` when it has neither. The same as `mov:move A, vW` for W below 4096 |
-| 1 | `var:store-var` | A=any, W=Var index | The Var's root `:= resolve(A)`, marked bound. Redefining a name updates the same Var, so code compiled against it sees the new root |
+| 1 | `var:store-var` | A=any, W=Var index | The Var's root `:= resolve(A)`, marked bound, its macro flag cleared (a `def` over a macro makes it a function, as Clojure's `def` resets the Var's metadata). Redefining a name updates the same Var, so code compiled against it sees the new root |
 | 2 | `var:var-object` | A=slot, W=Var index | `slot[A] :=` the Var object; an unbound Var does not trap |
 
 W past the Var table is `OperandOutOfRange`. `(def x v)` is
 `store-var` then `var-object`, so it yields the Var.
 
 A `Var` carries `root`, `bound`, `meta`, `macro` (set by `defmacro`,
-`docs/MACROEXPAND.md` §1.2), `dynamic`, `thread_value` and
+`docs/MACROEXPAND.md` §1.2, cleared by `def`), `dynamic`, `thread_value` and
 `thread_bound`.
 
 #### 10.8 `coll`
