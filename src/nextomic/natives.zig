@@ -123,10 +123,12 @@ pub const table: [rows.len]NativeFn = blk: {
     break :blk out;
 };
 
+const NativeDoc = struct { arglists: []const u8, doc: []const u8 };
+
 /// What `doc` prints of each native of `table`, in its order: the text
 /// of its `:arglists` list and its docstring.
-pub const docs: [rows.len]struct { arglists: []const u8, doc: []const u8 } = blk: {
-    var out: [rows.len]struct { arglists: []const u8, doc: []const u8 } = undefined;
+pub const docs: [rows.len]NativeDoc = blk: {
+    var out: [rows.len]NativeDoc = undefined;
     for (&out, rows) |*d, r| d.* = .{ .arglists = "(" ++ r[4] ++ ")", .doc = r[5] };
     break :blk out;
 };

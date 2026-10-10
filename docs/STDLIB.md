@@ -667,8 +667,8 @@ documentation from four places:
 - **A native's table row** (`src/stdlib.zig`). Each row ends with two
   strings, the arglists as `doc` prints them (`"[coll] [n coll]"`)
   and the docstring; Nextomic's natives, whose descriptors live in
-  `src/nextomic/`, have theirs in `nextomic_docs`, keyed by the
-  descriptor's name. The text is in the binary, not the image: the
+  `src/nextomic/`, have theirs in the rows of
+  `src/nextomic/natives.zig`. The text is in the binary, not the image: the
   Var a native was installed in takes `{:arglists (...) :doc "..."
   :name name :ns ns}` as its metadata the first time `meta` reads a
   Var with none, the arglists read by the reader, and keeps it. Another

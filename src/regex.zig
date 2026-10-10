@@ -359,7 +359,8 @@ const sets = struct {
 // Unicode: case mappings and general categories (Java's)
 // =============================================================================
 
-fn mapRun(runs: []const tables.Run, c: u21) u21 {
+/// `c` mapped by the runs of `runs` (`tables.Run`).
+pub fn mapRun(runs: []const tables.Run, c: u21) u21 {
     var lo: usize = 0;
     var hi = runs.len;
     while (lo < hi) {
@@ -401,7 +402,7 @@ fn preimage(arena: Allocator, out: *std.ArrayList(Range), runs: []const tables.R
 const mn = 6; // NON_SPACING_MARK
 
 /// `Character.getType`.
-fn category(c: u21) u5 {
+pub fn category(c: u21) u5 {
     const t = &tables.categories;
     var lo: usize = 0;
     var hi = t.len;

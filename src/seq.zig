@@ -152,6 +152,11 @@ pub fn isReduced(vm: *VM, v: Value) bool {
     return record_mod.typeId(v) == id;
 }
 
+/// The entries of a hash map, record or sorted map, in its order.
+pub fn mapEntries(m: Value) sorted_mod.MapEntries {
+    return sorted_mod.MapEntries.init(if (m.kind() == .record) record_mod.fieldsOf(m) else m);
+}
+
 /// The transient vector a step accumulates into, rooted in the block's
 /// result field; the outputs a step hands out are its elements. What
 /// `rf` returns is not an accumulator, as for Clojure's
@@ -958,7 +963,7 @@ fn realizeAllFound(vm: *VM, root: Value) VmError!bool {
 fn pushParts(vm: *VM, v: Value, work: *std.ArrayList(Value), found: *bool) VmError!void {
     switch (v.kind()) {
         .persistent_map, .sorted_map, .record => {
-            var it = sorted_mod.MapEntries.init(if (v.kind() == .record) record_mod.fieldsOf(v) else v);
+            var it = mapEntries(v);
             while (it.next()) |e| {
                 for ([_]Value{ e.key, e.value }) |x| if (mayHoldLazy(x.kind())) {
                     if (x.kind() == .lazy_seq) found.* = true;

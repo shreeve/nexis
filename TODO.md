@@ -131,14 +131,11 @@ Each needs a PLAN amendment before code (`AGENTS.md`, authority order).
 Small items the revamp-3 streams (PRs 36–45) found across each other's
 files; each is a few lines.
 
-27. **Duplicates left between files:** `stdlib.zig`'s `isReduced`, its
-    and `nextomic/transact.zig`'s map-entry walks (`seq.isReduced`,
-    `sorted.MapEntries`), `caseRun`/`categoryOf` (regex.zig's
-    `mapRun`/`category`), the LEB128 in `nextomic/datom.zig` (codec's),
-    the Nextomic docs table in `stdlib.zig` (`nextomic/natives.zig`
-    holds them), the sync mapping in `nextomic/natives.zig`
-    (`Durability.syncOverride`), and one random generator for the
-    query layer and `rand`.
+27. **Duplicates left between files:** the LEB128 in
+    `nextomic/datom.zig` (codec's), the sync mapping
+    `SyncMode.of` in `nextomic/store.zig` (`Durability.syncOverride`;
+    two enums, so one must be renamed across both layers), and one
+    random generator for the query layer and `rand`.
 28. **Small error-map and comment rows:** `:nextomic/conflict` names its
     attribute `:a` where the rest use `:attr`; `db.failureName` keeps
     arms for codec errors that no longer exist; a fulltext needle with
