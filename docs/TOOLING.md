@@ -263,18 +263,18 @@ build; `test/golden/cli/multi-arity.disasm` pins one. `test/golden/cli/sum10.dis
 pins the listing of `test/examples/pins/sum10.nx`:
 
 ```
-routine <top> (test/examples/pins/sum10.nx:4:1) slots=6 arity=0 upvalues=0
-  0000  var:load-var        s1  v0=nexis.core/println  ; 4:2
-  0001  mov:load-const      s3  c0=0  ; 5:13
-  0002  mov:load-const      s4  c0=0  ; 5:19
-  0003  cmp:lt.sc+if-false  s5  s3  c1=10  ; 6:9
-  0004  jump:if-false       s5  j0009  ; 6:5
-  0005  math:add.ss         s4  s4  s3  ; 7:22
-  0006  math:add.sc+lt.sc+if-true  s3  s3  c2=1  ; 7:14
-  0007  cmp:lt.sc+if-true   s5  s3  c1=10  ; 6:9
-  0008  jump:if-true        s5  j0005  ; 6:5
-  0009  mov:move-clear      s2  s4  -  ; 8:7
-  0010  call:call           s1  #1  s0  ; 4:1
+routine <top> (test/examples/pins/sum10.nx:5:1) slots=6 arity=0 upvalues=0
+  0000  var:load-var        s1  v0=nexis.core/println  ; 5:2
+  0001  mov:load-const      s3  c0=0  ; 6:13
+  0002  mov:load-const      s4  c0=0  ; 6:19
+  0003  cmp:lt.sc+if-false  s5  s3  c1=10  ; 7:9
+  0004  jump:if-false       s5  j0009  ; 7:5
+  0005  math:add.ss         s4  s4  s3  ; 8:22
+  0006  math:add.sc+lt.sc+if-true  s3  s3  c2=1  ; 8:14
+  0007  cmp:lt.sc+if-true   s5  s3  c1=10  ; 7:9
+  0008  jump:if-true        s5  j0005  ; 7:5
+  0009  mov:move-clear      s2  s4  -  ; 9:7
+  0010  call:call           s1  #1  s0  ; 5:1
   0011  call:return.s       s0  -  -
 ```
 
