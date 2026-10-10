@@ -3293,14 +3293,14 @@ test "materialise every value kind into a heap" {
     try testing.expect((try conn.valToValue(txn, &heap, .{ .boolean = true })).asBool());
     try testing.expectEqual(@as(i64, -3), (try conn.valToValue(txn, &heap, .{ .long = -3 })).asFixnum());
     try testing.expectEqual(@as(f64, 1.5), (try conn.valToValue(txn, &heap, .{ .double = 1.5 })).asFloat());
-    try testing.expectEqual(@as(i64, 7), (try conn.valToValue(txn, &heap, .{ .instant = 7 })).asFixnum());
+    try testing.expectEqual(@as(i64, 7), (try conn.valToValue(txn, &heap, .{ .instant = 7 })).asInstMs());
     try testing.expectEqual(@as(i64, 1 << 40), (try conn.valToValue(txn, &heap, .{ .ref = 1 << 40 })).asFixnum());
     const many = try conn.valToValue(txn, &heap, .{ .keyword = boot.card_many });
     try testing.expectEqualStrings("db.cardinality/many", tc.interner.keywordName(many.asKeywordId()));
     const s = try conn.valToValue(txn, &heap, .{ .string = "hi" });
     try testing.expectEqualStrings("hi", string_mod.asBytes(s));
-    const u = try conn.valToValue(txn, &heap, .{ .uuid = @splat(0) });
-    try testing.expectEqualStrings("00000000-0000-0000-0000-000000000000", string_mod.asBytes(u));
+    const u = try conn.valToValue(txn, &heap, .{ .uuid = @splat(0xab) });
+    try testing.expectEqualSlices(u8, &@as([16]u8, @splat(0xab)), nx.uuid.bytesOf(u));
     const b = try conn.valToValue(txn, &heap, .{ .bytes = "\x00\x01" });
     try testing.expectEqualStrings("\x00\x01", string_mod.asBytes(b));
 }

@@ -20,6 +20,7 @@
 const std = @import("std");
 const value = @import("../value.zig");
 const string_mod = @import("../string.zig");
+const uuid_mod = @import("../uuid.zig");
 const dispatch = @import("../dispatch.zig");
 const hash_mod = @import("../hash.zig");
 const bignum = @import("../bignum.zig");
@@ -38,14 +39,14 @@ pub const Var = u32;
 // =============================================================================
 
 /// A relation value in the VM's own terms: every integer-valued datom
-/// component (entity id, ref, long, instant, transaction entity) and
-/// every integer in i64, fixnum or bignum, is `int`; keywords carry the
-/// VM intern id, strings borrow arena bytes (uuids as their canonical
-/// text, byte arrays as their bytes), and every other VM value rides in
-/// `vm`. `Cell.fromValue` maps a VM value onto the first six arms, so
-/// `vm` never holds a fixnum, float, boolean, keyword, string or
-/// integer in i64; cross-arm equality is therefore always false without
-/// loss. An integer past i64 is a `vm` bignum and orders as a number. A
+/// component (entity id, ref, long, transaction entity) and every
+/// integer in i64, fixnum or bignum, is `int`; an instant is `inst`, its
+/// milliseconds, and a uuid `uuid`, its bytes; keywords carry the VM
+/// intern id, strings borrow arena bytes (byte arrays as their bytes),
+/// and every other VM value rides in `vm`. `Cell.fromValue` maps a VM
+/// value onto the first eight arms, so `vm` never holds a fixnum,
+/// float, boolean, keyword, string, instant, uuid or integer in i64;
+/// cross-arm equality is therefore always false without loss. An integer past i64 is a `vm` bignum and orders as a number. A
 /// function (a variable in function position holds one) is
 /// identity-valued: it hashes and compares by the bits of its value.
 pub const Cell = union(enum) {
@@ -56,6 +57,9 @@ pub const Cell = union(enum) {
     /// VM keyword intern id.
     keyword: u32,
     str: []const u8,
+    /// Milliseconds since the epoch.
+    inst: i64,
+    uuid: [16]u8,
     vm: Value,
 
     pub fn fromValue(v: Value) Cell {
@@ -66,6 +70,8 @@ pub const Cell = union(enum) {
             .true_, .false_ => .{ .boolean = v.asBool() },
             .keyword => .{ .keyword = v.asKeywordId() },
             .string => .{ .str = string_mod.asBytes(v) },
+            .inst => .{ .inst = v.asInstMs() },
+            .uuid => .{ .uuid = uuid_mod.bytesOf(v).* },
             .bignum => if (bignum.toI64(v)) |n| .{ .int = n } else .{ .vm = v },
             else => .{ .vm = v },
         };
@@ -80,6 +86,8 @@ pub const Cell = union(enum) {
             .boolean => |x| x == b.boolean,
             .keyword => |x| x == b.keyword,
             .str => |x| std.mem.eql(u8, x, b.str),
+            .inst => |x| x == b.inst,
+            .uuid => |x| std.mem.eql(u8, &x, &b.uuid),
             .vm => |x| if (isFunction(x)) x.tag == b.vm.tag and x.payload == b.vm.payload else dispatch.equal(x, b.vm),
         };
     }
@@ -104,10 +112,15 @@ pub const Cell = union(enum) {
             .boolean => |x| @intFromBool(x),
             .keyword => |x| hash_mod.hashU64(x),
             .str => |x| std.hash.Wyhash.hash(0, x),
+            .inst => |x| hash_mod.hashI64(x),
+            .uuid => |x| std.hash.Wyhash.hash(0, &x),
             .vm => |x| vmHash(x),
         };
         return hash_mod.hashU64(base ^ (tag *% 0x9E37_79B9_7F4A_7C15));
     }
+
+    /// The rank of VM values that are not numbers, the last.
+    const vm_rank = 7;
 
     /// Rank of the arm in the cross-type order used by `order`.
     fn rank(self: Cell) u8 {
@@ -116,8 +129,10 @@ pub const Cell = union(enum) {
             .boolean => 1,
             .int, .double => 2,
             .str => 3,
-            .keyword => 4,
-            .vm => |v| if (v.kind() == .bignum) 2 else 5,
+            .inst => 4,
+            .uuid => 5,
+            .keyword => 6,
+            .vm => |v| if (v.kind() == .bignum) 2 else vm_rank,
         };
     }
 
@@ -125,7 +140,7 @@ pub const Cell = union(enum) {
     /// one type), or null when they are not comparable here: different
     /// types, or VM values.
     pub fn compare(a: Cell, b: Cell, names: *const Interner) ?std.math.Order {
-        if (a.rank() != b.rank() or a.rank() == 5) return null;
+        if (a.rank() != b.rank() or a.rank() == vm_rank) return null;
         return a.orderBy(b, names);
     }
 
@@ -135,11 +150,11 @@ pub const Cell = union(enum) {
         return a.order(b);
     }
 
-    /// A total order: nil < booleans < numbers < strings < keywords <
-    /// other VM values. Numbers compare as `compare` orders them:
-    /// integers exactly at any size, and in f64 when either is a
-    /// double; strings by bytes; keywords by intern id; VM values by
-    /// hash. Keywords and VM values are in a stable order, not a
+    /// A total order: nil < booleans < numbers < strings < instants <
+    /// uuids < keywords < other VM values. Numbers compare as `compare`
+    /// orders them: integers exactly at any size, and in f64 when either
+    /// is a double; strings by bytes; instants by milliseconds; uuids by
+    /// unsigned bytes; keywords by intern id; VM values by hash. Keywords and VM values are in a stable order, not a
     /// semantic one; `orderBy` orders keywords as the language does.
     pub fn order(a: Cell, b: Cell) std.math.Order {
         const ra = a.rank();
@@ -150,6 +165,8 @@ pub const Cell = union(enum) {
             .nil => .eq,
             .boolean => |x| std.math.order(@intFromBool(x), @intFromBool(b.boolean)),
             .str => |x| std.mem.order(u8, x, b.str),
+            .inst => |x| std.math.order(x, b.inst),
+            .uuid => |x| std.mem.order(u8, &x, &b.uuid),
             .keyword => |x| std.math.order(x, b.keyword),
             .vm => |x| std.math.order(vmHash(x), vmHash(b.vm)),
             .int, .double => unreachable,
@@ -772,6 +789,26 @@ test "cells: equality, hash agreement, order" {
     try testing.expect(Cell.fromValue(value.fromChar('x').?) == .vm);
     try testing.expectEqual(@as(?u64, 5), (Cell{ .int = 5 }).asEid());
     try testing.expect((Cell{ .int = -5 }).asEid() == null);
+}
+
+test "cells: an instant and a uuid are cells of their own, never an int or a string" {
+    var heap = @import("../heap.zig").Heap.init(testing.allocator);
+    defer heap.deinit();
+    var names = Interner.init(testing.allocator);
+    defer names.deinit();
+    const t = Cell.fromValue(value.fromInst(-1));
+    try testing.expect(t == .inst and t.eql(.{ .inst = -1 }) and !t.eql(.{ .int = -1 }));
+    try testing.expectEqual(t.hash(), (Cell{ .inst = -1 }).hash());
+    try testing.expect(t.compare(.{ .inst = 0 }, &names) == .lt);
+    try testing.expect(t.compare(.{ .int = 0 }, &names) == null);
+    const lo: [16]u8 = @splat(0);
+    const hi: [16]u8 = @splat(0xff);
+    const u = Cell.fromValue(try uuid_mod.make(&heap, hi));
+    try testing.expect(u == .uuid and u.eql(.{ .uuid = hi }) and !u.eql(.{ .uuid = lo }));
+    try testing.expectEqual(u.hash(), (Cell{ .uuid = hi }).hash());
+    try testing.expect(u.compare(.{ .uuid = lo }, &names) == .gt);
+    try testing.expect(u.compare(.{ .str = "ffffffff-ffff-ffff-ffff-ffffffffffff" }, &names) == null);
+    try testing.expect((Cell{ .str = "z" }).order(t) == .lt and t.order(u) == .lt and u.order(.{ .keyword = 0 }) == .lt);
 }
 
 test "cells: an integer is int in i64 and a number past it" {

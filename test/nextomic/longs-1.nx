@@ -21,14 +21,14 @@
                 {:db/ident :n/id :db/valueType :db.type/long :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
                 {:db/ident :n/all :db/valueType :db.type/long :db/cardinality :db.cardinality/many}
                 {:db/ident :n/at :db/valueType :db.type/instant :db/cardinality :db.cardinality/one :db/index true}])
-(def r (d/transact! c (vec (map-indexed (fn [i v] {:db/id (str i) :n/v v :n/id v :n/at v}) edges))))
+(def r (d/transact! c (vec (map-indexed (fn [i v] {:db/id (str i) :n/v v :n/id v :n/at (nexis.time/instant v)}) edges))))
 (def ids (mapv #(get (:tempids r) (str %)) (range (count edges))))
 (def db (d/db c))
 
 ; Reads return the value written, a fixnum or a bignum as the language
 ; represents it.
 (t/check "entity reads every edge" (= edges (mapv #(:n/v (d/entity db %)) ids)))
-(t/check "instants read every edge" (= edges (mapv #(:n/at (d/entity db %)) ids)))
+(t/check "instants read every edge" (= edges (mapv #(inst-ms (:n/at (d/entity db %))) ids)))
 (t/check "pull reads every edge" (= edges (mapv #(:n/v (d/pull db [:n/v] %)) ids)))
 (t/check "datoms read every edge" (= edges (mapv #(nth (first (d/datoms db :eavt % :n/v)) 2) ids)))
 (t/check "an exact datom with a bignum value" (= 1 (count (d/datoms db :eavt (peek ids) :n/v i64-max))))
@@ -38,7 +38,8 @@
 ; Index order is value order, as compare sorts.
 (println (mapv #(nth % 2) (d/datoms db :avet :n/v)))
 (t/check "avet order agrees with sort" (= (sort edges) (mapv #(nth % 2) (d/datoms db :avet :n/v))))
-(t/check "instant order agrees with sort" (= (sort edges) (mapv #(nth % 2) (d/datoms db :avet :n/at))))
+(t/check "instant order agrees with sort" (= (sort edges) (mapv #(inst-ms (nth % 2)) (d/datoms db :avet :n/at))))
+(t/check "instants sort as the index orders them" (= (sort (map #(:n/at (d/entity db %)) ids)) (mapv #(nth % 2) (d/datoms db :avet :n/at))))
 
 ; Range seeks with fixnum and bignum bounds on either side of a boundary.
 (defn vs [ds] (mapv #(nth % 2) ds))
@@ -46,12 +47,14 @@
 (println (vs (d/index-range db :n/v i64-min i48-min)))
 (println (vs (d/index-range db :n/v (inc i48-max) nil)))
 (println (vs (d/index-range db :n/v nil (dec i48-min))))
-(println (vs (d/index-range db :n/at -1 (inc i48-max))))
+(println (vs (d/index-range db :n/at (nexis.time/instant -1) (nexis.time/instant (inc i48-max)))))
 
 ; Past i64 is refused, as Datomic's long refuses it.
 (println (t/caught (d/transact! c [{:n/v (inc i64-max)}])))
 (println (t/caught (d/transact! c [{:n/v (dec i64-min)}])))
+; An instant is an instant, never a number.
 (println (t/caught (d/transact! c [{:n/at (inc i64-max)}])))
+(println (t/caught (d/transact! c [{:n/at 0}])))
 (println (t/caught (d/index-range db :n/v 0 (inc i64-max))))
 (println (t/caught (d/datoms db :avet :n/v (dec i64-min))))
 
@@ -94,9 +97,9 @@
          (= (set edges) (set (keep (fn [[e a v]] (when (= a :n/v) v)) (:data (first (d/tx-range c t0 (inc t0))))))))
 
 ; A :db/txInstant past the fixnum range stands, in the entity and the txlog.
-(def late (d/transact! c [[:db/add "datomic.tx" :db/txInstant (inc i48-max)] [:db/add e0 :n/v 1]]))
-(t/check "the instant on the transaction entity" (= (inc i48-max) (:db/txInstant (d/entity (d/db c) (+ t/tx-partition (:tx late))))))
-(t/check "the instant in the txlog" (= (inc i48-max) (:instant (first (d/tx-range c (:tx late) nil)))))
+(def late (d/transact! c [[:db/add "datomic.tx" :db/txInstant (nexis.time/instant (inc i48-max))] [:db/add e0 :n/v 1]]))
+(t/check "the instant on the transaction entity" (= (inc i48-max) (inst-ms (:db/txInstant (d/entity (d/db c) (+ t/tx-partition (:tx late)))))))
+(t/check "the instant in the txlog" (= (inc i48-max) (inst-ms (:instant (first (d/tx-range c (:tx late) nil))))))
 
 (d/release c)
 (println :longs-1-done)

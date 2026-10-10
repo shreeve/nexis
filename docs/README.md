@@ -42,6 +42,5 @@ canonical Form schema in [`PLAN.md`](../PLAN.md) §23 and §28.
 | — | [`NEXTOMIC-EMDB.md`](NEXTOMIC-EMDB.md) | What Nextomic relies on in emdb, the engine facts that shape its keys, and what not to ask of emdb |
 | — | [`FILEMAN-NEXTOMIC.md`](FILEMAN-NEXTOMIC.md) | A design note, not a spec: VistA's FileMan data on Nextomic's time model (`TODO.md` #12) |
 | — | [`FORM-ENV.md`](FORM-ENV.md) | A design note, not a spec: `&form` and `&env` in macros (`TODO.md` #11) |
-| — | [`INST-UUID.md`](INST-UUID.md) | A design note, not a spec: `#inst` and `#uuid` literals and their value kinds (`TODO.md` #22) |
 | `src/bench.zig`, `bench/` | [`BENCH.md`](BENCH.md) | Benchmark method and harness |
 | — | [`PERF.md`](PERF.md) | Measured numbers, levers, non-goals |

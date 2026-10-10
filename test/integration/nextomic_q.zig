@@ -213,6 +213,8 @@ fn printRows(fx: *Fx, label: []const u8, rel: *const Relation) void {
                 .boolean => |b| std.debug.print(" {}", .{b}),
                 .keyword => |k| std.debug.print(" :{s}", .{fx.interner().keywordName(k)}),
                 .str => |s| std.debug.print(" \"{s}\"", .{if (s.len > 20) s[0..20] else s}),
+                .inst => |ms| std.debug.print(" #inst {d}", .{ms}),
+                .uuid => |u| std.debug.print(" #uuid {x}", .{&u}),
                 .vm => std.debug.print(" #vm", .{}),
             }
         }
@@ -509,6 +511,8 @@ const Naive = struct {
             .boolean => |b| value.fromBool(b),
             .keyword => |k| self.fx.interner().keywordValue(k),
             .str => |s| try string_mod.fromBytes(&self.fx.heap, s),
+            .inst => |ms| value.fromInst(ms),
+            .uuid => |u| try nx.uuid.make(&self.fx.heap, u),
             .vm => |v| v,
         };
     }
@@ -532,16 +536,13 @@ const Naive = struct {
             for (ds, out) |d, *o| {
                 const v: Cell = switch (d.v) {
                     .boolean => |b| .{ .boolean = b },
-                    .long, .instant => |n| .{ .int = n },
+                    .long => |n| .{ .int = n },
+                    .instant => |n| .{ .inst = n },
                     .double => |x| .{ .double = x },
                     .keyword => |id| .{ .keyword = (try dbv.conn.idents.internOf(read.txn, id)).? },
                     .ref => |r| .{ .int = @intCast(r) },
                     .string, .bytes => |s| .{ .str = s },
-                    .uuid => |u| blk: {
-                        const text = try self.arena.alloc(u8, 36);
-                        nx.uuid.writeText(text[0..36], u);
-                        break :blk .{ .str = text };
-                    },
+                    .uuid => |u| .{ .uuid = u },
                 };
                 o.* = .{ .{ .int = @intCast(d.e) }, .{ .int = d.a }, v, .{ .int = @intCast(key.txEntity(d.t)) }, .{ .boolean = d.added } };
                 if (!self.attr_types[src].contains(d.a)) {
@@ -974,6 +975,8 @@ fn cellToVal(c: Cell, vt: key.ValueType) !?key.Val {
         .double => if (c == .double) .{ .double = c.double } else null,
         .ref => if (c.asEid()) |e| .{ .ref = e } else null,
         .boolean => if (c == .boolean) .{ .boolean = c.boolean } else null,
+        .instant => if (c == .inst) .{ .instant = c.inst } else null,
+        .uuid => if (c == .uuid) .{ .uuid = c.uuid } else null,
         else => null,
     };
 }
@@ -1354,16 +1357,29 @@ test "corpus: every :in form" {
     try testing.expectError(error.UnknownAttribute, runEngineDiag(fx, fx.arena(), dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, try fx.read("[:nope/attr \"Ann\"]") }, &in_diag));
     try testing.expectEqual(try fx.kwId("nope/attr"), in_diag.attr.?.asKeywordId());
 
-    // A uuid compares as its canonical lowercase text, as a constant
-    // and as an input alike: other spellings name no stored value.
-    _ = try fx.transact("[{:db/ident :thing/uid :db/valueType :db.type/uuid :db/cardinality :db.cardinality/one}]");
-    _ = try fx.transact("[{:thing/uid \"0123abcd-4567-89ef-0123-456789abcdef\"}]");
+    // A uuid is a uuid, as a constant and as an input alike, in any
+    // spelling of its literal; its text, a string, names no stored
+    // value.
+    _ = try fx.transact("[{:db/ident :thing/uid :db/valueType :db.type/uuid :db/cardinality :db.cardinality/one :db/index true} {:db/ident :thing/at :db/valueType :db.type/instant :db/cardinality :db.cardinality/one :db/index true}]");
+    _ = try fx.transact("[{:thing/uid #uuid \"0123abcd-4567-89ef-0123-456789abcdef\" :thing/at #inst \"2026-10-09T12:00Z\"} {:thing/uid #uuid \"1-2-3-4-5\" :thing/at #inst \"2020\"} {:thing/at #inst \"2020\"}]");
     const uv = try fx.db();
-    try checkCount(fx, uv, "[:find ?e :where [?e :thing/uid \"0123abcd-4567-89ef-0123-456789abcdef\"]]", &.{nil}, 1);
-    try checkCount(fx, uv, "[:find ?e :where [?e :thing/uid \"0123ABCD-4567-89EF-0123-456789ABCDEF\"]]", &.{nil}, 0);
-    try checkCount(fx, uv, "[:find ?e :in $ ?u :where [?e :thing/uid ?u]]", &.{ nil, try fx.str("0123abcd-4567-89ef-0123-456789abcdef") }, 1);
-    try checkCount(fx, uv, "[:find ?e :in $ ?u :where [?e :thing/uid ?u]]", &.{ nil, try fx.str("0123ABCD-4567-89EF-0123-456789ABCDEF") }, 0);
-    try checkCount(fx, uv, "[:find ?e :in $ [?u ...] :where [?e :thing/uid ?u]]", &.{ nil, try fx.read("[\"0123ABCD-4567-89EF-0123-456789ABCDEF\" \"0123abcd-4567-89ef-0123-456789abcdef\"]") }, 1);
+    try checkCount(fx, uv, "[:find ?e :where [?e :thing/uid #uuid \"0123ABCD-4567-89EF-0123-456789ABCDEF\"]]", &.{nil}, 1);
+    try checkCount(fx, uv, "[:find ?e :where [?e :thing/uid \"0123abcd-4567-89ef-0123-456789abcdef\"]]", &.{nil}, 0);
+    try checkCount(fx, uv, "[:find ?e :in $ ?u :where [?e :thing/uid ?u]]", &.{ nil, try fx.read("#uuid \"1-2-3-4-5\"") }, 1);
+    try checkCount(fx, uv, "[:find ?e :in $ ?u :where [?e :thing/uid ?u]]", &.{ nil, try fx.str("00000001-0002-0003-0004-000000000005") }, 0);
+    try checkCount(fx, uv, "[:find ?e :in $ [?u ...] :where [?e :thing/uid ?u]]", &.{ nil, try fx.read("[\"0123abcd-4567-89ef-0123-456789abcdef\" #uuid \"0123abcd-4567-89ef-0123-456789abcdef\"]") }, 1);
+    try checkCount(fx, uv, "[:find ?u :where [_ :thing/uid ?u] [(< #uuid \"1-2-3-4-5\" ?u)]]", &.{nil}, 1);
+    // An instant is an instant: ordered by its milliseconds, joined
+    // across clauses as itself, never a long.
+    try checkCount(fx, uv, "[:find ?e :in $ ?c :where [?e :thing/at ?t] [(< ?t ?c)]]", &.{ nil, try fx.read("#inst \"2021\"") }, 2);
+    try checkCount(fx, uv, "[:find ?e :where [?e :thing/at #inst \"2020-01-01T00:00:00Z\"]]", &.{nil}, 2);
+    try checkCount(fx, uv, "[:find ?e :in $ ?t :where [?e :thing/at ?t]]", &.{ nil, value.fromFixnum(1577836800000).? }, 0);
+    try checkCount(fx, uv, "[:find ?a ?b :where [?a :thing/at ?t] [?b :thing/at ?t]]", &.{nil}, 5);
+    try checkCount(fx, uv, "[:find ?a ?b :in $ [?t ...] :where [?a :thing/at ?t] [?b :thing/at ?t]]", &.{ nil, try fx.read("[#inst \"2020\" 1577836800000]") }, 4);
+    try checkCount(fx, uv, "[:find (max ?t) (min ?t) :where [_ :thing/at ?t]]", &.{nil}, 1);
+    try testing.expectError(error.ValueType, runEngine(fx, fx.arena(), uv, "[:find ?e :where [?e :thing/at ?t] [(< ?t 5)]]", &.{nil}));
+    const latest = try runEngine(fx, fx.arena(), uv, "[:find (max ?t) :where [_ :db/txInstant ?t]]", &.{nil});
+    try testing.expect(latest[0][0] == .inst);
 }
 
 test "corpus: not, not-join, or, or-join, and" {

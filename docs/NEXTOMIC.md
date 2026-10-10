@@ -218,19 +218,23 @@ One tag byte orders types; within a type, byte order equals value order.
 | `0x60` | uuid | 16 bytes |
 | `0x70` | bytes | as string, both shapes |
 
-A uuid travels as a string, its canonical text: 36 characters,
-lower-case hex in groups of 8-4-4-4-12 joined by `-`. Any other string
-is `:nextomic/value-type` in tx-data, a lookup ref or a `datoms`
-component, and matches nothing as a query constant or input, so every
-path compares the same bytes.
+An instant is the `inst` kind and a uuid the `uuid` kind
+(`docs/SEMANTICS.md` §2.8), as Datomic's are a `java.util.Date` and a
+`java.util.UUID`, and nothing else is: a long, a string (a uuid's text
+in any spelling) or any other value is `:nextomic/value-type` in
+tx-data, a lookup ref, a `datoms` component or an `index-range` bound,
+and matches nothing as a query constant or input, so every path
+compares one representation. A read returns the kind. The stored bytes
+are the instant's milliseconds and the uuid's 16 bytes, whatever
+carried them in.
 
-A long or an instant is any integer in i64, as Datomic's long is: a
-fixnum, or a bignum past the fixnum range (`docs/SEMANTICS.md` §2.2),
-goes in, and a read returns the language's integer for the stored
-value, a bignum past `±2^47`. An integer outside i64 is
-`:nextomic/value-type`, in tx-data, a lookup ref, a `datoms` component
-or an `index-range` bound. A key holds every long in the same 8
-bytes, and the txlog every long as a zigzag LEB of up to ten. String
+A long is any integer in i64, as Datomic's long is: a fixnum, or a
+bignum past the fixnum range (`docs/SEMANTICS.md` §2.2), goes in, and
+a read returns the language's integer for the stored value, a bignum
+past `±2^47`. An integer outside i64 is `:nextomic/value-type`, in
+tx-data, a lookup ref, a `datoms` component or an `index-range` bound.
+A key holds every long and every instant in the same 8 bytes, and the
+txlog each as a zigzag LEB of up to ten. String
 order is UTF-8 byte order,
 which is code point order, not UTF-16 order; no Unicode normalization
 is applied.
@@ -776,10 +780,11 @@ That scan costs the whole database and is the price of `[?e _ ?v]`
 without an attribute; give the attribute when it is known. A constant
 that cannot exist in the store (an unknown ident, a lookup ref with no
 entity, a value of the wrong type for the attribute) makes its scan
-unsatisfiable: it yields nothing and is not an error. A uuid value is
-its canonical lowercase text in a query, as a constant or a bound
-value: another spelling of it matches nothing (`parse-uuid` gives the
-canonical text).
+unsatisfiable: it yields nothing and is not an error. An instant and
+a uuid compare as their kinds, constants and bound values alike:
+`[(< ?t #inst "2026")]` orders two instants, `(max ?t)` of
+`:db/txInstant` is an instant, and `<` between an instant and a long is
+`:nextomic/value-type`, as between any two kinds.
 
 Clauses are ordered greedily by estimate given the variables bound so
 far; predicates run at the first point all their variables are bound.
@@ -958,8 +963,8 @@ and `:with` variables) by the plain find elements: `count`, `sum`,
 largest, a vector), `(sample n ?x)` (up to n distinct values, a vector)
 and `(rand n ?x)` (n values with repetition, a vector). `min` and `max`
 take any type, in the cell order: nil, booleans, numbers, strings,
-keywords as `compare` orders them, then other values in a stable
-order; `sum`, `avg`, `variance` and `stddev` take numbers, bignums
+instants, uuids, keywords as `compare` orders them, then other values
+in a stable order; `sum`, `avg`, `variance` and `stddev` take numbers, bignums
 included (`:nextomic/value-type` otherwise), and a `sum` of integers
 is exact at any size, a bignum past the fixnum range as `+` gives;
 `median` of an odd count is the middle value of any type, of an even
@@ -1068,7 +1073,7 @@ predicate's is only tested (§5). Nextomic returns no lazy seq: `q`,
 | `(d/explain query & inputs)` / `(d/explain {:query query :args [...]})` | the plan `q` would run, as an aligned table: one numbered line per step with its description (index, estimate, tree size, source when not `$`, bound variables marked `!`, or `unsatisfiable`), the join the step runs (`nested`, one seek per input row; `hash`, one scan of the constant prefix hash-joined on the shared variables; `fixpoint` for a recursive rule; `none` for an unsatisfiable scan) and the estimated rows after the step; sub-plans indent under their step and end with `rows~` |
 | `(d/as-of db t)` / `(d/since db t)` / `(d/history db)` | new db-values (§4) |
 | `(d/excise! conn e)` / `(d/excise! conn e attr)` | §4 "Excision"; returns the recording transaction's report plus `:excised [e]` and `:removed`, the count of history rows that went: every assertion and retraction of the datoms, the current ones included |
-| `(d/tx-range conn)` / `(d/tx-range conn from)` / `(d/tx-range conn from to)` | vector of `{:t t :instant i :data [...]}` for `from ≤ t < to`, oldest first, with `:excised [e ...]` on an entry an excision touched; a bound that is `nil` or not given is open |
+| `(d/tx-range conn)` / `(d/tx-range conn from)` / `(d/tx-range conn from to)` | vector of `{:t t :instant i :data [...]}`, `i` the transaction's instant, for `from ≤ t < to`, oldest first, with `:excised [e ...]` on an entry an excision touched; a bound that is `nil` or not given is open |
 | `(d/schema db)` | map ident → `{:db/id :db/ident :db/valueType :db/cardinality :db/index :db/isComponent :db/fulltext}`, plus `:db/unique` and `:db/doc` when the attribute has them in this view; every flag as the view's basis saw it (§4 "Schema as-of") |
 | `(d/pull db pattern e)` | the pattern's map (§6.2); nil when the entity has no datoms in the view. Defined on current, as-of and since views; one read per call |
 | `(d/pull-many db pattern es)` | one result per entity of the vector or list `es`, in its order, in the same read |
@@ -1355,13 +1360,14 @@ damaged page is `:db/corrupted` (§7), never a short scan.
   an `:xform` function to the attribute's value.
 - **`min` and `max` take values of mixed kinds** (§5 "Aggregates"):
   they order by the cell order (nil, booleans, numbers, strings,
-  keywords, then other values), where Datomic compares with `compare`
+  instants, uuids, keywords, then other values), where Datomic compares with `compare`
   and throws on two kinds it cannot compare.
 - **An `:in` lookup ref or ident resolves once per query** (§5): in
   the source of the first step that reads its variable as an entity,
   and every later clause reads that eid. Datomic resolves it in the
   source of each clause that reads it.
-- **Values are the VM's.** A long or an instant is an integer in i64,
-  a fixnum or a bignum by its size (§2.2), and an instant is
-  milliseconds as a long; Datomic takes a 64-bit long and a
-  `java.util.Date`.
+- **Values are the VM's.** A long is an integer in i64, a fixnum or a
+  bignum by its size (§2.2); an instant is the `inst` kind and a uuid
+  the `uuid` kind, as Datomic's are a `java.util.Date` and a
+  `java.util.UUID`. `as-of` takes a basis `t`, not an instant
+  (`TODO.md` #22).

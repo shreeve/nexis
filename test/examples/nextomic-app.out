@@ -1,5 +1,5 @@
 intake at t = 3, basis now 5
-Mara today: {:patient/mrn "MRN-1001", :patient/name "Mara Quist", :patient/born 631152000000, :patient/allergies #{:latex}}
+Mara today: {:patient/mrn "MRN-1001", :patient/name "Mara Quist", :patient/born #inst "1990-01-01T00:00:00.000-00:00", :patient/allergies #{:latex}}
 Mara's doctor: "Dr. Okafor"
 V-1 notes: ["BP normal" "advised flu shot"]
 latex allergies: ["Mara Quist"]

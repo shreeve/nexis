@@ -120,13 +120,13 @@ schema as of 12, :addr/city {:db/cardinality :db.cardinality/one, :db/fulltext f
 the retired name nil
 the new name [36 :person/alias]
 -- indexes
-current eavt [7486 7485 32881353727033]
-current aevt [7486 7485 32883652223613]
-current avet [4078 4077 32880366935881]
+current eavt [7486 7485 32882886908377]
+current aevt [7486 7485 32880719603043]
+current avet [4078 4077 32880145568007]
 current vaet [1604 1604 32883479162653]
-history eavt [8882 8881 32879570376885]
-history aevt [8882 8881 32882042842719]
-history avet [4088 4087 32881913647107]
+history eavt [8882 8881 32880727175893]
+history aevt [8882 8881 32881289914565]
+history avet [4088 4087 32879799368385]
 history vaet [2408 2408 32882043197589]
 -- people's datoms, history
 [4294967296 :person/name "Ann" 3 true]
@@ -135,8 +135,8 @@ history vaet [2408 2408 32882043197589]
 [4294967296 :person/age 41 8 false]
 [4294967296 :person/age 42 8 true]
 [4294967296 :person/height 1.7 3 true]
-[4294967296 :person/born -315619200000 3 true]
-[4294967296 :person/id "0123abcd-4567-89ef-0123-456789abcdef" 3 true]
+[4294967296 :person/born #inst "1960-01-01T00:00:00.000-00:00" 3 true]
+[4294967296 :person/id #uuid "0123abcd-4567-89ef-0123-456789abcdef" 3 true]
 [4294967296 :person/photo "\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ" 3 true]
 [4294967296 :person/tags :staff 3 true]
 [4294967296 :person/tags :admin 3 true]
@@ -153,8 +153,8 @@ history vaet [2408 2408 32882043197589]
 [4294967298 :person/age 35 8 false]
 [4294967298 :person/age 36 8 true]
 [4294967298 :person/height 1.82 3 true]
-[4294967298 :person/born 0 3 true]
-[4294967298 :person/id "fedcba98-7654-3210-fedc-ba9876543210" 3 true]
+[4294967298 :person/born #inst "1970-01-01T00:00:00.000-00:00" 3 true]
+[4294967298 :person/id #uuid "fedcba98-7654-3210-fedc-ba9876543210" 3 true]
 [4294967298 :person/photo "png" 3 true]
 [4294967298 :person/tags :staff 3 true]
 [4294967298 :person/friends 4294967296 3 true]
@@ -314,8 +314,8 @@ history vaet [2408 2408 32882043197589]
 [43 :db/valueType :db.type/ref 2 true]
 [43 :db/cardinality :db.cardinality/one 2 true]
 -- entities
-4294967296 {:db/id 4294967296, :person/active true, :person/age 42, :person/alias "annie", :person/balance 9223372036854775807, :person/bio "Ann keeps the archive of the old observatory; she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. ", :person/born -315619200000, :person/email "ann@example.com", :person/height 1.7, :person/home 4294967297, :person/id "0123abcd-4567-89ef-0123-456789abcdef", :person/name "Ann", :person/photo "\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ", :person/tags #{:staff :founder}}
-4294967298 {:db/id 4294967298, :person/active false, :person/age 36, :person/balance -9223372036854775808, :person/bio "Bob's café moved north. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. ", :person/born 0, :person/email "bob@example.com", :person/friends #{4294967296}, :person/height 1.82, :person/home 4294967299, :person/id "fedcba98-7654-3210-fedc-ba9876543210", :person/name "Bob", :person/photo "png", :person/tags #{:staff}}
+4294967296 {:db/id 4294967296, :person/active true, :person/age 42, :person/alias "annie", :person/balance 9223372036854775807, :person/bio "Ann keeps the archive of the old observatory; she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. ", :person/born #inst "1960-01-01T00:00:00.000-00:00", :person/email "ann@example.com", :person/height 1.7, :person/home 4294967297, :person/id #uuid "0123abcd-4567-89ef-0123-456789abcdef", :person/name "Ann", :person/photo "\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ", :person/tags #{:staff :founder}}
+4294967298 {:db/id 4294967298, :person/active false, :person/age 36, :person/balance -9223372036854775808, :person/bio "Bob's café moved north. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. ", :person/born #inst "1970-01-01T00:00:00.000-00:00", :person/email "bob@example.com", :person/friends #{4294967296}, :person/height 1.82, :person/home 4294967299, :person/id #uuid "fedcba98-7654-3210-fedc-ba9876543210", :person/name "Bob", :person/photo "png", :person/tags #{:staff}}
 4294967300 {:db/id 4294967300, :person/age 29, :person/balance 140737488355328, :person/bio "red team lead, blue sky thinker", :person/email "cy@example.com", :person/friends #{4294967296}, :person/height 0.0, :person/name "Cy"}
 4294967301 nil
 4294967302 {:db/id 4294967302, :person/age 23, :person/email "eve@example.com", :person/name "Eve"}
@@ -331,11 +331,11 @@ keys ({:name "Ann", :age 42} {:name "Bob", :age 36} {:name "Cy", :age 29} {:name
 -- index-range
 ages 30..50 [36 42]
 balances [-9223372036854775808 140737488355328 9223372036854775807]
-born [-315619200000 0]
+born [#inst "1960-01-01T00:00:00.000-00:00" #inst "1970-01-01T00:00:00.000-00:00"]
 items n < 5000 [[4294968416 1060] [4294967810 1570] [4294967330 3138] [4294968444 3672] [4294969115 4827]]
 -- pull
-4294967296 {:db/id 4294967296, :item/_owner [{:db/id 4294967303, :item/sku "SKU-00000"} {:db/id 4294967308, :item/sku "SKU-00005"} {:db/id 4294967313, :item/sku "SKU-00010"}], :person/_friends [{:db/id 4294967298, :person/name "Bob"} {:db/id 4294967300, :person/name "Cy"}], :person/active true, :person/age 42, :person/alias "annie", :person/balance 9223372036854775807, :person/bio "Ann keeps the archive of the old observatory; she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. ", :person/born -315619200000, :person/email "ann@example.com", :person/height 1.7, :person/home {:db/id 4294967297, :addr/city "Rome", :addr/zip 100}, :person/id "0123abcd-4567-89ef-0123-456789abcdef", :person/name "Ann", :person/photo "\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ", :person/tags [:staff :founder]}
-4294967298 {:db/id 4294967298, :item/_owner [{:db/id 4294967304, :item/sku "SKU-00001"} {:db/id 4294967309, :item/sku "SKU-00006"} {:db/id 4294967314, :item/sku "SKU-00011"}], :person/active false, :person/age 36, :person/balance -9223372036854775808, :person/bio "Bob's café moved north. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. ", :person/born 0, :person/email "bob@example.com", :person/friends [{:db/id 4294967296, :person/name "Ann"}], :person/height 1.82, :person/home {:db/id 4294967299, :addr/city "Genoa", :addr/zip 16121}, :person/id "fedcba98-7654-3210-fedc-ba9876543210", :person/name "Bob", :person/photo "png", :person/tags [:staff]}
+4294967296 {:db/id 4294967296, :item/_owner [{:db/id 4294967303, :item/sku "SKU-00000"} {:db/id 4294967308, :item/sku "SKU-00005"} {:db/id 4294967313, :item/sku "SKU-00010"}], :person/_friends [{:db/id 4294967298, :person/name "Bob"} {:db/id 4294967300, :person/name "Cy"}], :person/active true, :person/age 42, :person/alias "annie", :person/balance 9223372036854775807, :person/bio "Ann keeps the archive of the old observatory; she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. ", :person/born #inst "1960-01-01T00:00:00.000-00:00", :person/email "ann@example.com", :person/height 1.7, :person/home {:db/id 4294967297, :addr/city "Rome", :addr/zip 100}, :person/id #uuid "0123abcd-4567-89ef-0123-456789abcdef", :person/name "Ann", :person/photo "\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ", :person/tags [:staff :founder]}
+4294967298 {:db/id 4294967298, :item/_owner [{:db/id 4294967304, :item/sku "SKU-00001"} {:db/id 4294967309, :item/sku "SKU-00006"} {:db/id 4294967314, :item/sku "SKU-00011"}], :person/active false, :person/age 36, :person/balance -9223372036854775808, :person/bio "Bob's café moved north. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. ", :person/born #inst "1970-01-01T00:00:00.000-00:00", :person/email "bob@example.com", :person/friends [{:db/id 4294967296, :person/name "Ann"}], :person/height 1.82, :person/home {:db/id 4294967299, :addr/city "Genoa", :addr/zip 16121}, :person/id #uuid "fedcba98-7654-3210-fedc-ba9876543210", :person/name "Bob", :person/photo "png", :person/tags [:staff]}
 4294967300 {:db/id 4294967300, :item/_owner [{:db/id 4294967305, :item/sku "SKU-00002"} {:db/id 4294967310, :item/sku "SKU-00007"} {:db/id 4294967315, :item/sku "SKU-00012"}], :person/age 29, :person/balance 140737488355328, :person/bio "red team lead, blue sky thinker", :person/email "cy@example.com", :person/friends [{:db/id 4294967296, :person/name "Ann"}], :person/height 0.0, :person/name "Cy"}
 4294967301 nil
 4294967302 {:db/id 4294967302, :item/_owner [{:db/id 4294967307, :item/sku "SKU-00004"} {:db/id 4294967312, :item/sku "SKU-00009"} {:db/id 4294967317, :item/sku "SKU-00014"}], :person/age 23, :person/email "eve@example.com", :person/name "Eve"}
@@ -343,17 +343,17 @@ pull-many [{:db/id 4294967300, :person/name "Cy", :person/age 29} {:db/id 429496
 pull as of 3 {:db/id 4294967296, :person/name "Ann", :person/age 41, :person/alias "annie", :person/tags [:staff :admin]}
 -- as-of, since, history
 as-of 1 [[44 43 32882116816164] nil]
-as-of 2 [[121 120 32881441550159] nil]
-as-of 3 [[171 170 32882101069685] ("Ann" "Bob" "Cy" "Dee" "Eve")]
-as-of 7 [[8171 8170 32880205891544] ("Ann" "Bob" "Cy" "Dee" "Eve")]
-as-of 8 [[8170 8169 32879565237990] ("Ann" "Bob" "Cy" "Dee" "Eve")]
-as-of 10 [[7887 7886 32879428072861] ("Ann" "Bob" "Cy" "Dee" "Eve")]
-as-of 11 [[7888 7887 32882691866336] ("Ann" "Bob" "Cy" "Dee" "Eve")]
-as-of 12 [[7889 7888 32881034012010] ("Ann" "Bob" "Cy" "Dee" "Eve")]
-as-of 13 [[7891 7890 32882849017420] ("Ann" "Bob" "Cy" "Dee" "Eve")]
-as-of 14 [[7486 7485 32881353727033] ("Ann" "Bob" "Cy" "Eve")]
+as-of 2 [[121 120 32883510498723] nil]
+as-of 3 [[171 170 32881707664193] ("Ann" "Bob" "Cy" "Dee" "Eve")]
+as-of 7 [[8171 8170 32880388733092] ("Ann" "Bob" "Cy" "Dee" "Eve")]
+as-of 8 [[8170 8169 32883115866862] ("Ann" "Bob" "Cy" "Dee" "Eve")]
+as-of 10 [[7887 7886 32880970075453] ("Ann" "Bob" "Cy" "Dee" "Eve")]
+as-of 11 [[7888 7887 32881023287700] ("Ann" "Bob" "Cy" "Dee" "Eve")]
+as-of 12 [[7889 7888 32882916630410] ("Ann" "Bob" "Cy" "Dee" "Eve")]
+as-of 13 [[7891 7890 32883149594240] ("Ann" "Bob" "Cy" "Dee" "Eve")]
+as-of 14 [[7486 7485 32882886908377] ("Ann" "Bob" "Cy" "Eve")]
 since 7 [[4294967296 :person/age 42 8 true] [4294967298 :person/age 36 8 true]]
-since 12 [[38 :db/fulltext true 13 true] [70368744177677 :db/txInstant 4102444813000 13 true] [70368744177678 :db/txInstant 4102444814000 14 true]]
+since 12 [[38 :db/fulltext true 13 true] [70368744177677 :db/txInstant #inst "2100-01-01T00:00:13.000-00:00" 13 true] [70368744177678 :db/txInstant #inst "2100-01-01T00:00:14.000-00:00" 14 true]]
 history of Ann's age [[4294967296 :person/age 41 3 true] [4294967296 :person/age 41 8 false] [4294967296 :person/age 42 8 true]]
 history of Bob's bio [[149 8 true] [25 3 true] [25 8 false]]
 history of the secrets [[4294967301 :person/secret "dee's pin is 1234" 10 true] [4294967301 :person/secret "dee's pin is 1234" 14 false]]
@@ -368,19 +368,19 @@ city rome ([4294967297 "Rome"])
 city as of 12 {:error :nextomic/tx-data, :message "attribute is not :db/fulltext", :attr :addr/city}
 -- tx-range
 1 [:clock [44 43 32882233377644] nil]
-2 [2000 [77 77 32881981012836] nil]
-3 [3000 [50 50 32881732152282] nil]
-4 [4000 [1997 1997 32879730101498] [4294967316]]
-5 [5000 [2001 2001 32883700392062] nil]
-6 [6000 [2001 2001 32880117745821] nil]
-7 [7000 [2001 2001 32883079862712] nil]
-8 [8000 [11 11 32881280853521] nil]
-9 [9000 [1 1 32879526503782] nil]
-10 [10000 [288 288 32881077437217] [4294967302]]
-11 [10000 [1 1 32879492249491] [4294967316]]
-12 [10000 [1 1 32880746031873] [4294967302]]
-13 [13000 [2 2 32881321092009] nil]
-14 [14000 [407 407 32879971391638] nil]
+2 [2000 [77 77 32879754994104] nil]
+3 [3000 [50 50 32882904291828] nil]
+4 [4000 [1997 1997 32881799050062] [4294967316]]
+5 [5000 [2001 2001 32881474373330] nil]
+6 [6000 [2001 2001 32882186694385] nil]
+7 [7000 [2001 2001 32880853843980] nil]
+8 [8000 [11 11 32883349802085] nil]
+9 [9000 [1 1 32881595452346] nil]
+10 [10000 [288 288 32883146385781] [4294967302]]
+11 [10000 [1 1 32881561198055] [4294967316]]
+12 [10000 [1 1 32882814980437] [4294967302]]
+13 [13000 [2 2 32883390040573] nil]
+14 [14000 [407 407 32882040340202] nil]
 8 [4294967296 :person/age 41 8 false]
 8 [4294967296 :person/age 42 8 true]
 8 [4294967296 :person/tags :admin 8 false]
@@ -391,8 +391,8 @@ city as of 12 {:error :nextomic/tx-data, :message "attribute is not :db/fulltext
 8 [4294967298 :person/bio "Café owner; ΣΟΦΙΑΣ reader" 8 false]
 8 [4294967298 :person/bio "Bob's café moved north. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. " 8 true]
 8 [4294967300 :person/friends 4294967298 8 false]
-8 [70368744177672 :db/txInstant 4102444808000 8 true]
-9 [70368744177673 :db/txInstant 4102444809000 9 true]
+8 [70368744177672 :db/txInstant #inst "2100-01-01T00:00:08.000-00:00" 8 true]
+9 [70368744177673 :db/txInstant #inst "2100-01-01T00:00:09.000-00:00" 9 true]
 10 [4294967301 :person/secret "dee's pin is 1234" 10 true]
 10 [4294967303 :item/w 0.875 10 false]
 10 [4294967310 :item/w 51.75 10 false]
@@ -405,10 +405,10 @@ city as of 12 {:error :nextomic/tx-data, :message "attribute is not :db/fulltext
 10 [4294967359 :item/w 80.875 10 false]
 10 [4294967366 :item/w 31.75 10 false]
 10 [4294967373 :item/w 102.125 10 false]
-11 [70368744177675 :db/txInstant 4102444810000 11 true]
-12 [70368744177676 :db/txInstant 4102444810000 12 true]
+11 [70368744177675 :db/txInstant #inst "2100-01-01T00:00:10.000-00:00" 11 true]
+12 [70368744177676 :db/txInstant #inst "2100-01-01T00:00:10.000-00:00" 12 true]
 13 [38 :db/fulltext true 13 true]
-13 [70368744177677 :db/txInstant 4102444813000 13 true]
+13 [70368744177677 :db/txInstant #inst "2100-01-01T00:00:13.000-00:00" 13 true]
 14 [4294967301 :person/name "Dee" 14 false]
 14 [4294967301 :person/age 52 14 false]
 14 [4294967301 :person/friends 4294967300 14 false]

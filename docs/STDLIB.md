@@ -782,10 +782,9 @@ instant's text reads back as the instant; Clojure prints the year
 10000 unsigned, which its reader refuses.
 
 **Nextomic.** A `:db.type/instant` value, `:db/txInstant` included, is
-epoch milliseconds, a long (`docs/NEXTOMIC.md` §2), and every function
-here that takes an instant takes such a long as well: `(t/format
-(:db/txInstant tx))` writes one, `(t/instant ms)` makes it an instant,
-and `(inst-ms i)` is what a transaction asserts.
+an instant (`docs/NEXTOMIC.md` §2.2), so `(t/format (:db/txInstant
+tx))` writes one and `(t/plus (t/now) (t/days 1))` is what a
+transaction asserts; a long is the wrong type there, as in Datomic.
 
 | Name | Arity | Semantics | Errors |
 |---|---|---|---|

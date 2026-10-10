@@ -8,14 +8,16 @@ ok a lookup ref by the least long
 [-9223372036854775808 -9007199254740993 -9007199254740992 -140737488355329 -140737488355328 -1 0 140737488355327 140737488355328 9007199254740992 9007199254740993 9223372036854775807]
 ok avet order agrees with sort
 ok instant order agrees with sort
+ok instants sort as the index orders them
 [140737488355327 140737488355328 9007199254740992]
 [-9223372036854775808 -9007199254740993 -9007199254740992 -140737488355329]
 [140737488355328 9007199254740992 9007199254740993 9223372036854775807]
 [-9223372036854775808 -9007199254740993 -9007199254740992]
-[-1 0 140737488355327]
+[#inst "1969-12-31T23:59:59.999-00:00" #inst "1970-01-01T00:00:00.000-00:00" #inst "6429-10-17T02:45:55.327-00:00"]
 {:error :nextomic/value-type, :message :n/v takes a :db.type/long, not 9223372036854775808, :attr :n/v, :value 9223372036854775808}
 {:error :nextomic/value-type, :message :n/v takes a :db.type/long, not -9223372036854775809, :attr :n/v, :value -9223372036854775809}
 {:error :nextomic/value-type, :message :n/at takes a :db.type/instant, not 9223372036854775808, :attr :n/at, :value 9223372036854775808}
+{:error :nextomic/value-type, :message :n/at takes a :db.type/instant, not 0, :attr :n/at, :value 0}
 {:error :nextomic/value-type, :message :n/v takes a :db.type/long, not 9223372036854775808, :attr :n/v, :value 9223372036854775808}
 {:error :nextomic/value-type, :message :n/v takes a :db.type/long, not -9223372036854775809, :attr :n/v, :value -9223372036854775809}
 ok a bignum constant in a pattern

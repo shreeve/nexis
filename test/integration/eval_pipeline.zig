@@ -5151,16 +5151,17 @@ test "time: an instant and a UUID in a durable ref read back equal" {
     , "[true true #inst \"2026-10-09T12:30:15.123-00:00\"]");
 }
 
-test "time: Nextomic's instants are epoch milliseconds, which every time function takes" {
+test "time: Nextomic's instants are instants, which every time function takes" {
     try expectOutputProgramWithStore("time-nextomic",
         \\(def c (nextomic/connect "@STORE@"))
         \\(nextomic/transact! c [{:db/ident :ev/at :db/valueType :db.type/instant :db/cardinality :db.cardinality/one}])
-        \\(nextomic/transact! c [{:ev/at (inst-ms (nexis.time/parse "2026-10-09T12:30:15.123Z"))}])
+        \\(nextomic/transact! c [{:ev/at (nexis.time/parse "2026-10-09T12:30:15.123Z")}])
         \\(def at (nextomic/q '[:find ?at . :where [_ :ev/at ?at]] (nextomic/db c)))
         \\(def tx (nextomic/q '[:find (max ?i) . :where [_ :db/txInstant ?i]] (nextomic/db c)))
+        \\(def long (try (nextomic/transact! c [{:ev/at 5}]) (catch any e (:error e))))
         \\(nextomic/release c)
-        \\[(nexis.time/format at) (inst? (nexis.time/instant tx)) (not (nexis.time/after? tx (nexis.time/now)))]
-    , "[2026-10-09T12:30:15.123Z true true]");
+        \\[at (inst? tx) (not (nexis.time/after? tx (nexis.time/now))) long]
+    , "[#inst \"2026-10-09T12:30:15.123-00:00\" true true :nextomic/value-type]");
 }
 
 test "json: read-str reads every JSON value" {

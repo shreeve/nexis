@@ -413,8 +413,8 @@ fulltext search. `d/explain` prints the plan a query would run.
 What differs from Datomic: it is embedded, one process writing at a
 time, with no peer, transactor or server. `d/with` takes the
 connection and a function of the speculative database, and
-`d/tx-range` the connection. An instant is milliseconds as an
-integer. A function in a query clause is one of the built-ins or any
+`d/tx-range` the connection. `as-of` takes a basis `t`, not an
+instant. A function in a query clause is one of the built-ins or any
 Var the symbol resolves to, as the compiler resolves it, so
 `clojure.string/starts-with?` works once `clojure.string` is
 required. `docs/NEXTOMIC.md` §12 lists the rest.

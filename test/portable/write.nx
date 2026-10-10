@@ -96,7 +96,7 @@
 ; excision, which takes the clock, takes the instant before it
 ; (docs/NEXTOMIC.md §3 step 4).
 (def t0 4102444800000)
-(defn at [n] [:db/add "datomic.tx" :db/txInstant (+ t0 (* n 1000))])
+(defn at [n] [:db/add "datomic.tx" :db/txInstant (nexis.time/instant (+ t0 (* n 1000)))])
 
 (def n (d/connect "nextomic.edb"))
 
@@ -132,12 +132,12 @@
 (def long-bio (apply str "Ann keeps the archive of the old observatory; " (repeat 6 "she reads every ledger twice. ")))
 (d/transact! n
   [{:db/id "ann" :person/name "Ann" :person/email "ann@example.com" :person/age 41 :person/height 1.7
-    :person/born -315619200000 :person/id "0123abcd-4567-89ef-0123-456789abcdef"
+    :person/born #inst "1960-01-01" :person/id #uuid "0123abcd-4567-89ef-0123-456789abcdef"
     :person/photo (apply str (repeat 40 "\u0001ÿ")) :person/tags [:staff :admin]
     :person/home {:addr/city "Rome" :addr/zip 100}
     :person/bio long-bio :person/active true :person/balance 9223372036854775807 :person/nick "annie"}
    {:db/id "bob" :person/name "Bob" :person/email "bob@example.com" :person/age 35 :person/height 1.82
-    :person/born 0 :person/id "fedcba98-7654-3210-fedc-ba9876543210" :person/photo "png"
+    :person/born #inst "1970-01-01" :person/id #uuid "fedcba98-7654-3210-fedc-ba9876543210" :person/photo "png"
     :person/tags [:staff] :person/friends ["ann"] :person/home {:addr/city "Genoa" :addr/zip 16121}
     :person/bio "Café owner; ΣΟΦΙΑΣ reader" :person/active false :person/balance -9223372036854775808}
    {:db/id "cy" :person/name "Cy" :person/email "cy@example.com" :person/age 29 :person/height -0.0
