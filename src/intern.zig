@@ -1,27 +1,8 @@
-//! intern.zig — keyword + symbol intern tables.
-//!
-//! Authoritative contract: `docs/INTERN.md`. Physical layout of the
-//! `Value` ids produced here is pinned in `docs/VALUE.md`. The hash
-//! domain separation between keyword and symbol lives in the Value
-//! layer (`mixKindDomain`), not here; this file maps textual names to
-//! dense process-local `u32` ids and keeps each name's text hash, which
-//! every keyword and symbol Value carries.
-//!
-//! Invariants (INTERN.md §1 — frozen):
-//!   - Dense-from-0 ids per table; never reused, never renumbered.
-//!   - No reserved sentinel id.
-//!   - Idempotent: interning the same byte sequence twice returns the
-//!     original id.
-//!   - Byte-exact round-trip: `name(intern(s)) == s`.
-//!   - Keyword and symbol tables have independent id spaces.
-//!   - Interner owns name bytes (`gpa.dupe` on first intern); freed in
-//!     `deinit`.
-//!   - Empty names rejected at the intern API boundary.
-//!   - `maxInt(u32)` entry cap per table; exceeding returns
-//!     `error.InternTableFull`.
-//!
-//! Errdefer discipline is structured so a mid-insert allocator failure
-//! leaves no duped bytes leaked and no half-committed map entries.
+//! intern.zig — the keyword and symbol intern tables (`docs/INTERN.md`):
+//! a name's dense process-local `u32` id and its text hash, both of
+//! which its Value carries (VALUE.md §2). Ids are dense from 0, never
+//! reused; the tables own the names; an empty name is refused, and a
+//! table past `maxInt(u32)` names is full (INTERN.md §1).
 
 const std = @import("std");
 const value = @import("value.zig");
@@ -45,52 +26,32 @@ pub const InternError = error{
 
 const Table = struct {
     by_name: std.StringHashMapUnmanaged(u32) = .empty,
-    names: std.ArrayList([]const u8) = .empty,
-    /// `hash.nameHash` of each name, by id.
-    hashes: std.ArrayList(u32) = .empty,
+    /// By id: the name, whose bytes the table owns and `by_name`'s
+    /// keys borrow, and its `hash.nameHash`.
+    entries: std.ArrayList(struct { name: []const u8, hash: u32 }) = .empty,
 
     fn deinit(self: *Table, gpa: Allocator) void {
-        // Lockstep invariant: `by_name` keys are borrowed slices into
-        // the duped bytes owned via `names`. Check before teardown so
-        // a mutation path can't silently break it.
-        std.debug.assert(self.by_name.count() == self.names.items.len);
-        // Free each duped name buffer, then drop both containers.
-        // Order matters: `by_name.deinit` does NOT free its keys, so
-        // the name bytes must be freed explicitly via `names`.
-        for (self.names.items) |n| gpa.free(n);
-        self.names.deinit(gpa);
-        self.hashes.deinit(gpa);
+        for (self.entries.items) |e| gpa.free(e.name);
+        self.entries.deinit(gpa);
         self.by_name.deinit(gpa);
     }
 };
 
-/// Shared insertion logic. Factored into a helper so keyword and symbol
-/// tables cannot drift (INTERN.md §4).
+/// The id of `name` in `table`, interned on first sight; keywords and
+/// symbols share this one path (INTERN.md §4). A failure leaves the
+/// table as it was.
 fn internInto(table: *Table, gpa: Allocator, name: []const u8) InternError!u32 {
     if (name.len == 0) return error.EmptyName;
-
-    if (table.by_name.get(name)) |existing| return existing;
-
-    if (table.names.items.len >= std.math.maxInt(u32)) {
-        return error.InternTableFull;
-    }
-    const id: u32 = @intCast(table.names.items.len);
-
-    // `dup` owns the name bytes for the lifetime of the interner.
-    // Both `names` (id -> slice) and `by_name` (slice -> id) point at
-    // the same buffer; the map key must NOT be a slice into the
-    // `names.items` array, which can relocate on growth.
+    // A plain `get` on the hit every name after its first takes: a
+    // `getOrPut` there costs more than the second hash a miss pays.
+    if (table.by_name.get(name)) |id| return id;
+    if (table.entries.items.len >= std.math.maxInt(u32)) return error.InternTableFull;
+    const id: u32 = @intCast(table.entries.items.len);
     const dup = try gpa.dupe(u8, name);
     errdefer gpa.free(dup);
-
-    try table.names.append(gpa, dup);
-    errdefer _ = table.names.pop();
-    try table.hashes.append(gpa, hash.nameHash(name));
-    errdefer _ = table.hashes.pop();
-
+    try table.entries.append(gpa, .{ .name = dup, .hash = hash.nameHash(name) });
+    errdefer _ = table.entries.pop();
     try table.by_name.put(gpa, dup, id);
-
-    std.debug.assert(table.by_name.count() == table.names.items.len and table.hashes.items.len == table.names.items.len);
     return id;
 }
 
@@ -99,13 +60,13 @@ fn internInto(table: *Table, gpa: Allocator, name: []const u8) InternError!u32 {
 /// invalid one is a runtime bug upstream. Contract is pinned in
 /// `docs/INTERN.md` §2.
 fn nameFrom(table: *const Table, id: u32) []const u8 {
-    if (id >= table.names.items.len) {
+    if (id >= table.entries.items.len) {
         std.debug.panic(
             "intern.nameFrom: id {d} out of range (table holds {d} entries)",
-            .{ id, table.names.items.len },
+            .{ id, table.entries.items.len },
         );
     }
-    return table.names.items[id];
+    return table.entries.items[id].name;
 }
 
 // =============================================================================
@@ -202,18 +163,19 @@ pub const Interner = struct {
     /// A keyword's full text is `ns/name` when it is qualified;
     /// `splitQualified` is the inverse.
     pub fn internQualifiedKeyword(self: *Interner, ns: ?[]const u8, name: []const u8) InternError!value.Value {
-        const ns_prefix = ns orelse return self.internKeywordValue(name);
-        const full = try self.gpa.print("{s}/{s}", .{ ns_prefix, name });
-        defer self.gpa.free(full);
-        return self.internKeywordValue(full);
+        return self.keywordValue(try self.internQualified(&self.keyword, ns, name));
     }
 
     /// `internQualifiedKeyword` for symbols.
     pub fn internQualifiedSymbol(self: *Interner, ns: ?[]const u8, name: []const u8) InternError!value.Value {
-        const ns_prefix = ns orelse return self.internSymbolValue(name);
+        return self.symbolValue(try self.internQualified(&self.symbol, ns, name));
+    }
+
+    fn internQualified(self: *Interner, table: *Table, ns: ?[]const u8, name: []const u8) InternError!u32 {
+        const ns_prefix = ns orelse return internInto(table, self.gpa, name);
         const full = try self.gpa.print("{s}/{s}", .{ ns_prefix, name });
         defer self.gpa.free(full);
-        return self.internSymbolValue(full);
+        return internInto(table, self.gpa, full);
     }
 
     /// Split an interned `ns/name` text back into its parts at its
@@ -251,13 +213,13 @@ pub const Interner = struct {
     /// hash (VALUE.md §2). Panics on an out-of-range id, as `keywordName`.
     pub fn keywordValue(self: *const Interner, id: u32) value.Value {
         _ = nameFrom(&self.keyword, id);
-        return value.fromKeyword(id, self.keyword.hashes.items[id]);
+        return value.fromKeyword(id, self.keyword.entries.items[id].hash);
     }
 
     /// `keywordValue` for symbols.
     pub fn symbolValue(self: *const Interner, id: u32) value.Value {
         _ = nameFrom(&self.symbol, id);
-        return value.fromSymbol(id, self.symbol.hashes.items[id]);
+        return value.fromSymbol(id, self.symbol.entries.items[id].hash);
     }
 
     // ---- Accessors: id -> name ----
@@ -274,11 +236,11 @@ pub const Interner = struct {
     }
 
     pub fn keywordCount(self: *const Interner) u32 {
-        return @intCast(self.keyword.names.items.len);
+        return @intCast(self.keyword.entries.items.len);
     }
 
     pub fn symbolCount(self: *const Interner) u32 {
-        return @intCast(self.symbol.names.items.len);
+        return @intCast(self.symbol.entries.items.len);
     }
 };
 
@@ -418,7 +380,7 @@ test "by_name lookups survive names reallocation" {
     // (ArrayList grows geometrically). Every previously-returned
     // id must still resolve, and every name must still be found. This
     // exercises the claim in `docs/INTERN.md` §4 that map keys point at
-    // the duped byte buffers, not into `names.items`.
+    // the duped byte buffers, not into `entries.items`.
     var it = Interner.init(testing.allocator);
     defer it.deinit();
 
