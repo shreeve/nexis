@@ -1191,9 +1191,10 @@ the map can fail only for memory; then the value is the bare keyword,
 which every `catch` that takes the map also takes, so a handler still
 runs when the heap is exhausted: nothing else a throw does allocates,
 since `ctrl:try-enter` reserves the room for a finally's continuation
-and the throw's origin is dropped when it cannot be recorded (§12). The line of a place costs a scan of
-the source before it; the VM keeps the last place it computed, so a
-handler taking an error in a loop scans once.
+and the throw's origin is dropped when it cannot be recorded (§12). A
+place is found from the last place the VM found in the same text
+(`SourceInfo.lineColFrom`), scanning only the text between the two,
+so a handler taking errors in a loop scans the text once.
 
 **Not catchable** (compiler bugs or corrupt bytecode; they leave the
 run):

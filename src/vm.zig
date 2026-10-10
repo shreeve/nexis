@@ -436,11 +436,36 @@ pub const SourceInfo = struct {
     /// position.
     pub fn lineCol(self: *const SourceInfo, pos: u32) LineCol {
         const before = self.text[0..@min(pos, self.text.len)];
-        const bom = "\xEF\xBB\xBF";
+        return .{ .line = @intCast(1 + std.mem.count(u8, before, "\n")), .col = columnOf(before) };
+    }
+
+    /// `lineCol(pos)` found from `from`, the place of `from_pos`: only
+    /// the text between the two positions is scanned, or the text
+    /// before `pos` when that is shorter, so places found one from the
+    /// last cost the distance moved.
+    pub fn lineColFrom(self: *const SourceInfo, from_pos: u32, from: LineCol, pos: u32) LineCol {
+        const a = @min(from_pos, self.text.len);
+        const b = @min(pos, self.text.len);
+        // Near the start, a byte-order mark included, from 0.
+        if (@min(a, b) <= bom.len or (b < a and b <= a - b)) return self.lineCol(pos);
+        const between = if (a <= b) self.text[a..b] else self.text[b..a];
+        const lines: u32 = @intCast(std.mem.count(u8, between, "\n"));
+        if (a <= b) return .{ .line = from.line + lines, .col = if (lines == 0) from.col + codePoints(between) else columnOf(between) };
+        return .{ .line = from.line - lines, .col = if (lines == 0) from.col - codePoints(between) else columnOf(self.text[0..b]) };
+    }
+
+    const bom = "\xEF\xBB\xBF";
+
+    /// The column at the end of `before`, a text from its start.
+    fn columnOf(before: []const u8) u32 {
         const start = if (std.mem.findScalarLast(u8, before, '\n')) |nl| nl + 1 else if (std.mem.startsWith(u8, before, bom)) bom.len else 0;
-        var col: u32 = 1;
-        for (before[start..]) |c| col += @intFromBool(c & 0xC0 != 0x80);
-        return .{ .line = @intCast(1 + std.mem.count(u8, before, "\n")), .col = col };
+        return 1 + codePoints(before[start..]);
+    }
+
+    fn codePoints(bytes: []const u8) u32 {
+        var n: u32 = 0;
+        for (bytes) |c| n += @intFromBool(c & 0xC0 != 0x80);
+        return n;
     }
 };
 
@@ -3619,13 +3644,16 @@ pub const VM = struct {
         return .{ .name = f.routine.name, .pc = pc, .span = f.routine.spanAt(pc), .source = f.routine.source };
     }
 
-    /// `source.lineCol(pos)`, remembered for the last place asked: a
-    /// handler taking errors in a loop is at one place, and a line
-    /// costs a scan of the text before it.
+    /// `source.lineCol(pos)`, found from the last place found in the
+    /// same text (`SourceInfo.lineColFrom`): a handler taking errors in
+    /// a loop is at one place.
     fn placeOf(self: *VM, source: *const SourceInfo, pos: u32) SourceInfo.LineCol {
         const c = &self.place_cache;
-        if (c.text.ptr != source.text.ptr or c.text.len != source.text.len or c.pos != pos) {
+        if (c.text.ptr != source.text.ptr or c.text.len != source.text.len) {
             c.* = .{ .text = source.text, .pos = pos, .place = source.lineCol(pos) };
+        } else if (c.pos != pos) {
+            c.place = source.lineColFrom(c.pos, c.place, pos);
+            c.pos = pos;
         }
         return c.place;
     }
@@ -5915,6 +5943,25 @@ test "SourceInfo.lineCol: columns count code points, past a byte-order mark" {
     try testing.expectEqual(SourceInfo.LineCol{ .line = 2, .col = 3 }, info.lineCol(1000));
     const marked = SourceInfo{ .path = "t.nx", .text = "\xEF\xBB\xBF(x)" };
     try testing.expectEqual(SourceInfo.LineCol{ .line = 1, .col = 1 }, marked.lineCol(3));
+}
+
+test "SourceInfo.lineColFrom: a place found from any other is the place found from the start" {
+    const texts = [_][]const u8{
+        "\xEF\xBB\xBF(a \"\u{e9}\u{20ac}\")\r\n  (b\n\n\u{1F600} c)\n",
+        "(str \"\u{e9}\u{e9}\") (x)\n\u{20ac}x",
+        "\n\n\n",
+        "\xEF\xBB\xBF",
+        "",
+    };
+    for (texts) |text| {
+        const info = SourceInfo{ .path = "t.nx", .text = text };
+        const end: u32 = @intCast(text.len + 2);
+        for (0..end) |a| for (0..end) |b| {
+            const from: u32 = @intCast(a);
+            const to: u32 = @intCast(b);
+            try testing.expectEqual(info.lineCol(to), info.lineColFrom(from, info.lineCol(from), to));
+        };
+    }
 }
 
 test "VM opcodes: mov, return and operand resolution" {
