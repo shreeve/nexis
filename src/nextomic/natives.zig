@@ -42,7 +42,6 @@ const heap_mod = @import("../heap.zig");
 const bignum = @import("../bignum.zig");
 const gc = @import("../gc.zig");
 const string_mod = @import("../string.zig");
-const list_mod = @import("../coll/list.zig");
 const vector_mod = @import("../coll/vector.zig");
 const champ = @import("../coll/champ.zig");
 const sorted = @import("../coll/sorted.zig");
@@ -87,66 +86,60 @@ const Diag = pull_mod.Diag;
 // Installation
 // =============================================================================
 
-const Entry = struct { name: []const u8, descriptor: *const NativeFn };
-
-const natives = [_]Entry{
-    .{ .name = "connect", .descriptor = &native_connect },
-    .{ .name = "release", .descriptor = &native_release },
-    .{ .name = "db", .descriptor = &native_db },
-    .{ .name = "basis-t", .descriptor = &native_basis_t },
-    .{ .name = "transact!", .descriptor = &native_transact },
-    .{ .name = "excise!", .descriptor = &native_excise },
-    .{ .name = "entity", .descriptor = &native_entity },
-    .{ .name = "touch", .descriptor = &native_touch },
-    .{ .name = "entity-db", .descriptor = &native_entity_db },
-    .{ .name = "entid", .descriptor = &native_entid },
-    .{ .name = "ident", .descriptor = &native_ident },
-    .{ .name = "datoms", .descriptor = &native_datoms },
-    .{ .name = "index-range", .descriptor = &native_index_range },
-    .{ .name = "as-of", .descriptor = &native_as_of },
-    .{ .name = "since", .descriptor = &native_since },
-    .{ .name = "history", .descriptor = &native_history },
-    .{ .name = "tx-range", .descriptor = &native_tx_range },
-    .{ .name = "schema", .descriptor = &native_schema },
-    .{ .name = "sync", .descriptor = &native_sync },
-    .{ .name = "pull", .descriptor = &native_pull },
-    .{ .name = "pull-many", .descriptor = &native_pull_many },
-    .{ .name = "with", .descriptor = &native_with },
+/// Each native once: its name, arity, function, and the arglists and
+/// docstring `doc` prints (docs/STDLIB.md §10), as stdlib.zig's tables
+/// carry theirs.
+const rows = .{
+    .{ "connect", 1, 2, &fnConnect, "[path] [path opts]", "Opens the Nextomic store at path, creating it and its parent\n  directories, and returns a connection. opts takes :durability\n  (:commit or :durable) and :sync (:full, :no-meta or :none for every\n  transaction). Release it with release, or use with-conn." },
+    .{ "release", 1, 1, &fnRelease, "[conn]", "Syncs conn's file when a commit left it unsynced, then closes conn;\n  returns nil, for a released conn too. Any other later use of conn is\n  :nextomic/closed; :nextomic/busy while an operation on it is in flight." },
+    .{ "db", 1, 1, &fnDb, "[conn]", "Returns the db-value of conn at its current basis, a view that later\n  transactions do not change." },
+    .{ "basis-t", 1, 1, &fnBasisT, "[db]", "Returns the basis of the db-value db: the number t of the last\n  transaction it reads." },
+    .{ "transact!", 2, 3, &fnTransact, "[conn tx-data] [conn tx-data opts]", "Commits tx-data as one transaction and returns the report {:db-before\n  :db-after :tx :tempids :tx-data}. tx-data holds entity maps and\n  [:db/add e a v], [:db/retract e a v?], [:db/retractEntity e],\n  [:db.fn/call f & args] and [:db.fn/cas e a old new]. opts takes :sync." },
+    .{ "excise!", 2, 3, &fnExcise, "[conn e] [conn e attr]", "Removes every datom of the entity e, or of e under attr, current and\n  history, from every view, in a transaction of its own. Returns its\n  report plus :excised [e] and :removed, the count of rows removed." },
+    .{ "entity", 2, 2, &fnEntity, "[db e]", "Returns a lazy entity of e, an eid, ident or lookup ref, in db: (:attr\n  ent), get, contains? and keys read its attributes, a card-many value\n  as a set and a ref as an entity. nil when e has no datoms in db; a\n  history db is :nextomic/history-view." },
+    .{ "touch", 1, 1, &fnTouch, "[ent]", "Returns the map {:db/id e :attr v ...} of every attribute of the\n  entity ent, read in one pass: card-many values as sets, refs as eids." },
+    .{ "entity-db", 1, 1, &fnEntityDb, "[ent]", "Returns the db-value the entity ent reads through." },
+    .{ "entid", 2, 2, &fnEntid, "[db x]", "Returns the eid x names in db: x itself for an eid, an ident's or a\n  lookup ref [attr v]'s entity, or nil when it names nothing." },
+    .{ "ident", 2, 2, &fnIdent, "[db x]", "Returns the ident keyword of the entity x, an eid or ident, in db, or\n  nil when it has none." },
+    .{ "datoms", 2, 7, &fnDatoms, "[db index] [db index c1] [db index c1 c2] [db index c1 c2 c3] [db index c1 c2 c3 tx] [db index c1 c2 c3 tx added]", "Returns a vector of the datoms [e a v t added] of db in the order of\n  index, :eavt, :aevt, :avet or :vaet, matching the components given\n  in that index's order, then tx and added; nil matches anything.\n  Another index is :invalid-argument." },
+    .{ "index-range", 4, 4, &fnIndexRange, "[db attr start end]", "Returns a vector of the AVET datoms of the indexed or unique attribute\n  attr whose value v has start <= v < end, in value order; a nil bound\n  is open. Another attribute is :nextomic/tx-data." },
+    .{ "as-of", 2, 2, &fnAsOf, "[db t]", "Returns the view of db as of the transaction t, a t or a transaction\n  entity id: what the transactions up to t asserted and did not\n  retract. Of repeated bounds the older holds. A negative t is\n  :invalid-argument." },
+    .{ "since", 2, 2, &fnSince, "[db t]", "Returns the view of db holding only what the transactions after t, a\n  t or a transaction entity id, asserted and did not retract: an entity\n  untouched since t is invisible. Of repeated bounds the newer holds." },
+    .{ "history", 1, 1, &fnHistory, "[db]", "Returns the history view of db: every assertion and retraction up to\n  its basis, each datom with its added flag. q and datoms read it;\n  entity and pull are :nextomic/history-view." },
+    .{ "tx-range", 1, 3, &fnTxRange, "[conn] [conn from] [conn from to]", "Returns a vector of the log's entries {:t t :instant ms :data [datoms]}\n  for from <= t < to, oldest first; a nil or missing bound is open. An\n  entry an excision touched carries :excised [e ...]." },
+    .{ "schema", 1, 1, &fnSchema, "[db]", "Returns a map of each attribute's ident to its definition as db's\n  basis saw it: :db/id, :db/ident, :db/valueType, :db/cardinality,\n  :db/index, :db/isComponent and :db/fulltext, with :db/unique and\n  :db/doc when the attribute has them." },
+    .{ "sync", 1, 1, &fnSync, "[conn]", "Makes every commit to conn's file durable, with one full sync when a\n  commit left it unsynced; returns nil. :db/sync-failed once a sync of\n  the file has failed, until it is reopened." },
+    .{ "pull", 3, 3, &fnPull, "[db pattern e]", "Returns the map pattern selects of the entity e in db, nil when e has\n  no datoms there: attributes, :ns/_name reverse refs, *, {attr\n  sub-pattern} and (attr :limit n :default v :as k), :db/id always.\n  A bad pattern is :nextomic/pull-syntax." },
+    .{ "pull-many", 3, 3, &fnPullMany, "[db pattern es]", "Returns a vector of the pull of pattern for each entity of es, a\n  vector or list, in its order, in one read." },
+    .{ "with", 3, 3, &fnWith, "[conn tx-data f]", "Applies tx-data without committing it: calls (f db-after report)\n  inside the held write transaction, then aborts it, and returns f's\n  value. db-after is :nextomic/closed once f returns. Unlike Datomic's,\n  it takes a connection and a function." },
+    .{ "q", 1, null, &query_natives.fnQ, "[query & inputs]", "Runs the Datalog query over inputs, positional to its :in ($ when\n  absent), and returns a set of tuple vectors, or what :find asks for\n  (., [?x ...], [[...]], :keys). (q {:query query :args [inputs]}) is\n  the same call. A query refused is :nextomic/query-syntax." },
+    .{ "explain", 1, null, &query_natives.fnExplain, "[query & inputs]", "Returns, as a string, the plan q would run for query and inputs: one\n  numbered line per step with its index, estimate and join (nested,\n  hash, fixpoint or none) and the rows estimated after it." },
 };
 
-/// Install the `nextomic/*` natives into `ns`, then the query natives
-/// (`q`, `explain`; NEXTOMIC.md §5) from `query/natives.zig`.
+/// The natives' descriptors, each named `nextomic/name`: immortal, so a
+/// `.native_fn` value can point at one.
+pub const table: [rows.len]NativeFn = blk: {
+    var out: [rows.len]NativeFn = undefined;
+    for (&out, rows) |*d, r| d.* = .{ .name = "nextomic/" ++ r[0], .min_arity = r[1], .max_arity = r[2], .call = r[3] };
+    break :blk out;
+};
+
+/// What `doc` prints of each native of `table`, in its order: the text
+/// of its `:arglists` list and its docstring.
+pub const docs: [rows.len]struct { arglists: []const u8, doc: []const u8 } = blk: {
+    var out: [rows.len]struct { arglists: []const u8, doc: []const u8 } = undefined;
+    for (&out, rows) |*d, r| d.* = .{ .arglists = "(" ++ r[4] ++ ")", .doc = r[5] };
+    break :blk out;
+};
+
+/// Bind every native of `table` as a Var of `ns` under its bare name.
 pub fn install(ns: *Namespace) !void {
-    for (natives) |entry| {
-        const v = try ns.intern(entry.name);
-        v.root = vm_mod.nativeFnValue(entry.descriptor);
+    for (&table) |*d| {
+        const v = try ns.intern(d.name["nextomic/".len..]);
+        v.root = vm_mod.nativeFnValue(d);
         v.bound = true;
     }
-    try query_natives.install(ns);
 }
-
-const native_connect = NativeFn{ .name = "nextomic/connect", .min_arity = 1, .max_arity = 2, .call = &fnConnect };
-const native_release = NativeFn{ .name = "nextomic/release", .min_arity = 1, .max_arity = 1, .call = &fnRelease };
-const native_db = NativeFn{ .name = "nextomic/db", .min_arity = 1, .max_arity = 1, .call = &fnDb };
-const native_basis_t = NativeFn{ .name = "nextomic/basis-t", .min_arity = 1, .max_arity = 1, .call = &fnBasisT };
-const native_transact = NativeFn{ .name = "nextomic/transact!", .min_arity = 2, .max_arity = 3, .call = &fnTransact };
-const native_excise = NativeFn{ .name = "nextomic/excise!", .min_arity = 2, .max_arity = 3, .call = &fnExcise };
-const native_entity = NativeFn{ .name = "nextomic/entity", .min_arity = 2, .max_arity = 2, .call = &fnEntity };
-const native_touch = NativeFn{ .name = "nextomic/touch", .min_arity = 1, .max_arity = 1, .call = &fnTouch };
-const native_entity_db = NativeFn{ .name = "nextomic/entity-db", .min_arity = 1, .max_arity = 1, .call = &fnEntityDb };
-const native_entid = NativeFn{ .name = "nextomic/entid", .min_arity = 2, .max_arity = 2, .call = &fnEntid };
-const native_ident = NativeFn{ .name = "nextomic/ident", .min_arity = 2, .max_arity = 2, .call = &fnIdent };
-const native_datoms = NativeFn{ .name = "nextomic/datoms", .min_arity = 2, .max_arity = 7, .call = &fnDatoms };
-const native_index_range = NativeFn{ .name = "nextomic/index-range", .min_arity = 4, .max_arity = 4, .call = &fnIndexRange };
-const native_as_of = NativeFn{ .name = "nextomic/as-of", .min_arity = 2, .max_arity = 2, .call = &fnAsOf };
-const native_since = NativeFn{ .name = "nextomic/since", .min_arity = 2, .max_arity = 2, .call = &fnSince };
-const native_history = NativeFn{ .name = "nextomic/history", .min_arity = 1, .max_arity = 1, .call = &fnHistory };
-const native_tx_range = NativeFn{ .name = "nextomic/tx-range", .min_arity = 1, .max_arity = 3, .call = &fnTxRange };
-const native_schema = NativeFn{ .name = "nextomic/schema", .min_arity = 1, .max_arity = 1, .call = &fnSchema };
-const native_sync = NativeFn{ .name = "nextomic/sync", .min_arity = 1, .max_arity = 1, .call = &fnSync };
-const native_pull = NativeFn{ .name = "nextomic/pull", .min_arity = 3, .max_arity = 3, .call = &fnPull };
-const native_pull_many = NativeFn{ .name = "nextomic/pull-many", .min_arity = 3, .max_arity = 3, .call = &fnPullMany };
-const native_with = NativeFn{ .name = "nextomic/with", .min_arity = 3, .max_arity = 3, .call = &fnWith };
 
 // =============================================================================
 // Per-VM state
@@ -193,31 +186,29 @@ fn closeState(ptr: *anyopaque) void {
 // =============================================================================
 
 /// The keyword an error surfaces as: the `nextomic` set for the
-/// storage, transaction and pull layers' own errors, the `db.zig` set
-/// for engine errors.
+/// storage, transaction, pull and query layers' own errors, each
+/// `nextomic/` and its name in kebab case; the `db.zig` set for engine
+/// errors.
 pub fn errorKeyword(err: anyerror) []const u8 {
+    const Own = db_mod.Error || transact_mod.Error || pull_mod.Error || error{ QuerySyntax, UnboundPattern };
+    inline for (@typeInfo(Own).error_set.error_names.?) |name| {
+        if (err == @field(anyerror, name)) return comptime "nextomic/" ++ kebab(name);
+    }
     return switch (err) {
-        error.UnknownAttribute => "nextomic/unknown-attribute",
-        error.ValueType => "nextomic/value-type",
-        error.Unique => "nextomic/unique",
-        error.Conflict => "nextomic/conflict",
-        error.NoEntity => "nextomic/no-entity",
-        error.BasisInFuture => "nextomic/basis-in-future",
-        error.Closed => "nextomic/closed",
-        error.Busy => "nextomic/busy",
-        error.TxData => "nextomic/tx-data",
-        error.Nested => "nextomic/nested",
-        error.TxFn => "nextomic/tx-fn",
-        error.Cas => "nextomic/cas",
-        error.Schema => "nextomic/schema",
-        error.PullSyntax => "nextomic/pull-syntax",
-        error.QuerySyntax => "nextomic/query-syntax",
-        error.UnboundPattern => "nextomic/unbound-pattern",
-        error.HistoryView => "nextomic/history-view",
         error.Format, error.UnknownIdent => "db/corrupted",
         error.StackOverflow => "stack-overflow",
         else => dblayer.failureName(err),
     };
+}
+
+/// `UnknownAttribute` as `unknown-attribute`.
+fn kebab(comptime name: []const u8) []const u8 {
+    comptime var out: []const u8 = "";
+    inline for (name, 0..) |c, i| {
+        if (std.ascii.isUpper(c) and i > 0) out = out ++ "-";
+        out = out ++ .{std.ascii.toLower(c)};
+    }
+    return out;
 }
 
 /// What an error payload carries beyond its `:error` keyword (§7).
@@ -333,31 +324,31 @@ fn writeMessage(w: *std.Io.Writer, interner: *const intern_mod.Interner, err: an
 
 fn payloadMap(vm: *VM, name: []const u8, detail: Detail, attr_key: []const u8) !Value {
     const heap = vm.ensureHeap();
-    const it = vm.ensureInterner();
-    var m = try champ.mapEmpty(heap);
-    m = try champ.mapAssoc(heap, m, try it.internKeywordValue("error"), try it.internKeywordValue(name), &dispatch.hashValue, &dispatch.equal);
-    if (detail.message) |message| {
-        m = try champ.mapAssoc(heap, m, try it.internKeywordValue("message"), try string_mod.fromBytes(heap, message), &dispatch.hashValue, &dispatch.equal);
-    }
-    if (detail.clause) |c| {
-        const n = value.fromFixnum(@intCast(c)) orelse return error.ArithmeticOverflow;
-        m = try champ.mapAssoc(heap, m, try it.internKeywordValue("clause"), n, &dispatch.hashValue, &dispatch.equal);
-    }
-    if (detail.e) |e| {
-        const n = value.fromFixnum(@intCast(e)) orelse return error.ArithmeticOverflow;
-        m = try champ.mapAssoc(heap, m, try it.internKeywordValue("e"), n, &dispatch.hashValue, &dispatch.equal);
-    }
-    if (detail.attr) |a| m = try champ.mapAssoc(heap, m, try it.internKeywordValue(attr_key), a, &dispatch.hashValue, &dispatch.equal);
-    if (detail.value) |v| m = try champ.mapAssoc(heap, m, try it.internKeywordValue("value"), v, &dispatch.hashValue, &dispatch.equal);
-    if (detail.format) |f| {
-        m = try champ.mapAssoc(heap, m, try it.internKeywordValue("format"), value.fromFixnum(f).?, &dispatch.hashValue, &dispatch.equal);
-    }
+    var m = Payload{ .vm = vm, .map = try champ.mapEmpty(heap) };
+    try m.put("error", try vm.ensureInterner().internKeywordValue(name));
+    if (detail.message) |message| try m.put("message", try string_mod.fromBytes(heap, message));
+    if (detail.clause) |c| try m.put("clause", value.fromFixnum(@intCast(c)) orelse return error.ArithmeticOverflow);
+    if (detail.e) |e| try m.put("e", value.fromFixnum(@intCast(e)) orelse return error.ArithmeticOverflow);
+    if (detail.attr) |a| try m.put(attr_key, a);
+    if (detail.value) |v| try m.put("value", v);
+    if (detail.format) |f| try m.put("format", value.fromFixnum(f).?);
     if (detail.cas) |c| {
-        m = try champ.mapAssoc(heap, m, try it.internKeywordValue("expected"), c.expected, &dispatch.hashValue, &dispatch.equal);
-        m = try champ.mapAssoc(heap, m, try it.internKeywordValue("actual"), c.actual, &dispatch.hashValue, &dispatch.equal);
+        try m.put("expected", c.expected);
+        try m.put("actual", c.actual);
     }
-    return m;
+    return m.map;
 }
+
+/// An error map being built, one keyword key at a time.
+const Payload = struct {
+    vm: *VM,
+    map: Value,
+
+    fn put(self: *Payload, key_name: []const u8, v: Value) !void {
+        const k = try self.vm.ensureInterner().internKeywordValue(key_name);
+        self.map = try champ.mapAssoc(self.vm.ensureHeap(), self.map, k, v, &dispatch.hashValue, &dispatch.equal);
+    }
+};
 
 /// The detail a failed transaction on `conn` left in `fault`. A
 /// value the connection can no longer render (its keyword was minted
@@ -498,9 +489,8 @@ fn connect(vm: *VM, args: []const Value, refused_format: *u16) !Value {
     return handle.makeConn(host.ensureHeap(), @ptrCast(c), c.gen, path);
 }
 
-/// `(release conn)`: idempotent; `:nextomic/busy` while a query, pull,
-/// transaction or `with` on the connection is in flight, so nothing
-/// running holds cursors into a freed store.
+/// `:nextomic/busy` while an operation on the connection is in flight,
+/// so nothing running holds cursors into a freed store.
 fn fnRelease(vm: *VM, args: []const Value) VmError!Value {
     const c = (connOf(args[0]) catch |err| return fail(vm, err)) orelse return value.nilValue();
     c.release() catch |err| return fail(vm, err);
@@ -765,9 +755,6 @@ fn reportMap(vm: *VM, conn: *Conn, arena: Allocator, report: transact_mod.Report
 
 const fnExcise = wrap(exciseNative);
 
-/// `(excise! conn e)` / `(excise! conn e attr)` (NEXTOMIC.md §4
-/// "Excision"): the report of the recording transaction plus
-/// `:excised [e]` and `:removed`, the history rows that went.
 fn exciseNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
     const c = try openConn(args[0]);
     var fault: Fault = .{};
@@ -791,12 +778,9 @@ fn exciseNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
 
 const fnWith = wrap(withNative);
 
-/// `(with conn tx-data f)`: apply tx-data in a held write transaction,
-/// call `f` with a db-value over the uncommitted state and the report
-/// `transact!` would have returned, then abort. Whatever `f` raises
-/// propagates after the abort. `db-after` and every db-value derived
-/// from it name the connection's view in this scope's life, closed
-/// once the scope ends; the scope's scratch is freed on return.
+/// `db-after` and every db-value derived from it name the connection's
+/// view in this scope's life, closed once the scope ends; the scope's
+/// scratch is freed on return.
 fn withNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
     const c = try openConn(args[0]);
     const f = args[2];
@@ -820,33 +804,15 @@ fn withNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
 // pull, pull-many
 // =============================================================================
 
-fn fnPull(vm: *VM, args: []const Value) VmError!Value {
-    const listed = try ListedArgs.of(vm, args);
-    defer listed.deinit(vm);
-    var diag: Diag = .{};
-    return pullNative(vm, listed.args, &diag) catch |err| switch (err) {
-        // The entity argument names nothing.
-        error.NoEntity => failWith(vm, err, .{ .value = listed.args[2] }),
-        else => failDiag(vm, err, &diag),
-    };
-}
+const fnPull = wrapDiag(pullNative);
 
-/// `(pull db pattern e)`: the pattern's map for `e`; nil when the
-/// entity has no datoms in this view.
 fn pullNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
     const d = try dbOf(args[0]);
     return pull_mod.pull(vm.allocator, vm.ensureInterner(), vm.ensureHeap(), d, args[1], args[2], diag);
 }
 
-fn fnPullMany(vm: *VM, args: []const Value) VmError!Value {
-    const listed = try ListedArgs.of(vm, args);
-    defer listed.deinit(vm);
-    var diag: Diag = .{};
-    return pullManyNative(vm, listed.args, &diag) catch |err| failDiag(vm, err, &diag);
-}
+const fnPullMany = wrapDiag(pullManyNative);
 
-/// `(pull-many db pattern es)`: one result per entity of the vector
-/// or list `es`, in its order, all in one read.
 fn pullManyNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
     const d = try dbOf(args[0]);
     var arena_state = std.heap.ArenaAllocator.init(vm.allocator);
@@ -855,14 +821,28 @@ fn pullManyNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
     return pull_mod.pullMany(vm.allocator, vm.ensureInterner(), vm.ensureHeap(), d, args[1], es, diag);
 }
 
-/// A pattern or entity syntax error travels with its reason.
+/// The `NativeFn.call` of a native of the query or pull pipeline,
+/// which leaves what a failure names in a `Diag` (`failDiag`).
+pub fn wrapDiag(comptime native: anytype) fn (*VM, []const Value) VmError!Value {
+    return struct {
+        fn call(vm: *VM, args: []const Value) VmError!Value {
+            const listed = try ListedArgs.of(vm, args);
+            defer listed.deinit(vm);
+            var diag: Diag = .{};
+            return native(vm, listed.args, &diag) catch |err| failDiag(vm, err, &diag);
+        }
+    }.call;
+}
+
 /// Surface an error of the query or pull pipeline with what `diag`
 /// knows: the reason and clause of a syntax error, the attribute of an
-/// unknown one, the reason and attribute of malformed input.
+/// unknown one, the reason and attribute of malformed input, the
+/// reference that names no entity.
 pub fn failDiag(vm: *VM, err: anyerror, diag: *const Diag) VmError {
     return switch (err) {
         error.QuerySyntax, error.PullSyntax => throwSyntax(vm, errorKeyword(err), diag.message, diag.clause),
         error.UnboundPattern => failWith(vm, err, .{ .message = diag.message, .clause = diag.clause }),
+        error.NoEntity => failWith(vm, err, .{ .value = diag.given }),
         error.UnknownAttribute => failWith(vm, err, .{ .attr = diag.attr }),
         error.TxData => failWith(vm, err, .{ .message = if (diag.message.len == 0) null else diag.message, .attr = diag.attr }),
         error.ValueType => failWith(vm, err, .{ .message = if (diag.message.len == 0) null else diag.message, .attr = diag.attr, .value = diag.given, .value_type = diag.value_type }),
@@ -876,10 +856,8 @@ pub fn failDiag(vm: *VM, err: anyerror, diag: *const Diag) VmError {
 
 const fnEntity = wrap(entityNative);
 
-/// `(entity db e)`: a lazy entity over this view; nil when the entity
-/// has no datoms in it. One read resolves `e` (an eid, ident or lookup
-/// ref) and confirms a datom exists; the attributes are read on
-/// access. A history view has no entities (`HistoryView`).
+/// One read resolves `e` and confirms a datom exists; the attributes
+/// are read on access.
 fn entityNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
     var sc = try Scope.open(vm, args[0]);
     defer sc.close();
@@ -1041,9 +1019,6 @@ fn fnTouch(vm: *VM, args: []const Value) VmError!Value {
     return touchNative(vm, args) catch |err| fail(vm, err);
 }
 
-/// `(touch ent)`: the map `{:db/id e :attr v ...}` of every attribute
-/// read in one pass, card-many as sets, refs as eids; `{:db/id e}`
-/// alone when the view holds no datom of `e`.
 fn touchNative(vm: *VM, args: []const Value) !Value {
     const box = try entityArg(args[0]);
     var sc = try Scope.open(vm, box);
@@ -1052,7 +1027,6 @@ fn touchNative(vm: *VM, args: []const Value) !Value {
     return (try entityMapIn(&sc, e, .id)) orelse idOnly(&sc.b, e);
 }
 
-/// `(entity-db ent)`: the db-value the entity reads through.
 fn fnEntityDb(_: *VM, args: []const Value) VmError!Value {
     return entityArg(args[0]) catch VmError.KindMismatch;
 }
@@ -1072,8 +1046,6 @@ fn fnIdent(vm: *VM, args: []const Value) VmError!Value {
     return identNative(vm, args) catch |err| fail(vm, err);
 }
 
-/// The ident keyword of an eid; a keyword answers itself when it is an
-/// ident in this view. Nil otherwise.
 fn identNative(vm: *VM, args: []const Value) !Value {
     var sc = try Scope.open(vm, args[0]);
     defer sc.close();
@@ -1105,9 +1077,6 @@ fn valOfAttr(rd: *Read, arena: Allocator, attr: Attr, name: Value, v: Value, fau
 
 const fnDatoms = wrap(datomsNative);
 
-/// `(datoms db index & components)`: the index's three components in
-/// its order, then `tx` (a t or a transaction entity id) and `added`
-/// (a boolean); nil leaves a position unbound, and a later one filters.
 fn datomsNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
     var sc = try Scope.open(vm, args[0]);
     defer sc.close();
@@ -1158,9 +1127,7 @@ fn datomsNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
 
 const fnIndexRange = wrap(indexRangeNative);
 
-/// `(index-range db attr start end)`: the AVET datoms of an indexed or
-/// unique attribute with `start <= v < end` in value order, either
-/// bound open when nil. The cursor seeks to the encoded start and
+/// The cursor seeks to the encoded start and
 /// stops at the encoded end; the range test is on decoded values, so
 /// a long string or byte array is placed by its value even where the
 /// index orders it by hash (§2.2), the seek window widening to the
@@ -1274,8 +1241,6 @@ fn fnTxRange(vm: *VM, args: []const Value) VmError!Value {
     return txRangeNative(vm, args) catch |err| fail(vm, err);
 }
 
-/// `(tx-range conn from to)`: entries with `from <= t < to`; a nil or
-/// absent bound is open.
 fn txRangeNative(vm: *VM, args: []const Value) !Value {
     const c = try openConn(args[0]);
     const from: u64 = if (args.len >= 2 and !args[1].isNil()) try tArg(args[1]) else 0;
@@ -1312,9 +1277,7 @@ fn fnSchema(vm: *VM, args: []const Value) VmError!Value {
     return schemaNative(vm, args) catch |err| fail(vm, err);
 }
 
-/// Ident → attribute map for every attribute this view sees: the
-/// flags as the view's basis saw them (§4 "Schema as-of"), and the
-/// attribute's `:db/doc` when the view holds one.
+/// The flags as the view's basis saw them (§4 "Schema as-of").
 fn schemaNative(vm: *VM, args: []const Value) !Value {
     var sc = try Scope.open(vm, args[0]);
     defer sc.close();
@@ -1341,8 +1304,8 @@ fn schemaNative(vm: *VM, args: []const Value) !Value {
         m = try b.putKw(m, "db/index", value.fromBool(attr.indexed));
         m = try b.putKw(m, "db/isComponent", value.fromBool(attr.component));
         m = try b.putKw(m, "db/fulltext", value.fromBool(attr.fulltext));
-        var docs = try sc.rd.scan(arena, .eavt, .{ .e = attr.id, .a = boot.doc });
-        if (try docs.next()) |d| m = try b.putKw(m, "db/doc", try b.val(d.v));
+        var doc = try sc.rd.scan(arena, .eavt, .{ .e = attr.id, .a = boot.doc });
+        if (try doc.next()) |d| m = try b.putKw(m, "db/doc", try b.val(d.v));
         out = try b.put(out, ident, m);
     }
     return out;
@@ -1353,7 +1316,6 @@ fn schemaNative(vm: *VM, args: []const Value) !Value {
 // =============================================================================
 
 const testing = std.testing;
-const TestConn = db_mod.TestConn;
 
 test {
     _ = query_natives;

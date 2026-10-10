@@ -197,21 +197,15 @@ pub const AggOp = enum {
     /// with the vector of the group's values.
     custom,
 
+    /// The aggregate as a query names it: its tag, `_` as `-`.
     pub fn name(self: AggOp) []const u8 {
         return switch (self) {
-            .count => "count",
-            .sum => "sum",
-            .min => "min",
-            .max => "max",
-            .avg => "avg",
-            .median => "median",
-            .variance => "variance",
-            .stddev => "stddev",
-            .count_distinct => "count-distinct",
-            .distinct => "distinct",
-            .sample => "sample",
-            .rand => "rand",
-            .custom => "custom",
+            inline else => |op| comptime blk: {
+                var out = @tagName(op)[0..].*;
+                std.mem.replaceScalar(u8, &out, '_', '-');
+                const final = out;
+                break :blk &final;
+            },
         };
     }
 

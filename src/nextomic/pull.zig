@@ -169,6 +169,7 @@ pub fn entityOf(read: *Read, arena: Allocator, e: Value, diag: *Diag) Failure!?u
     return marshal.entity(read, arena, e, &fault) catch |err| {
         diag.* = switch (err) {
             error.ValueType => .{ .attr = fault.attr, .given = fault.given, .value_type = fault.value_type },
+            error.NoEntity => .{ .given = e },
             else => .{ .message = fault.message orelse "unknown attribute", .attr = fault.attr },
         };
         return err;
@@ -439,7 +440,10 @@ const Puller = struct {
     /// The entity to pull, where a reference that names nothing is
     /// `NoEntity`.
     fn resolveEntity(self: *Puller, e: Value) Failure!u64 {
-        return (try entityOf(self.read, self.arena, e, self.diag)) orelse error.NoEntity;
+        return (try entityOf(self.read, self.arena, e, self.diag)) orelse {
+            self.diag.* = .{ .given = e };
+            return error.NoEntity;
+        };
     }
 
     fn root(self: *Puller, pat: *const Pattern, e: u64) Failure!?Value {
