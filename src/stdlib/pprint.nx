@@ -3,9 +3,9 @@
 ; via @embedFile and bootstrapped at VM startup with nexis.pprint as
 ; the current namespace, after core.nx.
 
-(def width
-  "The column pprint lays text out within, 72: a collection whose
-  pr-str fits within it from its indent prints on one line."
+(def ^:dynamic *print-right-margin*
+  "The column pprint lays text out within, 72 at the root: a collection
+  whose pr-str fits within it from its indent prints on one line."
   72)
 
 (defn- spaces [n] (apply str (repeat n " ")))
@@ -13,15 +13,15 @@
 (defn- breakable? [x]
   (and (coll? x)
        (not (empty? x))
-       (not (nexis.internal/#%record? x))))
+       (not (record? x))))
 
-; The strings in `strs` packed onto lines of at most `width`
+; The strings in `strs` packed onto lines of at most *print-right-margin*
 ; columns from column `indent`, joined by newline and indent.
 (defn- fill-lines [strs indent]
   (let* [lines (reduce (fn* [lines s]
                          (let* [cur (peek lines)]
                            (if (and (not (empty? cur))
-                                    (> (+ indent (count cur) 1 (count s)) width))
+                                    (> (+ indent (count cur) 1 (count s)) *print-right-margin*))
                              (conj lines s)
                              (conj (pop lines) (if (empty? cur) s (str cur " " s))))))
                        [""]
@@ -35,7 +35,7 @@
 ; per line, each laid out from its own column.
 (defn- layout [x indent]
   (let* [flat (pr-str x)]
-    (if (or (not (breakable? x)) (<= (+ indent (count flat)) width))
+    (if (or (not (breakable? x)) (<= (+ indent (count flat)) *print-right-margin*))
       flat
       (if (map? x)
         (str "{"
@@ -58,7 +58,7 @@
 
 (defn pprint
   "Prints x and a newline; returns nil. A collection whose pr-str fits
-  within width columns prints as pr-str prints it; a longer one breaks:
+  within *print-right-margin* columns prints as pr-str prints it; a longer one breaks:
   a map one key and value per line, a vector, list or set of scalars
   filled line by line, one holding a collection one element per line."
   [x]

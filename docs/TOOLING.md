@@ -349,12 +349,15 @@ the private helpers.
   `(catch MATCHER ...)` would take (a keyword tag, MACROEXPAND.md §2b,
   or `any`) and fails when `expr` returns, reporting the value; a
   throw the matcher does not take propagates and counts as an error.
+  `(is (thrown-with-msg? MATCHER re expr) msg?)` passes when, besides,
+  `re` finds a match in the thrown value's message (`ex-message`), and
+  fails reporting the pattern and the message when it does not.
   `(is expr msg?)` passes when `expr` is truthy. Every `is` returns
   whether it passed. The head is matched by name, so `t/thrown?` and
   `thrown?` are the same. `msg` is evaluated once, after the values,
   whether the assertion passes or fails, as in Clojure. An assertion
   is one call of a helper (`check=`, `check-truthy`; a
-  `thrown?` with a keyword tag is a `try` whose handler calls
+  `thrown?` or `thrown-with-msg?` is a `try` whose handler calls
   `check-thrown`) with the quoted form, the values and the message,
   so the judging and the reporting are compiled once, in
   `nexis.test`: `(is (= a 1))` as a function's body is seven
@@ -378,9 +381,9 @@ the private helpers.
   (`join-fixtures`, `compose-fixtures`). A fixture's throw is not a
   test's and propagates out of the run, as in Clojure.
 - `(run-tests)` runs the current namespace's tests in definition
-  order, `(run-tests 'my.ns)` a named namespace's, `(run-all-tests)`
-  every namespace that registered a test, in first-registration
-  order. Each returns `{:test n :pass n :fail n :error n}`: tests
+  order, `(run-tests 'my.ns 'other.ns)` the named namespaces',
+  `(run-all-tests)` every namespace that registered a test, in
+  first-registration order. Each returns `{:test n :pass n :fail n :error n}`: tests
   run, assertions passed, assertions failed, tests that threw. A
   test's throw is caught by `any` and counted as an error; the next
   test still runs. `(successful? summary)` is whether a summary has
@@ -415,7 +418,8 @@ lines; `zig build examples` runs the demo.
 
 **`nexis.pprint`** (`src/stdlib/pprint.nx`): `(pprint x)` prints `x`
 and a newline, `(pprint-str x)` returns the text. A collection whose
-`pr-str` fits within 72 columns from its indent prints on one line,
+`pr-str` fits within `*print-right-margin*` columns (dynamic, 72 at
+the root, as Clojure's) from its indent prints on one line,
 as `pr-str` prints it. A longer one breaks: a map one `key value`
 pair per line, separated by `,`, each value laid out from the column
 after its key; a vector, list or set of scalars filled line by line

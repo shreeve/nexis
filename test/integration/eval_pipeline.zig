@@ -1714,8 +1714,9 @@ test "integration: core.nx comment, doto, defonce, assert and time" {
     try expectOutput("[(assert (= 1 1)) (try (assert (= 1 2)) (catch :assertion-failed e (ex-message e)))]", "[nil Assert failed: (= 1 2)]");
     try expectOutput("(try (assert false \"nope\") (catch any e (ex-message e)))", "Assert failed: nope\nfalse");
     // The shape :pre and :post throw: {:error :assertion-failed :message ...}.
-    try expectOutput("(try (assert (= 1 \"a\") (str \"n\" 1)) (catch any e [(ex-message e) (:error e) (ex-data e)]))", "[Assert failed: n1\n(= 1 \"a\") :assertion-failed {:error :assertion-failed, :message Assert failed: n1\n(= 1 \"a\")}]");
-    try expectOutput("(= (try (assert (pos? -1)) (catch any e e)) (try ((fn [x] {:pre [(pos? x)]} x) -1) (catch any e (assoc e :message \"Assert failed: (pos? -1)\"))))", "true");
+    try expectOutput("(try (assert (= 1 \"a\") (str \"n\" 1)) (catch any e [(ex-message e) (:error e) (ex-data e)]))", "[Assert failed: n1\n(= 1 \"a\") :assertion-failed {:error :assertion-failed, :message Assert failed: n1\n(= 1 \"a\"), :fn test-form}]");
+    // The same map but for the place keys, each its own raise site's.
+    try expectOutput("(let [bare #(dissoc % :fn :file :line :column)] (= (try (assert (pos? -1)) (catch any e (bare e))) (try ((fn [x] {:pre [(pos? x)]} x) -1) (catch any e (bare (assoc e :message \"Assert failed: (pos? -1)\"))))))", "true");
     try expectOutput("(let [f (fn [] (try (assert false) (catch any e e)))] (identical? (f) (f)))", "false");
     try expectOutput("(let [r (atom nil) s (with-out-str (reset! r (time (+ 1 2))))] [@r (subs s 0 15) (subs s (- (count s) 8))])", "[3 \"Elapsed time:   msecs\"\n]");
 }
@@ -2080,7 +2081,7 @@ test "hierarchies: derive builds the closures, refuses cycles, and keeps an exis
         \\ (try (derive family :user/ancestor-1 :user/child) (catch any e e))
         \\ (try (derive family :user/child :user/ancestor-1) (catch Exception e (:message e)))
         \\ (identical? family (derive family :user/child :user/parent-1))]
-    , "[true true true (:user/ancestor-1 :user/ancestor-2) nil nil {:error :invalid-derivation, :message Cyclic derivation: :user/child has :user/ancestor-1 as ancestor} :user/child already has :user/ancestor-1 as ancestor true]");
+    , "[true true true (:user/ancestor-1 :user/ancestor-2) nil nil {:error :invalid-derivation, :message Cyclic derivation: :user/child has :user/ancestor-1 as ancestor, :fn test-form} :user/child already has :user/ancestor-1 as ancestor true]");
     // The assertions, each with the text of Clojure 1.12's form.
     try expectOutputProgram(hierarchies ++
         \\(map #(try (%) (catch AssertionError e (pr-str (:message e))))
@@ -2187,7 +2188,7 @@ test "multimethods: preferences resolve an ambiguity, directly or through ancest
         \\[(try (bar :user/rect :user/rect) (catch IllegalArgumentException e (:message e))) (prefers bar)
         \\ (do (prefer-method bar [:user/rect :user/shape] [:user/shape :user/rect]) (bar :user/rect :user/rect)) (prefers bar)
         \\ (try (prefer-method bar [:user/shape :user/rect] [:user/rect :user/shape]) (catch IllegalStateException e e))]
-    , "[Multiple methods in multimethod 'bar' match dispatch value: [:user/rect :user/rect] -> [:user/shape :user/rect] and [:user/rect :user/shape], and neither is preferred {} :rect-shape {[:user/rect :user/shape] #{[:user/shape :user/rect]}} {:error :preference-conflict, :message Preference conflict in multimethod 'bar': [:user/rect :user/shape] is already preferred to [:user/shape :user/rect]}]");
+    , "[Multiple methods in multimethod 'bar' match dispatch value: [:user/rect :user/rect] -> [:user/shape :user/rect] and [:user/rect :user/shape], and neither is preferred {} :rect-shape {[:user/rect :user/shape] #{[:user/shape :user/rect]}} {:error :preference-conflict, :message Preference conflict in multimethod 'bar': [:user/rect :user/shape] is already preferred to [:user/shape :user/rect], :fn test-form}]");
     // indirect-preferences-mulitmethod-test, against the global hierarchy and #'local-h.
     try expectOutputProgram(
         \\(derive :user/parent-1 :user/grandparent-1)
@@ -2257,7 +2258,7 @@ test "multimethods: methods, get-method, prefers, remove-all-methods and what ea
         \\(defmethod amb :user/a [_] :a)
         \\(defmethod amb :user/b [_] :b)
         \\[(try (get-method amb :user/ab) (catch IllegalArgumentException e e)) (get-method amb :user/zzz) ((get-method amb :user/a) 0)]
-    , "[{:error :ambiguous-method, :value :user/ab, :message Multiple methods in multimethod 'amb' match dispatch value: :user/ab -> :user/b and :user/a, and neither is preferred} nil :a]");
+    , "[{:error :ambiguous-method, :message Multiple methods in multimethod 'amb' match dispatch value: :user/ab -> :user/b and :user/a, and neither is preferred, :fn test-form, :value :user/ab} nil :a]");
 }
 
 test "multimethods: :default and :hierarchy options; the cache follows the hierarchy" {
@@ -2313,7 +2314,7 @@ test "multimethods: the no-method message prints the dispatch value as %s; recur
         \\(defmulti area :shape)
         \\(map #(try (area %) (catch IllegalArgumentException e (pr-str e))) [{:shape :tri} {:shape "tri"} {:shape [:a "b"]} {}])
     ,
-        \\({:error :no-method, :value :tri, :message "No method in multimethod 'area' for dispatch value: :tri"} {:error :no-method, :value "tri", :message "No method in multimethod 'area' for dispatch value: tri"} {:error :no-method, :value [:a "b"], :message "No method in multimethod 'area' for dispatch value: [:a \"b\"]"} {:error :no-method, :value nil, :message "No method in multimethod 'area' for dispatch value: nil"})
+        \\({:error :no-method, :message "No method in multimethod 'area' for dispatch value: :tri", :fn "fn", :value :tri} {:error :no-method, :message "No method in multimethod 'area' for dispatch value: tri", :fn "fn", :value "tri"} {:error :no-method, :message "No method in multimethod 'area' for dispatch value: [:a \"b\"]", :fn "fn", :value [:a "b"]} {:error :no-method, :message "No method in multimethod 'area' for dispatch value: nil", :fn "fn", :value nil})
     );
     // The dispatch function and the method are ordinary calls, so no native stack nests.
     try expectOutputProgram(
@@ -5086,7 +5087,7 @@ test "time: instants, the clock, durations and order" {
     try expectOutput("(nexis.time/instant 5)", "#nexis.time.Instant{:ms 5}");
     try expectOutput("(let [i (nexis.time/instant 5)] (identical? i (nexis.time/instant i)))", "true");
     try expectOutput("(try (nexis.time/instant :x) (catch any e (ex-message e)))", "instant takes an Instant, an integer or ISO-8601 text, got a keyword");
-    try expectOutput("(try (nexis.time/inst-ms \"x\") (catch any e (ex-message e)))", "inst-ms takes an Instant or an integer, got a string");
+    try expectOutput("(try (nexis.time/inst-ms \"x\") (catch any e (ex-message e)))", "an instant is an Instant or an integer, got a string");
     try expectOutput(
         \\(nexis.time/format (nexis.time/plus (nexis.time/parse "2026-10-09") (nexis.time/days 1) (nexis.time/hours 1) (nexis.time/minutes 30) (nexis.time/seconds 15) 7))
     , "2026-10-10T01:30:15.007Z");
@@ -8671,6 +8672,93 @@ test "a user macro named like a core macro is the namespace's own" {
         \\(defmacro when-let [b & body] :mine)
         \\[(when-let [x 1] x) (nexis.core/when-let [x 1] x)]
     , "[:mine 1]");
+}
+
+test "nexis.string: reverse and escape take a string, as every function there does" {
+    try expectOutput(
+        \\(mapv (fn [f] (try (f) (catch :kind-mismatch e (ex-message e))))
+        \\      [#(nexis.string/reverse [1 2]) #(nexis.string/reverse nil) #(nexis.string/escape [1 2] {})])
+    , "[reverse takes a string, got a vector reverse takes a string, got nil escape takes a string, got a vector]");
+}
+
+test "take-nth, replace, random-sample and partitionv-all have Clojure 1.12's transducer arities" {
+    try expectOutput(
+        \\[(into [] (take-nth 2) (range 10)) (into [] (take-nth 3) [1]) (into [] (replace {1 :a}) [1 2 1])
+        \\ (into [] (replace [:x :y]) [0 1 5]) (into [] (random-sample 1.0) [1 2]) (into [] (random-sample 0.0) [1 2])
+        \\ (into [] (partitionv-all 2) [1 2 3]) (transduce (take-nth 2) + (range 7))]
+    , "[[0 2 4 6 8] [1] [:a 2 :a] [:x :y 5] [1 2] [] [[1 2] [3]] 12]");
+}
+
+test "nexis.test: thrown-with-msg? passes when the matcher takes the throw and the pattern finds its message" {
+    try expectOutputProgram(
+        \\(def log (atom []))
+        \\(reset! nexis.test/out (fn [line] (swap! log conj line)))
+        \\(nexis.test/deftest msgs
+        \\  (nexis.test/is (nexis.test/thrown-with-msg? :x #"a+b" (throw {:error :x :message "caab"})))
+        \\  (nexis.test/is (nexis.test/thrown-with-msg? any #"divide" (/ 1 0)))
+        \\  (nexis.test/is (nexis.test/thrown-with-msg? :x #"zz" (throw {:error :x :message "caab"})) "m")
+        \\  (nexis.test/is (nexis.test/thrown-with-msg? :x #"a" (throw :x)))
+        \\  (nexis.test/is (nexis.test/thrown-with-msg? any #"a" 1)))
+        \\(nexis.test/deftest other-tag
+        \\  (nexis.test/is (nexis.test/thrown-with-msg? :y #"a" (throw {:error :x :message "a"}))))
+        \\(def r (nexis.test/run-tests))
+        \\[(:pass r) (:fail r) (:error r) @log]
+    ,
+        \\[2 3 1 [FAIL in user/msgs: (nexis.test/thrown-with-msg? :x #"zz" (throw {:error :x, :message "caab"})) expected: #"zz" actual: "caab" ; m FAIL in user/msgs: (nexis.test/thrown-with-msg? :x #"a" (throw :x)) expected: #"a" actual: nil FAIL in user/msgs: (nexis.test/thrown-with-msg? any #"a" 1) expected: any actual: 1 ERROR in user/other-tag: :x a Ran 2 tests containing 5 assertions. 3 failures, 1 errors.]]
+    );
+}
+
+test "nexis.test: run-tests takes any number of namespaces" {
+    try expectOutputProgram(
+        \\(reset! nexis.test/out (fn [line] nil))
+        \\(nexis.test/deftest one (nexis.test/is true))
+        \\[(nexis.test/run-tests 'user 'user) (nexis.test/run-tests)]
+    , "[{:test 2, :pass 2, :fail 0, :error 0} {:test 1, :pass 1, :fail 0, :error 0}]");
+}
+
+test "nexis.set/difference walks the smaller set and keeps the first's kind" {
+    try expectOutput(
+        \\(let [big (set (range 100000))]
+        \\  [(nexis.set/difference #{1 -2} big) (nexis.set/difference #{1 2 3} #{2 9 8 7 6}) (nexis.set/difference #{1 2 3 4 5} #{2})
+        \\   (nexis.set/difference (sorted-set 3 1 2) #{1 7 8 9} #{3}) (sorted? (nexis.set/difference (sorted-set 3 1 2) big)) (nexis.set/difference #{1})])
+    , "[#{-2} #{1 3} #{1 3 4 5} #{2} true #{1}]");
+}
+
+test "doseq and for share one modifier expander and check their bindings as Clojure's assert-args" {
+    try expectOutput(
+        \\[(for [x (range 5) :let [y (* x x)] :when (odd? x) z [1 2] :while (< z 2)] [x y z])
+        \\ (for [x (range 40) :when (even? x) :while (< x 9)] x) (for [x (list 1 2 3) :when (odd? x)] x)
+        \\ (with-out-str (doseq [x [1 2 3 4] :let [y (inc x)] :when (odd? y) z [:a :b] :while (= z :a)] (print x y z)))
+        \\ (with-out-str (doseq [] (print 1)))
+        \\ (map (fn [f] (try (eval f) (catch :compile-error e (ex-message e))))
+        \\      '((doseq [x] x) (doseq (x 1) x) (doseq [x [1] :foo 1] x) (doseq [:when 1] 2) (for [] 1) (for [x [1] y [2] :bar 1] 2)))]
+    ,
+        \\[([1 1 1] [3 9 1]) (0 2 4 6 8) (1 3) 2 3 :a4 5 :a 1 (macro doseq threw doseq requires an even number of forms in binding vector macro doseq threw doseq requires a vector for its binding macro doseq threw doseq: unknown modifier :foo macro doseq threw doseq: a modifier needs a binding before it macro for threw for requires a binding macro for threw for: unknown modifier :bar)]
+    );
+}
+
+test "defonce returns nil when the Var is bound; merge is Clojure's" {
+    try expectOutputProgram(
+        \\(defrecord R [a])
+        \\[(defonce a 1) (defonce a 2) a (merge nil (->R 1)) (record? (merge (->R 1) {:b 2})) (merge false {:a 1})
+        \\ (merge) (merge nil false) (merge {:a 1} nil {:a 2 :b 3})]
+    , "[#'user/a nil 1 {:a 1} true {:a 1} nil nil {:a 2, :b 3}]");
+}
+
+test "juxt and every-pred take a function, if-not two or three forms, find-var a qualified symbol" {
+    try expectOutput(
+        \\(let [err (fn [f] (try (f) (catch any e (:error e))))]
+        \\  [(err #(juxt)) (err #(every-pred)) ((juxt inc dec) 1) ((every-pred odd? pos?) 1 3)
+        \\   (err #(eval '(if-not true 1 2 3))) (if-not false 1) (if-not true 1 2)
+        \\   (try (find-var 'foo) (catch :invalid-argument e (ex-message e))) (find-var 'nexis.core/inc)
+        \\   (get-in {:a {:b 1}} [:a :b]) (get-in nil [:a]) (get-in {:a 1} nil) (get-in 5 [:a])])
+    , "[:arity-mismatch :arity-mismatch [2 0] true :compile-error 1 2 find-var takes a qualified symbol, got foo #'nexis.core/inc 1 nil {:a 1} nil]");
+}
+
+test "nexis.pprint lays out within the dynamic *print-right-margin*" {
+    try expectOutput(
+        \\(binding [nexis.pprint/*print-right-margin* 10] (nexis.pprint/pprint-str [1 2 3 4 5 6 7 8]))
+    , "[1 2 3 4 5\n 6 7 8]");
 }
 
 // =============================================================================
