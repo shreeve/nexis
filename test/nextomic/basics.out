@@ -55,7 +55,7 @@ ok a nil result is no tx-data
 ok a call inside with is speculative
 [[4294967298 :person/age 37 16 false] [4294967298 :person/age 40 16 true]]
 {:error :nextomic/cas, :expected 37, :actual 40, :message :person/age holds 40, not the 37 the cas expected, :attr :person/age}
-{:error :nextomic/conflict, :message two claims of one transaction disagree about :person/height of entity 4294967298, :e 4294967298, :a :person/height}
+{:error :nextomic/conflict, :message two claims of one transaction disagree about :person/height of entity 4294967298, :e 4294967298, :attr :person/height}
 ok cas against an absent attribute
 {:error :nextomic/cas, :expected nil, :actual 1.8, :message :person/height holds 1.8, not the nil the cas expected, :attr :person/height}
 []
@@ -65,20 +65,20 @@ ok the old name is gone from every view
 ok tx-range decodes the entries written under the old name
 {:error :nextomic/unknown-attribute, :message :person/name names no attribute, :attr :person/name}
 {:error :nextomic/tx-data, :message a retired ident name is never reused}
-{:error :nextomic/conflict, :message two claims of one transaction disagree about :db/ident of entity 23, :e 23, :a :db/ident}
+{:error :nextomic/conflict, :message two claims of one transaction disagree about :db/ident of entity 23, :e 23, :attr :db/ident}
 #{Bob Robert}
 Bob
 {:error :nextomic/schema, :message an entity holds two values; cardinality stays many, :e 4294967298, :attr :person/full-name}
 :db.cardinality/one
 Robert
 {:error :nextomic/schema, :message a unique attribute is cardinality one, :attr :person/email}
-{:error :nextomic/conflict, :message two claims of one transaction disagree about :db/valueType of entity 25, :e 25, :a :db/valueType}
+{:error :nextomic/conflict, :message two claims of one transaction disagree about :db/valueType of entity 25, :e 25, :attr :db/valueType}
 9
 10
-{:error :nextomic/conflict, :message two claims of one transaction disagree about :person/age of entity 4294967298, :e 4294967298, :a :person/age}
-{:error :nextomic/conflict, :message two claims of one transaction disagree about :person/age of entity 4294967298, :e 4294967298, :a :person/age}
-{:error :nextomic/conflict, :message two claims of one transaction disagree about :person/age of entity 4294967298, :e 4294967298, :a :person/age}
-{:error :nextomic/conflict, :message two claims of one transaction disagree about :person/age of entity 4294967298, :e 4294967298, :a :person/age}
+{:error :nextomic/conflict, :message two claims of one transaction disagree about :person/age of entity 4294967298, :e 4294967298, :attr :person/age}
+{:error :nextomic/conflict, :message two claims of one transaction disagree about :person/age of entity 4294967298, :e 4294967298, :attr :person/age}
+{:error :nextomic/conflict, :message two claims of one transaction disagree about :person/age of entity 4294967298, :e 4294967298, :attr :person/age}
+{:error :nextomic/conflict, :message two claims of one transaction disagree about :person/age of entity 4294967298, :e 4294967298, :attr :person/age}
 {:db/id 4294967298, :person/age 11}
 {:db/id 4294967298, :person/age 12}
 ok a unique value moves before its old holder lets go

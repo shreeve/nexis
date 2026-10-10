@@ -1178,7 +1178,7 @@ gives the place and the trace.
 | `:nextomic/unknown-attribute` | an attribute keyword or id names no attribute | `:attr`, as the program wrote it |
 | `:nextomic/value-type` | a value that does not fit its attribute's type (in tx-data, a lookup ref, a `datoms` or `index-range` component, a query input), or a comparison, aggregate, `fulltext` search or `pull` over a value it does not take, or an input or function result that does not fit its binding form | `:attr` and `:value`, as the program wrote them, when an attribute refused it; the message names the type (`:db.type/long`), the operation and the kinds it met (`< compares values of one kind, not a long and a string`), or the binding form, where its value came from and what it found (`[?x ...] takes a vector, list or set, and the input is a long`) |
 | `:nextomic/unique` | two entities would hold one unique `(a v)` | `:attr` and `:value` |
-| `:nextomic/conflict` | two claims in one transaction disagree, or a schema change §3 step 5 refuses as a conflict | `:e` and `:a` |
+| `:nextomic/conflict` | two claims in one transaction disagree, or a schema change §3 step 5 refuses as a conflict | `:e` and `:attr` |
 | `:nextomic/no-entity` | an entity reference names nothing, or an id no allocator handed out | `:value`, the reference as written; a lookup ref in tx-data that finds nothing, `:attr` and `:value` |
 | `:nextomic/unbound-pattern` | a pattern with nothing bound | `:clause`, the index into `:where`; the message shows the pattern |
 | `:nextomic/basis-in-future` | a db-value newer than its file (§4) | none |

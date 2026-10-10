@@ -242,19 +242,17 @@ pub fn failWith(vm: *VM, err: anyerror, detail: Detail) VmError {
     inline for (@typeInfo(VmError).error_set.error_names.?) |name| {
         if (err == @field(anyerror, name)) return @field(VmError, name);
     }
-    // A conflict names its datom as `:e` and `:a`.
-    const attr_key: []const u8 = if (err == error.Conflict) "a" else "attr";
     var buf: [message_capacity]u8 = undefined;
     var d = detail;
     if (d.message == null) d.message = messageOf(vm, err, detail, &buf);
-    const payload = payloadMap(vm, errorKeyword(err), d, attr_key) catch return VmError.OutOfMemory;
+    const payload = payloadMap(vm, errorKeyword(err), d) catch return VmError.OutOfMemory;
     return vm.throwErrorMap(payload);
 }
 
 /// Throw the map a syntax error travels as: `{:error name :message
 /// message :clause clause}`, `:clause` present when given.
 pub fn throwSyntax(vm: *VM, name: []const u8, message: []const u8, clause: ?usize) VmError {
-    const payload = payloadMap(vm, name, .{ .message = message, .clause = clause }, "attr") catch return VmError.OutOfMemory;
+    const payload = payloadMap(vm, name, .{ .message = message, .clause = clause }) catch return VmError.OutOfMemory;
     return vm.throwErrorMap(payload);
 }
 
@@ -323,14 +321,14 @@ fn writeMessage(w: *std.Io.Writer, interner: *const intern_mod.Interner, err: an
     }
 }
 
-fn payloadMap(vm: *VM, name: []const u8, detail: Detail, attr_key: []const u8) !Value {
+fn payloadMap(vm: *VM, name: []const u8, detail: Detail) !Value {
     const heap = vm.ensureHeap();
     var m = Payload{ .vm = vm, .map = try champ.mapEmpty(heap) };
     try m.put("error", try vm.ensureInterner().internKeywordValue(name));
     if (detail.message) |message| try m.put("message", try string_mod.fromBytes(heap, message));
     if (detail.clause) |c| try m.put("clause", value.fromFixnum(@intCast(c)) orelse return error.ArithmeticOverflow);
     if (detail.e) |e| try m.put("e", value.fromFixnum(@intCast(e)) orelse return error.ArithmeticOverflow);
-    if (detail.attr) |a| try m.put(attr_key, a);
+    if (detail.attr) |a| try m.put("attr", a);
     if (detail.value) |v| try m.put("value", v);
     if (detail.format) |f| try m.put("format", value.fromFixnum(f).?);
     if (detail.cas) |c| {
