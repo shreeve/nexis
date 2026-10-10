@@ -573,7 +573,10 @@ pub const Exec = struct {
             self.diag.* = .{ .message = "attribute is not :db/fulltext", .attr = self.interner.keywordValue(attr.keyword) };
             return error.TxData;
         }
-        const tokens = try fulltext.tokens(self.arena, needle.str);
+        const tokens = fulltext.needleTokens(self.arena, needle.str) catch |err| switch (err) {
+            error.TokenTooLong => return self.wrongType("fulltext tokens are at most {d} bytes, and the needle has a longer one", .{fulltext.max_token}),
+            else => |e| return e,
+        };
         var rows: std.ArrayList([]const Cell) = .empty;
         if (read.fast()) {
             const hits = try fulltext.search(read.db.conn.store, read.txn, self.arena, a, tokens);

@@ -946,8 +946,9 @@ Mtavruli, Glagolitic, Deseret and the letterlike, Roman numeral,
 circled and fullwidth forms, so `Café`, `CAFÉ` and `café` are one
 token, as are `ΣΟΦΙΑΣ` and `σοφιας`; a byte that is not UTF-8 stays as
 it is, and no accent or normalization is removed. A folded run longer
-than 255 bytes is not a token, and a needle without tokens matches
-nothing. Indexing and search fold through one tokenizer. The plain view
+than 255 bytes is not a token and is not indexed, so a needle holding
+one is `:nextomic/value-type` (dropping it would widen the search); a
+needle without tokens matches nothing. Indexing and search fold through one tokenizer. The plain view
 at the newest basis intersects the `nx/fulltext` rows of the tokens,
 then reads the matching values from EAVT; an as-of, since or history
 view re-tokenises the attribute's values under that view, so it answers
