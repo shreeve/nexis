@@ -961,7 +961,9 @@ and `:with` variables) by the plain find elements: `count`, `sum`,
 `avg`, `min`, `max`, `median`, `variance`, `stddev`, `count-distinct`,
 `distinct` (a set), `(min n ?x)` and `(max n ?x)` (the n smallest or
 largest, a vector), `(sample n ?x)` (up to n distinct values, a vector)
-and `(rand n ?x)` (n values with repetition, a vector). `min` and `max`
+and `(rand n ?x)` (n values with repetition, a vector), both drawn
+from the process's generator, the one behind `rand` and `shuffle`
+(`docs/STDLIB.md`). `min` and `max`
 take any type, in the cell order: nil, booleans, numbers, strings,
 instants, uuids, keywords as `compare` orders them, then other values
 in a stable order; `sum`, `avg`, `variance` and `stddev` take numbers, bignums

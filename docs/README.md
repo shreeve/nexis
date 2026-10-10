@@ -34,7 +34,7 @@ canonical Form schema in [`PLAN.md`](../PLAN.md) §23 and §28.
 | `src/expand.zig`, `src/loader.zig` | [`MACROEXPAND.md`](MACROEXPAND.md) | Macroexpander, syntax-quote, host macros; §2b namespaces and the loader |
 | `src/compile.zig` | [`COMPILER.md`](COMPILER.md) | Form → Tiny → bytecode, recur and capture lowering |
 | `src/vm.zig` | [`VM.md`](VM.md) | Bytecode format, opcodes, frames, try/throw, execution errors |
-| `src/stdlib.zig`, `src/stdlib/*.nx`, `src/image.zig`, `src/imagegen.zig`, `src/format.zig` | [`STDLIB.md`](STDLIB.md) | Namespaces and embedded sources, the stdlib image (§1), text, `nexis.string`, `nexis.set`, `nexis.walk`, `nexis.edn`, printing, I/O, documentation (§10), `nexis.sys` and `nexis.shell` (§11), `nexis.time` (§12), `nexis.json` (§13), UUIDs (§14) |
+| `src/random.zig`, `src/stdlib.zig`, `src/stdlib/*.nx`, `src/image.zig`, `src/imagegen.zig`, `src/format.zig` | [`STDLIB.md`](STDLIB.md) | Namespaces and embedded sources, the stdlib image (§1), text, `nexis.string`, `nexis.set`, `nexis.walk`, `nexis.edn`, printing, I/O, documentation (§10), `nexis.sys` and `nexis.shell` (§11), `nexis.time` (§12), `nexis.json` (§13), UUIDs (§14) |
 | `src/cli.zig`, `src/disasm.zig`, `src/stdlib/{test,pprint,math}.nx` | [`TOOLING.md`](TOOLING.md) | Commands, REPL, error report, disassembler, test runner, pprint, math |
 | `src/db.zig` | [`DB.md`](DB.md) | emdb connection, durable refs, the `db/*` surface |
 | `src/nextomic/` | [`NEXTOMIC.md`](NEXTOMIC.md) | The database (authoritative): store, transactions, time, query, pull, API, errors |

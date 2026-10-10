@@ -45,6 +45,7 @@ const std = @import("std");
 const value = @import("../../value.zig");
 const heap_mod = @import("../../heap.zig");
 const intern_mod = @import("../../intern.zig");
+const random_mod = @import("../../random.zig");
 const string_mod = @import("../../string.zig");
 const uuid_mod = @import("../../uuid.zig");
 const list_mod = @import("../../coll/list.zig");
@@ -120,8 +121,9 @@ pub const Exec = struct {
     args: []const Value = &.{},
     /// The plan's variable table, for messages naming a variable.
     names: []const ir.VarInfo = &.{},
-    /// The random source of `sample` and `rand`, made on first use.
-    prng: ?std.Random.DefaultPrng = null,
+    /// The random source of `sample` and `rand`; the process's
+    /// (`random.zig`) when none is given.
+    rng: ?std.Random = null,
     /// The constant-prefix scans run so far, reused by a later pattern
     /// that reads the same datoms (`Scanned`).
     scans: std.ArrayList(Scanned) = .empty,
@@ -1330,15 +1332,9 @@ pub const Exec = struct {
         return .{ .vm = try self.keptVector(cells) };
     }
 
-    /// The query's random source, seeded once per query from the clock.
+    /// The query's random source.
     fn random(self: *Exec) std.Random {
-        if (self.prng == null) {
-            var ts: std.c.timespec = undefined;
-            _ = std.c.clock_gettime(.MONOTONIC, &ts);
-            const seed = (@as(u64, @intCast(ts.sec)) *% 1_000_000_007) ^ @as(u64, @intCast(ts.nsec)) ^ @intFromPtr(self);
-            self.prng = std.Random.DefaultPrng.init(seed);
-        }
-        return self.prng.?.random();
+        return self.rng orelse random_mod.shared(std.Io.Threaded.global_single_threaded.io());
     }
 
     /// Copy `rows` into the VM heap as the find spec asks: a set of

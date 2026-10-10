@@ -46,6 +46,9 @@ pub const Options = struct {
     /// afresh and freed after the run.
     ir_cache: ?*Cache = null,
     rules_cache: ?*RulesCache = null,
+    /// The random source of `sample` and `rand`; without it the
+    /// process's (`random.zig`).
+    random: ?std.Random = null,
 };
 
 /// The parsed query and, when `:in` has `%`, its rule set: pinned in
@@ -177,7 +180,7 @@ pub fn q(gpa: Allocator, interner: *Interner, heap: *Heap, query: Value, db: ?Db
     try pr.init(gpa, interner, query, db, args, diag, options);
     defer pr.deinit();
     const parsed = pr.parsed.query;
-    var ex = exec.Exec{ .arena = pr.arena_state.allocator(), .sources = pr.sources.items, .heap = heap, .interner = interner, .hook = options.hook, .diag = diag, .args = args, .names = pr.ctx.vars.items };
+    var ex = exec.Exec{ .arena = pr.arena_state.allocator(), .sources = pr.sources.items, .heap = heap, .interner = interner, .hook = options.hook, .rng = options.random, .diag = diag, .args = args, .names = pr.ctx.vars.items };
     try ex.preparePulls(parsed);
     try ex.resolveFns(parsed, pr.plan);
     const rel = try ex.runPlan(pr.plan, try ex.inputRelation(parsed, pr.plan, args));
