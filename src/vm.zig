@@ -1838,11 +1838,13 @@ pub const VM = struct {
     /// The one namespace of a VM with no registry, built by hand.
     namespace: ?Namespace = null,
     registry: ?NamespaceRegistry = null,
-    /// Open store connections and the natives' Nextomic state, closed
-    /// at `deinit` through the callbacks their natives set (§14); the
-    /// natives own the casts, so this file imports neither.
-    db_connections: std.ArrayList(*anyopaque) = .empty,
-    db_close_callback: ?*const fn (*anyopaque) void = null,
+    /// Shuts down every db connection on the VM's heap at teardown
+    /// (`db.shutdownHeap`); set by the first `db/open`, so this file
+    /// needs no import of db.zig.
+    db_close_callback: ?*const fn (*heap_mod.Heap) void = null,
+    /// Open Nextomic connections and the natives' Nextomic state,
+    /// closed at `deinit` through the callbacks their natives set; the
+    /// natives own the casts, so this file needs no import.
     nextomic_connections: std.ArrayList(*anyopaque) = .empty,
     nextomic_close_callback: ?*const fn (*anyopaque) void = null,
     /// Parsed-query caches and finished `with` scopes, marked by every
@@ -1979,14 +1981,7 @@ pub const VM = struct {
         // Namespace structs themselves are arena-backed.
         if (self.registry) |*reg| reg.deinit();
         if (self.namespace) |*ns| ns.deinit();
-        // Close any still-open db Connections as a
-        // safety net (callers should explicitly `db/close`).
-        // Callback closes the emdb env AND destroys the
-        // Connection struct allocated via self.allocator.
-        if (self.db_close_callback) |close_fn| {
-            for (self.db_connections.items) |conn_ptr| close_fn(conn_ptr);
-        }
-        self.db_connections.deinit(self.allocator);
+        if (self.db_close_callback) |close_fn| if (self.heap) |*h| close_fn(h);
         if (self.nextomic_close_callback) |close_fn| {
             for (self.nextomic_connections.items) |conn_ptr| close_fn(conn_ptr);
         }

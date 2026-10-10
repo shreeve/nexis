@@ -446,7 +446,7 @@ test "a store of another format is refused at connect, naming the format it hold
     (try nextomic.Store.open(testing.allocator, path.ptr, .{})).close();
     {
         // A store an earlier build wrote: its format number is 2.
-        const file = try nx.db.StoreFile.acquire(path.ptr, .{ .allocator = testing.allocator });
+        const file = try nx.db.StoreFile.acquire(path.ptr, testing.allocator);
         defer file.release();
         const txn = try file.beginWrite(.{});
         errdefer txn.abort();

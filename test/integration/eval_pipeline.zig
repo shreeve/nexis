@@ -8729,3 +8729,29 @@ test "an uncaught error map loses its place keys only where the VM placed them" 
         try testing.expectEqual(case[1], !(try vm.lookup(reported, k, value_mod.nilValue())).isNil());
     }
 }
+
+test "db: a collection frees the closed connections nothing names" {
+    var store = try SeamStore.init("closed-conns");
+    defer store.deinit();
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const base = nx.db.connectionCount();
+    const steps = [_][]const u8{
+        \\(do (def kept (db/open "@STORE@"))
+        \\    (def r (db/ref kept :t "k"))
+        \\    (db/close kept)
+        \\    (dotimes [i 2000] (db/close (db/open "@STORE@"))))
+        ,
+        \\[(try (db/get-key r) (catch any e (:error e))) (db/close kept)]
+    };
+    var last = value_mod.nilValue();
+    for (steps) |step| {
+        const src = try store.source(step);
+        defer testing.allocator.free(src);
+        last = try program.run(src);
+        program.v.collectGarbage();
+        try testing.expect(nx.db.connectionCount() < base + 8);
+    }
+    try harness.expectResult(&program, steps[1], last, "[:db-closed nil]");
+}
