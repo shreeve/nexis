@@ -61,21 +61,23 @@ up. Every fix starts with its failing test (`AGENTS.md`).
     vectors' 2.2 M). Two ways around the sort cost more than they saved
     (`docs/PERF.md` §6 "A native's result assembled in a temporary",
     "A map literal's sort").
-19. **A leaf native called through a Var pays a whole call.** `(nth v
-    i)` or `(even? x)` is `var:load-var`, the argument moves and
-    `call:call` into `callLeaf`, about 240 instructions above a
-    counting-loop iteration (the micro kit's `leaf1` and `vnth`,
-    `docs/PERF.md` §3.37 "Var calls"). Fusing the load with its call
-    and calling in place without the moves removed 3–6% and 7–21% of
-    that, short of the bars they had to meet, and were not kept
-    (`docs/PERF.md` §6). An instruction trace of one `leaf1` iteration
-    puts the call at 107 instructions beside the native's own body,
-    most of those the out-of-line part's frame, tests and safe point;
-    the body, `count` of a vector, is 61 as a leaf that calls the
-    general native and 38 fewer on the M5 as a body of its own
-    (`docs/PERF.md` §3.37, §3.41). The levers left are the other
-    natives' leaf bodies and that part, and a cache at the call site
-    must still see the Var's latest root (PLAN §23 #20;
+19. **A leaf native called through a Var pays a whole call.** `(count
+    v)` or `(even? x)` is `var:load-var`, the argument moves and
+    `call:call` into `callLeaf`, about 195 instructions above a
+    counting-loop iteration on the M5 (the micro kit's `leaf1`,
+    `docs/PERF.md` §3.37 "Var calls"). `get`, `nth` and `count` take a
+    vector before the switch over every kind (`docs/PERF.md` §3.42:
+    `(get v 3)` 25% fewer instructions, `(nth v j)` 9%, `(count v)`
+    3%). Fusing the load with its call, calling in place without the
+    moves and testing a leaf's arity with one mask removed 2–21% and
+    were not kept (`docs/PERF.md` §6). What is left is frames: the
+    out-of-line part's (107 instructions beside the body in a trace of
+    `leaf1`, `docs/PERF.md` §3.37) and the native's own, which a leaf
+    body keeps on its common path because the optimizer builds it
+    before the first test (§6 "A leaf's common case without a
+    frame"). `first`, `next` and `rest` are not leaves: a leaf of them
+    would refuse a lazy seq at every step of a walk. A cache at the
+    call site must still see the Var's latest root (PLAN §23 #20;
     `docs/PERF.md` §6 "Inline caches at call sites").
 
 ## Store size

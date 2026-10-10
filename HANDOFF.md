@@ -58,7 +58,7 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 261/261 steps succeeded; 1551/1552 tests passed (1 skipped)
+Build Summary: 261/261 steps succeeded; 1552/1553 tests passed (1 skipped)
 ```
 
 With `../nexus` checked out the gate includes `parser-check`'s two
@@ -523,14 +523,19 @@ after numbers in the commit message.
      (`docs/VM.md` §6, "Batched calls"); on the Linux host the
      pipeline 60 → 47 ms and vectors 75 → 61 ms. What remains is the
      callee bodies' work, the largest a leaf native called through a
-     Var (`(nth v i)`, `(even? x)`). Running a Var's load with its call
-     and calling with one or two arguments in place were built and
-     measured, and neither paid what it had to (`docs/PERF.md` §3.37
-     "Var calls"; §6 "A Var's load run with its call", "Calls of one or
-     two arguments in place"): a dispatch is about ten instructions,
-     and a leaf call's cost is the native's body and the out-of-line
-     part's frame. A call-site cache stays rejected (§6 "Inline caches
-     at call sites").
+     Var (`(nth v i)`, `(even? x)`). `get`, `nth` and `count` take a
+     vector before the switch over every kind (`docs/PERF.md` §3.42;
+     `(get v 3)` 395 → 295 instructions on the M5, 88.7 → 60.1 cycles
+     on the Linux host). Running a Var's load with its call, calling
+     with one or two arguments in place and testing a leaf's arity
+     with one mask were built and measured, and none paid what it had
+     to (`docs/PERF.md` §3.37 "Var calls"; §6 "A Var's load run with
+     its call", "Calls of one or two arguments in place", "A leaf
+     call's kind and arity in one test"): a dispatch is about ten
+     instructions, and what a leaf call costs past its body is the
+     out-of-line part's frame and the body's own (`TODO.md` #19). A
+     call-site cache stays rejected (§6 "Inline caches at call
+     sites").
 2. TODO.md #13: `sort` and `sort-by` hold the seq they walk, and a
    local a closure captures holds it while the closure runs; every
    other native that walks a sequence to its end consumes it

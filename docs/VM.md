@@ -606,11 +606,14 @@ from an `if`, a `switch`, an `orelse` or a labeled block, or returned
 from a call of another native's body, is assembled in a temporary of
 narrow stores and copied on with an 8-byte load of the error's word
 and a 16-byte load of the value, which wait for those stores. So
-`count`, `nth` and `nthnext`, the leaves a destructuring form calls,
-return each result by a statement of its own, and the leaf and the
-general native of `count` and of `nthnext` are one body each, not a
-leaf that calls the general native (`docs/PERF.md` "Natives that
-return in place").
+`count`, `nth`, `nthnext` and `get` return each result by a statement
+of its own, and the leaf and the general native of each are one body,
+not a leaf that calls the general native (`docs/PERF.md` "Natives that
+return in place"). `count`, `nth` and `get` take their common
+receiver, a vector, before the switch over every kind, by a test of
+the whole tag word every vector value carries: the optimizer keeps
+that test apart, where a test of the kind joins the switch's table
+(`docs/PERF.md` "Leaf bodies that take a vector first").
 arm64 stores every value as two words and copies results and argument
 runs whole. On both, `max` and `min` read their winner a word at a
 time (`docs/PERF.md` "A width-consistent native boundary").
