@@ -1259,9 +1259,6 @@ pub const TraceFrame = struct {
 pub const ThrowOrigin = struct {
     value: Value,
     err: ?VmError,
-    /// `value` is an error map the VM placed (`errorValue`,
-    /// `throwErrorMap`): its place keys name this origin.
-    placed: bool,
     detail_buf: [160]u8 = undefined,
     detail_len: usize = 0,
     trace: [VM.trace_capacity]TraceFrame = undefined,
@@ -1907,9 +1904,6 @@ pub const VM = struct {
     escaped_origin: ?u32 = null,
     /// `ErrorKey`s as keywords, interned on first use (`errorKey`).
     error_keys: [6]?Value = @splat(null),
-    /// The uncaught error map `recordErrorTrace` reported at its own
-    /// origin when the VM placed it there (`withoutPlace`).
-    placed_report: ?Value = null,
 
     pub const track_high_water = builtin.optimize.runtimeSafety();
     pub const default_max_frames = 1 << 20;
@@ -3372,12 +3366,10 @@ pub const VM = struct {
     fn recordErrorTrace(self: *VM, err: VmError) void {
         self.error_trace.clearRetainingCapacity();
         self.traced_error = err;
-        self.placed_report = null;
         if (err == VmError.UncaughtThrow) if (self.escapedOrigin()) |o| {
             // The throw began below the frames still standing: report
             // the error, detail and chain it was raised with.
             if (o.err) |raised| self.traced_error = raised;
-            if (o.placed) self.placed_report = o.value;
             @memcpy(self.detail_buf[0..o.detail_len], o.detail_buf[0..o.detail_len]);
             self.error_detail = self.detail_buf[0..o.detail_len];
             self.error_trace.appendSlice(self.allocator, o.trace[0..o.trace_len]) catch return;
@@ -3417,15 +3409,15 @@ pub const VM = struct {
     /// force to take it (with none, it leaves `run` with its frames
     /// standing and `recordErrorTrace` sees them). `err` is the runtime
     /// error the value was translated from, if any; its detail is
-    /// `error_detail`; `placed`, whether the VM placed `value` here.
+    /// `error_detail`.
     /// The origin is for the report only: with no memory to record it
     /// the throw goes on without one.
-    fn originFor(self: *VM, value: Value, err: ?VmError, placed: bool) ?u32 {
+    fn originFor(self: *VM, value: Value, err: ?VmError) ?u32 {
         if (err == null) if (self.rethrownOrigin(value)) |o| return o;
         if (self.findThrowTarget() == null) return null;
         self.dropUnreferencedOrigins();
         const o = self.origins.addOne(self.allocator) catch return null;
-        o.* = .{ .value = value, .err = err, .placed = placed };
+        o.* = .{ .value = value, .err = err };
         const detail = self.error_detail[0..@min(self.error_detail.len, o.detail_buf.len)];
         @memcpy(o.detail_buf[0..detail.len], detail);
         o.detail_len = detail.len;
@@ -3483,7 +3475,6 @@ pub const VM = struct {
         self.finally_stack.clearRetainingCapacity();
         self.origins.clearRetainingCapacity();
         self.escaped_origin = null;
-        self.placed_report = null;
         while (self.dyn_frames.items.len > 0) self.popBindings();
         self.unhandled_throw = null;
         self.traced_error = null;
@@ -3520,7 +3511,7 @@ pub const VM = struct {
         if (self.findThrowTarget() == null) return err;
         const tag = self.ensureInterner().internKeywordValue(kw_name) catch return err;
         const payload = self.errorValue(tag, self.error_detail, self.raiseSite());
-        const origin = self.originFor(payload, err, payload.kind() == .persistent_map);
+        const origin = self.originFor(payload, err);
         self.error_detail = "";
         try self.unwindThrow(payload, origin);
     }
@@ -3569,23 +3560,6 @@ pub const VM = struct {
         return self.putKey(m, .column, value_mod.fromFixnum(place.col).?);
     }
 
-    /// `v` without the place keys `addPlace` gave it, for a report
-    /// that shows the place itself: when `v` is the uncaught error map
-    /// the VM placed and the report is at its origin (`placed_report`).
-    /// Any other value, a map the program built or derived, or one
-    /// thrown again from elsewhere, is `v` as it is, as it is when
-    /// memory is exhausted.
-    pub fn withoutPlace(self: *VM, v: Value) Value {
-        const placed = self.placed_report orelse return v;
-        if (!placed.identicalTo(v)) return v;
-        var m = v;
-        for ([_]ErrorKey{ .@"fn", .file, .line, .column }) |key| {
-            const k = self.errorKey(key) catch return v;
-            m = champ_mod.mapDissoc(self.ensureHeap(), m, k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch return v;
-        }
-        return m;
-    }
-
     /// The keys of an error map (§13).
     pub const ErrorKey = enum { @"error", message, @"fn", file, line, column };
 
@@ -3609,8 +3583,7 @@ pub const VM = struct {
     /// memory is exhausted.
     pub fn throwErrorMap(self: *VM, map: Value) VmError {
         if (self.findThrowTarget() == null) return self.throwValue(map);
-        const placed = self.addPlace(map, self.raiseSite()) catch return self.throwValue(map);
-        return self.throwFrom(placed, true);
+        return self.throwValue(self.addPlace(map, self.raiseSite()) catch map);
     }
 
     /// Where an error value says a runtime error was raised: the
@@ -5012,7 +4985,7 @@ pub const VM = struct {
 
     fn execCtrlThrow(self: *VM, inst: Inst) VmError!void {
         const value = try self.resolveIn(self.currentFrame(), inst.a);
-        try self.unwindThrow(value, self.originFor(value, null, false));
+        try self.unwindThrow(value, self.originFor(value, null));
     }
 
     /// The innermost handler a throw goes to: a `try_`, which catches,
@@ -5035,13 +5008,7 @@ pub const VM = struct {
     /// native returns what this returns, `ControlTransferred` when a
     /// handler took it, `UncaughtThrow` when none is in force.
     pub fn throwValue(self: *VM, value: Value) VmError {
-        return self.throwFrom(value, false);
-    }
-
-    /// `throwValue` of `value`, which the VM `placed` when it gave it
-    /// the place keys of this throw.
-    fn throwFrom(self: *VM, value: Value, placed: bool) VmError {
-        self.unwindThrow(value, self.originFor(value, null, placed)) catch |err| return err;
+        self.unwindThrow(value, self.originFor(value, null)) catch |err| return err;
         return VmError.ControlTransferred;
     }
 
@@ -5053,8 +5020,7 @@ pub const VM = struct {
     pub fn throwKeyword(self: *VM, name: []const u8) VmError {
         const kw = self.ensureInterner().internKeywordValue(name) catch return VmError.OutOfMemory;
         if (self.findThrowTarget() == null) return self.throwValue(kw);
-        const payload = self.errorValue(kw, "", self.raiseSite());
-        return self.throwFrom(payload, payload.kind() == .persistent_map);
+        return self.throwValue(self.errorValue(kw, "", self.raiseSite()));
     }
 
     /// The throw of `value`, from `ctrl:throw`, a native or a finally
