@@ -12,15 +12,8 @@
 //! persistent vector) and §3.2 (kind-local hash domain). Physical
 //! storage: `docs/HEAP.md`. Wire format: `docs/CODEC.md` §2.
 //!
-//! Surface: `fromI64Slice` / `fromF64Slice` / `count` / `elemType` /
-//! `i64Elems` / `f64Elems` / `nth` / `hashHeader` / `equalHeaders` /
-//! `format`; a typed vector is a leaf the collector does not trace
-//! (GC.md §5). There is no `conj`, `assoc` or `pop`: a typed
-//! vector is built whole and read; every derived vector is a fresh
-//! allocation made by a kernel or a constructor. `u8` elements are
-//! the province of `Kind.byte_vector` (22), which has no
-//! implementation; `i32` and `f32` are reserved subkinds with no
-//! implementation.
+//! Surface: TYPED_VECTOR.md §1. A typed vector is a leaf the
+//! collector does not trace (GC.md §5), built whole and never updated.
 //!
 //! An `f64` element is stored canonical: every NaN bit pattern
 //! collapses to `hash.canonical_nan_bits` at construction and at
@@ -110,15 +103,10 @@ fn elemBytes(h: *HeapHeader) []u8 {
     return bytes[@sizeOf(Body)..];
 }
 
-fn i64Slice(h: *HeapHeader) []i64 {
+/// The elements of `h`, read as `T`, `i64` or `f64`.
+fn elemSlice(comptime T: type, h: *HeapHeader) []T {
     const bytes = elemBytes(h);
-    const ptr: [*]i64 = @ptrCast(@alignCast(bytes.ptr));
-    return ptr[0 .. bytes.len / elem_size];
-}
-
-fn f64Slice(h: *HeapHeader) []f64 {
-    const bytes = elemBytes(h);
-    const ptr: [*]f64 = @ptrCast(@alignCast(bytes.ptr));
+    const ptr: [*]T = @ptrCast(@alignCast(bytes.ptr));
     return ptr[0 .. bytes.len / elem_size];
 }
 
@@ -152,7 +140,7 @@ fn header(v: Value) *HeapHeader {
 /// A typed vector of `i64` holding a copy of `elems`.
 pub fn fromI64Slice(heap: *Heap, elems: []const i64) !Value {
     const h = try alloc(heap, .i64, elems.len);
-    @memcpy(i64Slice(h), elems);
+    @memcpy(elemSlice(i64, h), elems);
     return valueFrom(h, .i64);
 }
 
@@ -160,7 +148,7 @@ pub fn fromI64Slice(heap: *Heap, elems: []const i64) !Value {
 /// canonicalized.
 pub fn fromF64Slice(heap: *Heap, elems: []const f64) !Value {
     const h = try alloc(heap, .f64, elems.len);
-    const dst = f64Slice(h);
+    const dst = elemSlice(f64, h);
     for (dst, elems) |*slot, x| slot.* = hash_mod.canonicalizeFloat(x);
     return valueFrom(h, .f64);
 }
@@ -172,10 +160,10 @@ pub fn fromLeBytes(heap: *Heap, elem: ElemType, raw: []const u8) !Value {
     std.debug.assert(raw.len % elem_size == 0);
     const h = try alloc(heap, elem, raw.len / elem_size);
     switch (elem) {
-        .i64 => for (i64Slice(h), 0..) |*slot, i| {
+        .i64 => for (elemSlice(i64, h), 0..) |*slot, i| {
             slot.* = std.mem.readInt(i64, raw[i * elem_size ..][0..elem_size], .little);
         },
-        .f64 => for (f64Slice(h), 0..) |*slot, i| {
+        .f64 => for (elemSlice(f64, h), 0..) |*slot, i| {
             slot.* = hash_mod.canonicalizeFloat(@bitCast(std.mem.readInt(u64, raw[i * elem_size ..][0..elem_size], .little)));
         },
     }
@@ -204,13 +192,13 @@ pub fn count(v: Value) usize {
 /// The elements of an `i64` vector. Asserts the element type.
 pub fn i64Elems(v: Value) []const i64 {
     std.debug.assert(elemType(v) == .i64);
-    return i64Slice(header(v));
+    return elemSlice(i64, header(v));
 }
 
 /// The elements of an `f64` vector. Asserts the element type.
 pub fn f64Elems(v: Value) []const f64 {
     std.debug.assert(elemType(v) == .f64);
-    return f64Slice(header(v));
+    return elemSlice(f64, header(v));
 }
 
 pub const NthError = error{ IndexOutOfBounds, OutOfMemory };
@@ -222,8 +210,8 @@ pub fn nth(heap: *Heap, v: Value, i: usize) NthError!Value {
     const h = header(v);
     if (i >= bodyOf(h).len) return NthError.IndexOutOfBounds;
     return switch (elemTypeOf(h)) {
-        .i64 => bignum.fromI64(heap, i64Slice(h)[i]) catch NthError.OutOfMemory,
-        .f64 => value.fromFloat(f64Slice(h)[i]),
+        .i64 => bignum.fromI64(heap, elemSlice(i64, h)[i]) catch NthError.OutOfMemory,
+        .f64 => value.fromFloat(elemSlice(f64, h)[i]),
     };
 }
 
@@ -266,10 +254,10 @@ pub fn hashHeader(h: *HeapHeader) u64 {
     var acc: u64 = hash_mod.ordered_init;
     acc = hash_mod.combineOrdered(acc, hash_mod.hashU64(body.elem));
     switch (elemTypeOf(h)) {
-        .i64 => for (i64Slice(h)) |x| {
+        .i64 => for (elemSlice(i64, h)) |x| {
             acc = hash_mod.combineOrdered(acc, hash_mod.hashI64(x));
         },
-        .f64 => for (f64Slice(h)) |x| {
+        .f64 => for (elemSlice(f64, h)) |x| {
             acc = hash_mod.combineOrdered(acc, hash_mod.hashFloat(x));
         },
     }
@@ -290,9 +278,9 @@ pub fn equalHeaders(a: *HeapHeader, b: *HeapHeader) bool {
     const bb = bodyOf(b);
     if (ab.elem != bb.elem or ab.len != bb.len) return false;
     switch (elemTypeOf(a)) {
-        .i64 => return std.mem.eql(i64, i64Slice(a), i64Slice(b)),
+        .i64 => return std.mem.eql(i64, elemSlice(i64, a), elemSlice(i64, b)),
         .f64 => {
-            for (f64Slice(a), f64Slice(b)) |x, y| {
+            for (elemSlice(f64, a), elemSlice(f64, b)) |x, y| {
                 if (!(x == y or (std.math.isNan(x) and std.math.isNan(y)))) return false;
             }
             return true;
@@ -316,11 +304,11 @@ pub fn format(v: Value, writer: *std.Io.Writer, floatFn: anytype) !void {
     try writer.writeAll(elem.name());
     try writer.writeByte('[');
     switch (elem) {
-        .i64 => for (i64Slice(h), 0..) |x, i| {
+        .i64 => for (elemSlice(i64, h), 0..) |x, i| {
             if (i > 0) try writer.writeByte(' ');
             try writer.print("{d}", .{x});
         },
-        .f64 => for (f64Slice(h), 0..) |x, i| {
+        .f64 => for (elemSlice(f64, h), 0..) |x, i| {
             if (i > 0) try writer.writeByte(' ');
             try floatFn(x, writer);
         },
@@ -342,7 +330,7 @@ test "Body prefix is 16 bytes; elements start 8-byte aligned" {
     const v = try fromI64Slice(&heap, &.{ 1, 2, 3 });
     const h = header(v);
     try testing.expectEqual(@as(usize, 16 + 3 * 8), Heap.bodyBytes(h).len);
-    try testing.expectEqual(@as(usize, 0), @intFromPtr(i64Slice(h).ptr) % 8);
+    try testing.expectEqual(@as(usize, 0), @intFromPtr(elemSlice(i64, h).ptr) % 8);
     try testing.expectEqual(@as(usize, 1), heap.liveCount());
 }
 

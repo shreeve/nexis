@@ -1,0 +1,32 @@
+; test/examples/pins/lazy-reentrance.nx — a lazy body that forces its
+; own seq before it returns raises :stack-overflow at once (LAZY.md §4),
+; and the block ends the seq there. The garbage each call makes lets a
+; collection run while the outer step fills its chunk.
+
+(def flag (atom true))
+(declare s)
+(def s (map (fn [x]
+              (when @flag (reset! flag false) (dorun 20 s))
+              (dotimes [_ 50] (vec (range 20)))
+              (str "v" x))
+            (vec (range 64))))
+(println (try (first s) (catch :stack-overflow e (:error e))))
+(println (seq s) (realized? s))
+
+; A body that catches the error goes on: its seq is what it returns.
+(declare t)
+(def t (map (fn [x]
+              (let [inner (try (first t) (catch :stack-overflow e :caught))]
+                (dotimes [_ 50] (vec (range 20)))
+                [x inner]))
+            (vec (range 40))))
+(println (take 3 t) (count t))
+
+; Through a block that forwards to the running one.
+(declare u)
+(def u (lazy-seq (lazy-seq (cons (try (first u) (catch :stack-overflow e :caught)) nil))))
+(println u)
+
+; One that always forces itself.
+(def w (lazy-seq (seq w)))
+(println (try (seq w) (catch :stack-overflow e (:error e))))

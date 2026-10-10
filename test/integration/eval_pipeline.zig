@@ -8673,6 +8673,32 @@ test "a user macro named like a core macro is the namespace's own" {
     , "[:mine 1]");
 }
 
+// =============================================================================
+// A lazy body that forces its own block (LAZY.md §4, re-entrance)
+// =============================================================================
+
+test "a lazy body that forces its own block raises :stack-overflow and ends the seq there" {
+    try expectOutputProgram(
+        \\(def flag (atom true))
+        \\(declare s)
+        \\(def s (map (fn [x]
+        \\              (when @flag (reset! flag false) (dorun 20 s))
+        \\              (dotimes [_ 50] (vec (range 20)))
+        \\              (str "v" x))
+        \\            (vec (range 64))))
+        \\[(try (first s) (catch :stack-overflow e (:error e))) (seq s)]
+    , "[:stack-overflow nil]");
+    try expectOutputProgram(
+        \\(declare t)
+        \\(def t (filter (fn [x] (try (first t) (catch :stack-overflow e nil)) (even? x)) (vec (range 40))))
+        \\[(take 3 t) (count t)]
+    , "[(0 2 4) 20]");
+}
+
+test "sequence with a transducer takes any number of colls" {
+    try expectOutput("[(count (first (apply sequence (map vector) (repeat 40 [1])))) (apply sequence (map +) (repeat 34 [1 2]))]", "[40 (34 68)]");
+}
+
 test "db: a collection frees the closed connections nothing names" {
     var store = try SeamStore.init("closed-conns");
     defer store.deinit();
