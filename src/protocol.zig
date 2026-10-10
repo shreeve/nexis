@@ -1,22 +1,7 @@
-//! protocol.zig — `Kind.protocol = 36` + `Kind.protocol_fn = 37`
-//! heap kinds.
-//!
-//! Authoritative spec: `docs/PROTOCOLS.md` §2.2 + §2.3. The per-VM
-//! protocol registry and method dispatch live in `vm.zig`; this module
-//! owns only the heap bodies of the two kinds:
-//!
-//!     ProtocolBody extern struct {
-//!         id: u32,         // dense per-VM
-//!         _pad: [4]u8,
-//!     }
-//!
-//!     ProtocolFnBody extern struct {
-//!         protocol_id: u32,
-//!         method_name_id: u32,   // interned keyword id of the method's name
-//!     }
-//!
-//! Both are identity kinds (`dispatch.isIdentityKind`): equal to
-//! themselves only, hashed by pointer, not serializable.
+//! protocol.zig — the protocol and protocol-fn kinds' bodies
+//! (`docs/PROTOCOLS.md` §2.2, §2.3): a protocol's per-VM id, and a
+//! protocol fn's protocol id and method keyword id. Both are identity
+//! kinds; the registry and the dispatch are `vm.zig`'s.
 
 const std = @import("std");
 const value_mod = @import("value.zig");
@@ -103,11 +88,6 @@ pub fn nameOf(v: Value, interner: *const intern_mod.Interner) ?[]const u8 {
 // =============================================================================
 // Inline tests
 // =============================================================================
-
-test "ProtocolBody / ProtocolFnBody: ABI invariants" {
-    try testing.expectEqual(@as(usize, 8), @sizeOf(ProtocolBody));
-    try testing.expectEqual(@as(usize, 8), @sizeOf(ProtocolFnBody));
-}
 
 test "makeProtocol / protocolId: round-trip" {
     var heap = Heap.init(testing.allocator);

@@ -1,21 +1,9 @@
-//! hash.zig — primitive hashing kernel for the runtime Value layer.
-//!
-//! This module is intentionally **Value-unaware**. It exports hashers over
-//! raw bytes and primitive machine types, plus the two structural combine
-//! functions that every aggregate kind must use. `src/value.zig` and
-//! `src/dispatch.zig` import these; no dependency goes the other way.
-//!
-//! Scope-of-authority: SEMANTICS.md §3 pins the hash invariants. VALUE.md
-//! §6 pins the contract (`(= x y) ⇒ (hash x) = (hash y)`). This file is
-//! the implementation, not the spec.
-//!
-//! Algorithm: xxHash3-64 (`src/xxhash3.zig`, `std.hash.XxHash3`'s
-//! values), for speed and distribution; Clojure uses Murmur3
-//! (CLOJURE-REVIEW §2.3).
-//!
-//! Collection combine functions match Clojure's structural hashing so
-//! that the cross-category sequential equality rule (SEMANTICS §2.6) yields
-//! equal hashes for `(list 1 2 3)` and `[1 2 3]` by construction.
+//! hash.zig — the hash primitives under every Value's hash: bytes and
+//! machine words through xxHash3-64 (`src/xxhash3.zig`; Clojure uses
+//! Murmur3, CLOJURE-REVIEW §2.3), the kind domains, and the ordered and
+//! unordered combiners, Clojure's, so `(list 1 2 3)` and `[1 2 3]` hash
+//! alike (SEMANTICS §3; the `=` ⇒ hash contract is VALUE.md §4). It
+//! knows nothing of Value.
 
 const std = @import("std");
 const xxhash3 = @import("xxhash3.zig");
@@ -29,30 +17,15 @@ pub const seed: u64 = 0x0000_0000_3173_6978_656E | (@as(u64, '/') << 48) | (@as(
 // below: each Kind byte lands in a distinct region of u64 space. That
 // subsumes Clojure's `keyword.hash ^= 0x9E3779B9` (SEMANTICS §3.2, PLAN §23 #32).
 
-/// Multiplier used by `combineOrdered`. Matches Clojure's `31 * h +
-/// hasheq(x)` (Util.java:hashCombine). List and vector both combine
-/// with it, so `(list 1 2 3)` and `[1 2 3]` share a hash, as the
-/// sequential equality rule (SEMANTICS §2.6) requires.
-pub const ordered_mul: u64 = 31;
-
-/// Per-kind domain mixer used by `mixKindDomain`. A 64-bit golden-ratio
-/// constant that, when multiplied by a kind byte, lands the result in a
-/// high-entropy quadrant of u64 space. Separates kinds that happen to
-/// share a raw-payload hash (e.g. `fixnum(65)` vs `symbol(65)`) so
-/// heterogeneous-key HAMTs don't degenerate on coincidentally-equal
-/// payload hashes.
-pub const kind_domain_mixer: u64 = 0x9E37_79B9_7F4A_7C15;
+/// `combineOrdered`'s multiplier, Clojure's `31 * h + hasheq(x)`
+/// (Util.java hashCombine).
+const ordered_mul: u64 = 31;
 
 /// Canonical NaN bit pattern (quiet NaN, zero payload). All NaN-valued
 /// `Value.float` instances are normalized to this exact bit pattern at
 /// construction so that `hash` and `=` can treat them as a single
 /// observable value (SEMANTICS §2.2 / §3.2).
 pub const canonical_nan_bits: u64 = 0x7FF8_0000_0000_0000;
-
-/// Positive-zero bit pattern. Both `+0.0` and `-0.0` hash from this
-/// pattern so the `(= 0.0 -0.0) ⇒ hash eq` invariant holds (SEMANTICS
-/// §3.2).
-pub const positive_zero_bits: u64 = 0x0000_0000_0000_0000;
 
 // -----------------------------------------------------------------------------
 // Primitive-level hashers
@@ -86,9 +59,7 @@ pub fn hashU64(n: u64) u64 {
     return hashBytes(&buf);
 }
 
-/// Hash a Unicode scalar (`u21`). Zero-extended to 4 bytes so the
-/// same scalar always produces the same hash across 32-bit and 64-bit
-/// platforms.
+/// Hash a Unicode scalar as its four little-endian bytes.
 pub fn hashChar(scalar: u21) u64 {
     var buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &buf, @intCast(scalar), .little);
@@ -101,7 +72,7 @@ pub fn hashChar(scalar: u21) u64 {
 /// the invariant in Debug builds.
 pub fn hashFloat(f: f64) u64 {
     var bits: u64 = @bitCast(f);
-    if (f == 0.0) bits = positive_zero_bits; // collapses -0.0 → +0.0
+    if (f == 0.0) bits = 0; // -0.0 hashes as +0.0
     if (std.math.isNan(f)) {
         std.debug.assert(bits == canonical_nan_bits);
     }
@@ -135,7 +106,7 @@ pub fn canonicalizeFloat(f: f64) f64 {
 /// keyword-vs-symbol separation as a special case (their kind bytes
 /// differ).
 pub inline fn mixKindDomain(base: u64, kind_tag: u8) u64 {
-    return base +% (@as(u64, kind_tag) *% kind_domain_mixer);
+    return base +% (@as(u64, kind_tag) *% 0x9E37_79B9_7F4A_7C15);
 }
 
 // -----------------------------------------------------------------------------

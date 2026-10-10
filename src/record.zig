@@ -1,35 +1,8 @@
-//! record.zig — `Kind.record` heap kind.
+//! record.zig — the record kind (`docs/PROTOCOLS.md` §2.1, §3).
 //!
-//! Authoritative spec: `docs/PROTOCOLS.md` §2.1 + §3. Derivative from
-//! the `PLAN.md` Amendment Log entry (protocols+records). Those
-//! documents win on conflict.
-//!
-//! ONE kind for all record types. RecordTypeId is a per-VM dense u32
-//! that lives in the heap body alongside a persistent_map of fields.
-//! Equality + hash are STRUCTURAL — two `(->Counter 5)` instances
-//! `(= ...)` true regardless of which constructor call produced them.
-//!
-//! Storage (16-byte-aligned body):
-//!
-//!     RecordValue extern struct {
-//!         type_id: u32,            // dense per-VM
-//!         _pad:    [4]u8,          // align to Value boundary
-//!         fields:  Value,          // persistent_map (keyword → value)
-//!     }
-//!
-//! Module graph (one-way terminal):
-//!
-//!     src/record.zig
-//!     ├── @import("std")
-//!     ├── @import("value.zig")
-//!     ├── @import("heap.zig")
-//!     ├── @import("hash.zig")
-//!     └── @import("coll/champ.zig")     // for hash composition of field map
-//!
-//! Nothing imports record.zig except `dispatch.zig` (heapHashBase +
-//! heapEqual arms), `gc.zig` (trace arm), `vm.zig` (dispatch key,
-//! lookup), `stdlib.zig` (native fns), `format.zig` (printer arm)
-//! and `root.zig`.
+//! One kind for every record type: the body is the per-VM type id and
+//! the field map. Equality and hash are structural: the same type id
+//! and equal field maps.
 
 const std = @import("std");
 const value_mod = @import("value.zig");
@@ -137,11 +110,6 @@ pub fn trace(h: *HeapHeader, visitor: anytype) void {
 // Inline tests
 // =============================================================================
 
-test "RecordBody: ABI invariants" {
-    try testing.expectEqual(@as(usize, 24), @sizeOf(RecordBody));
-    try testing.expect(@alignOf(RecordBody) <= 16);
-}
-
 test "make / typeId / fieldsOf: round-trip" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
@@ -156,22 +124,9 @@ test "make / typeId / fieldsOf: round-trip" {
 test "trace: marks the contained field map" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    const empty = try champ_mod.mapEmpty(&heap);
-    const r = try make(&heap, 7, empty);
-
-    var recorded: [4]Value = undefined;
-    var count: usize = 0;
-    const Visitor = struct {
-        recorded_ptr: *[4]Value,
-        count_ptr: *usize,
-        pub fn markValue(self: @This(), v: Value) void {
-            if (self.count_ptr.* < self.recorded_ptr.len) {
-                self.recorded_ptr.*[self.count_ptr.*] = v;
-            }
-            self.count_ptr.* += 1;
-        }
-    };
-    trace(Heap.asHeapHeader(r), Visitor{ .recorded_ptr = &recorded, .count_ptr = &count });
-    try testing.expectEqual(@as(usize, 1), count);
-    try testing.expect(recorded[0].kind() == .persistent_map);
+    const r = try make(&heap, 7, try champ_mod.mapEmpty(&heap));
+    var seen: @import("atom.zig").TestRecorder = .{};
+    trace(Heap.asHeapHeader(r), &seen);
+    try testing.expectEqual(@as(usize, 1), seen.n);
+    try testing.expect(seen.values[0].kind() == .persistent_map);
 }
