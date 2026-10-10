@@ -187,7 +187,7 @@ ok results are ordinary sets
 {:error :nextomic/query-syntax, :message fulltext is (fulltext $ :attr "needle"), :clause 0}
 {:error :nextomic/schema, :message :db/fulltext takes a string attribute, :attr :person/age}
 {:error :nextomic/schema, :message :db/fulltext takes a string attribute, :attr :person/nick}
-{:error :nextomic/conflict, :message two claims of one transaction disagree about :db/fulltext of entity 44, :e 44, :a :db/fulltext}
+{:error :nextomic/conflict, :message two claims of one transaction disagree about :db/fulltext of entity 44, :e 44, :attr :db/fulltext}
 ok :db/fulltext is a bootstrap attribute
 ([1 2] [4 5])
 ([7 2])

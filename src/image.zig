@@ -84,7 +84,7 @@ const version: u32 = 3;
 // before the tree compiles again, so no image ever drops one.
 comptime {
     expectFields(Routine, &.{ "code", "consts", "capture_descs", "tries", "slot_count", "fixed_arity", "variadic", "arities", "upvalue_count", "var_table", "name", "spans", "origin", "source" });
-    expectFields(Var, &.{ "name", "ns", "root", "bound", "macro", "meta", "dynamic", "thread_value", "thread_bound" });
+    expectFields(Var, &.{ "name", "ns", "root", "bound", "macro", "meta", "dynamic", "doc_filled", "thread_value", "thread_bound" });
     expectFields(vm_mod.CaptureDescriptor, &.{ "routine", "sources" });
     expectFields(vm_mod.Arities, &.{ "fixed", "rest" });
     expectFields(vm_mod.Try, &.{ "catch_pc", "finally_pc" });

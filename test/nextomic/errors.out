@@ -4,7 +4,7 @@
 [file-age 21 20 true]
 {:error :nextomic/value-type, :message :user/age takes a :db.type/long, not "old", :attr :user/age, :value old}
 {:error :nextomic/unique, :message :user/email "b@x" belongs to another entity, :attr :user/email, :value b@x}
-{:error :nextomic/conflict, :message two claims of one transaction disagree about :user/age of entity 4294967296, :e 4294967296, :a :user/age}
+{:error :nextomic/conflict, :message two claims of one transaction disagree about :user/age of entity 4294967296, :e 4294967296, :attr :user/age}
 {:error :nextomic/no-entity, :message the lookup ref [:user/email "nobody@x"] names no entity, :attr :user/email, :value nobody@x}
 {:error :nextomic/no-entity, :message 0 names no entity, :value 0}
 {:error :nextomic/tx-data, :message :db/add is [:db/add e a v], :value [:db/add 4294967296 :user/age]}
@@ -30,8 +30,8 @@ nil
 {:error :nextomic/value-type, :message :db/txInstant takes a :db.type/instant, not 5, :attr :db/txInstant, :value 5}
 ok a failed transaction leaves the basis alone
 ok the store still works after every failure
-{:error :nextomic/conflict, :message two claims of one transaction disagree about :db/ident of entity 27, :e 27, :a :db/ident}
-{:error :nextomic/conflict, :message two claims of one transaction disagree about :db/ident of entity 26, :e 26, :a :db/ident}
+{:error :nextomic/conflict, :message two claims of one transaction disagree about :db/ident of entity 27, :e 27, :attr :db/ident}
+{:error :nextomic/conflict, :message two claims of one transaction disagree about :db/ident of entity 26, :e 26, :attr :db/ident}
 ok a conflicting rename leaves the attribute its name
 ok an aborted rename is not cached
 ok the attribute keeps its old name

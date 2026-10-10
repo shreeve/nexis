@@ -110,26 +110,6 @@ fn isMapForm(v: Value) bool {
     return v.kind() == .persistent_map or v.kind() == .sorted_map;
 }
 
-/// The entries of a map form, in either kind's order.
-const MapEntries = union(enum) {
-    hash: champ.MapIter,
-    sorted: sorted.Cursor,
-
-    fn of(m: Value) MapEntries {
-        return if (m.kind() == .sorted_map) .{ .sorted = sorted.Cursor.init(m) } else .{ .hash = champ.mapIter(m) };
-    }
-
-    fn next(self: *MapEntries) ?sorted.Entry {
-        switch (self.*) {
-            .hash => |*it| {
-                const e = it.next() orelse return null;
-                return .{ .key = e.key, .value = e.value };
-            },
-            .sorted => |*c| return c.next(),
-        }
-    }
-};
-
 /// Everything a transaction can fail with: its own errors, the
 /// db-value's, the value contract's and the store's.
 pub const Failure = Error || stack.Error || db_mod.Error || marshal.Error || db_mod.ErrorsOf(Minter.lookup) || db_mod.ErrorsOf(Minter.resolve) || db_mod.ErrorsOf(Minter.lookupName) || db_mod.ErrorsOf(Store.scan) || db_mod.ErrorsOf(Txn.getFromTree) || db_mod.ErrorsOf(Store.currentPayload) || db_mod.ErrorsOf(champ.mapEmpty);
@@ -957,7 +937,7 @@ const Ctx = struct {
         // Nested map forms recurse here, one frame per level.
         try stack.check();
         var ent: ?Ent = null;
-        var it = MapEntries.of(m);
+        var it = sorted.MapEntries.init(m);
         while (it.next()) |entry| {
             if (self.formKeyword(entry.key) == .@"db/id") {
                 ent = try self.entityFromVm(entry.value);
@@ -967,7 +947,7 @@ const Ctx = struct {
         const e: Ent = ent orelse .{ .tempid = try self.internalTempid() };
         var identified = ent != null;
 
-        var it2 = MapEntries.of(m);
+        var it2 = sorted.MapEntries.init(m);
         while (it2.next()) |entry| {
             if (self.formKeyword(entry.key) == .@"db/id") continue;
             const v = entry.value;

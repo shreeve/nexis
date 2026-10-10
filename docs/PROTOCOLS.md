@@ -107,14 +107,17 @@ not read back: the reader has no tagged literals.
 The body holds the protocol's `u32` id. The name and method table live
 in the protocol registry (§3), so `extend-*` mutates the registry
 without cloning the Value. Identity equality; GC leaf; prints
-`#<protocol id=N>` in both modes.
+`#<protocol ns/Name>` in both modes, from the name `VM.registerProtocol`
+tells the interner (`Interner.nameProtocol`, `protocol.nameOf`), and
+`#<protocol id=N>` for an id the interner was never told.
 
 #### 2.3 `Kind.protocol_fn = 37`
 
 The body holds `protocol_id` and `method_name_id` (the method's
 keyword id). `defprotocol` makes one per method and binds it as the
 method Var's root. Identity equality; GC leaf; prints
-`#<protocol-fn NAME>`, the method's name (STDLIB.md §5).
+`#<protocol-fn ns/Name/method>`, `#<protocol-fn method>` when the
+interner has no name for the protocol (STDLIB.md §5).
 
 A protocol fn is callable anywhere a fn is: in call position and
 through `VM.callValue`, so it works as an argument to `map`, `apply`,

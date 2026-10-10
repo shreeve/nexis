@@ -131,28 +131,17 @@ Each needs a PLAN amendment before code (`AGENTS.md`, authority order).
 Small items the revamp-3 streams (PRs 36–45) found across each other's
 files; each is a few lines.
 
-24. **A multimethod is kept forever.** core.nx's global `multifns` atom
-    holds every multimethod; a fn carries metadata (SEMANTICS §7), so a
-    multifn can keep its state there and the atom can go.
-25. **A protocol prints as `#<protocol id=N>`.** `protocol.nameOf` reads
-    its name from the interner; `VM.registerProtocol` must call
-    `Interner.nameProtocol` and `src/format.zig` print through it
-    (PROTOCOLS.md §2, STDLIB.md §5).
-26. **`reset-meta!` cannot remove a library Var's `:doc`.** `meta`
-    refills a missing doc; a "doc filled" flag on `Var` ends it.
-27. **Duplicates left between files:** `stdlib.zig`'s `isReduced`, its
-    and `nextomic/transact.zig`'s map-entry walks (`seq.isReduced`,
-    `sorted.MapEntries`), `caseRun`/`categoryOf` (regex.zig's
-    `mapRun`/`category`), the LEB128 in `nextomic/datom.zig` (codec's),
-    the Nextomic docs table in `stdlib.zig` (`nextomic/natives.zig`
-    holds them), the sync mapping in `nextomic/natives.zig`
-    (`Durability.syncOverride`), and one random generator for the
-    query layer and `rand`.
-28. **Small error-map and comment rows:** `:nextomic/conflict` names its
-    attribute `:a` where the rest use `:attr`; `db.failureName` keeps
-    arms for codec errors that no longer exist; a fulltext needle with
-    an over-long token; the reserved `Kind` names `.error_` still used
-    in vm.zig and stdlib.zig.
+27. **Duplicates left between files:** the LEB128 in
+    `nextomic/datom.zig` (codec's), the sync mapping
+    `SyncMode.of` in `nextomic/store.zig` (`Durability.syncOverride`;
+    two enums, so one must be renamed across both layers), and one
+    random generator for the query layer and `rand`.
+28. **Small rows left:** a fulltext needle with an over-long token
+    (`nextomic/fulltext.zig` drops it from the needle, so the search
+    widens; a decision, not a deletion), and the reserved `Kind` name
+    `.error_` (kind 28 is one of three reserved wire tags, documented as
+    a set in VALUE.md, CODEC.md, GC.md and SEMANTICS.md §Kinds; the one
+    use is a `false` arm in `stdlib.zig`).
 29. **The test and doc pass the revamp deferred:** `eval_pipeline`'s
     superseded early cases and its fresh VM per case (31 s of the gate),
     the duplicated pins, `docs/PERF.md`'s superseded tables, test

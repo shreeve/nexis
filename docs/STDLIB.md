@@ -365,7 +365,7 @@ their elements in the same mode. Who uses which:
 | atom, transient | `#<atom>`, `#<transient>` |
 | regex | `#"source"`, with Clojure's escaping of `"` (`docs/REGEX.md` §8); `str` and `%s` of a bare pattern write its source, as `Pattern.toString` does |
 | matcher | `#<matcher #"source">` |
-| protocol, protocol fn | `#<protocol id=N>`, `#<protocol-fn NAME>` (`NAME` the method's: `(defprotocol P (area [x]))` makes `#<protocol-fn area>`) |
+| protocol, protocol fn | `#<protocol ns/Name>`, `#<protocol-fn ns/Name/method>` (`(defprotocol P (area [x]))` in `user` makes `#<protocol user/P>` and `#<protocol-fn user/P/area>`) |
 | durable ref | `#<durable-ref :tree hex:KEY>`, the key bytes in upper-case hex |
 | db connection, transactions | `#<db-connection>`, `#<db-write-txn>`, `#<db-read-txn>` |
 | Nextomic handles | `#nextomic/conn "path"`, `#nextomic/db {:basis-t N :mode :current}` (`:as-of N` / `:since N` when set), `#nextomic/entity {:db/id N}` |
@@ -635,14 +635,12 @@ table iterates in insertion order up to eight entries and in CHAMP
 order past them, where Clojure's iterates in its hash order, so the
 two can be named the other way round.
 
-The registry keeps every multimethod for the VM's life, as the record
-type and protocol registries keep theirs; re-evaluating a file keeps
-each multimethod (`defmulti` defines once) and replaces its methods,
-Clojure's reload story. The stdlib image carries the registry, an
-empty map, and the global hierarchy. The stdlib defines no
-multimethod: the registry's keys hash by address, so past eight
-entries the image's rebuilt map would iterate in another order and
-`image.verify` would fail the build.
+A multimethod keeps its state (its method table, prefer table and
+cache) in its own metadata under `:multifn-state`, so one nothing refers
+to is collected; `(meta mm)` is `{:multifn-state {...}}` where Clojure's
+is nil, and `with-meta` on it returns a plain function. Re-evaluating a
+file keeps each multimethod (`defmulti` defines once) and replaces its
+methods, Clojure's reload story.
 
 
 ---
@@ -663,12 +661,14 @@ documentation from four places:
   each), which the stdlib image carries: loading one string costs the
   boot less than a string and a map entry per Var. When `meta` reads a
   Var of a library namespace whose map has no `:doc`, it finds the
-  Var's docstring there, adds it under `:doc` and keeps it.
+  Var's docstring there, adds it under `:doc` and keeps it; once it has,
+  or once `reset-meta!` or `alter-meta!` has set the map, it does not
+  again, so removing `:doc` sticks.
 - **A native's table row** (`src/stdlib.zig`). Each row ends with two
   strings, the arglists as `doc` prints them (`"[coll] [n coll]"`)
   and the docstring; Nextomic's natives, whose descriptors live in
-  `src/nextomic/`, have theirs in `nextomic_docs`, keyed by the
-  descriptor's name. The text is in the binary, not the image: the
+  `src/nextomic/`, have theirs in the rows of
+  `src/nextomic/natives.zig`. The text is in the binary, not the image: the
   Var a native was installed in takes `{:arglists (...) :doc "..."
   :name name :ns ns}` as its metadata the first time `meta` reads a
   Var with none, the arglists read by the reader, and keeps it. Another

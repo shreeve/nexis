@@ -277,10 +277,8 @@ pub const embedded = [_]image_mod.Source{
     .{ .ns = "nexis.json", .info = .{ .path = "json.nx", .text = @embedFile("stdlib/json.nx"), .library = true } },
 };
 
-/// The docstrings two rows share: `deref` and `db/deref` are one
-/// native, and `nextomic/sync` does what `db/sync` does.
+/// The docstring two rows share: `deref` and `db/deref` are one native.
 const deref_doc = "Returns the value of ref: an atom's, a Var's, a delay's (forcing\n  it), a reduced's, or a durable ref's stored value (nil when absent,\n  read in one read transaction). Anything else is :not-derefable. @x\n  reads as (deref x).";
-const sync_doc = "Makes every commit to conn's file durable, with one full sync when a\n  commit left it unsynced; returns nil. :db/sync-failed once a sync of\n  the file has failed, until it is reopened.";
 
 const core_rows = .{
     // Sequence primitives.
@@ -568,7 +566,7 @@ const db_rows = .{
     // Connection + ref + auto-ephemeral primitives.
     .{ "open", 1, 2, &fnDbOpen, "[path] [path opts]", "Returns a connection to the emdb store at path, creating the file and\n  its parent directories; a file the process may only read opens\n  read-only. opts takes :durability, :commit or :durable. An empty\n  path or one with a NUL byte is :invalid-path." },
     .{ "close", 1, 1, &fnDbClose, "[conn]", "Closes conn: aborts its open transactions and syncs the file when a\n  commit left it unsynced. Returns nil; closing twice is nil. Any later\n  use of conn or of a ref through it is :db-closed." },
-    .{ "sync", 1, 1, &fnDbSync, "[conn]", sync_doc },
+    .{ "sync", 1, 1, &fnDbSync, "[conn]", "Makes every commit to conn's file durable, with one full sync when a\n  commit left it unsynced; returns nil. :db/sync-failed once a sync of\n  the file has failed, until it is reopened." },
     .{ "ref", 3, 3, &fnDbRef, "[conn tree key]", "Returns the durable ref naming key in tree of conn's store. tree is a\n  keyword, :a/b naming the tree a/b; key is a keyword, symbol or\n  string, equal by name, so :k, 'k and \"k\" name one key." },
     .{ "ref?", 1, 1, kindIs(&.{.durable_ref}), "[x]", "Returns true if x is a durable ref." },
     .{ "put-key!", 2, 2, &fnDbPutKey, "[ref v]", "Stores v at ref in one write transaction, committed as the\n  connection's durability says; returns nil." },
@@ -1602,14 +1600,14 @@ fn fnReduce(vm: *VM, args: []const Value) VmError!Value {
         // A walk that hands out one element at a time calls as it goes.
         if (xs.len == 1) {
             acc = try cb.call2(acc, xs[0]);
-            if (isReduced(vm, acc)) return reducedValue(acc);
+            if (seq_mod.isReduced(vm, acc)) return reducedValue(acc);
             continue;
         }
         var rest = xs;
         while (rest.len > 0) {
             const folded = try cb.fold(acc, rest);
             acc = folded.acc;
-            if (isReduced(vm, acc)) return reducedValue(acc);
+            if (seq_mod.isReduced(vm, acc)) return reducedValue(acc);
             rest = rest[folded.used..];
         }
     }
@@ -1643,7 +1641,7 @@ fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
                 const x = if (tag == .range) value_mod.fromFixnum(r.start + step * @as(i64, @intCast(i))).? else first;
                 const folded = try cb.foldRange(acc, x, step, @intCast(n - i));
                 acc = folded.acc;
-                if (isReduced(vm, acc)) return reducedValue(acc);
+                if (seq_mod.isReduced(vm, acc)) return reducedValue(acc);
                 i += folded.used;
             }
             return acc;
@@ -1663,7 +1661,7 @@ fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
                 vm.roots.items[scope.base] = acc;
                 vm.roots.items[scope.base + 1] = x;
                 acc = try cb.call2(acc, x);
-                if (isReduced(vm, acc)) return reducedValue(acc);
+                if (seq_mod.isReduced(vm, acc)) return reducedValue(acc);
                 x = try vm_mod.numAdd(heap, x, value_mod.fromFixnum(1).?);
             }
         },
@@ -1672,7 +1670,7 @@ fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
             while (true) {
                 vm.roots.items[scope.base] = acc;
                 acc = try cb.call2(acc, x);
-                if (isReduced(vm, acc)) return reducedValue(acc);
+                if (seq_mod.isReduced(vm, acc)) return reducedValue(acc);
             }
         },
         // `x` and its successor wait in a second root slot while `f`
@@ -1689,7 +1687,7 @@ fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
                 vm.roots.items[scope.base] = acc;
                 vm.roots.items[scope.base + 1] = x;
                 acc = try cb.call2(acc, x);
-                if (isReduced(vm, acc)) return reducedValue(acc);
+                if (seq_mod.isReduced(vm, acc)) return reducedValue(acc);
                 vm.roots.items[scope.base] = acc;
                 x = try step.call1(x);
             }
@@ -1703,7 +1701,7 @@ fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
                 while (try it.next()) |x| {
                     if (acc) |a| {
                         const r = try cb.call2(a, x);
-                        if (isReduced(vm, r)) return reducedValue(r);
+                        if (seq_mod.isReduced(vm, r)) return reducedValue(r);
                         acc = r;
                     } else acc = x;
                     vm.roots.items[scope.base] = acc.?;
@@ -1721,14 +1719,7 @@ fn fnReduced(vm: *VM, args: []const Value) VmError!Value {
 }
 
 fn fnReducedQ(vm: *VM, args: []const Value) VmError!Value {
-    return value_mod.fromBool(isReduced(vm, args[0]));
-}
-
-/// The kind first: a fold's accumulator is rarely a record.
-fn isReduced(vm: *VM, v: Value) bool {
-    if (v.kind() != .record) return false;
-    const type_id = vm.home().reduced_type_id orelse return false;
-    return record_mod.typeId(v) == type_id;
+    return value_mod.fromBool(seq_mod.isReduced(vm, args[0]));
 }
 
 /// The value inside a `reduced` record.
@@ -1745,10 +1736,10 @@ fn fnReduceKv(vm: *VM, args: []const Value) VmError!Value {
     switch (coll.kind()) {
         .nil => {},
         .persistent_map, .record, .sorted_map => {
-            var it = MapEntries.of(coll).?;
+            var it = seq_mod.mapEntries(coll);
             while (it.next()) |e| {
                 acc = try cb.call(&.{ acc, e.key, e.value });
-                if (isReduced(vm, acc)) return reducedValue(acc);
+                if (seq_mod.isReduced(vm, acc)) return reducedValue(acc);
             }
         },
         .persistent_vector => {
@@ -1756,7 +1747,7 @@ fn fnReduceKv(vm: *VM, args: []const Value) VmError!Value {
             var i: i64 = 0;
             while (c.next()) |x| : (i += 1) {
                 acc = try cb.call(&.{ acc, value_mod.fromFixnum(i).?, x });
-                if (isReduced(vm, acc)) return reducedValue(acc);
+                if (seq_mod.isReduced(vm, acc)) return reducedValue(acc);
             }
         },
         else => return VmError.KindMismatch,
@@ -2090,7 +2081,7 @@ fn mapPart(vm: *VM, args: []const Value, comptime part: enum { key, value }) VmE
     };
     var collected: std.ArrayList(Value) = .empty;
     defer collected.deinit(vm.allocator);
-    var it = MapEntries.of(map_v).?;
+    var it = seq_mod.mapEntries(map_v);
     while (it.next()) |e| {
         collected.append(vm.allocator, if (part == .key) e.key else e.value) catch return VmError.OutOfMemory;
     }
@@ -2149,7 +2140,7 @@ fn fnConj(vm: *VM, args: []const Value) VmError!Value {
             for (xs) |x| switch (x.kind()) {
                 .nil => {},
                 .persistent_map, .record, .sorted_map => {
-                    var it = MapEntries.of(x).?;
+                    var it = seq_mod.mapEntries(x);
                     while (it.next()) |e| kvs.appendSlice(vm.allocator, &.{ e.key, e.value }) catch return VmError.OutOfMemory;
                 },
                 .persistent_vector => {
@@ -2184,7 +2175,7 @@ fn conjMap(vm: *VM, coll: Value, xs: []const Value) VmError!Value {
         switch (x.kind()) {
             .nil => {},
             .persistent_map, .record, .sorted_map => {
-                var it = MapEntries.of(x).?;
+                var it = seq_mod.mapEntries(x);
                 while (it.next()) |e| result = try assocOne(vm, result, e.key, e.value);
             },
             .persistent_vector => {
@@ -3166,8 +3157,9 @@ fn fnMeta(vm: *VM, args: []const Value) VmError!Value {
         const v = VM.asVar(x);
         if (v.meta.isNil()) {
             v.meta = try nativeVarMeta(vm, v);
-        } else if (v.meta.kind() == .persistent_map and isLibraryNs(v.ns)) {
+        } else if (!v.doc_filled and v.meta.kind() == .persistent_map and isLibraryNs(v.ns)) {
             v.meta = try withPackedDoc(vm, v);
+            v.doc_filled = true;
         }
         return v.meta;
     }
@@ -3234,6 +3226,7 @@ fn setRefMeta(vm: *VM, r: Value, m: Value) VmError!void {
 /// Var dynamic for good (`(def ^:dynamic *x* ...)`, VM.md §6.5).
 fn setVarMeta(vm: *VM, v: *vm_mod.Var, m: Value) VmError!void {
     v.meta = m;
+    v.doc_filled = true;
     if (m.isNil()) return;
     const key = vm.ensureInterner().internKeywordValue("dynamic") catch return VmError.OutOfMemory;
     if ((try vm_mod.lookupIn(vm, m, key, value_mod.nilValue())).isTruthy()) v.dynamic = true;
@@ -3275,8 +3268,8 @@ const documented = .{
 };
 
 /// The `Doc` of the native `d`: from its table row, or from
-/// `nextomic_docs` for one of Nextomic's, which keep their descriptors
-/// in src/nextomic.
+/// the rows of src/nextomic/natives.zig for one of Nextomic's, which keep
+/// their descriptors there.
 pub fn nativeDoc(d: *const NativeFn) ?Doc {
     inline for (documented) |t| {
         const first = @intFromPtr(&t[0][0]);
@@ -3286,7 +3279,14 @@ pub fn nativeDoc(d: *const NativeFn) ?Doc {
             return if (doc.doc.len == 0) null else doc;
         }
     }
-    return nextomic_docs.get(d.name);
+    const nx_table = &nextomic_mod.natives.table;
+    const first = @intFromPtr(&nx_table[0]);
+    const at = @intFromPtr(d);
+    if (at >= first and at < first + nx_table.len * @sizeOf(NativeFn)) {
+        const doc = nextomic_mod.natives.docs[(at - first) / @sizeOf(NativeFn)];
+        return .{ .arglists = doc.arglists, .doc = doc.doc };
+    }
+    return null;
 }
 
 /// The metadata of `v` when it is the Var a native was installed in
@@ -3527,38 +3527,6 @@ const namespace_docs = std.StaticStringMap([]const u8).initComptime(.{
     .{ "nexis.simd", "Kernels over typed vectors (i64-vector, f64-vector): sum, dot,\n  scale and map." },
     .{ "nexis.internal", "The helpers macro expansions call. Not for programs." },
 });
-
-/// The docs of Nextomic's natives (NEXTOMIC.md), by descriptor name.
-const nextomic_docs = std.StaticStringMap(Doc).initComptime(.{
-    .{ "nextomic/as-of", nextomicDoc("[db t]", "Returns the view of db as of the transaction t, a t or a transaction\n  entity id: what the transactions up to t asserted and did not\n  retract. Of repeated bounds the older holds. A negative t is\n  :invalid-argument.") },
-    .{ "nextomic/basis-t", nextomicDoc("[db]", "Returns the basis of the db-value db: the number t of the last\n  transaction it reads.") },
-    .{ "nextomic/connect", nextomicDoc("[path] [path opts]", "Opens the Nextomic store at path, creating it and its parent\n  directories, and returns a connection. opts takes :durability\n  (:commit or :durable) and :sync (:full, :no-meta or :none for every\n  transaction). Release it with release, or use with-conn.") },
-    .{ "nextomic/datoms", nextomicDoc("[db index] [db index c1] [db index c1 c2] [db index c1 c2 c3] [db index c1 c2 c3 tx] [db index c1 c2 c3 tx added]", "Returns a vector of the datoms [e a v t added] of db in the order of\n  index, :eavt, :aevt, :avet or :vaet, matching the components given\n  in that index's order, then tx and added; nil matches anything.\n  Another index is :invalid-argument.") },
-    .{ "nextomic/db", nextomicDoc("[conn]", "Returns the db-value of conn at its current basis, a view that later\n  transactions do not change.") },
-    .{ "nextomic/entid", nextomicDoc("[db x]", "Returns the eid x names in db: x itself for an eid, an ident's or a\n  lookup ref [attr v]'s entity, or nil when it names nothing.") },
-    .{ "nextomic/entity", nextomicDoc("[db e]", "Returns a lazy entity of e, an eid, ident or lookup ref, in db: (:attr\n  ent), get, contains? and keys read its attributes, a card-many value\n  as a set and a ref as an entity. nil when e has no datoms in db; a\n  history db is :nextomic/history-view.") },
-    .{ "nextomic/entity-db", nextomicDoc("[ent]", "Returns the db-value the entity ent reads through.") },
-    .{ "nextomic/excise!", nextomicDoc("[conn e] [conn e attr]", "Removes every datom of the entity e, or of e under attr, current and\n  history, from every view, in a transaction of its own. Returns its\n  report plus :excised [e] and :removed, the count of rows removed.") },
-    .{ "nextomic/explain", nextomicDoc("[query & inputs]", "Returns, as a string, the plan q would run for query and inputs: one\n  numbered line per step with its index, estimate and join (nested,\n  hash, fixpoint or none) and the rows estimated after it.") },
-    .{ "nextomic/history", nextomicDoc("[db]", "Returns the history view of db: every assertion and retraction up to\n  its basis, each datom with its added flag. q and datoms read it;\n  entity and pull are :nextomic/history-view.") },
-    .{ "nextomic/ident", nextomicDoc("[db x]", "Returns the ident keyword of the entity x, an eid or ident, in db, or\n  nil when it has none.") },
-    .{ "nextomic/index-range", nextomicDoc("[db attr start end]", "Returns a vector of the AVET datoms of the indexed or unique attribute\n  attr whose value v has start <= v < end, in value order; a nil bound\n  is open. Another attribute is :nextomic/tx-data.") },
-    .{ "nextomic/pull", nextomicDoc("[db pattern e]", "Returns the map pattern selects of the entity e in db, nil when e has\n  no datoms there: attributes, :ns/_name reverse refs, *, {attr\n  sub-pattern} and (attr :limit n :default v :as k), :db/id always.\n  A bad pattern is :nextomic/pull-syntax.") },
-    .{ "nextomic/pull-many", nextomicDoc("[db pattern es]", "Returns a vector of the pull of pattern for each entity of es, a\n  vector or list, in its order, in one read.") },
-    .{ "nextomic/q", nextomicDoc("[query & inputs]", "Runs the Datalog query over inputs, positional to its :in ($ when\n  absent), and returns a set of tuple vectors, or what :find asks for\n  (., [?x ...], [[...]], :keys). (q {:query query :args [inputs]}) is\n  the same call. A query refused is :nextomic/query-syntax.") },
-    .{ "nextomic/release", nextomicDoc("[conn]", "Syncs conn's file when a commit left it unsynced, then closes conn;\n  returns nil, for a released conn too. Any other later use of conn is\n  :nextomic/closed; :nextomic/busy while an operation on it is in flight.") },
-    .{ "nextomic/schema", nextomicDoc("[db]", "Returns a map of each attribute's ident to its definition as db's\n  basis saw it: :db/id, :db/ident, :db/valueType, :db/cardinality,\n  :db/index, :db/isComponent and :db/fulltext, with :db/unique and\n  :db/doc when the attribute has them.") },
-    .{ "nextomic/since", nextomicDoc("[db t]", "Returns the view of db holding only what the transactions after t, a\n  t or a transaction entity id, asserted and did not retract: an entity\n  untouched since t is invisible. Of repeated bounds the newer holds.") },
-    .{ "nextomic/sync", nextomicDoc("[conn]", sync_doc) },
-    .{ "nextomic/touch", nextomicDoc("[ent]", "Returns the map {:db/id e :attr v ...} of every attribute of the\n  entity ent, read in one pass: card-many values as sets, refs as eids.") },
-    .{ "nextomic/transact!", nextomicDoc("[conn tx-data] [conn tx-data opts]", "Commits tx-data as one transaction and returns the report {:db-before\n  :db-after :tx :tempids :tx-data}. tx-data holds entity maps and\n  [:db/add e a v], [:db/retract e a v?], [:db/retractEntity e],\n  [:db.fn/call f & args] and [:db.fn/cas e a old new]. opts takes :sync.") },
-    .{ "nextomic/tx-range", nextomicDoc("[conn] [conn from] [conn from to]", "Returns a vector of the log's entries {:t t :instant inst :data\n  [datoms]} for from <= t < to, oldest first, :instant the\n  transaction's instant; a nil or missing bound is open. An entry an\n  excision touched carries :excised [e ...].") },
-    .{ "nextomic/with", nextomicDoc("[conn tx-data f]", "Applies tx-data without committing it: calls (f db-after report)\n  inside the held write transaction, then aborts it, and returns f's\n  value. db-after is :nextomic/closed once f returns. Unlike Datomic's,\n  it takes a connection and a function.") },
-});
-
-fn nextomicDoc(comptime arglists: []const u8, comptime doc: []const u8) Doc {
-    return .{ .arglists = "(" ++ arglists ++ ")", .doc = doc };
-}
 
 // =============================================================================
 // Dynamic bindings (VM.md §6.5)
@@ -4011,7 +3979,7 @@ fn fnDbDeref(vm: *VM, args: []const Value) VmError!Value {
         },
         .var_ => vm_mod.VM.asVar(x).current() orelse VmError.UnboundVar,
         .atom => atom_mod.getValue(x),
-        .record => if (isReduced(vm, x)) reducedValue(x) else if (isDelay(vm, x)) forceDelay(vm, x) else VmError.NotDerefable,
+        .record => if (seq_mod.isReduced(vm, x)) reducedValue(x) else if (isDelay(vm, x)) forceDelay(vm, x) else VmError.NotDerefable,
         else => VmError.NotDerefable,
     };
 }
@@ -4609,7 +4577,7 @@ fn conjBangMap(vm: *VM, t: Value, x: Value) VmError!void {
     try checkMapConjOperand(x);
     switch (x.kind()) {
         .persistent_map, .record, .sorted_map => {
-            var it = MapEntries.of(x).?;
+            var it = seq_mod.mapEntries(x);
             while (it.next()) |e| try assocBang(vm, t, e.key, e.value);
         },
         .persistent_vector => try assocBang(vm, t, vector_mod.nth(x, 0), vector_mod.nth(x, 1)),
@@ -5279,7 +5247,7 @@ fn caseMap(vm: *VM, args: []const Value, comptime up: bool) VmError!Value {
             i += 1;
             continue;
         };
-        const c = if (up) caseRun(&regex_tables.upper, d.scalar) else lowerCase(d.scalar);
+        const c = if (up) regex_mod.mapRun(&regex_tables.upper, d.scalar) else lowerCase(d.scalar);
         var buf: [4]u8 = undefined;
         const n = std.unicode.utf8Encode(c, &buf) catch unreachable;
         w.writer.writeAll(buf[0..n]) catch return VmError.OutOfMemory;
@@ -5293,34 +5261,8 @@ fn caseMap(vm: *VM, args: []const Value, comptime up: bool) VmError!Value {
 /// for a lower-case letter whose upper case differs (`ſ`, `ς`, `ı`
 /// stay themselves); a titlecase letter (`ǅ`) folds.
 fn lowerCase(c: u21) u21 {
-    if (caseRun(&regex_tables.upper, c) != c and categoryOf(c) != 3) return c;
-    return caseRun(&regex_tables.fold, c);
-}
-
-/// `c` mapped by the runs of `runs` (`regex_tables.Run`).
-fn caseRun(runs: []const regex_tables.Run, c: u21) u21 {
-    var lo: usize = 0;
-    var hi = runs.len;
-    while (lo < hi) {
-        const mid = (lo + hi) / 2;
-        if (runs[mid][0] <= c) lo = mid + 1 else hi = mid;
-    }
-    if (lo == 0) return c;
-    const r = runs[lo - 1];
-    if (c > r[1] or (c - r[0]) % r[2] != 0) return c;
-    return @intCast(@as(i32, c) + r[3]);
-}
-
-/// `Character.getType` of `c` (3 is `Lt`, titlecase).
-fn categoryOf(c: u21) u5 {
-    const t = &regex_tables.categories;
-    var lo: usize = 0;
-    var hi = t.len;
-    while (lo < hi) {
-        const mid = (lo + hi) / 2;
-        if (t[mid] >> 5 <= c) lo = mid + 1 else hi = mid;
-    }
-    return @truncate(t[lo - 1]);
+    if (regex_mod.mapRun(&regex_tables.upper, c) != c and regex_mod.category(c) != 3) return c;
+    return regex_mod.mapRun(&regex_tables.fold, c);
 }
 
 /// Java's `Character.isWhitespace`, which Clojure's `blank?` and `trim`
@@ -6041,7 +5983,7 @@ fn shEnviron(vm: *VM, arena: std.mem.Allocator, map: Value) VmError!std.process.
     var env = std.process.Environ.Map.init(arena);
     // Each entry lies in the map, reachable from it across the call
     // back into the VM that realizing a value can make.
-    var it = MapEntries.of(map).?;
+    var it = seq_mod.mapEntries(map);
     while (it.next()) |entry| {
         const key = entry.key;
         const name = if (key.kind() == .string) string_mod.asBytes(key) else intern_mod.Interner.splitQualified(internedName(vm, key) catch
@@ -6626,7 +6568,7 @@ const JsonWriter = struct {
     }
 
     fn object(jw: *JsonWriter, m: Value) VmError!void {
-        var it = MapEntries.of(m).?;
+        var it = seq_mod.mapEntries(m);
         try jw.put("{");
         jw.depth += 1;
         var first = true;
@@ -6826,7 +6768,7 @@ fn fnMakeRecord(vm: *VM, args: []const Value) VmError!Value {
             // `Heap.alloc` never collects (GC.md §11.5): the map
             // being built needs no root.
             var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
-            var it = MapEntries.of(args[1]).?;
+            var it = seq_mod.mapEntries(args[1]);
             while (it.next()) |e| m = try mapPut(heap, m, e.key, e.value);
             break :blk m;
         },
@@ -7343,31 +7285,6 @@ fn scopeItems(scope: vm_mod.RootScope) []const Value {
 // class 4); `subseq` and `rsubseq` gather the tree's own entries and
 // build the result after the last comparison.
 // =============================================================================
-
-/// The entries of a hash map, record or sorted map, in its order.
-const MapEntries = union(enum) {
-    champ: champ_mod.MapIter,
-    sorted: sorted_mod.Iter,
-
-    fn of(m: Value) ?MapEntries {
-        return switch (m.kind()) {
-            .persistent_map => .{ .champ = champ_mod.mapIter(m) },
-            .record => .{ .champ = champ_mod.mapIter(record_mod.fieldsOf(m)) },
-            .sorted_map => .{ .sorted = sorted_mod.Iter.init(m, true) },
-            else => null,
-        };
-    }
-
-    fn next(self: *MapEntries) ?sorted_mod.Entry {
-        switch (self.*) {
-            .champ => |*it| {
-                const e = it.next() orelse return null;
-                return .{ .key = e.key, .value = e.value };
-            },
-            .sorted => |*it| return it.next(),
-        }
-    }
-};
 
 fn isReversible(k: Kind) bool {
     return k == .persistent_vector or sorted_mod.isSortedKind(k);

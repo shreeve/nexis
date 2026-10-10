@@ -914,6 +914,10 @@ pub const Var = struct {
     /// Set once the metadata has carried `:dynamic true`, never cleared
     /// (VM.md §6.5).
     dynamic: bool = false,
+    /// Set once `meta` has filled in a library Var's packed docstring or
+    /// the metadata was set in place: the doc is not filled in again, so
+    /// removing it sticks (STDLIB.md §10).
+    doc_filled: bool = false,
     /// The binding in force when `thread_bound` (VM.md §6.5).
     thread_value: Value = value_mod.nilValue(),
     thread_bound: bool = false,
@@ -2421,6 +2425,7 @@ pub const VM = struct {
         for (method_specs) |spec| {
             methods.appendAssumeCapacity(.{ .name_id = spec.name_id, .name = try self.allocator.dupe(u8, spec.name) });
         }
+        try self.ensureInterner().nameProtocol(new_id, ns_name, protocol_name);
         try self.protocol_registry.append(self.allocator, .{
             .id = new_id,
             .ns_name = ns_dup,
