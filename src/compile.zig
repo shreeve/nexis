@@ -1012,17 +1012,22 @@ const Emitter = struct {
     }
 };
 
+/// Whether `inst` is the opcode `group`:`variant`.
+fn isOp(inst: Inst, group: vm.Group, variant: anytype) bool {
+    return inst.group == @backingInt(group) and inst.variant == @backingInt(variant);
+}
+
+/// Set `i` of the bit sets of `w` words each laid end to end in `sets`.
+fn setAt(sets: []u64, i: usize, w: usize) []u64 {
+    return sets[i * w ..][0..w];
+}
+
 /// Whether control never passes from `inst` to the instruction after
 /// it: a jump, a return, a throw, or a `try` or `finally` exit.
 fn transfersAway(inst: Inst) bool {
     if (inst.kind != .primary) return false;
-    const is = struct {
-        fn op(i: Inst, g: vm.Group, v: anytype) bool {
-            return i.group == @backingInt(g) and i.variant == @backingInt(v);
-        }
-    }.op;
-    return is(inst, .jump, vm.Jump.jmp) or is(inst, .call, vm.Call.@"return") or is(inst, .call, vm.Call.return_nil) or
-        is(inst, .ctrl, vm.CtrlOp.throw_) or is(inst, .ctrl, vm.CtrlOp.try_exit) or is(inst, .ctrl, vm.CtrlOp.finally_exit);
+    return isOp(inst, .jump, vm.Jump.jmp) or isOp(inst, .call, vm.Call.@"return") or isOp(inst, .call, vm.Call.return_nil) or
+        isOp(inst, .ctrl, vm.CtrlOp.throw_) or isOp(inst, .ctrl, vm.CtrlOp.try_exit) or isOp(inst, .ctrl, vm.CtrlOp.finally_exit);
 }
 
 // =============================================================================
@@ -1105,13 +1110,11 @@ fn bitOr(dst: []u64, src: []const u64) void {
 fn effectsOf(inst: Inst, caps: []const vm.CaptureDescriptor, slot_count: u16) ?Effects {
     var fx: Effects = .{};
     if (inst.kind != .primary) return null;
-    const shape = Routine.shapeOf(vm.VM.opIndex(inst)) orelse return fx;
+    // Of the opcodes with no shape, only these two are written, and
+    // they read no slot; any other is left unmodelled.
+    const shape = Routine.shapeOf(vm.VM.opIndex(inst)) orelse
+        return if (isOp(inst, .call, vm.Call.return_nil) or isOp(inst, .ctrl, vm.CtrlOp.finally_exit)) fx else null;
     const group = inst.groupOf();
-    const is = struct {
-        fn op(i: Inst, g: vm.Group, v: anytype) bool {
-            return i.group == @backingInt(g) and i.variant == @backingInt(v);
-        }
-    }.op;
     const wide = shape.wide != null;
     const operands = [3]Operand{ inst.a, inst.b, inst.c };
     const roles = [3]Routine.Role{ shape.a, if (wide) .none else shape.b, if (wide) .none else shape.c };
@@ -1125,13 +1128,13 @@ fn effectsOf(inst: Inst, caps: []const vm.CaptureDescriptor, slot_count: u16) ?E
             if (op.kind != .slot) return null;
             if (shape.block and i == 0) {
                 fx.block_lo = op.index;
-                fx.block_len = @as(u32, inst.b.index) + @intFromBool(is(inst, .call, vm.Call.call));
+                fx.block_len = @as(u32, inst.b.index) + @intFromBool(isOp(inst, .call, vm.Call.call));
             } else if (shape.pair and i == 1) {
                 fx.block_lo = op.index;
                 fx.block_len = 2;
-            } else if (is(inst, .closure, vm.Closure_.new_cell)) {
+            } else if (isOp(inst, .closure, vm.Closure_.new_cell)) {
                 fx.def = op.index;
-            } else if (is(inst, .closure, vm.Closure_.box_local)) {
+            } else if (isOp(inst, .closure, vm.Closure_.box_local)) {
                 fx.def = op.index;
                 fx.use(op.index);
             } else if (group != .ctrl) {
@@ -1188,17 +1191,12 @@ const Flow = struct {
     /// whose sets of `words` words would pass the budget.
     fn build(arena: std.mem.Allocator, code: []const Inst, tries: []const vm.Try, extents: []const TryExtent, words: usize) error{OutOfMemory}!?Flow {
         const n = code.len;
-        const is = struct {
-            fn op(i: Inst, g: vm.Group, v: anytype) bool {
-                return i.group == @backingInt(g) and i.variant == @backingInt(v);
-            }
-        }.op;
         const leader = try arena.alloc(bool, n + 1);
         @memset(leader, false);
         leader[0] = true;
         leader[n] = true;
         for (code, 0..) |inst, pc| {
-            const jumps = inst.groupOf() == .jump or is(inst, .ctrl, vm.CtrlOp.try_exit);
+            const jumps = inst.groupOf() == .jump or isOp(inst, .ctrl, vm.CtrlOp.try_exit);
             if (jumps) {
                 if (inst.wide() >= n) return null;
                 leader[inst.wide()] = true;
@@ -1212,7 +1210,7 @@ const Flow = struct {
         for (tries, extents, 0..) |t, x, i| {
             const fin = t.finally_pc orelse t.catch_pc;
             if (!(x.enter < t.catch_pc and t.catch_pc <= fin and fin < x.end and x.end <= n)) return null;
-            if (!is(code[x.enter], .ctrl, vm.CtrlOp.try_enter) or code[x.enter].wide() != i) return null;
+            if (!isOp(code[x.enter], .ctrl, vm.CtrlOp.try_enter) or code[x.enter].wide() != i) return null;
             leader[x.enter + 1] = true;
             leader[t.catch_pc] = true;
             leader[fin] = true;
@@ -1244,14 +1242,14 @@ const Flow = struct {
             const next: u32 = if (last + 1 < n) block_of[last + 1] else none;
             if (inst.groupOf() == .jump) {
                 s[0] = block_of[inst.wide()];
-                if (!is(inst, .jump, vm.Jump.jmp)) s[1] = next;
-            } else if (is(inst, .ctrl, vm.CtrlOp.try_exit)) {
+                if (!isOp(inst, .jump, vm.Jump.jmp)) s[1] = next;
+            } else if (isOp(inst, .ctrl, vm.CtrlOp.try_exit)) {
                 // The exit of the try ending where it jumps, from its
                 // body or its handler.
                 const i = exit_try[inst.wide()];
                 if (i == none or last <= extents[i].enter or last >= (tries[i].finally_pc orelse extents[i].end)) return null;
                 s[0] = block_of[tries[i].finally_pc orelse extents[i].end];
-            } else if (is(inst, .ctrl, vm.CtrlOp.finally_exit)) {
+            } else if (isOp(inst, .ctrl, vm.CtrlOp.finally_exit)) {
                 // The last instruction of a finally, which goes on
                 // past its try; a throw it resumes is its enclosing
                 // region's.
@@ -1364,22 +1362,17 @@ fn clearDeadMoves(
     const h_body = try arena.alloc(u64, tries.len * words);
     const h_handler = try arena.alloc(u64, tries.len * words);
     const out = try arena.alloc(u64, words);
-    const at = struct {
-        fn set(sets: []u64, i: usize, w: usize) []u64 {
-            return sets[i * w ..][0..w];
-        }
-    }.set;
     var passes: usize = 0;
     while (true) : (passes += 1) {
         if (passes == clear_max_passes) return false;
         for (tries, extents, 0..) |t, x, i| {
-            const hb = at(h_body, i, words);
-            const hh = at(h_handler, i, words);
-            @memcpy(hb, at(live_in, flow.block_of[t.catch_pc], words));
+            const hb = setAt(h_body, i, words);
+            const hh = setAt(h_handler, i, words);
+            @memcpy(hb, setAt(live_in, flow.block_of[t.catch_pc], words));
             bitClear(hb, code[x.enter].a.index);
             @memset(hh, 0);
             if (t.finally_pc) |f| {
-                @memcpy(hh, at(live_in, flow.block_of[f], words));
+                @memcpy(hh, setAt(live_in, flow.block_of[f], words));
                 bitOr(hb, hh);
             }
         }
@@ -1388,10 +1381,10 @@ fn clearDeadMoves(
         while (b > 0) {
             b -= 1;
             @memset(out, 0);
-            for (flow.succ[b]) |s| if (s != Flow.none) bitOr(out, at(live_in, s, words));
-            for (out, at(use, b, words), at(def, b, words)) |*o, u, d| o.* = u | (o.* & ~d);
-            for (flow.regions(b)) |r| bitOr(out, at(if (r.handler) h_handler else h_body, r.t, words));
-            const in = at(live_in, b, words);
+            for (flow.succ[b]) |s| if (s != Flow.none) bitOr(out, setAt(live_in, s, words));
+            for (out, setAt(use, b, words), setAt(def, b, words)) |*o, u, d| o.* = u | (o.* & ~d);
+            for (flow.regions(b)) |r| bitOr(out, setAt(if (r.handler) h_handler else h_body, r.t, words));
+            const in = setAt(live_in, b, words);
             if (!std.mem.eql(u64, in, out)) {
                 @memcpy(in, out);
                 changed = true;
@@ -1408,8 +1401,8 @@ fn clearDeadMoves(
     for (0..nb) |b| {
         @memset(live, 0);
         @memset(held, 0);
-        for (flow.succ[b]) |s| if (s != Flow.none) bitOr(live, at(live_in, s, words));
-        for (flow.regions(b)) |r| bitOr(held, at(if (r.handler) h_handler else h_body, r.t, words));
+        for (flow.succ[b]) |s| if (s != Flow.none) bitOr(live, setAt(live_in, s, words));
+        for (flow.regions(b)) |r| bitOr(held, setAt(if (r.handler) h_handler else h_body, r.t, words));
         var pc = flow.starts[b + 1];
         while (pc > flow.starts[b]) {
             pc -= 1;
@@ -1428,7 +1421,7 @@ fn clearDeadMoves(
 /// Whether `inst` is a `mov:move` of one slot to another, which
 /// clears its source where the source is dead after it.
 fn isSlotMove(inst: Inst) bool {
-    return inst.group == @backingInt(vm.Group.mov) and inst.variant == @backingInt(vm.Mov.move) and
+    return isOp(inst, .mov, vm.Mov.move) and
         inst.b.kind == .slot and inst.a.kind == .slot and inst.b.index != inst.a.index;
 }
 
@@ -1455,11 +1448,6 @@ fn checkClears(
     const state = try arena.alloc(u64, words);
     @memset(in, 0);
     @memset(seen, 0);
-    const at = struct {
-        fn set(sets: []u64, i: usize, w: usize) []u64 {
-            return sets[i * w ..][0..w];
-        }
-    }.set;
     var changed = true;
     while (changed) {
         changed = false;
@@ -1467,28 +1455,28 @@ fn checkClears(
         // carries.
         @memset(thrown, 0);
         for (0..nb) |b| for (flow.regions(b)) |r| {
-            bitOr(at(thrown, 2 * r.t + @intFromBool(r.handler), words), at(seen, b, words));
+            bitOr(setAt(thrown, 2 * r.t + @intFromBool(r.handler), words), setAt(seen, b, words));
         };
         for (tries, extents, 0..) |t, x, i| {
-            const body = at(thrown, 2 * i, words);
+            const body = setAt(thrown, 2 * i, words);
             bitClear(body, code[x.enter].a.index);
-            changed = orChanged(at(in, flow.block_of[t.catch_pc], words), body) or changed;
-            if (t.finally_pc) |f| changed = orChanged(at(in, flow.block_of[f], words), at(thrown, 2 * i + 1, words)) or changed;
+            changed = orChanged(setAt(in, flow.block_of[t.catch_pc], words), body) or changed;
+            if (t.finally_pc) |f| changed = orChanged(setAt(in, flow.block_of[f], words), setAt(thrown, 2 * i + 1, words)) or changed;
         }
         for (0..nb) |b| {
-            @memcpy(state, at(in, b, words));
-            const s = at(seen, b, words);
+            @memcpy(state, setAt(in, b, words));
+            const s = setAt(seen, b, words);
             changed = orChanged(s, state) or changed;
             for (flow.starts[b]..flow.starts[b + 1]) |pc| {
                 const fx = &effects[pc];
                 if (fx.readsAny(state)) return CompileError.InternalCompilerBug;
                 const inst = code[pc];
-                if (inst.group == @backingInt(vm.Group.mov) and inst.variant == @backingInt(vm.Mov.move_clear)) bitSet(state, inst.b.index);
+                if (isOp(inst, .mov, vm.Mov.move_clear)) bitSet(state, inst.b.index);
                 if (fx.def) |d| bitClear(state, d);
                 changed = orChanged(s, state) or changed;
             }
             for (flow.succ[b]) |succ| if (succ != Flow.none) {
-                changed = orChanged(at(in, succ, words), state) or changed;
+                changed = orChanged(setAt(in, succ, words), state) or changed;
             };
         }
     }
