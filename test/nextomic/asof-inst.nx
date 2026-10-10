@@ -1,0 +1,53 @@
+; test/nextomic/asof-inst.nx — as-of and since of an instant: the last
+; transaction at or before it, composed with history.
+
+(require '[nextomic :as d])
+(require '[prelude :as t])
+
+(defn vals-of [db e a] (mapv #(nth % 2) (d/datoms db :eavt e a)))
+(defn rows-of [db e a] (mapv #(vector (nth % 2) (nth % 4)) (d/datoms db :eavt e a)))
+
+(def c (d/connect "asof-inst.edb"))
+(d/transact! c [{:db/ident :doc/title :db/valueType :db.type/string :db/cardinality :db.cardinality/one}])
+; t=2 schema at the clock; t=3, 4 and 5 at stated instants.
+(def r3 (d/transact! c [{:db/id "d" :doc/title "One"} [:db/add "datomic.tx" :db/txInstant #inst "2100-01-01T00:00:00.000Z"]]))
+(def doc (get (:tempids r3) "d"))
+(d/transact! c [[:db/add doc :doc/title "Two"] [:db/add "datomic.tx" :db/txInstant #inst "2100-01-02T00:00:00.000Z"]])
+(d/transact! c [[:db/add doc :doc/title "Three"] [:db/add "datomic.tx" :db/txInstant #inst "2100-01-02T00:00:00.000Z"]])
+(def db (d/db c))
+
+(println "between" (vals-of (d/as-of db #inst "2100-01-01T12:00:00.000Z") doc :doc/title))
+(println "exactly at the first" (vals-of (d/as-of db #inst "2100-01-01T00:00:00.000Z") doc :doc/title))
+(println "one millisecond before the first" (vals-of (d/as-of db #inst "2099-12-31T23:59:59.999Z") doc :doc/title))
+(println "exactly at two transactions" (vals-of (d/as-of db #inst "2100-01-02T00:00:00.000Z") doc :doc/title))
+(println "after all" (vals-of (d/as-of db #inst "2200-01-01") doc :doc/title))
+(println "before all" (count (d/datoms (d/as-of db #inst "1970-01-01") :eavt)))
+(t/check "an instant before the first transaction is an empty history"
+         (and (= (d/as-of db 0) (d/as-of db #inst "1970-01-01"))
+              (empty? (d/datoms (d/as-of db #inst "1970-01-01") :eavt))))
+(t/check "an instant resolves to the t it names"
+         (= (mapv #(d/as-of db %) [3 3 2 5 5])
+            (mapv #(d/as-of db %) [#inst "2100-01-01T12:00:00.000Z" #inst "2100-01-01T00:00:00.000Z"
+                                   #inst "2099-12-31T23:59:59.999Z" #inst "2100-01-02T00:00:00.000Z" #inst "2200"])))
+(t/check "the instant and the t it resolves to are the same view"
+         (= (d/as-of db 3) (d/as-of db #inst "2100-01-01T12:00:00.000Z")))
+(t/check "an instant narrows to the older bound"
+         (= (d/as-of db 3) (d/as-of (d/as-of db 4) #inst "2100-01-01T12:00:00.000Z")))
+
+(println "since between" (vals-of (d/since db #inst "2100-01-01T12:00:00.000Z") doc :doc/title))
+(println "since the first" (vals-of (d/since db #inst "2100-01-01T00:00:00.000Z") doc :doc/title))
+(println "since before all" (vals-of (d/since db #inst "1970-01-01") doc :doc/title))
+(println "since after all" (vals-of (d/since db #inst "2200-01-01") doc :doc/title))
+(t/check "since an instant is since the t it resolves to"
+         (= (d/since db 3) (d/since db #inst "2100-01-01T12:00:00.000Z")))
+(t/check "since an instant before all is since 0" (= (d/since db 0) (d/since db #inst "1970-01-01")))
+
+(println "history as-of" (rows-of (d/history (d/as-of db #inst "2100-01-01T12:00:00.000Z")) doc :doc/title))
+(println "history since" (rows-of (d/history (d/since db #inst "2100-01-01T12:00:00.000Z")) doc :doc/title))
+(println "as-of history" (rows-of (d/as-of (d/history db) #inst "2100-01-01T12:00:00.000Z") doc :doc/title))
+(println "history between" (rows-of (d/since (d/history (d/as-of db #inst "2100-01-02T00:00:00.000Z")) #inst "2100-01-01T00:00:00.000Z") doc :doc/title))
+
+(println (t/caught (d/as-of db "2100")))
+(println (t/caught (d/since db 1.5)))
+(d/release c)
+(println :asof-inst-done)

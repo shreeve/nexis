@@ -1,0 +1,23 @@
+between [One]
+exactly at the first [One]
+one millisecond before the first []
+exactly at two transactions [Three]
+after all [Three]
+before all 0
+ok an instant before the first transaction is an empty history
+ok an instant resolves to the t it names
+ok the instant and the t it resolves to are the same view
+ok an instant narrows to the older bound
+since between [Three]
+since the first [Three]
+since before all [Three]
+since after all []
+ok since an instant is since the t it resolves to
+ok since an instant before all is since 0
+history as-of [[One true]]
+history since [[One false] [Three true] [Two true] [Two false]]
+as-of history [[One true]]
+history between [[One false] [Three true] [Two true] [Two false]]
+{:error :kind-mismatch, :message kind mismatch}
+{:error :kind-mismatch, :message kind mismatch}
+:asof-inst-done
