@@ -82,28 +82,7 @@ pub const Trees = struct {
     }
 };
 
-/// How one commit syncs: data and meta, data only, or nothing
-/// (`db.Durability` chooses a connection's).
-pub const SyncMode = enum {
-    full,
-    no_meta,
-    none,
-
-    pub fn of(durability: db_layer.Durability) SyncMode {
-        return switch (durability) {
-            .commit => .none,
-            .durable => .full,
-        };
-    }
-
-    fn override(self: SyncMode) emdb.SyncOverride {
-        return switch (self) {
-            .full => .full,
-            .no_meta => .noMeta,
-            .none => .none,
-        };
-    }
-};
+pub const SyncMode = db_layer.SyncMode;
 
 pub const Options = struct {
     /// How the commit that creates and bootstraps the store syncs.

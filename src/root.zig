@@ -34,6 +34,7 @@ pub const sorted = @import("coll/sorted.zig");
 pub const transient = @import("coll/transient.zig");
 pub const record = @import("record.zig");
 pub const codec = @import("codec.zig");
+pub const random = @import("random.zig");
 pub const db = @import("db.zig");
 pub const nextomic_handle = @import("nextomic/handle.zig");
 pub const gc = @import("gc.zig");

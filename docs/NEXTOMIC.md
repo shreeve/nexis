@@ -954,8 +954,9 @@ Mtavruli, Glagolitic, Deseret and the letterlike, Roman numeral,
 circled and fullwidth forms, so `Café`, `CAFÉ` and `café` are one
 token, as are `ΣΟΦΙΑΣ` and `σοφιας`; a byte that is not UTF-8 stays as
 it is, and no accent or normalization is removed. A folded run longer
-than 255 bytes is not a token, and a needle without tokens matches
-nothing. Indexing and search fold through one tokenizer. The plain view
+than 255 bytes is not a token and is not indexed, so a needle holding
+one is `:nextomic/value-type` (dropping it would widen the search); a
+needle without tokens matches nothing. Indexing and search fold through one tokenizer. The plain view
 at the newest basis intersects the `nx/fulltext` rows of the tokens,
 then reads the matching values from EAVT; an as-of, since or history
 view re-tokenises the attribute's values under that view, so it answers
@@ -969,7 +970,9 @@ and `:with` variables) by the plain find elements: `count`, `sum`,
 `avg`, `min`, `max`, `median`, `variance`, `stddev`, `count-distinct`,
 `distinct` (a set), `(min n ?x)` and `(max n ?x)` (the n smallest or
 largest, a vector), `(sample n ?x)` (up to n distinct values, a vector)
-and `(rand n ?x)` (n values with repetition, a vector). `min` and `max`
+and `(rand n ?x)` (n values with repetition, a vector), both drawn
+from the process's generator, the one behind `rand` and `shuffle`
+(`docs/STDLIB.md`). `min` and `max`
 take any type, in the cell order: nil, booleans, numbers, strings,
 instants, uuids, keywords as `compare` orders them, then other values
 in a stable order; `sum`, `avg`, `variance` and `stddev` take numbers, bignums

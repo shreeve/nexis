@@ -180,7 +180,7 @@ The dispatch in `Collector.trace`:
 | `nextomic_entity` | `nextomic_handle.traceEntity` | the db-value box and the map of the entity's last full read |
 | `function` | `Host.trace` (`VM.gcTrace`) | every upvalue cell (cells are blocks of their own kind, marked through `mark`), then the routine's heap constants, and those of every member of its arity table, which a closure reaches only through the routine it names, the table's head (`docs/VM.md` §5), recursively through nested routines (`docs/VM.md` §6); a routine with more than eight constants and nested routines is walked once per cycle however many closures reach it (`VM.gc_routines`) |
 | `cell_internal` | `Host.trace` (`VM.gcTrace`) | the cell's value |
-| anything else (`var_`, whose payload is an arena `*Var`; `byte_vector`, `error_`, `meta_symbol`, reserved and never allocated; an immediate) | panic | |
+| anything else (`var_`, whose payload is an arena `*Var`; `byte_vector`, `meta_symbol`, reserved and never allocated; an immediate) | panic | |
 
 **Transaction handles and connections.** A `db_write_txn` or
 `db_read_txn` Value points at a `db.Handle`, which is not a block but

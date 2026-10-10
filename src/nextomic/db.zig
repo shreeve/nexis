@@ -179,7 +179,7 @@ pub const Conn = struct {
     }
 
     fn openIn(self: *Conn, path: [*:0]const u8, options: OpenOptions, gen: u64) !void {
-        const sync_mode = options.sync orelse SyncMode.of(store_mod.db_layer.Durability.process());
+        const sync_mode = options.sync orelse store_mod.db_layer.Durability.process().syncMode();
         const store = try Store.open(self.gpa, path, .{ .sync = sync_mode, .refused_format = options.refused_format });
         errdefer store.close();
         const gpa = self.gpa;

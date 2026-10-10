@@ -169,6 +169,7 @@ ok results are ordinary sets
 [false true]
 ([Ann] [Bob])
 ([Ann Ann runs the red team; loves Café Noir.])
+{:error :nextomic/value-type, :message fulltext tokens are at most 255 bytes, and the needle has a longer one}
 ([Ann])
 ([Ann])
 ([Cy])

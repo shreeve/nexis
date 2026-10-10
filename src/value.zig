@@ -34,14 +34,14 @@ pub const Kind = enum(u8) {
     persistent_vector = 20,
     list = 21,
     /// Reserved: never constructed. 22, 28 and 29 stay out of use
-    /// because kind bytes are the codec's wire tags (CODEC.md §9).
+    /// because kind bytes are the codec's wire tags (CODEC.md §9);
+    /// 28 has no member.
     byte_vector = 22,
     typed_vector = 23,
     function = 24,
     var_ = 25,
     durable_ref = 26,
     transient = 27,
-    error_ = 28,
     meta_symbol = 29,
     native_fn = 30,
     db_connection = 31,

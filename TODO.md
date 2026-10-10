@@ -126,17 +126,6 @@ Each needs a PLAN amendment before code (`AGENTS.md`, authority order).
 Small items the revamp-3 streams (PRs 36–45) found across each other's
 files; each is a few lines.
 
-27. **Duplicates left between files:** the LEB128 in
-    `nextomic/datom.zig` (codec's), the sync mapping
-    `SyncMode.of` in `nextomic/store.zig` (`Durability.syncOverride`;
-    two enums, so one must be renamed across both layers), and one
-    random generator for the query layer and `rand`.
-28. **Small rows left:** a fulltext needle with an over-long token
-    (`nextomic/fulltext.zig` drops it from the needle, so the search
-    widens; a decision, not a deletion), and the reserved `Kind` name
-    `.error_` (kind 28 is one of three reserved wire tags, documented as
-    a set in VALUE.md, CODEC.md, GC.md and SEMANTICS.md §Kinds; the one
-    use is a `false` arm in `stdlib.zig`).
 29. **The test and doc pass the revamp deferred:** `eval_pipeline`'s
     superseded early cases and its fresh VM per case (31 s of the gate),
     the duplicated pins, `docs/PERF.md`'s superseded tables, test

@@ -1777,7 +1777,7 @@ test "durability: a connection opened without :sync takes the process's (NEXIS_D
     defer tc.deinit();
     const conn = try Conn.open(testing.allocator, &tc.interner, tc.td.path.ptr, .{});
     defer conn.destroy();
-    try testing.expectEqual(SyncMode.of(store_mod.db_layer.Durability.process()), conn.sync_mode);
+    try testing.expectEqual(store_mod.db_layer.Durability.process().syncMode(), conn.sync_mode);
 }
 
 test "reads share the file's held snapshot until a commit passes it; a with view's reads are never kept" {

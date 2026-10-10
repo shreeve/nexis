@@ -93,7 +93,7 @@ three db handles) the payload is a 16-byte-aligned `*HeapHeader`
 | 25 | `var_` | Namespace Var | The payload is a raw `*Var` in the VM's runtime arena, not a block: Vars are immortal and the collector reaches their contents through the namespaces (`docs/GC.md` §3) |
 | 26 | `durable_ref` | Durable ref: store id, tree, key bytes (`docs/DB.md`) | |
 | 27 | `transient` | Mutable wrapper over a persistent collection | 0 = map, 1 = set, 2 = vector (`docs/TRANSIENT.md` §2) |
-| 28 | `error_` | Reserved: never constructed | |
+| 28 | (none) | Reserved wire tag: no kind, never constructed | |
 | 29 | `meta_symbol` | Reserved: never constructed | Symbols carry no metadata (SEMANTICS §7) |
 | 30 | `native_fn` | Host function | The payload points at a static `NativeFn` descriptor, not a block |
 | 31 | `db_connection` | emdb connection handle | Payload: a VM-owned `*db.Connection`, not a block |

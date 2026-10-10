@@ -394,6 +394,8 @@
 (println [(:db/fulltext (get (d/schema before-items) :order/items)) (:db/fulltext (get (d/schema ft) :order/items))])
 (println (rows (d/q '[:find ?n :where [(fulltext $ :person/bio "red") [[?e ?v]]] [?e :person/name ?n]] ft)))
 (println (rows (d/q '[:find ?n ?v :where [(fulltext $ :person/bio "RED team") [[?e ?v]]] [?e :person/name ?n]] ft)))
+; A needle token past 255 bytes is refused; it would never match.
+(println (t/caught (d/q '[:find ?e :where [(fulltext $ :person/bio "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") [[?e ?v]]]] ft)))
 (println (rows (d/q '[:find ?n :where [(fulltext $ :person/bio "café") [[?e ?v]]] [?e :person/name ?n]] ft)))
 ; Case folds by Unicode simple case folding, not ASCII alone.
 (println (rows (d/q '[:find ?n :where [(fulltext $ :person/bio "CAFÉ NOIR") [[?e ?v]]] [?e :person/name ?n]] ft)))

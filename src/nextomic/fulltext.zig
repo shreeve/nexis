@@ -17,7 +17,8 @@
 //!     Armenian, Georgian, Glagolitic, Deseret, the letterlike and
 //!     fullwidth forms); bytes that are not UTF-8 stay as they are. A
 //!     folded token longer than `max_token` bytes is dropped, so no row
-//!     key exceeds the page's key bound. A token never holds 0x00,
+//!     key exceeds the page's key bound; in a search needle it is
+//!     refused (`needleTokens`), as dropping it would widen the search. A token never holds 0x00,
 //!     which makes the separator unambiguous. Indexing and search both
 //!     tokenise through `tokens`, so they fold alike.
 //!   - The rows are written under `store.fulltext_fold`, which the
@@ -39,8 +40,23 @@ const Store = store_mod.Store;
 /// Longest token indexed, in bytes.
 pub const max_token = 255;
 
-/// The distinct folded tokens of `text`, in byte order.
+/// The distinct folded tokens of `text`, in byte order; one past
+/// `max_token` bytes is dropped, as it is never indexed.
 pub fn tokens(arena: Allocator, text: []const u8) ![]const []const u8 {
+    return tokenize(arena, text, false) catch |err| switch (err) {
+        error.TokenTooLong => unreachable,
+        else => |e| e,
+    };
+}
+
+/// The tokens of a search `text`: as `tokens`, but a token past
+/// `max_token` bytes is `error.TokenTooLong`, since no row holds it and
+/// dropping it would widen the search.
+pub fn needleTokens(arena: Allocator, text: []const u8) ![]const []const u8 {
+    return tokenize(arena, text, true);
+}
+
+fn tokenize(arena: Allocator, text: []const u8, refuse_long: bool) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     var i: usize = 0;
@@ -57,7 +73,10 @@ pub fn tokens(arena: Allocator, text: []const u8) ![]const []const u8 {
             i += d.len;
         }
         const token = try foldRun(arena, text[start..i]);
-        if (token.len > max_token) continue;
+        if (token.len > max_token) {
+            if (refuse_long) return error.TokenTooLong;
+            continue;
+        }
         const g = try seen.getOrPut(arena, token);
         if (!g.found_existing) try out.append(arena, token);
     }
@@ -477,6 +496,20 @@ test "tokens fold case, keep digits and non-ASCII bytes, split on the rest" {
     try testing.expectEqual(@as(usize, 2), odd.len);
     try testing.expectEqualStrings("kelvin", odd[0]);
     try testing.expectEqualStrings("\xC3\xFF\xE9", odd[1]);
+}
+
+test "needleTokens refuses a token past the bound; tokens drops it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const long = try arena.alloc(u8, max_token + 1);
+    @memset(long, 'a');
+    const text = try std.mem.concat(arena, u8, &.{ "b ", long });
+    try testing.expectError(error.TokenTooLong, needleTokens(arena, text));
+    try testing.expectEqual(@as(usize, 1), (try tokens(arena, text)).len);
+    @memset(long, 'a');
+    const fits = try needleTokens(arena, long[0..max_token]);
+    try testing.expectEqual(@as(usize, 1), fits.len);
 }
 
 test "matches needs every needle token and refuses an empty needle" {

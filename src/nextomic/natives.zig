@@ -454,7 +454,7 @@ fn durabilityOption(vm: *VM, v: Value) !?SyncMode {
     const found = (try option(vm, v, "durability")) orelse return null;
     if (found.kind() != .keyword) return error.InvalidArgument;
     const durability = dblayer.Durability.parse(vm.ensureInterner().keywordName(found.asKeywordId())) orelse return error.InvalidArgument;
-    return SyncMode.of(durability);
+    return durability.syncMode();
 }
 
 /// The connection is the owner VM's (`vm.home()`), so one a macro

@@ -356,10 +356,11 @@ domain its hash lands in. `dispatch.zig` is its code
 | 45 | `matcher` | identity | 45 | same value | pointer |
 | 46 | `uuid` | own kind | 46 | bytes | bytes |
 
-The reserved kinds (22 `byte_vector`, 28 `error_`, 29 `meta_symbol`)
-are never constructed; `dispatch` panics on one. A kind module
-implements only its structural rule and base hash; the routing, the
-identity test and the domain mix are `dispatch.zig`'s.
+The reserved kinds (22 `byte_vector`, 29 `meta_symbol`) and the
+reserved tag 28, which has no kind, are never constructed; `dispatch`
+panics on a reserved kind. A kind module implements only its
+structural rule and base hash; the routing, the identity test and the
+domain mix are `dispatch.zig`'s.
 
 ---
 
