@@ -2177,6 +2177,19 @@ test "hierarchies: class? holds of what class returns, which the global hierarch
 // Multimethods (STDLIB.md §9.2–§9.4): Clojure 1.12's multimethods.clj
 // tests and further cases, each expected value checked with bb.
 
+test "multimethods: an unreachable multimethod is collected" {
+    var p: Program = undefined;
+    try p.init();
+    defer p.deinit();
+    _ = try p.run("(def mm (make-multifn \"m\" identity :default (atom {})))");
+    p.v.collectGarbage();
+    const before = p.v.ensureHeap().live_bytes;
+    _ = try p.run("(dotimes [_ 20000] (make-multifn \"m\" identity :default (atom {})))");
+    p.v.collectGarbage();
+    const after = p.v.ensureHeap().live_bytes;
+    try testing.expect(after < before + 64 * 1024);
+}
+
 test "multimethods: dispatch, :default, remove-method and a method added later" {
     try expectOutputProgram(
         \\(defmulti too-simple identity)
@@ -2284,10 +2297,10 @@ test "multimethods: methods, get-method, prefers, remove-all-methods and what ea
         \\(defmulti rv identity)
         \\[(= rv (defmethod rv :a [_] :a)) (= rv (prefer-method rv :a :b)) (prefers rv) (= rv (remove-method rv :a))
         \\ (do (defmethod rv :c [_] :c) (= rv (remove-all-methods rv))) (methods rv) (prefers rv)
-        \\ (multifn? rv) (multifn? inc) (fn? rv) (ifn? rv) (= rv rv) (get {rv 1} rv) (meta rv)
+        \\ (multifn? rv) (multifn? inc) (fn? rv) (ifn? rv) (= rv rv) (get {rv 1} rv) (keys (meta rv))
         \\ (meta (with-meta rv {:a 1})) (try (methods {}) (catch ClassCastException e e))
         \\ (try (defmethod {} :a [] 1) (catch any e e))]
-    , "[true true {:a #{:b}} true true {} {} true false true true true 1 nil {:a 1} {:error :kind-mismatch, :message expected a multimethod, got a map, :fn test-form} {:error :kind-mismatch, :message expected a multimethod, got a map, :fn test-form}]");
+    , "[true true {:a #{:b}} true true {} {} true false true true true 1 (:multifn-state) {:a 1} {:error :kind-mismatch, :message expected a multimethod, got a map, :fn test-form} {:error :kind-mismatch, :message expected a multimethod, got a map, :fn test-form}]");
     // get-method: an ambiguity throws as a call does; no match and no default is nil.
     try expectOutputProgram(
         \\(derive :user/a :user/c) (derive :user/b :user/c) (derive :user/ab :user/a) (derive :user/ab :user/b)

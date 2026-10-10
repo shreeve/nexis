@@ -131,9 +131,6 @@ Each needs a PLAN amendment before code (`AGENTS.md`, authority order).
 Small items the revamp-3 streams (PRs 36–45) found across each other's
 files; each is a few lines.
 
-24. **A multimethod is kept forever.** core.nx's global `multifns` atom
-    holds every multimethod; a fn carries metadata (SEMANTICS §7), so a
-    multifn can keep its state there and the atom can go.
 25. **A protocol prints as `#<protocol id=N>`.** `protocol.nameOf` reads
     its name from the interner; `VM.registerProtocol` must call
     `Interner.nameProtocol` and `src/format.zig` print through it

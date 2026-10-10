@@ -1558,22 +1558,18 @@
        (reduce #(apply derive %1 %2) (make-hierarchy) (partition 2 deriv-seq))
        h))))
 
-; Every multimethod made, by identity (a function's = and hash are its
-; own), to its state: {:state s :cache c}, where the atom s holds
+; A multimethod keeps its state in its own metadata under
+; :multifn-state, {:state s :cache c}: the atom s holds
 ; {:name :default :href :table :prefers} and the atom c the pair
-; [hierarchy method-cache] the cache was built against. Nothing
-; unregisters, as with record types and protocols. The stdlib itself
-; defines no multimethod: past eight, the keys' pointer hashes would
-; order the image's copy of this map differently and fail its
-; verification (STDLIB.md §9.4).
-(def ^:private multifns (atom {}))
+; [hierarchy method-cache] the cache was built against. Nothing else
+; refers to it, so an unreachable multimethod is collected.
 
 (defn multifn?
   "Returns true if x is a multimethod."
-  [x] (contains? @multifns x))
+  [x] (and (fn? x) (contains? (meta x) :multifn-state)))
 
 (defn- multifn-entry [mf]
-  (or (get @multifns mf) (nexis.internal/#%raise :kind-mismatch "expected a multimethod, got" mf)))
+  (or (and (fn? mf) (:multifn-state (meta mf))) (nexis.internal/#%raise :kind-mismatch "expected a multimethod, got" mf)))
 
 ; MultiFn.resetCache: the cache is the method table, so an exact key
 ; is found before any isa? search.
@@ -1662,8 +1658,7 @@
              ([a b c] (mm-call dispatch-fn state cache href [a b c] nil))
              ([a b c d] (mm-call dispatch-fn state cache href [a b c d] nil))
              ([a b c d & more] (mm-call dispatch-fn state cache href [a b c d] more)))]
-    (swap! multifns assoc mf {:state state :cache cache})
-    mf))
+    (with-meta mf {:multifn-state {:state state :cache cache}})))
 
 ; Applies f to mf's state, resets its cache, and returns mf.
 (defn- mm-update! [mf f & args]

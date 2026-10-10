@@ -635,14 +635,12 @@ table iterates in insertion order up to eight entries and in CHAMP
 order past them, where Clojure's iterates in its hash order, so the
 two can be named the other way round.
 
-The registry keeps every multimethod for the VM's life, as the record
-type and protocol registries keep theirs; re-evaluating a file keeps
-each multimethod (`defmulti` defines once) and replaces its methods,
-Clojure's reload story. The stdlib image carries the registry, an
-empty map, and the global hierarchy. The stdlib defines no
-multimethod: the registry's keys hash by address, so past eight
-entries the image's rebuilt map would iterate in another order and
-`image.verify` would fail the build.
+A multimethod keeps its state (its method table, prefer table and
+cache) in its own metadata under `:multifn-state`, so one nothing refers
+to is collected; `(meta mm)` is `{:multifn-state {...}}` where Clojure's
+is nil, and `with-meta` on it returns a plain function. Re-evaluating a
+file keeps each multimethod (`defmulti` defines once) and replaces its
+methods, Clojure's reload story.
 
 
 ---
