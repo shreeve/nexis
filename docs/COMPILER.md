@@ -37,8 +37,9 @@ guarantees, not the Zig shape of `Tiny`, `Compiled` or the `Emitter`
 - A bytecode cache or object file: every run compiles from source.
 - A separate resolver or analyzer module: classification and
   capture marking happen inside `lowerForm`.
-- Register allocation beyond a stack of slots (§4.4); inline caches,
-  operand-specialized opcodes.
+- Register allocation beyond a stack of slots (§4.4) and inline
+  caches. Operand-specialized forms are the VM's quickening of the
+  finished code (§4.5, VM.md §10.10), not opcodes the emitter chooses.
 
 ---
 
