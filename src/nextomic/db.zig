@@ -179,7 +179,7 @@ pub const Conn = struct {
     }
 
     fn openIn(self: *Conn, path: [*:0]const u8, options: OpenOptions, gen: u64) !void {
-        const sync_mode = options.sync orelse SyncMode.of(store_mod.db_layer.Durability.process());
+        const sync_mode = options.sync orelse store_mod.db_layer.Durability.process().syncMode();
         const store = try Store.open(self.gpa, path, .{ .sync = sync_mode, .refused_format = options.refused_format });
         errdefer store.close();
         const gpa = self.gpa;
@@ -706,6 +706,40 @@ pub const TxEntry = struct {
     /// The excision marker (§4); empty on an untouched entry.
     excised: []u64,
 };
+
+/// The newest `t` whose transaction entity's `:db/txInstant` is at or
+/// before `ms`, 0 when every transaction is later. Instants never go
+/// back, so the last AVET entry below `ms + 1` is the answer: one seek
+/// and one step back (NEXTOMIC.md §4).
+pub fn txAtInstant(conn: *Conn, ms: i64) !u64 {
+    const txn = try conn.beginReadTxn();
+    defer conn.endReadTxn(txn);
+    var abuf: [key.ordered_max]u8 = undefined;
+    const ab = key.writeOrdered(&abuf, boot.tx_instant);
+    var buf: [key.max_key_len]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const gpa = fba.allocator();
+    const seek = if (ms == std.math.maxInt(i64))
+        (try key.successor(gpa, ab)).?
+    else blk: {
+        var list: std.ArrayList(u8) = .empty;
+        try list.appendSlice(gpa, ab);
+        try key.encodeVal(&list, gpa, .{ .instant = ms + 1 });
+        break :blk list.items;
+    };
+    var c = try txn.openCursorForTree(conn.store.trees.cur(.avet));
+    const below = if (c.setRange(seek)) |_| c.prev() else blk: {
+        try Store.ended(&c);
+        break :blk c.last();
+    };
+    const kv = below orelse {
+        try Store.ended(&c);
+        return 0;
+    };
+    if (!key.hasPrefix(kv.key, ab)) return 0;
+    const parts = try key.unpackKey(.avet, false, kv.key);
+    return key.txOfEntity(parts.e) orelse error.Corrupted;
+}
 
 /// Txlog entries with `from <= t < to` (an absent `to` runs to the newest).
 pub fn txRange(conn: *Conn, arena: Allocator, from: u64, to: ?u64) ![]TxEntry {

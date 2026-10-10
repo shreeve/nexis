@@ -48,6 +48,7 @@
 const std = @import("std");
 const value = @import("../../value.zig");
 const vm_mod = @import("../../vm.zig");
+const random_mod = @import("../../random.zig");
 const string_mod = @import("../../string.zig");
 const champ = @import("../../coll/champ.zig");
 const dispatch = @import("../../dispatch.zig");
@@ -185,7 +186,7 @@ fn explainNative(vm: *VM, call_args: []const Value, diag: *Diag) !Value {
 /// The options of a query this VM runs: its caches and `hook`.
 fn options(vm: *VM, hook: ?query.CallHook) !query.Options {
     const st = try natives.state(vm);
-    return .{ .hook = hook, .db_of = &natives.dbOf, .ir_cache = &st.ir_cache, .rules_cache = &st.rules_cache };
+    return .{ .hook = hook, .db_of = &natives.dbOf, .ir_cache = &st.ir_cache, .rules_cache = &st.rules_cache, .random = random_mod.shared(vm.io orelse std.Io.Threaded.global_single_threaded.io()) };
 }
 
 /// The arguments an arg-map call `(q {:query q :args [...]})` stands

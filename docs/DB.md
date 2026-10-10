@@ -429,6 +429,7 @@ emdb, codec, intern and allocator errors propagate unchanged.
 | `StoreFile.acquire(path, allocator) !*StoreFile` / `release(*StoreFile)` / `beginWrite(*StoreFile, options) !*emdb.Txn` | §3.1; the last `release` syncs (§3.3). |
 | `StoreFile.commit(*StoreFile, txn) !void` / `sync(*StoreFile) !void` / `closingSync(*StoreFile) !void` / `syncFailed(*const StoreFile) bool` / `StoreFile.syncAll() void` | Commit the file's write transaction, noting whether it synced; one full sync when a commit left the file unsynced, `SyncFailed` once a sync of the file has failed; a close's sync, nothing once one has; whether one has; the closing sync of every open file (§3.3). |
 | `Durability.parse(text) ?Durability` / `Durability.process() Durability` | `commit` or `durable`; the process's, from `NEXIS_DURABILITY` (§3.3). |
+| `Durability.syncMode() SyncMode` | The sync of a commit, `none` or `full`; `SyncMode` (`full`, `no_meta`, `none`) is Nextomic's too. |
 | `close(*Connection) !void` / `shutdown(*Connection) void` / `shutdownHeap(*Heap) void` / `sync(*Connection) !void` | §3, §3.3. |
 | `storeId(*const Connection) u128` | §2. |
 | `beginWrite(*Connection) !WriteTxn` / `beginRead(*Connection) !ReadTxn` | `ConnectionUnavailable` on a closed connection. |

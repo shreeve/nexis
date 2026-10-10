@@ -28,6 +28,7 @@
 const std = @import("std");
 const value_mod = @import("value.zig");
 const vm_mod = @import("vm.zig");
+const random_mod = @import("random.zig");
 const list_mod = @import("coll/list.zig");
 const lazy_mod = @import("coll/lazy.zig");
 const seq_mod = @import("seq.zig");
@@ -1317,18 +1318,10 @@ fn fnBitClear(vm: *VM, args: []const Value) VmError!Value {
     return integerValue(vm, try intArg(args[0]) & ~try bitMask(args[1]));
 }
 
-/// The generator behind `rand`, `rand-int` and `shuffle`, seeded from
-/// the I/O's entropy at first use. One
-/// isolate, one thread.
-var prng: ?std.Random.DefaultPrng = null;
-
+/// The generator behind `rand`, `rand-int` and `shuffle`: the
+/// process's (`random.zig`), which Nextomic's `sample` shares.
 fn random(vm: *VM) std.Random {
-    if (prng == null) {
-        var seed: [8]u8 = undefined;
-        ioOf(vm).random(&seed);
-        prng = std.Random.DefaultPrng.init(std.mem.readInt(u64, &seed, .little));
-    }
-    return prng.?.random();
+    return random_mod.shared(ioOf(vm));
 }
 
 fn fnRand(vm: *VM, args: []const Value) VmError!Value {
@@ -4139,7 +4132,7 @@ fn isClassKeyword(name: []const u8) bool {
     return switch (kinds[0]) {
         // nil has no class, a record's is a symbol, and the rest are
         // reserved or never escape.
-        .nil, .record, .byte_vector, .error_, .meta_symbol, .cell_internal => false,
+        .nil, .record, .byte_vector, .meta_symbol, .cell_internal => false,
         else => |k| std.mem.eql(u8, className(k), name),
     };
 }

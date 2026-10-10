@@ -122,28 +122,12 @@ Each needs a PLAN amendment before code (`AGENTS.md`, authority order).
     `docs/FILEMAN-NEXTOMIC.md` has the mapping from `^DD`, the three
     ways to combine them (a temporal mirror first) and a first
     demonstration. The capture hook belongs to em's repository.
-22. **`as-of` of an instant.** Datomic's `(d/as-of db #inst "...")`
-    takes a `Date` and resolves it through the `:db/txInstant` index to
-    the last transaction at or before it; nexis's `as-of` and `since`
-    take a basis `t` only (`docs/NEXTOMIC.md` §4). The `inst` kind and
-    the AVET entries of `:db/txInstant` make it a small change.
 
 ## Open from revamp 3
 
 Small items the revamp-3 streams (PRs 36–45) found across each other's
 files; each is a few lines.
 
-27. **Duplicates left between files:** the LEB128 in
-    `nextomic/datom.zig` (codec's), the sync mapping
-    `SyncMode.of` in `nextomic/store.zig` (`Durability.syncOverride`;
-    two enums, so one must be renamed across both layers), and one
-    random generator for the query layer and `rand`.
-28. **Small rows left:** a fulltext needle with an over-long token
-    (`nextomic/fulltext.zig` drops it from the needle, so the search
-    widens; a decision, not a deletion), and the reserved `Kind` name
-    `.error_` (kind 28 is one of three reserved wire tags, documented as
-    a set in VALUE.md, CODEC.md, GC.md and SEMANTICS.md §Kinds; the one
-    use is a `false` arm in `stdlib.zig`).
 29. **The test and doc pass the revamp deferred:** `eval_pipeline`'s
     superseded early cases and its fresh VM per case (31 s of the gate),
     the duplicated pins, `docs/PERF.md`'s superseded tables, test

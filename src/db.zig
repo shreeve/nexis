@@ -523,10 +523,26 @@ pub const Durability = enum {
         return parse(std.mem.span(std.c.getenv("NEXIS_DURABILITY") orelse return .durable)) orelse .durable;
     }
 
-    pub fn syncOverride(self: Durability) emdb.SyncOverride {
+    pub fn syncMode(self: Durability) SyncMode {
         return switch (self) {
             .commit => .none,
             .durable => .full,
+        };
+    }
+};
+
+/// How one commit syncs: data and meta, data only, or nothing
+/// (`Durability` chooses a connection's).
+pub const SyncMode = enum {
+    full,
+    no_meta,
+    none,
+
+    pub fn override(self: SyncMode) emdb.SyncOverride {
+        return switch (self) {
+            .full => .full,
+            .no_meta => .noMeta,
+            .none => .none,
         };
     }
 };
@@ -683,7 +699,7 @@ pub const ReadTxn = struct {
 
 pub fn beginWrite(conn: *Connection) !WriteTxn {
     if (!conn.open_flag) return DbError.ConnectionUnavailable;
-    const txn = try conn.file.beginWrite(.{ .sync = conn.durability.syncOverride() });
+    const txn = try conn.file.beginWrite(.{ .sync = conn.durability.syncMode().override() });
     conn.open_txns += 1;
     return .{ .conn = conn, .inner = txn };
 }
@@ -1332,6 +1348,12 @@ test "failureName: every emdb error nexis can meet has its keyword; every decode
         else if (std.mem.eql(u8, name, "UnserializableKind")) "unserializable" else "codec-failed";
         try testing.expectEqualStrings(expected, failureName(@field(codec_mod.DecodeError, name)));
     }
+}
+
+test "Durability: maps to the sync of a commit" {
+    try testing.expectEqual(SyncMode.none, Durability.commit.syncMode());
+    try testing.expectEqual(SyncMode.full, Durability.durable.syncMode());
+    try testing.expectEqual(emdb.SyncOverride.noMeta, SyncMode.no_meta.override());
 }
 
 test "Durability: parses its two names and nothing else" {
