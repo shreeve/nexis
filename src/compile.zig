@@ -410,13 +410,6 @@ pub const CompileError = error{
     /// or an upvalue raises this.
     UnresolvedSymbol,
 
-    /// Two bindings in the same `letfn*` group carry the same
-    /// name. Unlike `let*` (sequential shadowing allowed),
-    /// `letfn*` names are mutually visible — duplicates
-    /// create resolution ambiguity. Matches Clojure
-    /// (`letfn` rejects duplicate names).
-    DuplicateBinding,
-
     /// `(recur ...)` appears in a position that is not a tail
     /// position of an enclosing `loop*` or `fn*` body. Per
     /// COMPILER.md §4.4, §5.6 + VM.md §11: `recur` MUST
@@ -4467,15 +4460,6 @@ fn compileLetFnStar(
     dst: u12,
     recur_target: ?*const RecurTarget,
 ) CompileError!void {
-    // Reject duplicate binding names. Unlike let* (sequential
-    // shadowing OK), letfn* names are mutually visible — two
-    // with the same name create resolution ambiguity.
-    for (bindings, 0..) |b, i| {
-        for (bindings[0..i]) |b2| {
-            if (std.mem.eql(u8, b.name, b2.name)) return CompileError.DuplicateBinding;
-        }
-    }
-
     const scope_mark = e.scope.mark();
     defer e.scope.restore(scope_mark);
 
@@ -4760,7 +4744,6 @@ test "compile errors: each malformed program fails with its variant" {
         .{ .src = "(def)", .err = CompileError.MalformedForm },
         .{ .src = "(def 42 5)", .err = CompileError.ExpectedSymbol },
         .{ .src = "(var)", .err = CompileError.MalformedForm },
-        .{ .src = "(letfn* [(f [] 1) (f [] 2)] (f))", .err = CompileError.DuplicateBinding },
         .{ .src = "(recur)", .err = CompileError.RecurOutsideTail },
         .{ .src = "(loop* [i 0] (let* [x (recur 1)] x))", .err = CompileError.RecurOutsideTail },
         .{ .src = "(loop* [i 0] (do (recur 1) i))", .err = CompileError.RecurOutsideTail },

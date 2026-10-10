@@ -8770,3 +8770,7 @@ test "loader: with on_failure, a form that fails at run time does not stop the f
     try testing.expectEqual(@as(usize, 2), repl.failures);
     try harness.expectResult(&program, src, last, "3");
 }
+
+test "letfn: a repeated name is its last binding, everywhere in the form, as in Clojure" {
+    try expectOutput("[(letfn [(f [] 1) (f [] 2)] (f)) (letfn [(f [] 1) (g [] (f)) (f [] 2)] (g))]", "[2 2]");
+}
