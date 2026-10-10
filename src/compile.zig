@@ -792,6 +792,30 @@ const Emitter = struct {
 
     /// `SlotOverflow`, with `LowerDiag.detail` naming this routine
     /// and the limit it reached, `what` (COMPILER.md §7).
+    /// What compiling one node changes and `leaveNode` restores: the
+    /// span its instructions carry (a parent's instructions after it
+    /// carry the parent's again) and the slots it allocates, dead once
+    /// it is compiled.
+    const NodeMark = struct { span: ?reader_mod.SrcSpan, slot_top: u16 };
+
+    fn enterNode(self: *Emitter, t: *const Tiny) NodeMark {
+        const mark: NodeMark = .{ .span = self.current_span, .slot_top = self.slot_top };
+        if (@as(*const TinyNode, @fieldParentPtr("tiny", t)).span) |span| self.current_span = span;
+        return mark;
+    }
+
+    fn leaveNode(self: *Emitter, mark: NodeMark) void {
+        self.current_span = mark.span;
+        self.slot_top = mark.slot_top;
+    }
+
+    /// Locate a failure at the innermost node being compiled.
+    fn locateError(self: *const Emitter) void {
+        if (self.diag) |d| if (d.span == null) {
+            d.span = self.current_span;
+        };
+    }
+
     /// `err`, saying why when nothing has yet (COMPILER.md §7).
     fn fail(self: *const Emitter, err: CompileError, comptime fmt: []const u8, args: anytype) CompileError {
         const d = self.diag orelse return err;
@@ -3071,19 +3095,10 @@ fn compileExpr(
     dst: u12,
     recur_target: ?*const RecurTarget,
 ) CompileError!void {
-    // Instructions this node emits carry its own span; whatever the
-    // parent emits after this call carries the parent's again.
-    const saved_span = e.current_span;
-    defer e.current_span = saved_span;
-    if (@as(*const TinyNode, @fieldParentPtr("tiny", form)).span) |span| e.current_span = span;
-    // The innermost form reports the error.
-    errdefer if (e.diag) |d| {
-        if (d.span == null) d.span = e.current_span;
-    };
+    const node = e.enterNode(form);
+    defer e.leaveNode(node);
+    errdefer e.locateError();
     try stack.check();
-    // What this node allocates is dead once it is compiled.
-    const slot_mark = e.slot_top;
-    defer e.slot_top = slot_mark;
     // In a tail of the function a form returns its value itself: in
     // place when it is a literal, a local or a Var, else from `dst`
     // once computed. The forms that pass the tail on to their parts
@@ -4088,15 +4103,10 @@ fn compileDo(
 /// slot freed at once.
 fn compileEffect(e: *Emitter, t: *const Tiny) CompileError!void {
     if (isInert(e, t)) return;
-    const saved_span = e.current_span;
-    defer e.current_span = saved_span;
-    if (@as(*const TinyNode, @fieldParentPtr("tiny", t)).span) |span| e.current_span = span;
-    errdefer if (e.diag) |d| {
-        if (d.span == null) d.span = e.current_span;
-    };
+    const node = e.enterNode(t);
+    defer e.leaveNode(node);
+    errdefer e.locateError();
     try stack.check();
-    const slot_mark = e.slot_top;
-    defer e.slot_top = slot_mark;
     switch (t.*) {
         .do_ => |items| for (items) |item| try compileEffect(e, item),
         .if_ => |i| {
