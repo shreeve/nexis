@@ -2045,7 +2045,7 @@ fn constantColl(allocator: std.mem.Allocator, op: vm.CollOp, items: []const *con
     const values = try allocator.alloc(Value, items.len);
     defer allocator.free(values);
     for (items, values) |item, *v| v.* = try constValue(item) orelse return null;
-    return buildColl(heap, op, values) catch CompileError.OutOfMemory;
+    return expand_mod.collOf(heap, op, values) catch CompileError.OutOfMemory;
 }
 
 /// The constant `t` is, if it is one.
@@ -2057,27 +2057,6 @@ fn constValue(t: *const Tiny) CompileError!?Value {
         .literal => |v| v,
         else => null,
     };
-}
-
-fn buildColl(heap: *heap_mod.Heap, op: vm.CollOp, values: []const Value) !Value {
-    switch (op) {
-        .list => return list_mod.fromSlice(heap, values),
-        .vector => return if (values.len == 0) vector_mod.empty(heap) else vector_mod.fromSlice(heap, values),
-        .map => {
-            var m = try champ_mod.mapEmpty(heap);
-            var i: usize = 0;
-            while (i < values.len) : (i += 2) {
-                m = try champ_mod.mapAssoc(heap, m, values[i], values[i + 1], &dispatch_mod.hashValue, &dispatch_mod.equal);
-            }
-            return m;
-        },
-        .set => {
-            var set = try champ_mod.setEmpty(heap);
-            for (values) |v| set = try champ_mod.setConj(heap, set, v, &dispatch_mod.hashValue, &dispatch_mod.equal);
-            return set;
-        },
-        else => unreachable,
-    }
 }
 
 /// `(quote x)` and `'x`: `x` as data. A self-evaluating scalar lowers

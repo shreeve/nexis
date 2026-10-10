@@ -1302,12 +1302,12 @@ fn formValue(ctx: *ExpandContext, form: *const Form) ExpandError!value_mod.Value
             const values = try ctx.allocator.alloc(value_mod.Value, items.len);
             defer ctx.allocator.free(values);
             for (items, values) |item, *v| v.* = try formToValue(ctx, item);
-            break :blk switch (form.datum) {
-                .list => list_mod.fromSlice(heap, values),
-                .vector => vector_mod.fromSlice(heap, values),
-                .set => setOf(heap, values),
-                else => mapOf(heap, values),
-            } catch return oom;
+            break :blk collOf(heap, switch (form.datum) {
+                .list => .list,
+                .vector => .vector,
+                .set => .set,
+                else => .map,
+            }, values) catch return oom;
         },
         .quote => |inner| try callForm(ctx, "quote", inner),
         .deref => |inner| try callForm(ctx, "nexis.core/deref", inner),
@@ -1369,19 +1369,18 @@ fn callForm(ctx: *ExpandContext, head: []const u8, x: *const Form) ExpandError!v
     return list_mod.fromSlice(try ctx.heapForArgs(), &items) catch ExpandError.OutOfMemory;
 }
 
-fn setOf(heap: *heap_mod.Heap, values: []const value_mod.Value) !value_mod.Value {
-    var s = try champ_mod.setEmpty(heap);
-    for (values) |v| s = try champ_mod.setConj(heap, s, v, &dispatch.hashValue, &dispatch.equal);
-    return s;
-}
-
-/// The map of `kvs`, keys and values alternating (the reader
-/// guarantees an even count).
-fn mapOf(heap: *heap_mod.Heap, kvs: []const value_mod.Value) !value_mod.Value {
-    var m = try champ_mod.mapEmpty(heap);
-    var i: usize = 0;
-    while (i + 1 < kvs.len) : (i += 2) m = try champ_mod.mapAssoc(heap, m, kvs[i], kvs[i + 1], &dispatch.hashValue, &dispatch.equal);
-    return m;
+/// The list, vector, set or map (`values` alternating keys and
+/// values) of `values`, built at once as the VM's `coll:` instructions
+/// build one: a form as data and the compiler's constant collections.
+pub fn collOf(heap: *heap_mod.Heap, op: vm_mod.CollOp, values: []const value_mod.Value) !value_mod.Value {
+    return switch (op) {
+        .list => list_mod.fromSlice(heap, values),
+        .vector => vector_mod.fromSlice(heap, values),
+        .set => champ_mod.setFromElements(heap, values, &dispatch.hashValue, &dispatch.equal),
+        // Flat key, value pairs are `Entry`s laid end to end.
+        .map => champ_mod.mapFromEntries(heap, @as([*]const champ_mod.Entry, @ptrCast(values.ptr))[0 .. values.len / 2], &dispatch.hashValue, &dispatch.equal),
+        else => unreachable,
+    };
 }
 
 /// A macro's result as a form in `ctx.allocator`, each one the macro
