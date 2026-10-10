@@ -2,7 +2,8 @@
 
 The contract of `src/intern.zig`: the process-local tables that map
 keyword and symbol names to the ids and name hashes a keyword or
-symbol Value carries, and the record-type names the printer reads. PLAN §23 #32 freezes the keyword/symbol asymmetry; equality and
+symbol Value carries, and the record-type and protocol names the
+printer reads. PLAN §23 #32 freezes the keyword/symbol asymmetry; equality and
 hashing of the two kinds are `docs/SEMANTICS.md` §2.5 and §3.3.
 
 A VM owns one `Interner` (`VM.ensureInterner`); a sub-VM the expander
@@ -64,6 +65,8 @@ split (§3) and the map/list lockstep (§4) over random names.
 | `keywordCount()`, `symbolCount()` | The table sizes |
 | `nameRecordType(type_id, ns, name) !void` | Names a record type `ns.name`, the printer's source for `#ns.Type{...}` (`docs/PROTOCOLS.md` §2.1); naming an id again renames it |
 | `recordTypeName(type_id) ?[]const u8` | That name, or null for a type never named |
+| `nameProtocol(protocol_id, ns, name) !void` | Names a protocol `ns/name` (`name` alone for an empty `ns`), the printer's source for a protocol and its fns (`protocol.nameOf`, `docs/PROTOCOLS.md` §2.2); naming an id again renames it |
+| `protocolName(protocol_id) ?[]const u8` | That name, or null for a protocol never named |
 
 The intern calls fail with `error.OutOfMemory`, `error.EmptyName` or
 `error.InternTableFull` (`InternError`); the stdlib maps `EmptyName`
@@ -96,18 +99,15 @@ returned slices point into the argument.
 
 ### 4. Internal shape
 
-Each table is a `StringHashMapUnmanaged(u32)` from name to id, an
-`ArrayList([]const u8)` from id to the owned copy of the
-name, and an `ArrayList(u32)` from id to the name's
+Each table is a `StringHashMapUnmanaged(u32)` from name to id and an
+`ArrayList` from id to the owned copy of the name and its
 `hash.nameHash`; the map's key is the owned copy, never a slice of
 the list's backing array, which moves when the list grows. The hash
 is computed once, at the first intern, so building a Value from an
 id costs an index. `internInto`, shared by both tables, rejects an
 empty name, returns an existing id on a hit, checks the bound, then
 copies the name, appends it and its hash and inserts it, each step
-undone by an `errdefer` if a following step fails. `internInto`
-asserts that the map and the lists have the same length, `deinit`
-that the map and the names do.
+undone by an `errdefer` if a following one fails.
 
 ---
 

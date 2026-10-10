@@ -150,6 +150,9 @@ the first `delay` registers `nexis.core/Delay` with field `:state`.
   Clojure's `defrecord` makes a new class: the constructors and
   predicate name the new type, and values built before keep the old
   one, so they are not `=` to new ones and fail the new predicate.
+  `class`, `type` and `instance?` name a record type by `ns.Name`
+  alone, so an old value and a new one report one class and `(instance?
+  P old)` is true, where Clojure, whose classes differ, says false.
 - `defprotocol` of an existing `(ns, name)` registers a new protocol
   with no impls, as Clojure's does; the method Vars are rebound to the
   new protocol's fns, so old impls no longer apply.

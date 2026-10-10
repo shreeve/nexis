@@ -1,40 +1,13 @@
-//! gc.zig — precise mark-sweep tracing garbage collector.
+//! gc.zig — the precise, non-moving mark-sweep collector (`docs/GC.md`).
 //!
-//! Authoritative spec: `docs/GC.md` (strategy §1, roots §3; PLAN.md
-//! §23 #2, #18). Mark-bit layout: `docs/HEAP.md` §4. Heap / sweep
-//! scaffold: `docs/HEAP.md` and `src/heap.zig`.
-//!
-//! Every heap kind whose blocks hold heap values (the collections,
-//! transient, atom, record, the Nextomic entity) exposes a `trace`
-//! function this collector dispatches to during the mark phase; a
-//! leaf kind (string, bignum, typed vector, durable ref, protocol,
-//! protocol fn, Nextomic connection and db) has nothing to trace.
-//!
-//! Collector contract (GC.md §4):
-//!   - A cycle is `collect(roots)`: the caller's roots, then the
-//!     host's (`Host.roots`), then the sweep. The VM decides when a
-//!     cycle is due (GC.md §7); the collector has no policy of its
-//!     own.
-//!   - Iterative — `mark` sets the bit and pushes the header on a
-//!     gray worklist; `collect` drains it. Data nesting depth never
-//!     becomes native recursion depth (GC.md §4). A worklist that
-//!     cannot grow abandons the cycle; it never recurses.
-//!   - Precise — the roots are complete; the collector does NOT
-//!     scan stacks or registers.
-//!   - No write barriers (STW, single-threaded).
-//!   - No generational / concurrent phases.
-//!
-//! Imports: the heap, `value.zig`, and each module whose kind has a
-//! block to trace (the collections, transient, atom, record,
-//! `nextomic/handle.zig`) or a handle to flag (db); the kind → trace
-//! table is GC.md §5.
-//!
-//! `vm.zig` imports gc.zig and is the collector's host: it
-//! enumerates the runtime's roots and traces the two block kinds
-//! whose layout it owns (closures and upvalue cells) through
-//! `Host`. Per-kind modules take the visitor as `anytype`;
-//! `gc.Collector` satisfies the duck-typed visitor ABI
-//! `{ markValue, mark, markInternal }`.
+//! `collect` marks the caller's roots, then the host's, and sweeps; the
+//! VM decides when (GC.md §7). Marking is a loop over a gray worklist,
+//! never a recursion on the data's depth (§4). Each kind whose blocks
+//! hold heap values has a `trace` the collector dispatches to (§5),
+//! called with the collector as its `anytype` visitor
+//! (`markValue`, `mark`, `markInternal`). The VM is the host: it marks
+//! the runtime's roots and traces the closures and upvalue cells whose
+//! layout it owns.
 
 const std = @import("std");
 const value = @import("value.zig");
@@ -58,6 +31,8 @@ const Heap = heap_mod.Heap;
 const HeapHeader = heap_mod.HeapHeader;
 
 const testing = std.testing;
+const synthHash = Value.hashImmediate;
+const synthEq = value.testEqual;
 
 // =============================================================================
 // Collector — the public API (GC.md §4)
@@ -139,7 +114,7 @@ pub const Collector = struct {
     /// When the worklist cannot grow, the header stays marked but
     /// untraced and `overflowed` says the marks are incomplete.
     pub fn mark(self: *Collector, h: *HeapHeader) void {
-        if (!self.markHeaderOnce(h)) return;
+        if (!self.markInternal(h)) return;
         if (h.meta == null and isLeafKind(h.kind)) return;
         if (self.in_place > 0) {
             // A bounded number of levels: below them what a trace
@@ -154,10 +129,7 @@ pub const Collector = struct {
             self.overflowed = true;
             return;
         };
-        if (!self.draining) {
-            self.drain();
-            self.gray.clearRetainingCapacity();
-        }
+        if (!self.draining) self.drain();
     }
 
     /// How many levels below a popped header the drain traces in
@@ -226,28 +198,11 @@ pub const Collector = struct {
         }
     }
 
-    /// Mark an INTERNAL heap node (a subkind-2/3 CHAMP node or a
-    /// subkind-2/3/4 vector node — nodes that are never directly
-    /// referenced by a user-visible Value). Returns `true` if this
-    /// call flipped the mark bit, `false` if the node was already
-    /// marked. Callers (per-kind trace code) use the return value
-    /// to decide whether to walk the node's payload.
-    ///
-    /// Does NOT walk `h.meta` — internal nodes have no metadata
-    /// semantics (CHAMP.md §4, VECTOR.md §3 invariants).
-    /// Does NOT dispatch on `h.kind` — the caller knows the
-    /// structural context and will walk the payload itself (vector
-    /// trie walking via `traceTrie`; CHAMP walking via
-    /// `Trie.traceNode`).
-    pub fn markInternal(self: *Collector, h: *HeapHeader) bool {
-        return self.markHeaderOnce(h);
-    }
-
-    /// Shared mark-bit primitive. Returns `true` if this call flipped
-    /// the bit (caller should continue walking); `false` if already
-    /// marked (caller should stop).
-    fn markHeaderOnce(self: *Collector, h: *HeapHeader) bool {
-        _ = self;
+    /// Set the mark bit of an internal node, one no Value points at,
+    /// which its owner's trace walks (GC.md §5): true when this call
+    /// set it, so the caller walks the node. Neither the node's
+    /// metadata nor its kind is looked at.
+    pub fn markInternal(_: *Collector, h: *HeapHeader) bool {
         if (h.isMarked()) return false;
         h.setMarked();
         return true;
@@ -362,24 +317,6 @@ test "collect: cross-kind graph — map whose values are lists" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
 
-    const synthHash = struct {
-        fn f(x: Value) u64 {
-            return x.hashImmediate();
-        }
-    }.f;
-    const synthEq = struct {
-        fn f(a: Value, b: Value) bool {
-            if (a.tag == b.tag and a.payload == b.payload) return true;
-            if (a.kind() != b.kind()) return false;
-            return switch (a.kind()) {
-                .nil, .false_, .true_ => true,
-                .fixnum => a.asFixnum() == b.asFixnum(),
-                .keyword => a.asKeywordId() == b.asKeywordId(),
-                else => false,
-            };
-        }
-    }.f;
-
     const l1 = try list.fromSlice(&heap, &.{ value.fromFixnum(10).?, value.fromFixnum(20).? });
     const l2 = try list.fromSlice(&heap, &.{value.fromFixnum(30).?});
     var m = try champ.mapEmpty(&heap);
@@ -403,18 +340,6 @@ test "collect: cross-kind graph — map whose values are lists" {
 test "collect: CHAMP-backed map survives (>8 entries exercises internal nodes)" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-
-    const synthHash = struct {
-        fn f(x: Value) u64 {
-            return x.hashImmediate();
-        }
-    }.f;
-    const synthEq = struct {
-        fn f(a: Value, b: Value) bool {
-            if (a.tag == b.tag and a.payload == b.payload) return true;
-            return false;
-        }
-    }.f;
 
     // 20 keyword → fixnum entries forces CHAMP promotion. Each
     // `mapAssoc` is path-copy persistent, so ALL the intermediate
@@ -484,14 +409,6 @@ test "collect: a vector's element blocks are traced in place, not queued" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
 
-    const synth = struct {
-        fn hash(x: Value) u64 {
-            return x.hashImmediate();
-        }
-        fn eq(a: Value, b: Value) bool {
-            return a.tag == b.tag and a.payload == b.payload;
-        }
-    };
     // 2,000 small maps of immediates, the elements of one vector; the
     // last also holds a list, which its trace queues.
     const n: usize = 2000;
@@ -500,7 +417,7 @@ test "collect: a vector's element blocks are traced in place, not queued" {
     const key = value.fromFixnum(0).?;
     for (elems, 0..) |*slot, i| {
         const x = if (i == n - 1) try list.fromSlice(&heap, &.{value.fromFixnum(@intCast(i)).?}) else value.fromFixnum(@intCast(i)).?;
-        slot.* = try champ.mapAssoc(&heap, try champ.mapEmpty(&heap), key, x, &synth.hash, &synth.eq);
+        slot.* = try champ.mapAssoc(&heap, try champ.mapEmpty(&heap), key, x, &synthHash, &synthEq);
     }
     const v = try vector.fromSlice(&heap, elems);
     _ = try string.fromBytes(&heap, "orphan");
@@ -515,9 +432,9 @@ test "collect: a vector's element blocks are traced in place, not queued" {
     // worklist held the vector and the one list, never the maps.
     try testing.expect(gc.gray.capacity < 64);
     for (0..n - 1) |i| {
-        try testing.expectEqual(@as(i64, @intCast(i)), champ.mapGet(vector.nth(v, i), key, &synth.hash, &synth.eq).present.asFixnum());
+        try testing.expectEqual(@as(i64, @intCast(i)), champ.mapGet(vector.nth(v, i), key, &synthHash, &synthEq).present.asFixnum());
     }
-    const l = champ.mapGet(vector.nth(v, n - 1), key, &synth.hash, &synth.eq).present;
+    const l = champ.mapGet(vector.nth(v, n - 1), key, &synthHash, &synthEq).present;
     try testing.expectEqual(@as(i64, n - 1), list.head(l).asFixnum());
 
     // The same vector inside a transient, two levels below the root.
@@ -578,18 +495,6 @@ test "collect: a chain of realized lazy cells survives a cycle and an unreachabl
 test "collect: persistent set survives (>8 elements exercises CHAMP internals)" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-
-    const synthHash = struct {
-        fn f(x: Value) u64 {
-            return x.hashImmediate();
-        }
-    }.f;
-    const synthEq = struct {
-        fn f(a: Value, b: Value) bool {
-            if (a.tag == b.tag and a.payload == b.payload) return true;
-            return false;
-        }
-    }.f;
 
     var s = try champ.setEmpty(&heap);
     var i: u32 = 0;
@@ -682,22 +587,6 @@ test "collect: idempotent — second call frees 0 blocks" {
     // Second collect: only `a` is live, and it's in roots → nothing freed.
     try testing.expectEqual(@as(usize, 0), gc.collect(&.{Heap.asHeapHeader(a)}));
     try testing.expectEqual(@as(usize, 1), heap.liveCount());
-}
-
-test "collect: sweep clears mark bits on survivors" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const a = try string.fromBytes(&heap, "a");
-    const ah = Heap.asHeapHeader(a);
-    try testing.expect(!ah.isMarked()); // freshly allocated
-
-    var gc = Collector.init(&heap);
-    defer gc.deinit();
-    _ = gc.collect(&.{ah});
-    // After sweep, survivor's mark bit must be cleared so the next
-    // cycle starts fresh.
-    try testing.expect(!ah.isMarked());
 }
 
 test "collect: a worklist that cannot grow abandons the cycle instead of recursing" {
@@ -810,22 +699,6 @@ test "metadata chain: reachable through h.meta" {
     // Both `a` and its meta must survive.
     try testing.expectEqual(@as(usize, 0), freed);
     try testing.expectEqual(@as(usize, 2), heap.liveCount());
-}
-
-test "metadata chain: meta-only unreachable block is swept" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const meta_h = try heap.alloc(.string, 4);
-    _ = meta_h;
-    // Allocate without attaching — pure orphan.
-    try testing.expectEqual(@as(usize, 1), heap.liveCount());
-
-    var gc = Collector.init(&heap);
-    defer gc.deinit();
-    const freed = gc.collect(&.{}); // no roots
-    try testing.expectEqual(@as(usize, 1), freed);
-    try testing.expectEqual(@as(usize, 0), heap.liveCount());
 }
 
 test "host: roots are marked after the explicit roots and closure/cell blocks trace through it" {

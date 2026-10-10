@@ -176,7 +176,15 @@ therefore key by heap values (§12.3).
 The hash has a fixed seed, so keys can be chosen to share one indexing
 hash: n such keys land in one collision node, a linear list, which
 makes each insert and lookup O(n) and building the map O(n²), as in
-Clojure. Finding each such key takes about 2³² hashes offline.
+Clojure. What finding such keys costs depends on the kind. A string,
+keyword or symbol takes about 2³² hashes offline per key. A fixnum or
+float takes none: its hash is xxHash3's 8-byte path, a bijection of the
+64-bit word, plus a constant per kind, so keys with any chosen indexing
+hash come from inverting it. Every preimage is a float key (NaN aside)
+and about one in 2¹⁶ a fixnum. A char has 2²¹ values to try. So a set
+or map built from untrusted numbers (`set`, `frequencies`, `group-by`
+or `distinct` over a JSON array; a Nextomic `:find` set) can be made
+quadratic, as Clojure's can: its `Murmur3.hashLong` is invertible too.
 
 #### 5.2 Levels
 

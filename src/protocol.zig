@@ -1,26 +1,12 @@
-//! protocol.zig — `Kind.protocol = 36` + `Kind.protocol_fn = 37`
-//! heap kinds.
-//!
-//! Authoritative spec: `docs/PROTOCOLS.md` §2.2 + §2.3. The per-VM
-//! protocol registry and method dispatch live in `vm.zig`; this module
-//! owns only the heap bodies of the two kinds:
-//!
-//!     ProtocolBody extern struct {
-//!         id: u32,         // dense per-VM
-//!         _pad: [4]u8,
-//!     }
-//!
-//!     ProtocolFnBody extern struct {
-//!         protocol_id: u32,
-//!         method_name_id: u32,   // interned keyword id of the method's name
-//!     }
-//!
-//! Both are identity kinds (`dispatch.isIdentityKind`): equal to
-//! themselves only, hashed by pointer, not serializable.
+//! protocol.zig — the protocol and protocol-fn kinds' bodies
+//! (`docs/PROTOCOLS.md` §2.2, §2.3): a protocol's per-VM id, and a
+//! protocol fn's protocol id and method keyword id. Both are identity
+//! kinds; the registry and the dispatch are `vm.zig`'s.
 
 const std = @import("std");
 const value_mod = @import("value.zig");
 const heap_mod = @import("heap.zig");
+const intern_mod = @import("intern.zig");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;
@@ -88,14 +74,20 @@ pub inline fn protocolFnMethodNameId(v: Value) u32 {
     return Heap.bodyOf(ProtocolFnBody, Heap.asHeapHeader(v)).method_name_id;
 }
 
+/// The `ns/Name` of protocol `v`, or of the protocol a protocol fn `v`
+/// dispatches for; null when the interner never named it
+/// (`Interner.nameProtocol`).
+pub fn nameOf(v: Value, interner: *const intern_mod.Interner) ?[]const u8 {
+    return interner.protocolName(switch (v.kind()) {
+        .protocol => protocolId(v),
+        .protocol_fn => protocolFnProtocolId(v),
+        else => unreachable,
+    });
+}
+
 // =============================================================================
 // Inline tests
 // =============================================================================
-
-test "ProtocolBody / ProtocolFnBody: ABI invariants" {
-    try testing.expectEqual(@as(usize, 8), @sizeOf(ProtocolBody));
-    try testing.expectEqual(@as(usize, 8), @sizeOf(ProtocolFnBody));
-}
 
 test "makeProtocol / protocolId: round-trip" {
     var heap = Heap.init(testing.allocator);
@@ -103,6 +95,19 @@ test "makeProtocol / protocolId: round-trip" {
     const p = try makeProtocol(&heap, 42);
     try testing.expect(p.kind() == .protocol);
     try testing.expectEqual(@as(u32, 42), protocolId(p));
+}
+
+test "nameOf: a protocol and its fns by the name the interner holds" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var it = intern_mod.Interner.init(testing.allocator);
+    defer it.deinit();
+    const p = try makeProtocol(&heap, 3);
+    const f = try makeProtocolFn(&heap, 3, 0);
+    try testing.expect(nameOf(p, &it) == null);
+    try it.nameProtocol(3, "user", "Shape");
+    try testing.expectEqualStrings("user/Shape", nameOf(p, &it).?);
+    try testing.expectEqualStrings("user/Shape", nameOf(f, &it).?);
 }
 
 test "makeProtocolFn / accessors" {

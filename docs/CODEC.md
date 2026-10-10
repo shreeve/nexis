@@ -6,9 +6,10 @@ the one table of which kinds serialize (§3). Derivative from PLAN §23
 `docs/SEMANTICS.md` (numeric canonical form, hash invariants) and
 `docs/VALUE.md` §2 (kind numbers). Those win on conflict.
 
-Codec bytes are the value half of every `db/*` entry and of the
-Nextomic transaction log: bytes one process writes, another reads, so
-the format is frozen (§9).
+Codec bytes are the value half of every `db/*` entry: bytes one
+process writes, another reads, so the format is frozen (§9). Nextomic
+does not use the codec: its trees and its transaction log have formats
+of their own (`docs/NEXTOMIC.md` §2).
 
 ---
 
@@ -50,7 +51,7 @@ keys and values inside a container carry only their per-kind encoding.
 A major version marks a breaking change, a minor one a new optional
 subformat. The format is 1.0. A new kind byte is additive without a
 version change: a reader that predates it refuses the byte as
-`InvalidKindByte`, never misreads it.
+`MalformedPayload`, never misreads it.
 
 **Per-kind `ValueEncoding`**, kind byte first (the `Kind` number of
 VALUE.md §2):
@@ -91,7 +92,7 @@ VALUE.md §2):
   two, each limb or typed-vector element eight. A count past what
   remains is `TruncatedInput`, never an overflow or an allocation
   sized by the count. The tenth byte of a LEB128 may carry only bit
-  63; more is `InvalidLeb128`. Overlong encodings (`80 00` for 0) name
+  63; more is `MalformedPayload`. Overlong encodings (`80 00` for 0) name
   the same number and are accepted; encode never writes them.
 
 #### 2.2 Keyword, symbol and string bytes
@@ -193,17 +194,14 @@ is `UnserializableKind`: the comparator is code.
 | `regex` (44), `matcher` (45) | no | Identity kinds: a decoded pattern could never be `=` to the one encoded, and EDN has no regex (`docs/REGEX.md` §8). |
 | `byte_vector` (22), `error_` (28), `meta_symbol` (29) | no | Reserved numbers; never constructed. |
 
-Encoding any kind marked no is `UnserializableKind`. Decoding a kind byte that names a heap kind
-outside the set (every "no" row above, and 43) is `UnserializableKind` too;
-a byte that names no kind (the reserved immediates 8–15, the reserved
-heap bytes 46–63, the runtime-private sentinels 64 and up) is
-`InvalidKindByte`. No silent stubs, no lossy round trips.
+Encoding any kind marked no is `UnserializableKind`. Decoding any byte
+outside the set, whether it names a kind marked no (or 43) or no kind at
+all, is `MalformedPayload`: no encoder writes it. No silent stubs, no
+lossy round trips.
 
 **At the language level** (`db.failureName`, `docs/DB.md` §8)
-`UnserializableKind` is `:unserializable`, on encode and on decode
-alike, and every other codec error — hostile lengths and counts,
-a bad envelope, trailing bytes — is
-`:codec-failed`.
+`UnserializableKind` is `:unserializable`, raised by encode only, and
+every decode error is `:codec-failed`.
 
 ---
 
@@ -225,32 +223,26 @@ This is the codec gate property, run by `test/prop/codec.zig` (§7).
 
 | Name | Contract |
 |---|---|
-| `encode(allocator, *const Interner, Value) (CodecError \|\| Allocator.Error)![]u8` | The owned bytes of `v`; the caller frees. |
+| `encode(allocator, *const Interner, Value) EncodeError![]u8` | The owned bytes of `v`; the caller frees. `EncodeError` is `UnserializableKind` (§3), `Unrealized` (a lazy seq a block of which has not run, §3) and `OutOfMemory`. |
 | `decode(*Heap, *Interner, bytes, elementHash, elementEq) DecodeError!Value` | Consumes `bytes` completely. Maps and sets are rebuilt with the supplied hash and equality, which must be `dispatch.hashValue` / `dispatch.equal` or agree with them (`docs/DB.md` §5). |
 | `version_major = 1`, `version_minor = 0` | §2. |
 
-`DecodeError` is `CodecError` plus allocation and interning errors.
+`DecodeError` is the two below, plus `OutOfMemory`, the intern
+table's errors and the `Overflow` of a block size past `usize`.
 Neither function mutates its input or any existing value.
 
-| `CodecError` | Meaning |
+| Decode error | Meaning |
 |---|---|
-| `UnserializableKind` | A kind outside the set (§3), on encode or as a decoded kind byte. |
 | `TruncatedInput` | The input ends mid-value, or a length or count asks for more than remains. |
-| `TrailingBytes` | A whole value, then more bytes. |
-| `InvalidVersion` | An envelope other than `[1, 0]`. |
-| `InvalidKindByte` | A byte that names no kind. |
-| `InvalidLeb128` | A LEB128 past u64. |
-| `InvalidCharScalar` | A surrogate or a scalar past `0x10FFFF`. |
-| `MalformedPayload` | Input no encoder writes: a bad sign byte or element tag, a fixnum outside i48, a count that disagrees with the distinct entries. |
+| `MalformedPayload` | Input no encoder writes: an envelope other than `[1, 0]`, bytes after the value, a kind byte outside the set (§3), a LEB128 past u64, a surrogate or a char past `0x10FFFF`, a bad sign byte or element tag, a fixnum outside i48, a count that disagrees with the distinct entries, sorted keys out of order. |
 
 ---
 
 ### 6. Callers
 
-`src/db.zig` (`put` / `get`), `src/stdlib.zig` (`db/scan`,
-`db/reduce-tree`) and `src/nextomic/datom.zig` (the transaction log)
-call `encode` and `decode`; the codec imports only the value layer and
-the collection modules it walks.
+`src/db.zig` (`put` / `get`) and `src/stdlib.zig` (`db/scan`,
+`db/reduce-tree`) call `encode` and `decode`; the codec imports only
+the value layer and the collection modules it walks.
 
 ---
 
@@ -261,7 +253,7 @@ sorted map and set among them, with the refusal of a comparator and of
 keys out of order), the
 envelope, truncation, trailing bytes, malformed LEB128, surrogate
 chars, every one of the 256 kind bytes outside the set
-(`UnserializableKind` or `InvalidKindByte` as §3 says), a transient on
+(`MalformedPayload`, §3), a transient on
 encode, hostile lengths and counts near 2^64 (`TruncatedInput` with
 nothing allocated), a value 200 000 levels deep round-tripping byte
 for byte, 200 000 levels of input of each container kind decoding,
@@ -272,7 +264,7 @@ and sets, byte-stable. `test/prop/codec.zig`: **C1** 100 000 random values of ev
 serializable kind, nested up to depth 4, round-trip equal with equal
 hashes; **C2** re-encode is byte-equal for every kind but map and set;
 **C3** a transient is `UnserializableKind`; **C4** 1 000 random byte
-slices decode to a value or a `CodecError`, never a crash; **C5** 500
+slices decode to a value or a `DecodeError`, never a crash; **C5** 500
 hostile headers (lengths and counts near 2^64 or past the input,
 under nesting thousands of levels deep) end in a typed error or a
 value, never `OutOfMemory`, allocating no more than the nesting read. `test/prop/typed_vector.zig`
@@ -282,8 +274,8 @@ T1 is the typed-vector round trip.
 
 ### 9. Stability
 
-The format is the on-disk form of every durable value and the
-Nextomic transaction log, so it is frozen: a build reads what an
+The format is the on-disk form of every durable value, so it is
+frozen: a build reads what an
 earlier build wrote. The kind bytes are the `Kind` numbers of
 `docs/VALUE.md` §2, which are never renumbered; a retired kind leaves
 a reserved gap. Any byte-level change bumps the major or minor version

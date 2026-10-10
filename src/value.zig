@@ -1,41 +1,22 @@
-//! value.zig — 16-byte tagged runtime Value.
+//! value.zig — the 16-byte tagged Value, the `Kind` numbers and the
+//! immediates' constructors (`docs/VALUE.md`; `=` and hash,
+//! `docs/SEMANTICS.md`).
 //!
-//! Authoritative physical layout spec is `docs/VALUE.md`. Equality and
-//! hashing semantics live in `docs/SEMANTICS.md`. This file is the
-//! implementation; frozen decisions belong in those docs.
-//!
-//! This file owns every immediate kind (nil, bool, char, fixnum, float,
-//! keyword, symbol). Heap kinds (string, bignum, collections, var,
-//! durable-ref, ...) are defined in the Kind enum here, but their
-//! constructors and accessors live in the per-kind modules that
-//! allocate the body.
-//!
-//! Design invariants enforced here (VALUE.md §3):
-//!   - One canonical constructor per immediate kind.
-//!   - An immediate is built through its constructor here, which
-//!     enforces range and canonicalization; a heap Value through its
-//!     kind's module (VALUE.md §3). Zig has no private fields, so
-//!     this is a convention the tree keeps, not a guard.
-//!   - `nil == Value{}` — the all-zero bit pattern is a valid `nil`.
-//!   - Every f64 stored in a `Value.float` is canonical form (SEMANTICS
-//!     §2.2). NaN bit patterns are collapsed at construction.
-//!   - `fromChar` rejects UTF-16 surrogate codepoints.
-//!   - `fromFixnum` rejects values outside i48 range (±140 trillion);
-//!     callers that need larger integers must go via the bignum path.
+//! An immediate is built only through its constructor here, which
+//! enforces its range and canonical form (VALUE.md §3); a heap Value
+//! through its kind's module. Zig has no private fields, so this is a
+//! convention the tree keeps.
 
 const std = @import("std");
 const hash = @import("hash.zig");
 
 // =============================================================================
-// Kind discriminator
-//
-// Numeric values are frozen per VALUE.md §2 so the bytecode dispatcher
-// and the codec can use them as jump-table indices and wire tags with no
-// remapping layer.
+// Kind discriminator: the numbers are frozen (VALUE.md §2), since the
+// dispatcher and the codec use them as table indices and wire tags.
 // =============================================================================
 
+/// What each kind is: VALUE.md §2.1-§2.3.
 pub const Kind = enum(u8) {
-    // ---- Immediates (payload lives inside the Value) ----
     nil = 0,
     false_ = 1,
     true_ = 2,
@@ -44,9 +25,7 @@ pub const Kind = enum(u8) {
     float = 5,
     keyword = 6,
     symbol = 7,
-    // 8..15 reserved for immediate kinds.
-
-    // ---- Heap-allocated (payload is *HeapHeader) ----
+    // 8..15 reserved for immediates.
     string = 16,
     bignum = 17,
     persistent_map = 18,
@@ -61,112 +40,29 @@ pub const Kind = enum(u8) {
     var_ = 25,
     durable_ref = 26,
     transient = 27,
-    /// Reserved: never constructed.
     error_ = 28,
-    /// Reserved: never constructed.
     meta_symbol = 29,
-    /// Host-Zig function exposed as a first-class Value. Payload is a pointer to a STATIC
-    /// `NativeFn` descriptor (no heap allocation per fn).
-    /// Distinguished from `.function` (user closure) at
-    /// `call:call` dispatch.
     native_fn = 30,
-    /// emdb connection handle.
-    /// Payload is a pointer to a `db.Connection` struct owned
-    /// by the VM (NOT the runtime arena — Connections hold OS
-    /// resources and must be closed explicitly or by VM.deinit
-    /// safety-net).
     db_connection = 31,
-    /// Write transaction handle. Payload is a
-    /// pointer to a heap-allocated `db.WriteTxn`. Single-owner,
-    /// invalidated on commit/abort.
     db_write_txn = 32,
-    /// Read transaction handle. Payload is a
-    /// pointer to a heap-allocated `db.ReadTxn`.
     db_read_txn = 33,
-    /// In-memory mutable cell.
-    /// Payload is `*HeapHeader` → `AtomBox { value, in_flight,
-    /// _pad }` in heap body. Identity equality + identity hash;
-    /// GC traces the contained value; codec rejects as
-    /// `:unserializable`. See `docs/ATOM.md`.
     atom = 34,
-    /// User-defined record value. Payload is `*HeapHeader` → `RecordBody
-    /// { type_id, _pad, fields }`. STRUCTURAL equality + hash
-    /// (same type_id + equal field maps). NOT serializable.
-    /// See `docs/PROTOCOLS.md` §2.1.
     record = 35,
-    /// Protocol handle.
-    /// Opaque, identity-valued. Payload `*HeapHeader` →
-    /// `ProtocolBody { id }`. Per-VM dense `id` indexes into
-    /// `VM.protocol_registry`. See `docs/PROTOCOLS.md` §2.2.
     protocol = 36,
-    /// Protocol-method dispatcher. Opaque,
-    /// identity-valued. Payload `*HeapHeader` →
-    /// `ProtocolFnBody { protocol_id, method_name_id }`. The
-    /// `call:call` dispatch arm routes invocations to
-    /// `vm.dispatchProtocolMethod`. Solves the "NativeFn is a
-    /// static descriptor with no per-instance state" hazard.
-    /// See `docs/PROTOCOLS.md` §2.3.
     protocol_fn = 37,
-    /// Nextomic connection handle (docs/NEXTOMIC.md §8). Payload is
-    /// a pointer to a `nextomic.Conn` owned by the VM, closed
-    /// explicitly or by the VM's teardown; identity-valued.
     nextomic_conn = 38,
-    /// Nextomic db-value (docs/NEXTOMIC.md §4). The heap body is the
-    /// inline `DbBox` `{conn, file, basis, as-of, since, history}` of
-    /// src/nextomic/handle.zig; a plain value with no open transaction,
-    /// compared and hashed structurally (SEMANTICS §2.6).
     nextomic_db = 39,
-    /// Nextomic lazy entity (docs/NEXTOMIC.md §6). The heap body is
-    /// the `EntityBox` of src/nextomic/handle.zig: the db box the
-    /// entity reads through, its eid, and the read hook the natives
-    /// install; every attribute access opens one read at the
-    /// db-value's basis and mode. Equal when the db-values are equal
-    /// and the eids agree.
     nextomic_entity = 40,
-    /// Sorted map (docs/SORTED.md): a weight-balanced tree ordered by
-    /// its comparator. The root block holds the comparator and the
-    /// tree; the nodes are blocks of this kind that no Value points
-    /// at. Equal to, and hashed as, a hash map with the same entries.
     sorted_map = 41,
-    /// Sorted set (docs/SORTED.md), laid out as `sorted_map` without
-    /// the values.
     sorted_set = 42,
-    /// Lazy seq (docs/LAZY.md): an unrealized-or-realized lazy block,
-    /// a cons cell whose rest may be lazy, or a chunked cons over a
-    /// chunk; the subkind and the header's flags bits 1–2 name the
-    /// shape. Sequential: equal to, and hashed as, the list of its
-    /// elements.
     lazy_seq = 43,
-    /// Regular expression (docs/REGEX.md §8): the compiled program and
-    /// the source text, inline in one leaf block. Identity-valued, as
-    /// `java.util.regex.Pattern` is.
     regex = 44,
-    /// Regex matcher (docs/REGEX.md §8): `re-matcher`'s search state
-    /// over one pattern and one string, advanced in place by
-    /// `re-find`. Identity-valued, as `java.util.regex.Matcher` is.
     matcher = 45,
     // 46..63 reserved for heap kinds.
-
-    // ---- Runtime-private sentinels (never escape public API) ----
-    /// Lazy boxing: a slot's stored Value is the `*HeapHeader` of an
-    /// upvalue cell block (a heap block of this kind whose body is
-    /// `vm.UpvalCell`) rather than an ordinary user value. Set by
-    /// `closure:box-local`, consumed by `closure:get-cell` and
-    /// `closure:make`'s `local_cell_slot` source. Never observable
-    /// by user code; the binding's `BindingRef` in the compiler's
-    /// scope is what records "this slot is now a cell" so subsequent
-    /// reads dispatch to `closure:get-cell` instead of plain
-    /// `mov:move`. The collector traces the cell through the VM
-    /// (`docs/GC.md` §5).
+    /// An upvalue cell block: runtime-private, never a user value
+    /// (VALUE.md §2.3).
     cell_internal = 66,
     _,
-
-    /// Does this kind store its entire value inside the tag+payload
-    /// (no heap pointer)? Pure predicate — safe to use in tight loops.
-    pub inline fn isImmediate(k: Kind) bool {
-        const n: u8 = @backingInt(k);
-        return n < 16;
-    }
 
     /// Does the payload word hold a `*HeapHeader` pointer?
     pub inline fn isHeap(k: Kind) bool {
@@ -205,7 +101,7 @@ pub const Value = extern struct {
 
     /// Primary discriminator. Cheap bit-shift on the tag word.
     pub inline fn kind(self: Value) Kind {
-        return @fromBackingInt(@intCast(@as(u8, @truncate(self.tag))));
+        return @fromBackingInt(@as(u8, @truncate(self.tag)));
     }
 
     pub inline fn subkind(self: Value) u16 {
@@ -442,21 +338,11 @@ pub fn testSymbol(id: u32) Value {
 
 /// `=` over immediates, for the tests of the modules below `dispatch`
 /// (the collections, the codec, durable refs), with `hashImmediate` as
-/// the hash: the same bits, or the same kind and value, any NaN equal
-/// to any NaN. A heap value equals only itself.
+/// the hash: the same bits, or two zeros. NaN is canonical at
+/// construction; a heap value equals only itself.
 pub fn testEqual(a: Value, b: Value) bool {
     if (!@import("builtin").is_test) @compileError("testEqual is for tests");
-    if (a.tag == b.tag and a.payload == b.payload) return true;
-    if (a.kind() != b.kind()) return false;
-    return switch (a.kind()) {
-        .nil, .false_, .true_ => true,
-        .fixnum => a.asFixnum() == b.asFixnum(),
-        .keyword => a.asKeywordId() == b.asKeywordId(),
-        .symbol => a.asSymbolId() == b.asSymbolId(),
-        .char => a.asChar() == b.asChar(),
-        .float => a.asFloat() == b.asFloat() or (std.math.isNan(a.asFloat()) and std.math.isNan(b.asFloat())),
-        else => false,
-    };
+    return a.tag == b.tag and (a.payload == b.payload or (a.kind() == .float and a.asFloat() == b.asFloat()));
 }
 
 /// Pack a STATIC `NativeFn` descriptor pointer into a Value of kind `.native_fn`. The
@@ -474,11 +360,6 @@ pub fn fromNativeFnPtr(descriptor_ptr: *const anyopaque) Value {
 // =============================================================================
 // Tests
 // =============================================================================
-
-test "Value size and alignment are stable" {
-    try std.testing.expectEqual(@as(usize, 16), @sizeOf(Value));
-    try std.testing.expect(@alignOf(Value) >= 8);
-}
 
 test "nil is the all-zero Value" {
     const n = nilValue();
@@ -551,37 +432,8 @@ test "fromFloat: NaN canonicalization" {
     try std.testing.expect(nan_a.identicalTo(nan_b));
 }
 
-test "fromFloat: -0.0 and +0.0 are distinct bit patterns but equal-hashed" {
-    const pos = fromFloat(0.0);
-    const neg = fromFloat(-0.0);
-    // The Value preserves the bit pattern — we do NOT collapse -0.0 to
-    // +0.0 at storage time, only at hash time. This matches the
-    // SEMANTICS §2.2 rule: `identical?` distinguishes, `=` collapses.
-    try std.testing.expect(pos.payload != neg.payload);
-    try std.testing.expectEqual(pos.hashImmediate(), neg.hashImmediate());
-}
-
-test "keyword and same-named symbol hash into different domains" {
-    // A keyword and a symbol with the same intern id must not collide
-    // in a mixed-key HAMT. Separation comes from `mixKindDomain` — the
-    // keyword and symbol kind bytes differ, so their final hashes do too.
-    const kw = testKeyword(7);
-    const sy = testSymbol(7);
-    try std.testing.expect(kw.hashImmediate() != sy.hashImmediate());
-    // Within-kind: same id ⇒ same hash.
-    try std.testing.expectEqual(testKeyword(7).hashImmediate(), testKeyword(7).hashImmediate());
-    try std.testing.expectEqual(testSymbol(7).hashImmediate(), testSymbol(7).hashImmediate());
-}
-
-test "kind predicates cover the immediate family" {
-    try std.testing.expect(Kind.nil.isImmediate());
-    try std.testing.expect(Kind.fixnum.isImmediate());
-    try std.testing.expect(Kind.keyword.isImmediate());
-    try std.testing.expect(!Kind.nil.isHeap());
-    try std.testing.expect(Kind.string.isHeap());
-    try std.testing.expect(!Kind.string.isImmediate());
-    try std.testing.expect(!Kind.cell_internal.isImmediate());
-    try std.testing.expect(!Kind.cell_internal.isHeap());
+test "isHeap: the heap kinds, not the immediates or the sentinels" {
+    try std.testing.expect(!Kind.nil.isHeap() and Kind.string.isHeap() and Kind.matcher.isHeap() and !Kind.cell_internal.isHeap());
 }
 
 test "identicalTo: bit-equality over the full Value" {

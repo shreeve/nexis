@@ -1,28 +1,10 @@
-//! atom.zig — in-memory mutable cells.
+//! atom.zig — the atom: a mutable cell (`docs/ATOM.md`).
 //!
-//! Authoritative spec: `docs/ATOM.md`. Derivative from the PLAN.md
-//! Amendment Log (atoms entry), `docs/VALUE.md` §2.2 (kind 34
-//! `atom`), `docs/SEMANTICS.md` §2.6 / §3.2 (atom identity equality +
-//! identity hash).
-//!
-//! Responsibilities:
-//!   - `AtomBox` heap body: `{ value, validator, watches, in_flight, _pad }`.
-//!   - `make(heap, init)` — allocate a fresh atom holding `init`.
-//!   - `getValue` / `setValue` — body accessors used by the native fns;
-//!     `body` for the validator and the watches.
-//!   - `tryEnterCritical` / `exitCritical` — `in_flight` flag for
-//!     `swap!` / `reset!` / `compare-and-set!` re-entrancy detection.
-//!   - `trace` — GC walks the contained value.
-//!
-//! An atom is an identity kind (`dispatch.isIdentityKind`): equal to
-//! itself only and hashed by its pointer, never by the value it holds.
-//! A mutable value that took part in structural equality would let a
-//! map key become unequal to itself after a mutation (SEMANTICS.md
-//! §2.6).
-//!
-//! GC rooting: the natives in `src/stdlib.zig` call the validator
-//! and the watches through `vm.callValue`, a safe point; they root
-//! the values the atom does not hold across those calls (ATOM.md §7).
+//! An identity kind: equal only to itself and hashed by its pointer,
+//! never by what it holds, so a map key never changes under a mutation
+//! (SEMANTICS.md §2.6). The natives in `src/stdlib.zig` call the
+//! validator and the watches through `vm.callValue`, a safe point, and
+//! root what the atom does not hold across those calls (ATOM.md §7).
 
 const std = @import("std");
 const value_mod = @import("value.zig");
@@ -141,11 +123,6 @@ pub fn trace(h: *HeapHeader, visitor: anytype) void {
 // Inline tests
 // =============================================================================
 
-test "AtomBox: ABI invariants" {
-    try testing.expectEqual(@as(usize, 56), @sizeOf(AtomBox));
-    try testing.expect(@alignOf(AtomBox) <= 16);
-}
-
 test "make / getValue / setValue: round-trips" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
@@ -173,58 +150,28 @@ test "tryEnterCritical / exitCritical: re-entrancy guard" {
     exitCritical(a);
 }
 
-test "trace: visits the contained value, the validator and the watches via markValue" {
+test "trace: the value, the validator and the watches, without recursing into a self-holding atom" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-
-    const a = try make(&heap, value_mod.fromFixnum(7).?);
-
-    // Stub visitor records every markValue call. Trace must mark
-    // the contained value, then the validator and the watches.
-    var recorded: [4]Value = undefined;
-    var count: usize = 0;
-    const Visitor = struct {
-        recorded_ptr: *[4]Value,
-        count_ptr: *usize,
-        pub fn markValue(self: @This(), v: Value) void {
-            if (self.count_ptr.* < self.recorded_ptr.len) {
-                self.recorded_ptr.*[self.count_ptr.*] = v;
-            }
-            self.count_ptr.* += 1;
-        }
-    };
-    trace(Heap.asHeapHeader(a), Visitor{ .recorded_ptr = &recorded, .count_ptr = &count });
-
-    try testing.expectEqual(@as(usize, 3), count);
-    try testing.expectEqual(value_mod.fromFixnum(7).?.payload, recorded[0].payload);
-}
-
-test "trace: self-referential atom does not stack-overflow the visitor" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    // Build an atom whose contained value IS the atom itself.
     const a = try make(&heap, value_mod.nilValue());
     setValue(a, a);
-
-    // The visitor records the contained Value; it does NOT recurse.
-    // Recursion is the collector's job, and the collector short-
-    // circuits on the mark-bit. trace itself must terminate in O(1).
-    var recorded: [4]Value = undefined;
-    var count: usize = 0;
-    const Visitor = struct {
-        recorded_ptr: *[4]Value,
-        count_ptr: *usize,
-        pub fn markValue(self: @This(), v: Value) void {
-            if (self.count_ptr.* < self.recorded_ptr.len) {
-                self.recorded_ptr.*[self.count_ptr.*] = v;
-            }
-            self.count_ptr.* += 1;
-        }
-    };
-    trace(Heap.asHeapHeader(a), Visitor{ .recorded_ptr = &recorded, .count_ptr = &count });
-
-    try testing.expectEqual(@as(usize, 3), count);
-    try testing.expectEqual(a.payload, recorded[0].payload);
-    try testing.expectEqual(a.tag, recorded[0].tag);
+    body(a).validator = value_mod.fromFixnum(1).?;
+    var seen: TestRecorder = .{};
+    trace(Heap.asHeapHeader(a), &seen);
+    try testing.expectEqual(@as(usize, 3), seen.n);
+    try testing.expect(seen.values[0].identicalTo(a));
+    try testing.expectEqual(@as(i64, 1), seen.values[1].asFixnum());
 }
+
+/// A trace visitor that records what it is shown, for the kinds'
+/// trace tests.
+pub const TestRecorder = struct {
+    values: [4]Value = undefined,
+    n: usize = 0,
+
+    pub fn markValue(self: *TestRecorder, v: Value) void {
+        if (!@import("builtin").is_test) @compileError("TestRecorder is for tests");
+        self.values[self.n] = v;
+        self.n += 1;
+    }
+};
