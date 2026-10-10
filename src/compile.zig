@@ -228,6 +228,8 @@ const Clause = struct {
 const FnBinding = struct {
     name: []const u8,
     clauses: []const Clause,
+    /// The entry's span, its routine's origin.
+    span: reader_mod.SrcSpan,
 };
 
 /// The sequential bindings and body of a `let*` or `loop*`.
@@ -2537,7 +2539,7 @@ fn lowerLetFnStar(
         const name = try expectUnqualifiedSymbol(entry_items[0]);
         parsed[i] = try parseClauses(allocator, entry_items[1..]);
         try ctx.bind(allocator, name, &names_captured, null);
-        bindings[i] = .{ .name = name, .clauses = &.{} };
+        bindings[i] = .{ .name = name, .clauses = &.{}, .span = entry.origin };
     }
     for (bindings, parsed) |*b, clauses| b.clauses = try lowerClauses(allocator, clauses, ctx);
     const body = try lowerBody(allocator, args[1..], ctx);
@@ -4481,7 +4483,9 @@ fn compileLetFnStar(
     // .cell_slot via the entries we just pushed).
     const closure_slots = try e.allocator.alloc(u12, bindings.len);
     defer e.allocator.free(closure_slots);
+    const outer_span = e.current_span;
     for (bindings, 0..) |b, i| {
+        e.current_span = b.span;
         const cs = try e.allocSlot();
         closure_slots[i] = cs;
         // compileFn handles the named case via the
@@ -4493,6 +4497,7 @@ fn compileLetFnStar(
         // self-name machinery here would double-allocate.
         try compileFn(e, .{ .display_name = b.name, .clauses = b.clauses }, cs);
     }
+    e.current_span = outer_span;
 
     // 3. Init each cell with its closure.
     for (bindings, 0..) |_, i| {
@@ -5320,6 +5325,18 @@ test "span table: a nested routine carries its own table, origin and name" {
     // after it carries the fn's.
     const last = r.spanAt(@intCast(r.code.len - 2)) orelse return error.TestFailed;
     try testing.expectEqualStrings("(* x x)", src[last.pos .. last.pos + last.len]);
+}
+
+test "span table: each letfn* function's routine is at its own entry" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src = "(letfn* [(g [] 1) (k [] 2)] (g))";
+    const compiled = try compileSourceWith(arena.allocator(), src, .{});
+    if (compiled.capture_descs.len != 2) return error.TestFailed;
+    for (compiled.capture_descs, [_][]const u8{ "(g [] 1)", "(k [] 2)" }) |desc, entry| {
+        const origin = desc.routine.origin orelse return error.TestFailed;
+        try testing.expectEqualStrings(entry, src[origin.pos .. origin.pos + origin.len]);
+    }
 }
 
 test "span table: a loop's test repeated at its recur carries the test's spans" {
