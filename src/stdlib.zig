@@ -4064,11 +4064,11 @@ fn isIfn(k: Kind) bool {
 // `vm.unhandled_throw`, exactly like `(throw :db/key-too-large)`.
 //
 // Connection lifetime: each `db/open` allocates a Connection on the
-// allocator of the VM that owns the registries (`VM.home`: a macro's
-// sub-VM opens for the VM it compiles for, VM.md §9.1) and appends it
-// to that VM's `db_connections`. `db/close`
-// closes its env and leaves the struct in place; VM.deinit closes
-// whatever is still open and frees every Connection.
+// allocator and heap of the VM that owns the registries (`VM.home`: a
+// macro's sub-VM opens for the VM it compiles for, VM.md §9.1).
+// `db/close` closes its env and leaves the struct while a Value names
+// it; a collection frees it after (DB.md §3), and that VM's teardown
+// shuts down whatever is left.
 
 /// Throw a db.zig / emdb / codec error to the program as its
 /// keyword (`db.failureName`).
@@ -4096,15 +4096,9 @@ fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
     const host = vm.home();
     const path_z = host.allocator.dupeSentinel(u8, path, 0) catch return VmError.OutOfMemory;
     defer host.allocator.free(path_z);
-    const conn = host.allocator.create(db_mod.Connection) catch return VmError.OutOfMemory;
-    errdefer host.allocator.destroy(conn);
-    conn.* = db_mod.open(host.allocator, host.ensureHeap(), host.ensureInterner(), path_z.ptr, .{ .allocator = host.allocator }) catch |err| return dbFailure(vm, err);
+    const conn = db_mod.open(host.allocator, host.ensureHeap(), host.ensureInterner(), path_z.ptr) catch |err| return dbFailure(vm, err);
     if (durability) |d| conn.durability = d;
-    host.db_close_callback = &dbCloseCallback;
-    host.db_connections.append(host.allocator, @ptrCast(conn)) catch {
-        db_mod.shutdown(conn);
-        return VmError.OutOfMemory;
-    };
+    host.db_close_callback = &db_mod.shutdownHeap;
     return .{ .tag = @backingInt(Kind.db_connection), .payload = @intFromPtr(conn) };
 }
 
@@ -4120,16 +4114,6 @@ fn durabilityOption(vm: *VM, opts: Value) VmError!?db_mod.Durability {
     };
     if (found.kind() != .keyword) return VmError.InvalidArgument;
     return db_mod.Durability.parse(vm.ensureInterner().keywordName(found.asKeywordId())) orelse VmError.InvalidArgument;
-}
-
-/// Teardown of the VM: close whatever is still open and free the
-/// struct. Only here is a Connection freed, so every ref, handle
-/// and connection Value that names one stays valid while the VM
-/// lives.
-fn dbCloseCallback(opaque_ptr: *anyopaque) void {
-    const conn: *db_mod.Connection = @ptrCast(@alignCast(opaque_ptr));
-    db_mod.shutdown(conn);
-    conn.allocator.destroy(conn);
 }
 
 /// `(db/close conn)` → nil. Aborts the connection's open
@@ -6463,7 +6447,7 @@ fn fnReadLine(vm: *VM, _: []const Value) VmError!Value {
 fn fnExit(vm: *VM, args: []const Value) VmError!Value {
     const status: u8 = if (args.len == 0) 0 else @truncate(@as(u64, @bitCast(try requireFixnum(args[0]))));
     const host = vm.home();
-    for (host.db_connections.items) |conn| db_mod.shutdown(@ptrCast(@alignCast(conn)));
+    db_mod.shutdownHeap(host.ensureHeap());
     if (host.nextomic_close_callback) |close| for (host.nextomic_connections.items) |conn| close(conn);
     db_mod.StoreFile.syncAll();
     std.process.exit(status);

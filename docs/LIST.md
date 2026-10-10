@@ -22,8 +22,9 @@ apart (0, 16, 32 bytes), which is what the collector sees.
 **Vector view.** The offset is a `u32` (as a vector's count is) held in
 the Value's tag bits 32..63, never in the block, and is at most the
 vector's count; the view is empty when the offset equals the count.
-`seq`, `rest`, `next`, `nthrest`, `nthnext` and `drop` of a vector
-allocate one view block, O(1) whatever the length. `tail` and `drop` of
+`seq`, `rest`, `next`, `nthrest` and `nthnext` of a vector allocate
+one view block, O(1) whatever the length (`drop` is a lazy seq that
+realizes to one, `docs/LAZY.md` §7). `tail` and `drop` of
 a view return the same block at a later offset and allocate nothing,
 which is why the offset lives in the Value. `head` is the vector's
 `nth` (O(log₃₂ n)); `count` is the vector's count minus the offset;
@@ -113,6 +114,7 @@ reader and macro material; large sequences are vectors.
 | `cons(heap, head, tail) !Value` | one cons cell; `error.InvalidListTail` for a non-list tail |
 | `conj(heap, l, x) !Value` | `cons` whose cell carries `l`'s metadata |
 | `fromSlice(heap, elems) !Value` | `(a b c)` from `&.{a, b, c}`, right-folded `cons` |
+| `build(heap, elems) !Value` | a fresh list of `elems`: a vector's view from `view_min` (4) elements, cons cells below |
 | `ofVector(heap, vec, start) !Value` | one view block; `start` ≤ the vector's count |
 | `viewWithMeta(heap, view, meta) !Value` | the view carrying `meta` (§2 invariant 4); null gives the metadata-free view |
 | `isEmpty(v) bool` | the empty list, or a view at its vector's end |
@@ -121,7 +123,8 @@ reader and macro material; large sequences are vectors.
 | `count(v) usize` | O(1) for a view, O(n) over cons cells |
 | `drop(v, n) Value` | without the first `n` elements, empty when shorter; never allocates |
 | `Cursor.init(v)`, `next() ?Value` | streaming iteration in order |
-| `viewCursor(v) ?vector.Cursor` | a view's elements as its vector's cursor from its offset, so a walk of a built sequence steps the vector's leaves directly (`stdlib.zig` `SeqIter`); null for a cons chain or the empty list |
+| `viewCursor(v) ?vector.Cursor` | a view's elements as its vector's cursor from its offset, so a walk of a built sequence steps the vector's leaves directly (`seq.zig` `SeqIter`); null for a cons chain or the empty list |
+| `viewChunk(v) ?[]const Value` | a view's elements from its offset to the end of the leaf or tail holding it (a chunked producer's chunk, `docs/LAZY.md` §7); null for a cons chain or the empty list |
 | `hashSeq(v, elementHash) u64` | §2 invariant 2; `elementHash` is `&dispatch.hashValue` |
 | `equalSeq(a, b, elementEq) bool` | §2 invariant 3; `elementEq` is `&dispatch.equal` |
 | `trace(h, visitor)` | GC trace, §4 |

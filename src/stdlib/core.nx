@@ -124,26 +124,28 @@
 
 (defmacro defonce
   "Defines name as the value of expr unless the Var is already bound,
-  in which case expr is not evaluated. Returns the Var."
+  in which case expr is not evaluated. Returns the Var when it defines
+  name, else nil."
   [name expr]
   `(let [v# (def ~name)]
-     (when-not (bound? v#) (def ~name ~expr))
-     v#))
+     (when-not (bound? v#) (def ~name ~expr))))
 
 ; The printed form is built when the macro expands, so the check costs
-; its test and the failure one call of two constants, a conj that makes
-; a fresh map each time.
+; its test and the failure one call.
 (defmacro assert
-  "Returns nil when x is truthy, else throws {:error :assertion-failed
-  :message \"Assert failed: ...\"} holding message, when given, and the
-  form x: the value a failed :pre or :post condition throws."
+  "Returns nil when x is truthy, else raises :assertion-failed, the
+  error map {:error :assertion-failed :message \"Assert failed: ...\"}
+  holding message, when given, and the form x, with the place of the
+  call as a runtime error's: the error a failed :pre or :post condition
+  raises."
   [x & message]
   `(when-not ~x
-     (throw (conj {:error :assertion-failed}
-                  [:message ~(cond
-                               (empty? message) (str "Assert failed: " (pr-str x))
-                               (string? (first message)) (str "Assert failed: " (first message) "\n" (pr-str x))
-                               true `(str "Assert failed: " ~(first message) ~(str "\n" (pr-str x))))]))))
+     (nexis.internal/#%raise
+       :assertion-failed
+       ~(cond
+          (empty? message) (str "Assert failed: " (pr-str x))
+          (string? (first message)) (str "Assert failed: " (first message) "\n" (pr-str x))
+          true `(str "Assert failed: " ~(first message) ~(str "\n" (pr-str x)))))))
 
 (defmacro time
   "Evaluates expr, prints the time it took as \"Elapsed time: N msecs\"
@@ -199,13 +201,8 @@
   afterwards, whether or not body throws. Returns body's value."
   [binding & body]
   `(let* [~(first binding) (db/begin-read ~(first (rest binding)))]
-     (try
-       (let* [r# (do ~@body)]
-         (db/abort-read! ~(first binding))
-         r#)
-       (catch any e#
-         (db/abort-read! ~(first binding))
-         (throw e#)))))
+     (try (do ~@body)
+          (finally (db/abort-read! ~(first binding))))))
 
 ; A snapshot is an emdb read transaction pinned to the commit
 ; generation that was current when it began (docs/DB.md §12).
@@ -217,13 +214,8 @@
   held snapshot keeps emdb from reclaiming the pages it sees."
   [binding & body]
   `(let* [~(first binding) (db/snapshot ~(first (rest binding)))]
-     (try
-       (let* [r# (do ~@body)]
-         (db/release-snapshot! ~(first binding))
-         r#)
-       (catch any e#
-         (db/release-snapshot! ~(first binding))
-         (throw e#)))))
+     (try (do ~@body)
+          (finally (db/release-snapshot! ~(first binding))))))
 
 ; ============================================================
 ; Dynamic bindings (docs/VM.md §6.5)
@@ -232,15 +224,19 @@
 ; One binding frame for the Vars named, pushed after every value is
 ; evaluated and popped in a finally.
 
+; The form of the map {(var name) val ...} of a binding vector, for
+; binding and with-redefs.
+(defn- var-map [bindings]
+  `(hash-map ~@(mapcat (fn [pair] [`(var ~(first pair)) (second pair)])
+                       (partition 2 bindings))))
+
 (defmacro binding
   "bindings is [var-name val ...]. Evaluates every val, then binds each
   dynamic Var to its value while body runs, restoring the previous
   bindings on every exit, a throw included. A function called inside
   sees them wherever it was made. A Var not ^:dynamic is :not-dynamic."
   [bindings & body]
-  `(do (push-thread-bindings
-         (hash-map ~@(mapcat (fn [pair] [`(var ~(first pair)) (second pair)])
-                             (partition 2 bindings))))
+  `(do (push-thread-bindings ~(var-map bindings))
        (try
          (do ~@body)
          (finally (pop-thread-bindings)))))
@@ -269,12 +265,9 @@
   "bindings is [name val ...]. Evaluates body with the root of each Var
   a name resolves to set to its val, as with-redefs-fn does, and every
   root restored afterwards. A call the compiler inlines (arithmetic,
-  comparison) does not go through the Var."
+  comparison, not) does not go through the Var."
   [bindings & body]
-  `(with-redefs-fn
-     (hash-map ~@(mapcat (fn [pair] [`(var ~(first pair)) (second pair)])
-                         (partition 2 bindings)))
-     (fn [] ~@body)))
+  `(with-redefs-fn ~(var-map bindings) (fn [] ~@body)))
 
 ; The compiler sets the root before it expands each top-level form,
 ; and in-ns when it switches (STDLIB.md §8).
@@ -352,12 +345,12 @@
 ; ---- collection extras ----
 
 (defn merge
-  "Returns a map of the maps conj'd left to right, a later key's value
-  winning. nil when no map is non-nil; the first non-nil map decides
-  the result's kind, so a record stays one."
+  "Returns a map of the maps conj'd onto the first left to right, a
+  later key's value winning; {} stands for a leading nil or false.
+  nil when every map is nil or false."
   [& maps]
-  (when (some some? maps)
-    (reduce conj (remove nil? maps))))
+  (when (some identity maps)
+    (reduce (fn* [acc m] (conj (or acc {}) m)) maps)))
 
 ; The short arities call f directly, with no argument list to build.
 (defn update
@@ -372,10 +365,7 @@
   "Returns the value in nested associative m at the path of keys ks:
   nil, or default when given, if a key along the path is absent. A
   present nil value is nil."
-  ([m ks]
-   (reduce (fn* [acc k] (if (nil? acc) nil (get acc k)))
-           m
-           ks))
+  ([m ks] (reduce get m ks))
   ([m ks default]
    ; A fresh atom is identical to no value a map holds.
    (let* [missing (atom nil)]
@@ -434,23 +424,30 @@
 
 (defn take-nth
   "Returns a lazy seq of every nth element of coll, starting with the
-  first."
-  [n coll]
-  (lazy-seq
-    (when-let [s (seq coll)]
-      (cons (first s) (take-nth n (drop n s))))))
+  first. Returns a transducer when no coll is given."
+  ([n]
+   (fn* [rf]
+     (let [iv (atom -1)]
+       (fn ([] (rf))
+           ([result] (rf result))
+           ([result input]
+            (if (zero? (rem (swap! iv inc) n)) (rf result input) result))))))
+  ([n coll]
+   (lazy-seq
+     (when-let [s (seq coll)]
+       (cons (first s) (take-nth n (drop n s)))))))
 
 (defn partition-by
   "Returns a lazy seq of the runs of coll, split each time (f x)
   returns a new value. Returns a transducer when no coll is given."
   ([f] (xf-partition-by f))
   ([f coll]
-  (lazy-seq
-    (when-let [s (seq coll)]
-      (let [fst (first s)
-            fv (f fst)
-            run (cons fst (take-while (fn [x] (= fv (f x))) (next s)))]
-        (cons run (partition-by f (lazy-seq (drop (count run) s)))))))))
+   (lazy-seq
+     (when-let [s (seq coll)]
+       (let [fst (first s)
+             fv (f fst)
+             run (cons fst (take-while (fn [x] (= fv (f x))) (next s)))]
+         (cons run (partition-by f (lazy-seq (drop (count run) s)))))))))
 
 ; The seqs of children still to visit wait on an explicit stack, so the
 ; depth of the tree costs no native stack.
@@ -513,9 +510,10 @@
 (defn juxt
   "Returns a function that calls each of fs on its arguments and
   returns the vector of results: ((juxt a b) x) is [(a x) (b x)]."
-  [& fs]
-  (fn* [& args]
-    (mapv (fn* [f] (apply f args)) fs)))
+  [f & fs]
+  (let* [fs (cons f fs)]
+    (fn* [& args]
+      (mapv (fn* [f] (apply f args)) fs))))
 
 (defn vary-meta
   "Returns obj with metadata (apply f (meta obj) args)."
@@ -566,8 +564,8 @@
 (defmacro if-not
   "Evaluates then when test is falsy, else evaluates else (nil when
   absent)."
-  [test then & else]
-  `(if ~test ~(first else) ~then))
+  ([test then] `(if ~test nil ~then))
+  ([test then else] `(if ~test ~else ~then)))
 
 (defmacro while
   "Evaluates body repeatedly while test is truthy. Returns nil."
@@ -585,10 +583,32 @@
   [bindings & body]
   `(letfn* ~bindings ~@body))
 
-; One loop per pair:
+; Fails the expansion of the binding macro `who` unless its bindings
+; are a vector of pairs whose first is a binding, as Clojure's
+; assert-args does.
+(defn- check-seq-exprs [who bindings]
+  (when-not (vector? bindings)
+    (throw (ex-info (str who " requires a vector for its binding") {})))
+  (when (odd? (count bindings))
+    (throw (ex-info (str who " requires an even number of forms in binding vector") {})))
+  (when (keyword? (first bindings))
+    (throw (ex-info (str who ": a modifier needs a binding before it") {}))))
+
+; The modifiers of one binding of doseq or for, [[k v] ...] in source
+; order, wrapped around leaf, the first outermost: :let binds, :when
+; evaluates skip when false, :while ends the walk (nil).
+(defn- wrap-mods [who mods skip leaf]
+  (reduce (fn [inner [k v]]
+            (cond (= k :let) `(let ~v ~inner)
+                  (= k :when) `(if ~v ~inner ~skip)
+                  (= k :while) `(when ~v ~inner)
+                  true (throw (ex-info (str who ": unknown modifier " k) {}))))
+          leaf
+          (reverse mods)))
+
+; One loop per binding, the modifiers around the rest:
 ;   (loop* [s (seq xs)]
-;     (if s (let [x (first s)] <modifiers around
-;                               (do (doseq [rest...] body...) (recur (next s)))>)
+;     (if s (let [x (first s)] <(do (doseq [rest...] body...) (recur (next s)))>)
 ;           nil))
 (defmacro doseq
   "bindings is [x xs modifiers... y ys ...]. Evaluates body for each x
@@ -596,27 +616,18 @@
   destructure, and :let [b], :when t and :while t modifiers work as in
   for. Returns nil."
   [bindings & body]
+  (check-seq-exprs "doseq" bindings)
   (if (empty? bindings)
     `(do ~@body nil)
-    (let* [pat (first bindings)
-           src (second bindings)
-           s (gensym "s")]
-      (loop* [more (rest (rest bindings)) mods (list)]
-        (if (and (seq more) (keyword? (first more)))
-          (recur (rest (rest more)) (cons [(first more) (second more)] mods))
-          (let* [inner (reduce (fn* [inner mod]
-                                 (let* [k (first mod) v (second mod)]
-                                   (cond
-                                     (= k :let) `(let ~v ~inner)
-                                     (= k :when) `(if ~v ~inner (recur (next ~s)))
-                                     (= k :while) `(if ~v ~inner nil)
-                                     true (throw (str "doseq: unknown modifier " k)))))
-                               `(do (doseq ~(vec more) ~@body) (recur (next ~s)))
-                               mods)]
-            `(loop* [~s (seq ~src)]
-               (if ~s
-                 (let [~pat (first ~s)] ~inner)
-                 nil))))))))
+    (let* [s (gensym "s")
+           pairs (partition 2 (drop 2 bindings))
+           mods (take-while (fn* [p] (keyword? (first p))) pairs)
+           more (vec (apply concat (drop (count mods) pairs)))]
+      `(loop* [~s (seq ~(second bindings))]
+         (if ~s
+           (let [~(first bindings) (first ~s)]
+             ~(wrap-mods "doseq" mods `(recur (next ~s)) `(do (doseq ~more ~@body) (recur (next ~s)))))
+           nil)))))
 
 ; Clojure 1.12's for (docs/LAZY.md §7): one iterator per binding, each
 ; a lazy-seq over the seq of its coll; the innermost walks a chunk at a
@@ -629,10 +640,9 @@
   varying fastest. Modifiers: :let [b], :when t (skip the element) and
   :while t (end that binding's walk)."
   [seq-exprs body-expr]
-  (when (or (not (vector? seq-exprs)) (zero? (count seq-exprs)) (odd? (count seq-exprs)))
-    (throw (ex-info "for requires an even number of forms in the binding vector" {})))
-  (when (keyword? (first seq-exprs))
-    (throw (ex-info "for: a modifier needs a binding before it" {})))
+  (check-seq-exprs "for" seq-exprs)
+  (when (empty? seq-exprs)
+    (throw (ex-info "for requires a binding" {})))
   (if (= 2 (count seq-exprs))
     `(map (fn* [x#] (let [~(first seq-exprs) x#] ~body-expr)) ~(second seq-exprs))
     (let [groups (reduce (fn* [groups pair]
@@ -640,9 +650,6 @@
                              (conj (pop groups) (conj (peek groups) pair))
                              (conj groups [(first pair) (second pair)])))
                          [] (partition 2 seq-exprs))
-          check (fn* [k]
-                  (when-not (contains? #{:let :when :while} k)
-                    (throw (ex-info (str "for: unknown modifier " k) {}))))
           emit-bind
           (fn emit-bind [groups]
             (let [group (first groups)
@@ -650,38 +657,22 @@
                   mod-pairs (drop 2 group)
                   next-groups (next groups)
                   giter (gensym "iter__")
-                  gxs (gensym "s__")
-                  do-mod (fn do-mod [mods]
-                           (let [k (first (first mods)) v (second (first mods))]
-                             (when k (check k))
-                             (cond
-                               (= k :let) `(let ~v ~(do-mod (rest mods)))
-                               (= k :while) `(when ~v ~(do-mod (rest mods)))
-                               (= k :when) `(if ~v ~(do-mod (rest mods)) (recur (rest ~gxs)))
-                               next-groups `(let [iterys# ~(emit-bind next-groups)
-                                                  fs# (seq (iterys# ~(second (first next-groups))))]
-                                              (if fs#
-                                                (concat fs# (~giter (rest ~gxs)))
-                                                (recur (rest ~gxs))))
-                               true `(cons ~body-expr (~giter (rest ~gxs))))))]
+                  gxs (gensym "s__")]
               (if next-groups
                 `(fn ~giter [~gxs]
                    (lazy-seq
                      (loop [~gxs ~gxs]
                        (when-first [~bind ~gxs]
-                         ~(do-mod mod-pairs)))))
+                         ~(wrap-mods "for" mod-pairs `(recur (rest ~gxs))
+                                     `(let [iterys# ~(emit-bind next-groups)
+                                            fs# (seq (iterys# ~(second (first next-groups))))]
+                                        (if fs#
+                                          (concat fs# (~giter (rest ~gxs)))
+                                          (recur (rest ~gxs)))))))))
                 (let [gi (gensym "i__")
                       gb (gensym "b__")
                       gc (gensym "c__")
-                      gsize (gensym "size__")
-                      do-cmod (fn do-cmod [mods]
-                                (let [k (first (first mods)) v (second (first mods))]
-                                  (when k (check k))
-                                  (cond
-                                    (= k :let) `(let ~v ~(do-cmod (rest mods)))
-                                    (= k :while) `(when ~v ~(do-cmod (rest mods)))
-                                    (= k :when) `(if ~v ~(do-cmod (rest mods)) (recur (inc ~gi)))
-                                    true `(do (chunk-append ~gb ~body-expr) (recur (inc ~gi))))))]
+                      gsize (gensym "size__")]
                   `(fn ~giter [~gxs]
                      (lazy-seq
                        (loop [~gxs ~gxs]
@@ -693,12 +684,14 @@
                                (if (loop [~gi 0]
                                      (if (< ~gi ~gsize)
                                        (let [~bind (nth ~gc ~gi)]
-                                         ~(do-cmod mod-pairs))
+                                         ~(wrap-mods "for" mod-pairs `(recur (inc ~gi))
+                                                     `(do (chunk-append ~gb ~body-expr) (recur (inc ~gi)))))
                                        true))
                                  (chunk-cons (chunk ~gb) (~giter (chunk-rest ~gxs)))
                                  (chunk-cons (chunk ~gb) nil)))
                              (let [~bind (first ~gxs)]
-                               ~(do-mod mod-pairs)))))))))))]
+                               ~(wrap-mods "for" mod-pairs `(recur (rest ~gxs))
+                                           `(cons ~body-expr (~giter (rest ~gxs))))))))))))))]
       `(let [iter# ~(emit-bind groups)]
          (iter# ~(second seq-exprs))))))
 
@@ -783,8 +776,9 @@
 (defn every-pred
   "Returns a function that returns true when every predicate in ps is
   truthy of every one of its arguments, else false."
-  [& ps]
-  (fn [& xs] (every? (fn [p] (every? p xs)) ps)))
+  [p & ps]
+  (let [ps (cons p ps)]
+    (fn [& xs] (every? (fn [p] (every? p xs)) ps))))
 
 (defn memoize
   "Returns a memoized version of f: a function that caches the result
@@ -842,13 +836,17 @@
   (= (inc (count xs)) (count (set (cons x xs)))))
 
 
+(defn- replacer [smap] (fn [x] (let [e (find smap x)] (if e (val e) x))))
+
 (defn replace
   "Returns coll with each element that is a key of smap (a map, or a
   vector by index) replaced by its value: a vector, keeping its
-  metadata, when coll is one, else a lazy seq."
-  [smap coll]
-  (let [f (fn [x] (let [e (find smap x)] (if e (val e) x)))]
-    (if (vector? coll) (with-meta (mapv f coll) (meta coll)) (map f coll))))
+  metadata, when coll is one, else a lazy seq. Returns a transducer
+  when no coll is given."
+  ([smap] (map (replacer smap)))
+  ([smap coll]
+   (let [f (replacer smap)]
+     (if (vector? coll) (with-meta (mapv f coll) (meta coll)) (map f coll)))))
 
 (defn bounded-count
   "Returns (count coll) when coll is counted?, else the count of at
@@ -861,9 +859,9 @@
 
 (defn random-sample
   "Returns a lazy seq of the elements of coll, each kept with
-  probability prob."
-  [prob coll]
-  (filter (fn [_] (< (rand) prob)) coll))
+  probability prob. Returns a transducer when no coll is given."
+  ([prob] (filter (fn [_] (< (rand) prob))))
+  ([prob coll] (filter (fn [_] (< (rand) prob)) coll)))
 
 (defn partitionv
   "As partition, with each part a vector."
@@ -871,7 +869,9 @@
   ([n step coll] (map vec (partition n step coll)))
   ([n step pad coll] (map vec (partition n step pad coll))))
 (defn partitionv-all
-  "As partition-all, with each part a vector."
+  "As partition-all, with each part a vector. Returns a transducer
+  when no coll is given."
+  ([n] (partition-all n))
   ([n coll] (map vec (partition-all n coll)))
   ([n step coll] (map vec (partition-all n step coll))))
 (defn splitv-at
@@ -1315,8 +1315,11 @@
 (defn find-var
   "Returns the Var the qualified symbol sym names, nil when its
   namespace has none; :no-such-namespace when the namespace does not
-  exist."
-  [sym] (ns-resolve (the-ns (symbol (namespace sym))) sym))
+  exist, :invalid-argument for an unqualified symbol."
+  [sym]
+  (if-let [ns (namespace sym)]
+    (ns-resolve (the-ns (symbol ns)) sym)
+    (nexis.internal/#%raise :invalid-argument (str "find-var takes a qualified symbol, got " sym))))
 
 ; Each form is compiled as read, as a file's form is, and the namespace
 ; in force is restored afterwards, as Clojure's Compiler.load binds *ns*.
@@ -1388,11 +1391,10 @@
 ; Clojure's Inst: what inst? and inst-ms take as an instant. nexis.time's
 ; Instant extends it (docs/STDLIB.md §12).
 (defprotocol Inst
+  "An instant: a value with epoch milliseconds, which inst-ms* returns.
+  nexis.time's Instant extends it, and so may any record."
   (inst-ms* [inst]
     "Returns the epoch milliseconds of the instant inst."))
-(alter-meta! #'Inst assoc :doc
-  "An instant: a value with epoch milliseconds, which inst-ms* returns.
-  nexis.time's Instant extends it, and so may any record.")
 
 (defn inst?
   "Returns true if x is an instant: of a type extended to Inst, as
@@ -1498,10 +1500,10 @@
   ([tag] (descendants global-hierarchy tag))
   ([h tag] (not-empty (get (:descendants h) tag))))
 
-; Throws the :assertion-failed of Clojure's assert of the form `text`,
+; Raises the :assertion-failed of Clojure's assert of the form `text`,
 ; for the assertions whose form names a Java class.
 (defn- assert-failed [text]
-  (throw {:error :assertion-failed :message (str "Assert failed: " text)}))
+  (nexis.internal/#%raise :assertion-failed (str "Assert failed: " text)))
 
 (defn derive
   "Returns hierarchy h with tag a child of parent (h itself when it is
@@ -1528,9 +1530,9 @@
      (or
       (when-not (contains? (get tp tag) parent)
         (when (contains? (get ta tag) parent)
-          (throw {:error :invalid-derivation :message (print-str tag "already has" parent "as ancestor")}))
+          (nexis.internal/#%raise :invalid-derivation (print-str tag "already has" parent "as ancestor")))
         (when (contains? (get ta parent) tag)
-          (throw {:error :invalid-derivation :message (print-str "Cyclic derivation:" parent "has" tag "as ancestor")}))
+          (nexis.internal/#%raise :invalid-derivation (print-str "Cyclic derivation:" parent "has" tag "as ancestor")))
         {:parents (assoc tp tag (conj (get tp tag #{}) parent))
          :ancestors (tf ta tag td parent ta)
          :descendants (tf td parent ta tag td)})
@@ -1576,6 +1578,12 @@
 (defn- mm-reset! [state cache]
   (let [s @state] (reset! cache [@(:href s) (:table s)])))
 
+; Raises tag as #%raise does, the error map holding the dispatch value
+; dv under :value.
+(defn- raise-value [tag message dv]
+  (try (nexis.internal/#%raise tag message)
+       (catch any e (throw (if (map? e) (assoc e :value dv) e)))))
+
 ; Whether x is preferred to y in the prefer table pt, directly or
 ; through the parents of either in h (MultiFn.prefers).
 (defn- mm-prefers? [h pt x y]
@@ -1587,7 +1595,10 @@
 
 ; MultiFn.findAndCacheBestMethod: the entry whose key dv isa? and that
 ; dominates every other such entry, else the default's method, else
-; nil. The result is cached when nothing it read changed meanwhile.
+; nil. The result is cached when nothing it read changed meanwhile,
+; else the cache is reset and the search runs again; with one thread
+; only an isa? that realizes a lazy dispatch value whose body changes
+; the hierarchy or the table can change them.
 (defn- mm-find [state cache dv]
   (let [s @state
         ch (nth @cache 0)
@@ -1597,9 +1608,10 @@
                 (if (isa? ch dv k)
                   (let [best (if (or (nil? best) (mm-dominates? ch pt k (nth best 0))) [k m] best)]
                     (when-not (mm-dominates? ch pt (nth best 0) k)
-                      (throw {:error :ambiguous-method :value dv
-                              :message (format "Multiple methods in multimethod '%s' match dispatch value: %s -> %s and %s, and neither is preferred"
-                                               (:name s) dv k (nth best 0))}))
+                      (raise-value :ambiguous-method
+                                   (format "Multiple methods in multimethod '%s' match dispatch value: %s -> %s and %s, and neither is preferred"
+                                           (:name s) dv k (nth best 0))
+                                   dv))
                     best)
                   best))
               nil (:table s))
@@ -1619,8 +1631,7 @@
 
 (defn- mm-fn [state cache dv]
   (or (mm-method state cache dv)
-      (throw {:error :no-method :value dv
-              :message (format "No method in multimethod '%s' for dispatch value: %s" (:name @state) dv)})))
+      (raise-value :no-method (format "No method in multimethod '%s' for dispatch value: %s" (:name @state) dv) dv)))
 
 ; One arity of a multimethod: the dispatch value of the arguments,
 ; its method from the cache when the hierarchy is still the one the
@@ -1678,8 +1689,8 @@
   [mf x y]
   (let [s @(:state (multifn-entry mf))]
     (when (mm-prefers? @(:href s) (:prefers s) y x)
-      (throw {:error :preference-conflict
-              :message (format "Preference conflict in multimethod '%s': %s is already preferred to %s" (:name s) y x)}))
+      (nexis.internal/#%raise :preference-conflict
+                              (format "Preference conflict in multimethod '%s': %s is already preferred to %s" (:name s) y x)))
     (mm-update! mf update-in [:prefers x] (fnil conj #{}) y)))
 
 (defn methods

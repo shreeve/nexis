@@ -4,7 +4,7 @@
 ; bootstrapped at VM startup with nexis.test as the current
 ; namespace, after core.nx and walk.nx.
 ; The helpers the macros call (register!, check=, check-truthy,
-; check-thrown, pass!, fail!) are public, since an expansion names
+; check-thrown, fail!) are public, since an expansion names
 ; them from the caller's namespace, and so is the state they keep
 ; (tests, counts, contexts, ...).
 
@@ -76,13 +76,7 @@
     (str (if c (str " in " (:ns c) "/" (:name c)) "")
          (if (empty? ctxs) "" (str " (" (apply str (interpose " > " ctxs)) ")")))))
 
-; The three outcomes of an assertion or a test. `pass!` is true and
-; `fail!` false so `is` yields what it asserted.
-(defn pass!
-  "Counts a passed assertion in a run; returns true. Used by the
-  expansion of is."
-  [] (bump! :pass) true)
-
+; `fail!` is false so `is` yields what it asserted.
 (defn fail!
   "Counts a failed assertion and reports form, the expected and actual
   values and msg when given; returns false. Used by the expansion of
@@ -114,8 +108,7 @@
 
 ; What an assertion calls: `is` expands to one call of these, so the
 ; judging and the reporting are here once, not in every assertion.
-; Each returns whether the assertion passed; a pass is counted here
-; rather than through `pass!`, one closure call fewer per assertion.
+; Each returns whether the assertion passed.
 (defn check=
   "Judges (is (= expected actual) msg): counts a pass and returns true
   when expected equals actual, else reports form and both values and
@@ -132,33 +125,40 @@
 
 ; A throw of the value the catch holds keeps its origin (VM.md §12).
 (defn check-thrown
-  "Judges the thrown value e of (is (thrown? tag expr)): counts a pass
-  and returns true when (catch tag ...) would take e, else throws e
-  on. Used by the expansion of is."
-  [e tag]
-  (if (nexis.internal/#%catch-matches? e tag) (do (bump! :pass) true) (throw e)))
+  "Judges the thrown value e of (is (thrown? tag expr) msg) or (is
+  (thrown-with-msg? tag re expr) msg): throws e on unless (catch tag
+  ...) would take it (a nil tag takes any value); then counts a pass
+  and returns true unless re is given and finds no match in e's
+  message, which reports form, re and the message and returns false.
+  Used by the expansion of is."
+  ([e tag] (check-thrown e tag nil nil nil))
+  ([e tag re form msg]
+   (cond (and tag (not (nexis.internal/#%catch-matches? e tag))) (throw e)
+         (or (nil? re) (some->> (ex-message e) (re-find re))) (do (bump! :pass) true)
+         :else (fail! form re (ex-message e) msg))))
 
 (defmacro is
   "Asserts form and returns whether it passed. (is (= expected actual))
   reports both values on failure. (is (thrown? matcher expr)) passes
   when expr throws a value (catch matcher ...) would take, a keyword
   tag or any, and fails when it returns; another throw propagates.
-  (is expr) passes when expr is truthy. msg is evaluated once, after
-  the values."
+  (is (thrown-with-msg? matcher re expr)) passes when, besides, re
+  finds a match in the value's message (ex-message). (is expr) passes
+  when expr is truthy. msg is evaluated once, after the values."
   [form & more]
   (let* [msg (first more)
          head (if (seq? form) (name (first form)) nil)]
     (cond
       (and (= head "=") (= (count form) 3))
       `(nexis.test/check= '~form ~(second form) ~(nth form 2) ~msg)
-      (= head "thrown?")
+      (or (= head "thrown?") (= head "thrown-with-msg?"))
       (let* [m (second form)
+             re (when (= head "thrown-with-msg?") (nth form 2 nil))
              tag? (and (keyword? m) (not= m :default))]
         `(try
-           (nexis.test/fail! '~form '~m ~(nth form 2 nil) ~msg)
-           ~(if tag?
-              `(catch any e# (nexis.test/check-thrown e# ~m))
-              `(catch ~m e# (nexis.test/pass!)))))
+           (nexis.test/fail! '~form '~m ~(nth form (if re 3 2) nil) ~msg)
+           (catch ~(if tag? `any m) e#
+             (nexis.test/check-thrown e# ~(when tag? m) ~@(when re [re `'~form msg])))))
       true
       `(nexis.test/check-truthy '~form ~form ~msg))))
 
@@ -168,13 +168,11 @@
   (do (is (= 1 1)) (is (= 2 2))). A count of args that is not a
   multiple of argv's fails the expansion."
   [argv expr & args]
-  (cond
-    (empty? args) (if (empty? argv) nil (throw (ex-info "The number of args doesn't match are's argv." {})))
-    (or (empty? argv) (not (zero? (mod (count args) (count argv)))))
-    (throw (ex-info "The number of args doesn't match are's argv." {}))
-    :else
+  (if (or (and (empty? argv) (empty? args))
+          (and (seq argv) (seq args) (zero? (mod (count args) (count argv)))))
     `(do ~@(map (fn [vals] `(is ~(nexis.walk/postwalk-replace (zipmap argv vals) expr)))
-                (partition (count argv) args)))))
+                (when (seq argv) (partition (count argv) args))))
+    (throw (ex-info "The number of args doesn't match are's argv." {}))))
 
 (defmacro testing
   "Evaluates body with desc added to the descriptions report lines
@@ -247,12 +245,12 @@
       (reset! contexts []))))
 
 (defn run-tests
-  "Runs the tests of the current namespace, or of the namespace ns
-  names, in definition order, and reports. Returns {:test n :pass n
-  :fail n :error n}: tests run, assertions passed and failed, and tests
-  that threw."
-  ([] (run-namespaces [(nexis.internal/#%current-ns)]))
-  ([ns] (run-namespaces [(name ns)])))
+  "Runs the tests of the current namespace, or of the namespaces the
+  symbols nss name, in definition order, and reports. Returns {:test n
+  :pass n :fail n :error n}: tests run, assertions passed and failed,
+  and tests that threw."
+  [& nss]
+  (run-namespaces (if nss (map name nss) [(nexis.internal/#%current-ns)])))
 
 (defn successful?
   "Returns true if the run summary has no failure and no error."

@@ -15,6 +15,7 @@
   "Returns s with its code points in reverse order (not grapheme
   clusters)."
   [s]
+  (when-not (string? s) (nexis.internal/#%raise :kind-mismatch "reverse takes a string, got" s))
   (apply str (nexis.core/reverse s)))
 
 (defn split-lines
@@ -28,4 +29,5 @@
   replaced by that value's text (str), the others kept:
   (escape \"a<b\" {\\< \"&lt;\"}) is \"a&lt;b\"."
   [s cmap]
+  (when-not (string? s) (nexis.internal/#%raise :kind-mismatch "escape takes a string, got" s))
   (apply str (map (fn [c] (if-let [r (cmap c)] r c)) s)))

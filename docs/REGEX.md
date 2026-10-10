@@ -256,7 +256,6 @@ not turn every slow search into an error.
 
 | Limit | Value | Sentence |
 |---|---|---|
-| a repetition bound | 1000 | `repetition count exceeds 1000` |
 | program size, after every repetition is expanded | 10 000 instructions | `the pattern compiles to more than 10000 instructions` |
 | program size × slots | 2^20 slot words | `the pattern has too many groups for its size` |
 | AST nodes compiled, after every repetition is expanded (a body that compiles to nothing, such as `(?:)` or `x{0}`, still counts) | 1 000 000 | `the pattern expands to more than 1000000 nodes` |
@@ -341,15 +340,19 @@ Java without `(?U)`.
 
 ### 7. The differential test
 
-`test/regex/corpus.json` holds 9 000 random cases and then a few
-hand-written regressions, each `[pattern, input, result]`: random
+`test/regex/corpus.json` holds 9 000 random cases and then about 150
+hand-written ones, each `[pattern, input, result]`: random
 patterns from a grammar of the supported constructs (three seeds,
 nesting to depth 5) and random inputs over ASCII, accented and astral
 letters, line terminators, a combining mark and the case-folding
 special cases, with Java's every find and its groups
 (`null` for a group that did not take part), `"ERR"` when Java
 refuses the pattern, or `"TIMEOUT"` when Java runs past a second.
-`test/regex/corpus.clj` generates it through `bb`:
+The hand-written cases cover what the grammar does not generate
+(escapes, nested and intersected classes, POSIX classes and
+properties, every flag, line terminators, the prefilters) and its
+regressions; Java computes their results as it does the random
+ones'. `test/regex/corpus.clj` generates the file through `bb`:
 
 ```
 bb test/regex/corpus.clj > test/regex/corpus.json
@@ -420,7 +423,7 @@ fails.
 
 | Name | Arity | Result |
 |---|---|---|
-| `re-pattern` | 1 | The pattern a string compiles to; a pattern is itself. An invalid one throws `{:error :invalid-regex :message M :pattern s :index I}`: the sentence of §2, the string, and the index in code points Java reports for the sentence (Java's is one before its cursor: `a)` and `*a` are 0, `[z-a]` 3, `\p{Foo}` 6), or the start of a construct §2 refuses (`catch :invalid-regex` takes it) |
+| `re-pattern` | 1 | The pattern a string compiles to; a pattern is itself. An invalid one throws `{:error :invalid-regex :message M :pattern s :index I}`: the sentence of §2, the string, and the index in code points Java reports for the sentence (Java's is one before its cursor: `a)` and `*a` are 0, `[z-a]` 3, `\p{Foo}` 6), or the start of a construct §2 refuses (`catch :invalid-regex` takes it). Where the two differ: the index counts the pattern as written, where Java counts it after rewriting each `\Q...\E` (`\0\Qi` is 4, Java's 2); a lone `)` is 0, Java's -1; a trailing `\` is `Unescaped trailing backslash` even inside an open group or class, which Java reports as unclosed |
 | `re-matcher` | 2 | `(re-matcher re s)`: a fresh matcher (§8) |
 | `re-find` | 1–2 | `(re-find m)`: the next match of the matcher, or nil; `(re-find re s)`: the first match of `re` in `s`, or nil |
 | `re-matches` | 2 | The match of the whole of `s` (`Matcher.matches`: `(re-matches #"a\|ab" "ab")` is `"ab"`), or nil |

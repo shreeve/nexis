@@ -8,8 +8,10 @@ programs (`nexis.sys`, `nexis.shell`, §11), instants (`nexis.time`,
 §12) and JSON (`nexis.json`, §13). The natives are in
 `src/stdlib.zig`, one table per namespace; the rest of the library is
 nexis in `src/stdlib/*.nx`.
-An error a native raises is caught as its error map, `{:error :tag
-:message m ...}` with the place it was raised (`docs/VM.md` §13); a
+An error a native or a library function raises is caught as its error
+map, `{:error :tag :message m ...}` with the place of the program's
+call it was raised under (`docs/VM.md` §13): the `.nx` sources raise
+theirs through `nexis.internal/#%raise`; a
 wrong argument count is `:arity-mismatch` for every native (the VM
 checks the declared arity).
 
@@ -40,7 +42,7 @@ Any other failure there is a bug in an embedded file or the image and
 panics with the loader's diagnostic or the image's error.
 
 **The image.** Evaluating the sources at every start would read,
-expand, compile and run 66 KB of nexis; instead the build does it once
+expand, compile and run 100 KB of nexis; instead the build does it once
 and every binary loads the result (`src/image.zig`). `zig build` runs
 `src/imagegen.zig`, built for the host over a runtime without an
 image: it boots the sources (`stdlib.writeImage`), writes the image of
@@ -102,7 +104,7 @@ Var inside a `binding`.
 
 | Namespace | Natives (`src/stdlib.zig`) | nexis source | Contract |
 |---|---|---|---|
-| `nexis.core` | `core_natives` | `core.nx` | text §2, printing §5, I/O §6, the rest of Clojure's core §8; `=` and `hash` SEMANTICS.md; `compare`, sorted collections, `subseq` and `rseq` SORTED.md; atoms ATOM.md; transients TRANSIENT.md; typed vectors TYPED_VECTOR.md §7.1; records and protocols PROTOCOLS.md; hierarchies and multimethods §9; the macros MACROEXPAND.md §2b |
+| `nexis.core` | `core_natives` | `core.nx` | text §2, printing §5, I/O §6, the rest of Clojure's core §8; `=` and `hash` SEMANTICS.md; `compare`, sorted collections, `subseq` and `rseq` SORTED.md; atoms ATOM.md; transients TRANSIENT.md; typed vectors TYPED_VECTOR.md §7.1; records and protocols PROTOCOLS.md; hierarchies and multimethods §9; the host macros MACROEXPAND.md §10 |
 | `db` | `db_natives` | (`with-tx`, `with-read-tx`, `with-snapshot` in `core.nx`) | DB.md §12 |
 | `nextomic` | `src/nextomic/natives.zig` | `nextomic.nx` (`with-conn`) | NEXTOMIC.md |
 | `nexis.string` | `string_natives` | `string.nx` | §3 |
@@ -152,7 +154,8 @@ the names the namespace's own (`MACROEXPAND.md` §2b).
 - A helper no caller outside the file names is `defn-`, so `(require
   '[ns :refer :all])` skips it; a function a macro's expansion calls
   stays public, since the expansion names it from the caller's
-  namespace.
+  namespace, unless the expansion calls it through its Var, as `doc`
+  calls `(#'nexis.core/doc-of ...)`.
 
 ---
 
@@ -268,7 +271,7 @@ are absent (STRING.md §6).
 |---|---|---|
 | `union` | 0+ | Every element of any argument, poured `into` the largest, which keeps its kind and metadata: `(union (sorted-set 3 1) #{2})` is a sorted set; `(union)` is `#{}`, one argument is itself (`(union nil)` is nil) |
 | `intersection` | 1+ | The elements of the first set present in every other one, `disj`ed from the smallest, which keeps its kind; with one argument, that argument unchanged |
-| `difference` | 1+ | The first set without the elements of the others; the first must be a set (`disj`), else `:kind-mismatch` |
+| `difference` | 1+ | The first set without the elements of the others, as Clojure's: of each pair the smaller set is walked, the first's elements tested against the second's when it has fewer; the first must be a set (`disj`), else `:kind-mismatch` |
 | `subset?`, `superset?` | 2 | Whether every element of the first is in the second (`subset?`), or the reverse |
 | `select` | 2 | `(select pred s)`: `s` without the elements for which `pred` is falsy (`disj`), so of `s`'s kind |
 | `map-invert` | 1 | The map with keys and values swapped; of duplicate values, the key iterated last wins |
@@ -339,9 +342,8 @@ their elements in the same mode. Who uses which:
 |---|---|
 | nil, booleans | `nil`, `true`, `false` |
 | fixnum, bignum | Decimal, no suffix |
-| float | SEMANTICS.md §6.3: `1.0`, `-0.0`, `1.0E10`, `1.0E-4`; `##NaN`, `##Inf`, `##-Inf` in both modes (`str` and `%s` of a bare float write Java's `NaN`, `Infinity`, `-Infinity`) |
-| char | display: its UTF-8. readable: `\space`, `\newline`, `\tab`, `\return`, `\formfeed`, `\backspace`, `\\`, the other ASCII controls and DEL as `\u{HEX}` (`\u{0}`), anything else as `\` and the char itself, as Clojure prints it (`\a`, `\é`) |
-| string | display: its bytes. readable: double-quoted, `\" \\ \n \t \r` escaped, other ASCII controls and DEL as `\u{HEX}`, every other byte as itself (`"é"`) |
+| float | SEMANTICS.md §6.3, in both modes (`str` and `%s` of a bare float write Java's `NaN`, `Infinity`, `-Infinity`) |
+| char, string | display: a char's UTF-8, a string's bytes. readable: SEMANTICS.md §6.4, §6.5 |
 | keyword, symbol | `:ns/name`, `ns/name`; names are not escaped |
 | list, vector, set | `(a b)`, `[a b]`, `#{a b}`, elements separated by one space; a sorted set in its order |
 | lazy seq | as a list, `(a b)`, `()` when empty. The printer runs no code: every caller but an error report realizes the value first, and a block whose body has not run prints as `...`, as does a cell of a realized cycle met again (`docs/LAZY.md` §8) |
@@ -353,7 +355,7 @@ their elements in the same mode. Who uses which:
 | atom, transient | `#<atom>`, `#<transient>` |
 | regex | `#"source"`, with Clojure's escaping of `"` (`docs/REGEX.md` §8); `str` and `%s` of a bare pattern write its source, as `Pattern.toString` does |
 | matcher | `#<matcher #"source">` |
-| protocol, protocol fn | `#<protocol id=N>`, `#<protocol-fn proto=N method=M>` |
+| protocol, protocol fn | `#<protocol id=N>`, `#<protocol-fn NAME>` (`NAME` the method's: `(defprotocol P (area [x]))` makes `#<protocol-fn area>`) |
 | durable ref | `#<durable-ref :tree hex:KEY>`, the key bytes in upper-case hex |
 | db connection, transactions | `#<db-connection>`, `#<db-write-txn>`, `#<db-read-txn>` |
 | Nextomic handles | `#nextomic/conn "path"`, `#nextomic/db {:basis-t N :mode :current}` (`:as-of N` / `:since N` when set), `#nextomic/entity {:db/id N}` |
@@ -421,14 +423,9 @@ the VM, so none needs a root scope (GC.md §11.5).
 
 ### 7. Tests
 
-`test/integration/eval_pipeline.zig` pins the text natives
-(`parse-long` and `parse-double` included), `format`,
-`nexis.string`, printing in both modes, `with-out-str`, `slurp` and
-`spit` end to end; `src/format.zig` carries the per-kind printer
-tests; `test/golden/cli/` pins `read-line` (`stdin`),
-`*command-line-args*` (`args`) and `exit` (`exit-status`) through
-`bin/nexis`; `test/integration/numbers.zig` pins the float
-spellings.
+`test/integration/eval_pipeline.zig` pins this document end to end,
+`src/format.zig` the printer kind by kind, `test/golden/cli/` what
+needs `bin/nexis` (`read-line`, `*command-line-args*`, `exit`).
 
 ---
 
@@ -443,14 +440,14 @@ returns a realized list where Clojure returns a lazy seq.
 |---|---|---|
 | `nfirst` | 1 | `(next (first x))` |
 | `tree-seq` | 3 | `(tree-seq branch? children root)`: the lazy seq of every node, depth first, each before its children; `children` of a node for which `branch?` is truthy gives its children. Realizing a node calls `branch?` and `children` on it, as Clojure's does; the children still to visit wait on an explicit stack, so a tree of any depth walks |
-| `replace` | 2 | `(replace smap coll)`: each element that `smap` (a map, or a vector by index) has as a key replaced by its value; a vector of a vector, keeping its metadata, else a lazy seq |
-| `partitionv`, `partitionv-all` | 2–4, 2–3 | `partition` and `partition-all` with each part a vector |
+| `replace` | 1–2 | `(replace smap coll)`: each element that `smap` (a map, or a vector by index) has as a key replaced by its value; a vector of a vector, keeping its metadata, else a lazy seq |
+| `partitionv`, `partitionv-all` | 2–4, 1–3 | `partition` and `partition-all` with each part a vector |
 | `splitv-at` | 2 | `[(vec (take n coll)) (drop n coll)]` |
 | `bounded-count` | 2 | `(count coll)` of a counted collection, else the count of at most the first `n` elements (`(bounded-count 2 "abcd")` is 2) |
-| `random-sample` | 2 | `(random-sample prob coll)`: each element kept with probability `prob` (`rand`) |
+| `random-sample` | 1–2 | `(random-sample prob coll)`: each element kept with probability `prob` (`rand`) |
 | `lazy-seq` | macro | `(lazy-seq body...)`: a lazy seq whose body runs once, when the seq is first walked, its result cached; a body that throws ends the seq there on the next walk (`docs/LAZY.md` §4) |
 | `chunked-seq?`, `chunk-first`, `chunk-rest`, `chunk-next`, `chunk-buffer`, `chunk-append`, `chunk`, `chunk-cons` | 1, 1, 1, 1, 1, 2, 1, 2 | Clojure's chunk functions, for library code (`docs/LAZY.md` §7): `chunked-seq?` is true of a chunked cons and of a vector's view; a chunk is a vector, `chunk-buffer` a transient vector, `chunk-append` `conj!`, `chunk` `persistent!`; `chunk-cons` copies the vector into a chunked cons in front of the rest, or is the rest itself when the chunk is empty |
-| `transduce`, `completing`, `cat`, `halt-when`, `eduction` | 3–4, 1–2, 1, 1–2, 1+ | Clojure 1.12's transducers (`docs/LAZY.md` §10), as are `into`'s 3-arity, `sequence`'s 2-arity and the transducer arities of `map`, `filter`, `remove`, `keep`, `take`, `take-while`, `drop`, `drop-while`, `map-indexed`, `keep-indexed`, `partition-all`, `partition-by`, `mapcat`, `interpose`, `distinct` and `dedupe` |
+| `transduce`, `completing`, `cat`, `halt-when`, `eduction` | 3–4, 1–2, 1, 1–2, 1+ | Clojure 1.12's transducers (`docs/LAZY.md` §10), as are `into`'s 3-arity, `sequence`'s 2-arity and the transducer arities of `map`, `filter`, `remove`, `keep`, `take`, `take-while`, `drop`, `drop-while`, `map-indexed`, `keep-indexed`, `partition-all`, `partition-by`, `partitionv-all`, `mapcat`, `interpose`, `take-nth`, `replace`, `random-sample`, `distinct` and `dedupe` |
 | `lazy-cat` | macro | `(lazy-cat coll...)`: `(concat (lazy-seq coll) ...)`, each coll's expression evaluated when the walk reaches it |
 | `iterate`, `repeat`, `repeatedly`, `cycle` | 2, 1–2, 1–2, 1 | Lazy and, without a count, infinite (`docs/LAZY.md` §7): `(take 5 (iterate inc 0))`; `(iterate f x n)` is `:arity-mismatch`; `repeat`'s count is truncated, as Clojure's `(long n)`, and every other sequence function's rounds up (`docs/LAZY.md` §9) |
 | `doall`, `dorun` | 1–2 | Walk the seq, realizing it (the first `n` steps with a count, as Clojure's `next` loop); `doall` returns its argument, `dorun` nil |
@@ -483,7 +480,7 @@ returns a realized list where Clojure returns a lazy seq.
 | `qualified-ident?`, `simple-ident?` | 1 | Whether `x` is a keyword or symbol with a namespace, without one |
 | `bit-and-not`, `bit-flip` | 2+, 2 | `(bit-and x (bit-not y))` over each further argument; `bit-flip` is `bit-set` or `bit-clear` of the bit, as `bit-test` finds it |
 | `alter-var-root` | 2+ | `(alter-var-root v f & args)`: sets the root of the Var `v` to `(apply f root args)` and returns it; a `binding` in force is left as it is. An unbound Var's root is nil to `f` and bound after (Clojure passes its `Unbound` object). A non-Var is `:kind-mismatch` |
-| `with-redefs-fn`, `with-redefs` | 2, macro | `(with-redefs-fn {#'v val ...} f)` calls `f` with each Var's root set to its value; `(with-redefs [name val ...] body...)` does it for the body, the names resolved as `var` resolves them. Root writes, not bindings, so every caller sees them and a Var need not be dynamic; each root is restored on every exit, a throw included, and a Var that was unbound is unbound again (`nexis.internal/#%unbind-root`), as Clojure restores its `Unbound` root. A call the compiler inlines (the arithmetic and comparison functions, COMPILER.md) does not go through the Var |
+| `with-redefs-fn`, `with-redefs` | 2, macro | `(with-redefs-fn {#'v val ...} f)` calls `f` with each Var's root set to its value; `(with-redefs [name val ...] body...)` does it for the body, the names resolved as `var` resolves them. Root writes, not bindings, so every caller sees them and a Var need not be dynamic; each root is restored on every exit, a throw included, and a Var that was unbound is unbound again (`nexis.internal/#%unbind-root`), as Clojure restores its `Unbound` root. A call the compiler inlines (the arithmetic and comparison functions and `not`, COMPILER.md) does not go through the Var |
 | `*ns*` | Var | The namespace a form is compiled in, as its name symbol: the compiler sets the root before it expands each top-level form, and `in-ns` when it switches, so `(ns-name *ns*)` in a file or a macro names the file's namespace. Dynamic, but a `binding` of it does not change where forms compile |
 | `ex-info`, `ex-data`, `ex-message`, `ex-cause` | 2–3, 1, 1, 1 | `(ex-info msg data cause?)` is the map `{:message msg :data data}` (`:cause` with a third argument), `msg` a string or nil and `data` a map, nil meaning `{}`, else `:kind-mismatch`. `ex-message` is a map's `:message`; `ex-data` an `ex-info` map's `:data`, and an error map (one with an `:error` and no `:data`: a caught runtime error, a Nextomic error) is its own data, so `(:error (ex-data e))` is the tag of either; `ex-cause` a map's `:cause`; each nil for anything else (`docs/VM.md` §13) |
 | `special-symbol?` | 1 | Whether `s` is a name the compiler takes as a special form: `def if do let* fn* loop* letfn* quote var recur try catch finally throw set! &` |
@@ -609,13 +606,16 @@ Vars, as `MultiFn` calls `clojure.core/isa?`.
 
 #### 9.4 Errors, the registry and the image
 
-| Situation | Thrown value | `catch` class |
+| Situation | Error map | `catch` class |
 |---|---|---|
 | No method | `{:error :no-method :message "No method in multimethod 'f' for dispatch value: X" :value dv}` | `IllegalArgumentException` |
 | An ambiguity | `{:error :ambiguous-method :message "Multiple methods in multimethod 'f' match dispatch value: X -> K and B, and neither is preferred" :value dv}` | `IllegalArgumentException` |
 | A preference conflict | `{:error :preference-conflict :message ...}` | `IllegalStateException` |
 | A cycle, or an edge to an ancestor (§9.1) | `{:error :invalid-derivation :message ...}` | any |
 | A `derive` assertion (§9.1) | `{:error :assertion-failed :message "Assert failed: ..."}` | `AssertionError` |
+
+Each is raised through `#%raise`, so a caught one carries the place
+keys of the program's call, as a runtime error does (`docs/VM.md` §13).
 
 Each value is printed into its message by `format`'s `%s`: a string
 bare, a keyword or vector as `pr-str` prints it, nil as `nil` where
@@ -841,14 +841,6 @@ other class (a function, an atom). A text that is not a string, or an
 options map that is not a map, is `:kind-mismatch`; a string that is
 not UTF-8 `:utf8-error`; a throw from an option's function passes
 through.
-
-**Speed.** An optimized build (`-Doptimize=fast`, the Apple M5, one
-core under the machine's queue) reads a 10.5 MB document of 42,000
-records (nested objects, arrays, strings with escapes and non-ASCII
-text, doubles, integers to 10^12) in 41–56 ms, 30–43 ms with keyword
-keys, and writes it back in 42–47 ms (5 runs in one process); the
-process peaks at 203 MB. Babashka's cheshire takes 121–175 ms and
-60–161 ms on the same document.
 
 `test/integration/eval_pipeline.zig` pins every value kind both ways,
 the options, each error and its position, a round trip of every kind

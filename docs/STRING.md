@@ -9,14 +9,8 @@ is STDLIB.md.
 
 ### 1. Subkinds
 
-| Subkind | Name | State |
-|---|---|---|
-| 0 | inline short string (up to 15 bytes in the Value itself) | reserved |
-| 1 | heap string (`subkind_heap`): the body is the raw UTF-8 bytes, no length prefix | the only one built |
-| 2 | zero-copy slice over an emdb page | reserved |
-
-A second subkind would have to keep every invariant below, with
-`=` and `hash` over the logical bytes whatever the storage.
+One: subkind 1, the heap string (`subkind_heap`), whose body is the
+raw UTF-8 bytes with no length prefix.
 
 ---
 
@@ -50,8 +44,9 @@ A second subkind would have to keep every invariant below, with
 
 Strings are immutable; there is no mutable string builder, and
 `subs` copies (no slice of a heap string shares its body). A native
-that builds a string measures it first and writes it once into an
-`allocUninit` block (§3).
+that knows its result's length (`str` of strings, chars and fixnums,
+`join` of the same, the replaces) measures it first and writes it
+once into an `allocUninit` block (§3).
 
 ---
 
@@ -61,7 +56,7 @@ that builds a string measures it first and writes it once into an
 |---|---|
 | `fromBytes(heap, bytes) !Value` | A fresh `.string` block (`heap.alloc(.string, len)`) holding a copy of `bytes` |
 | `allocUninit(heap, len)` | A fresh `.string` block of `len` bytes and its writable body, for a builder that knows its length (`str`, `join`, `replace`) to write its text once, in place; the caller fills every byte before the value is used |
-| `asBytes(v) []const u8` | The byte view; asserts the kind, and subkind 1 in safe builds. Callers must not assume the bytes live on the heap |
+| `asBytes(v) []const u8` | The byte view, the body of the heap block; asserts the kind, and the subkind in safe builds |
 | `byteLen(v) usize` | The byte length |
 | `hashHeader(h) u32` | Invariants 3 and 7; called by `dispatch.heapHashBase` |
 | `bytesEqual(a, b) bool` | Byte comparison of two string headers; called by `dispatch.equal` |
@@ -94,20 +89,16 @@ ASCII run directly and decode only past it, and `codepointCount`
 counts past the same run: O(n). The stdlib maps `error.InvalidUtf8`
 to `:utf8-error`.
 
-`test/prop/string.zig` checks the kind: S1–S3 equality and hash
-(reflexive, symmetric, transitive; equal implies equal hash; never
-equal to another kind), S4 the `fromBytes` / `asBytes` round trip,
-S5 the hash function, S6 the hash cache, S7 the code-point helpers
-against a plain decode, malformed bytes included. The inline tests of
-`src/string.zig` check `Matches` against a plain left-to-right scan,
-across block edges and over random text.
+`test/prop/string.zig` checks the kind, its properties listed in its
+header; the inline tests of `src/string.zig` check the layout, the
+hash and `Matches` against a plain left-to-right scan.
 
 ---
 
 ### 5. Interactions
 
 - **Heap.** `heap.alloc(.string, len)` is the only way a string
-  header is made; strings use none of the header flags.
+  header is made.
 - **Dispatch.** `dispatch.hashValue` and `dispatch.equal` reach
   `hashHeader` and `bytesEqual` for `.string` (SEMANTICS.md §3.3).
 - **Compiler.** `src/compile.zig` makes each string literal of a
@@ -121,7 +112,6 @@ across block edges and over random text.
 
 ### 6. Absent
 
-- Subkinds 0 and 2 (§1).
 - Unicode case mapping, normalization, grapheme segmentation and
   collation: the runtime carries no Unicode tables; `nexis.string`'s
   case functions are ASCII-only (STDLIB.md §3).
