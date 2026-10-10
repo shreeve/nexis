@@ -129,7 +129,8 @@ pub const Program = struct {
                 .registry = self.registry,
                 .declared = declared,
             });
-            const routine = compiled.toRoutine("test-form");
+            var routine = compiled;
+            routine.name = "test-form";
             try self.v.retargetTop(&routine);
             const stack_len = self.v.stack.items.len;
             const frame_depth = self.v.frames.items.len;

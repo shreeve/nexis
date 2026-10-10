@@ -3635,7 +3635,8 @@ test "integration: catchable — KindMismatch BYPASSES translation when no handl
     var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     const compiled = try compile.compileSourceWith(arena.allocator(), "(+ 1 :hello)", .{ .namespace = ns, .interner = interner, .host_macros = &host_macros });
-    const routine = compiled.toRoutine("catchable-no-handler");
+    var routine = compiled;
+    routine.name = "catchable-no-handler";
     v.frames.items[0].routine = &routine;
     v.frames.items[0].pc = 0;
     if (v.stack.items.len < routine.slot_count) {
@@ -7766,7 +7767,7 @@ fn runLocated(program: *Program, info: *const vm.SourceInfo) anyerror!value_mod.
             .declared = &declared,
             .source = info,
         });
-        const routine = compiled.toRoutine("<top>");
+        const routine = compiled;
         try program.v.retargetTop(&routine);
         last = try program.v.run();
     }
@@ -7928,7 +7929,9 @@ fn compileRoutineForTest(program: *Program, src: []const u8) !vm.Routine {
         .registry = program.registry,
         .declared = &declared,
     });
-    return compiled.toRoutine("nested");
+    var routine = compiled;
+    routine.name = "nested";
+    return routine;
 }
 
 var nested_routine: ?*const vm.Routine = null;
@@ -8048,7 +8051,7 @@ const RequireDir = struct {
 
     /// Compile `src` (one form) with the loader in place, so a
     /// `require` in it runs while the form is being compiled.
-    fn compileOne(self: *RequireDir, program: *Program, src: []const u8) !compile.Compiled {
+    fn compileOne(self: *RequireDir, program: *Program, src: []const u8) !vm.Routine {
         var parse_result = try reader_mod.parser.parseProgram(testing.allocator, src);
         defer parse_result.parser.deinit();
         var rdr = reader_mod.Reader.init(testing.allocator, src);
@@ -8089,7 +8092,8 @@ fn expectOutputWithFiles(files: []const [2][]const u8, src: []const u8, expected
             .registry = program.registry,
             .load_callback = dir.callback(),
         });
-        const routine = compiled.toRoutine("test-form");
+        var routine = compiled;
+        routine.name = "test-form";
         try program.v.retargetTop(&routine);
         last = try program.v.run();
     }

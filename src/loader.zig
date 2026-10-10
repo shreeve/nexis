@@ -317,7 +317,7 @@ pub const Loader = struct {
         // A run that fails leaves its frame for the trace, and the
         // frame points at the routine.
         const routine = try out.create(vm_mod.Routine);
-        routine.* = compiled.toRoutine("<top>");
+        routine.* = compiled;
         return routine;
     }
 

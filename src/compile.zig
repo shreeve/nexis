@@ -390,16 +390,6 @@ const BottomTest = struct {
 // =============================================================================
 
 pub const CompileError = error{
-    /// `eval` was given a value that is not a form, such as a list
-    /// holding a function (MACROEXPAND.md §1.2); the compiler itself
-    /// never raises it.
-    UnsupportedForm,
-
-    /// A hand-built `Tiny.int` outside the i48 fixnum range. Form
-    /// lowering never produces one: a wider literal lowers to a
-    /// bignum `Tiny.literal`.
-    IntegerOutOfFixnumRange,
-
     /// A routine needs more than 4096 slots live at once or more
     /// than 4096 upvalues, the two limits the 12-bit slot and
     /// upvalue operands leave (COMPILER.md §4.4); `LowerDiag.detail`
@@ -502,64 +492,12 @@ pub const CompileError = error{
 // Output
 // =============================================================================
 
-/// The compiler's product. Wrap with `toRoutine(name)` to get a
-/// `vm.Routine` ready for `vm.VM.init`. `capture_descs` supports
-/// `closure:make` lowering and `fixed_arity` call-site validation.
-///
-/// **Ownership**: the slices live on the routine allocator
-/// (`CompileOptions.routine_allocator`, else the compile allocator)
-/// until it is reset or destroyed; there is no `deinit`.
-pub const Compiled = struct {
-    code: []const Inst,
-    consts: []const Value,
-    capture_descs: []const vm.CaptureDescriptor = &.{},
-    /// The routine's `try` forms, which `ctrl:try-enter` names.
-    tries: []const vm.Try = &.{},
-    /// Per-routine Var table. The V operand index
-    /// resolves through this table at runtime. Lifetime: same
-    /// as the rest of the Compiled (compile-arena-owned).
-    var_table: []const *vm.Var = &.{},
-    slot_count: u16,
-    /// Top-level Compiled has fixed_arity 0; child routines built
-    /// by `compileFn` set this to their fixed parameter count.
-    fixed_arity: u16 = 0,
-    /// True for `(fn* [a b & r] ...)`. The VM packs
-    /// excess args into a list at call time.
-    variadic: bool = false,
-    /// PC → source span table (VM.md §5); empty for a hand-built
-    /// tree.
-    spans: []const vm.SpanEntry = &.{},
-    /// The span of the form this routine was lowered from.
-    origin: ?vm.SourceSpan = null,
-    /// The source the spans index into.
-    source: ?*const vm.SourceInfo = null,
-
-    pub fn toRoutine(self: Compiled, name: []const u8) Routine {
-        return .{
-            .code = self.code,
-            .consts = self.consts,
-            .capture_descs = self.capture_descs,
-            .tries = self.tries,
-            .var_table = self.var_table,
-            .slot_count = self.slot_count,
-            .fixed_arity = self.fixed_arity,
-            .variadic = self.variadic,
-            .upvalue_count = 0, // top-level routines have no upvalues
-            .name = name,
-            .spans = self.spans,
-            .origin = self.origin,
-            .source = self.source,
-        };
-    }
-};
-
 /// What lowering allocates for every Tiny node: the node and the
 /// span of the Form it came from. A node lowering synthesizes
 /// without a Form (the `do` around a body) has no span and inherits
 /// the span of the form that encloses it. The Emitter recovers the
-/// node from the `Tiny` pointer with `@fieldParentPtr`, so a tree
-/// compiled with spans must consist of these nodes only; hand-built
-/// `&Tiny{...}` trees compile without spans.
+/// node from the `Tiny` pointer with `@fieldParentPtr`, so every
+/// tree it compiles consists of these nodes (`allocTiny`).
 const TinyNode = struct {
     span: ?reader_mod.SrcSpan = null,
     tiny: Tiny,
@@ -603,8 +541,7 @@ const HeldVar = struct { var_: *vm.Var, slot: u12 };
 
 /// `Emitter` accumulates a routine's bytecode, constants, slot
 /// count, and active lexical scope as a tree of `compileExpr`
-/// calls runs. It's allocator-owned and turned into a `Compiled`
-/// at the end via `finish()`.
+/// calls runs, turned into a `vm.Routine` by `finish()`.
 ///
 /// **Slot allocation**: a stack (`slot_top`); `compileExpr` frees
 /// what a node allocated once the node is compiled.
@@ -682,15 +619,11 @@ const Emitter = struct {
     /// per-routine.
     var_table: std.ArrayList(*vm.Var) = .empty,
     /// Namespace used for `def` / `var` / symbol fall-through.
-    /// `null` means no namespace was passed to `compileTiny`;
+    /// `null` means no namespace was given;
     /// in that case `def`/`var_ref` raise `UnresolvedSymbol`
     /// and unresolved symbols stay unresolved. Child Emitters
     /// inherit the parent's namespace pointer.
     namespace: ?*vm.Namespace = null,
-    /// Whether every Tiny node is the `tiny` field of a `TinyNode`
-    /// (a tree `lowerForm` built), so its span can be read; false
-    /// for a hand-built tree, which compiles without a span table.
-    spanned: bool = false,
     /// The span the next emitted instruction is attributed to:
     /// that of the innermost form being compiled, set on entry to
     /// `compileExpr` and restored on exit, so an instruction a
@@ -1042,7 +975,7 @@ const Emitter = struct {
     /// any `toOwnedSlice` fails after a previous one succeeded,
     /// the earlier slice would leak under a non-arena allocator.
     /// The chained errdefers guard against that.
-    fn finish(self: *Emitter) CompileError!Compiled {
+    fn finish(self: *Emitter) CompileError!Routine {
         const code = try self.out.dupe(Inst, self.code.items);
         errdefer self.out.free(code);
         const consts = try self.out.dupe(Value, self.consts.items);
@@ -1065,8 +998,7 @@ const Emitter = struct {
             .tries = tries,
             .var_table = vt,
             .slot_count = slot_count,
-            .fixed_arity = 0, // top-level only; compileFn sets this for child routines via Routine struct
-            .variadic = false, // top-level routine never variadic
+            .name = "<top>",
             .spans = spans,
             .source = self.source,
         };
@@ -1569,21 +1501,11 @@ fn orChanged(dst: []u64, src: []const u64) bool {
 // Public API
 // =============================================================================
 
-/// Compile a `Tiny` tree built by hand: no namespace (every symbol
-/// must be lexical) and no span table. Source and Form callers use
-/// `compileSourceWith` / `compileFormWith`.
-fn compileTiny(allocator: std.mem.Allocator, form: *const Tiny) CompileError!Compiled {
-    return emitRoutine(allocator, form, .{});
-}
-
 /// What `emitRoutine` compiles a top-level `Tiny` tree with.
 const EmitOptions = struct {
     /// Where the routines go; the scratch allocator when null.
     out: ?std.mem.Allocator = null,
     namespace: ?*vm.Namespace = null,
-    /// Whether every node is a `TinyNode` (a tree `lowerForm`
-    /// built), so the routines carry span tables.
-    spanned: bool = false,
     /// The span of the form the tree was lowered from.
     origin: ?reader_mod.SrcSpan = null,
     source: ?*const vm.SourceInfo = null,
@@ -1594,11 +1516,10 @@ const EmitOptions = struct {
 /// The top-level routine for `form`: its value in slot 0, returned.
 /// There is no enclosing `recur` target, so a top-level `(recur)`
 /// is `RecurOutsideTail`.
-fn emitRoutine(allocator: std.mem.Allocator, form: *const Tiny, opts: EmitOptions) CompileError!Compiled {
+fn emitRoutine(allocator: std.mem.Allocator, form: *const Tiny, opts: EmitOptions) CompileError!Routine {
     var emitter = Emitter.init(allocator, opts.out orelse allocator);
     defer emitter.deinit();
     emitter.namespace = opts.namespace;
-    emitter.spanned = opts.spanned;
     emitter.current_span = opts.origin;
     emitter.source = opts.source;
     emitter.diag = opts.diag;
@@ -2132,7 +2053,7 @@ fn constValue(t: *const Tiny) CompileError!?Value {
     return switch (t.*) {
         .nil => value_mod.nilValue(),
         .bool => |b| value_mod.fromBool(b),
-        .int => |n| value_mod.fromFixnum(n) orelse CompileError.IntegerOutOfFixnumRange,
+        .int => |n| value_mod.fromFixnum(n).?,
         .literal => |v| v,
         else => null,
     };
@@ -2737,7 +2658,8 @@ fn compileEvalCallback(user_data: *anyopaque, form: *const reader_mod.Form, fail
         return err;
     };
     const routine = try persistent.create(vm.Routine);
-    routine.* = compiled.toRoutine("defmacro-eval");
+    routine.* = compiled;
+    routine.name = "defmacro-eval";
     const heap = registryHeap(opts.namespace);
     var sub = try vm.VM.init(if (heap != null) data.allocator else persistent, routine);
     defer if (heap != null) sub.deinit();
@@ -2928,7 +2850,8 @@ pub const RuntimeHooks = struct {
             }
             const compiled = compileFormWith(scratch.allocator(), top, opts) catch |err| return self.evalFailure(v, scratch, err, form, form_value, detail);
             const routine = persistent.create(vm.Routine) catch return vm.VmError.OutOfMemory;
-            routine.* = compiled.toRoutine("<eval>");
+            routine.* = compiled;
+            routine.name = "<eval>";
             last = try v.runRoutine(routine);
         }
         return last;
@@ -3124,7 +3047,7 @@ pub fn compileFormWith(
     allocator: std.mem.Allocator,
     form: *const reader_mod.Form,
     opts: CompileOptions,
-) CompileError!Compiled {
+) CompileError!Routine {
     const interner = opts.interner orelse return compileExpanded(allocator, form, opts);
     try publishNamespace(opts, interner);
     var ceval_data = CompileEvalData{ .allocator = allocator, .opts = opts };
@@ -3138,7 +3061,7 @@ fn compileExpanded(
     allocator: std.mem.Allocator,
     working_form: *const reader_mod.Form,
     opts: CompileOptions,
-) CompileError!Compiled {
+) CompileError!Routine {
     const namespace = opts.namespace;
     const out_span = opts.out_span;
     const declared = opts.declared;
@@ -3171,7 +3094,6 @@ fn compileExpanded(
     return emitRoutine(allocator, tiny, .{
         .out = opts.routine_allocator,
         .namespace = namespace,
-        .spanned = true,
         .origin = working_form.origin,
         .source = opts.source,
         .diag = &diag,
@@ -3188,7 +3110,7 @@ pub fn compileSourceWith(
     allocator: std.mem.Allocator,
     source: []const u8,
     opts: CompileOptions,
-) CompileError!Compiled {
+) CompileError!Routine {
     var p = reader_mod.parser.parseForm(allocator, source) catch {
         return CompileError.ReaderFailure;
     };
@@ -3219,10 +3141,7 @@ fn compileExpr(
     // parent emits after this call carries the parent's again.
     const saved_span = e.current_span;
     defer e.current_span = saved_span;
-    if (e.spanned) {
-        const node: *const TinyNode = @fieldParentPtr("tiny", form);
-        if (node.span) |span| e.current_span = span;
-    }
+    if (@as(*const TinyNode, @fieldParentPtr("tiny", form)).span) |span| e.current_span = span;
     // The innermost form reports the error.
     errdefer if (e.diag) |d| {
         if (d.span == null) d.span = e.current_span;
@@ -3244,7 +3163,7 @@ fn compileExpr(
     switch (form.*) {
         .nil => try e.emit(vm.asm_.loadNil(dst)),
         .bool => |b| try e.emit(if (b) vm.asm_.loadTrue(dst) else vm.asm_.loadFalse(dst)),
-        .int => |n| try e.emit(vm.asm_.loadConst(dst, try e.addValueConst(value_mod.fromFixnum(n) orelse return CompileError.IntegerOutOfFixnumRange))),
+        .int => |n| try e.emit(vm.asm_.loadConst(dst, try e.addValueConst(value_mod.fromFixnum(n).?))),
         .literal => |v| try e.emit(vm.asm_.loadConst(dst, try e.addValueConst(v))),
         .symbol => |name| try compileSymbol(e, name, dst),
         .qualified_symbol => |qs| try compileQualifiedSymbol(e, qs.ns, qs.name, dst),
@@ -3277,8 +3196,7 @@ fn compileExpr(
 /// return (or recur, or throw) on every path.
 fn passesTail(form: *const Tiny) bool {
     return switch (form.*) {
-        .if_, .let_star, .letfn_star, .loop_star, .recur, .throw_ => true,
-        .do_ => |items| items.len > 0,
+        .if_, .let_star, .letfn_star, .loop_star, .recur, .throw_, .do_ => true,
         else => false,
     };
 }
@@ -3509,7 +3427,7 @@ fn primOperand(e: *Emitter, t: *const Tiny, allow_var: bool, dst: u12, free_dst:
 fn isInert(e: *const Emitter, t: *const Tiny) bool {
     return switch (t.*) {
         .nil, .bool, .literal => true,
-        .int => |n| value_mod.isFixnumRange(n),
+        .int => true,
         .symbol => |name| e.resolveLocalRef(name) != null,
         else => false,
     };
@@ -4221,18 +4139,7 @@ fn compileDo(
     dst: u12,
     recur_target: ?*const RecurTarget,
 ) CompileError!void {
-    // Empty do is nil.
-    if (exprs.len == 0) {
-        try e.emit(vm.asm_.loadNil(dst));
-        return;
-    }
-    // Single-expression do compiles directly into dst, inheriting
-    // tail position from the enclosing form.
-    if (exprs.len == 1) {
-        try compileExpr(e, exprs[0], dst, recur_target);
-        return;
-    }
-    // The forms before the last run for effect and are not in tail
+    // `lowerBody` makes a `do` of two forms or more. The forms before the last run for effect and are not in tail
     // position.
     for (exprs[0 .. exprs.len - 1]) |expr| try compileEffect(e, expr);
     // Last expression IS tail position; inherit recur target.
@@ -4248,10 +4155,7 @@ fn compileEffect(e: *Emitter, t: *const Tiny) CompileError!void {
     if (isInert(e, t)) return;
     const saved_span = e.current_span;
     defer e.current_span = saved_span;
-    if (e.spanned) {
-        const node: *const TinyNode = @fieldParentPtr("tiny", t);
-        if (node.span) |span| e.current_span = span;
-    }
+    if (@as(*const TinyNode, @fieldParentPtr("tiny", t)).span) |span| e.current_span = span;
     errdefer if (e.diag) |d| {
         if (d.span == null) d.span = e.current_span;
     };
@@ -4374,7 +4278,6 @@ fn compileClause(parent: *Emitter, f: FnSpec, clause: Clause, shared: *Captures)
     var child = Emitter.init(parent.allocator, parent.out);
     child.parent = parent;
     child.namespace = parent.namespace;
-    child.spanned = parent.spanned;
     child.source = parent.source;
     // The prelude (parameter boxing) carries the fn form's span.
     child.current_span = parent.current_span;
@@ -4416,24 +4319,14 @@ fn compileClause(parent: *Emitter, f: FnSpec, clause: Clause, shared: *Captures)
     try shared.sources.appendSlice(parent.allocator, child.captures.items);
     shared.names.clearRetainingCapacity();
     try shared.names.appendSlice(parent.allocator, child.captured_names.items);
-    const child_compiled = try child.finish();
-    // The routine lives on the compile allocator with the tree it
-    // belongs to; its name is copied because it borrows from source
-    // text that need not outlive the routine.
-    return .{
-        .code = child_compiled.code,
-        .consts = child_compiled.consts,
-        .capture_descs = child_compiled.capture_descs,
-        .tries = child_compiled.tries,
-        .var_table = child_compiled.var_table,
-        .slot_count = child_compiled.slot_count,
-        .fixed_arity = @intCast(clause.params.len),
-        .variadic = clause.rest_param != null,
-        .name = if (f.display_name) |n| try parent.out.dupe(u8, n) else "fn",
-        .spans = child_compiled.spans,
-        .origin = if (parent.current_span) |sp| toSourceSpan(sp) else null,
-        .source = parent.source,
-    };
+    var routine = try child.finish();
+    routine.fixed_arity = @intCast(clause.params.len);
+    routine.variadic = clause.rest_param != null;
+    // The name borrows from source text that need not outlive the
+    // routine.
+    routine.name = if (f.display_name) |n| try parent.out.dupe(u8, n) else "fn";
+    routine.origin = if (parent.current_span) |sp| toSourceSpan(sp) else null;
+    return routine;
 }
 
 /// Lower `letfn*` per COMPILER.md §5.6b: mutually-recursive
@@ -4707,7 +4600,8 @@ const stub_routine = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count
 fn runBare(arena: std.mem.Allocator, v: *vm.VM, src: []const u8) !Value {
     const compiled = try compileSourceWith(arena, src, .{ .namespace = v.ensureNamespace(), .interner = v.ensureInterner() });
     const routine = try arena.create(vm.Routine);
-    routine.* = compiled.toRoutine("test");
+    routine.* = compiled;
+    routine.name = "test";
     try v.retargetTop(routine);
     return v.run();
 }
@@ -4784,9 +4678,6 @@ test "compile errors: each malformed program fails with its variant" {
         std.debug.print("\n  source: {s} compiled\n", .{c.src});
         return error.TestExpectedError;
     }
-    // Only a hand-built tree can carry an integer past the fixnum
-    // range: lowering makes a wider literal a bignum.
-    try testing.expectError(CompileError.IntegerOutOfFixnumRange, compileTiny(a, &.{ .int = value_mod.fixnum_max + 1 }));
 }
 
 test "compile errors: a macro failure is reported at the innermost form, with the expander's message" {
@@ -4877,7 +4768,8 @@ test "bytecode: only a captured binding is boxed, and on every path" {
         var boxes: usize = 0;
         var routines: std.ArrayList(*const vm.Routine) = .empty;
         const top = try arena.allocator().create(vm.Routine);
-        top.* = compiled.toRoutine("t");
+        top.* = compiled;
+        top.name = "t";
         try routines.append(arena.allocator(), top);
         while (routines.pop()) |r| {
             for (r.code) |inst| {
@@ -4942,7 +4834,8 @@ test "bytecode: recur runs a 10k-iteration loop in constant stack space" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const compiled = try compileSourceWith(arena.allocator(), "(loop* [i 0] (if (< i 10000) (recur (+ i 1)) i))", .{});
-    const routine = compiled.toRoutine("10k-loop");
+    var routine = compiled;
+    routine.name = "10k-loop";
     var v = try vm.VM.init(testing.allocator, &routine);
     defer v.deinit();
     const stack_before = v.stack_high_water;
@@ -5026,7 +4919,8 @@ test "bytecode: forms compile and run in a bare namespace" {
     try testing.expectError(vm.VmError.ArityMismatch, runBare(a, &v, "((fn* [x y] x) 1)"));
     // A closure over the catch binding sees the thrown value.
     const caught = try compileSourceWith(a, "((try (throw 7) (catch any e (fn* [] e))))", .{});
-    const routine = caught.toRoutine("t");
+    var routine = caught;
+    routine.name = "t";
     try v.retargetTop(&routine);
     try testing.expectEqual(@as(i64, 7), (try v.run()).asFixnum());
 }
@@ -5174,17 +5068,17 @@ test "stack guard: a form nested past the stack budget is StackOverflow, not a c
         const shallow = try nestedVectorForm(a, 100, quoted);
         _ = try compileFormWith(a, shallow, opts);
     }
-    // A hand-built Tiny tree reaches the Emitter without lowering;
-    // a one-form `do` allocates no slot, so only depth can fail it.
-    var tiny: *const Tiny = &.{ .int = 1 };
+    // A tree that reaches the Emitter that deep fails there: a `do`
+    // of a nil and the tree below allocates no slot it keeps, so
+    // only depth can fail it.
+    var tiny: *const Tiny = try allocTiny(a, .{ .int = 1 });
     for (0..100_000) |_| {
-        const node = try a.create(Tiny);
-        const items = try a.alloc(*const Tiny, 1);
-        items[0] = tiny;
-        node.* = .{ .do_ = items };
-        tiny = node;
+        const items = try a.alloc(*const Tiny, 2);
+        items[0] = try allocTiny(a, .nil);
+        items[1] = tiny;
+        tiny = try allocTiny(a, .{ .do_ = items });
     }
-    try testing.expectError(CompileError.StackOverflow, compileTiny(a, tiny));
+    try testing.expectError(CompileError.StackOverflow, emitRoutine(a, tiny, .{}));
 }
 
 test "declared names: an unresolved symbol is reported at its own span" {
@@ -5294,7 +5188,8 @@ test "span table: entries ascend from pc 0, cover the source and carry the form'
     try testing.expect(compiled.source == &info);
     // Every instruction resolves, and the inlined `math:add` carries
     // the span of `(+ 1 2)`.
-    const routine = compiled.toRoutine("t");
+    var routine = compiled;
+    routine.name = "t";
     var saw_add = false;
     for (routine.code, 0..) |inst, pc| {
         const span = routine.spanAt(@intCast(pc)) orelse return error.TestFailed;
@@ -5344,7 +5239,7 @@ test "span table: a loop's test repeated at its recur carries the test's spans" 
     defer arena.deinit();
     const src = "(loop* [i 0] (if (< i 3) (recur (inc i)) i))";
     const info = vm.SourceInfo{ .path = "t.nx", .text = src };
-    const routine = (try compileSourceWith(arena.allocator(), src, .{ .source = &info })).toRoutine("t");
+    const routine = try compileSourceWith(arena.allocator(), src, .{ .source = &info });
     // Each instruction of the test, at the entry and at the recur,
     // names `(< i 3)` or the `if` it branches for.
     var seen: [2][2][]const u8 = undefined;
@@ -5361,13 +5256,4 @@ test "span table: a loop's test repeated at its recur carries the test's spans" 
     try testing.expectEqualStrings("(< i 3)", seen[0][0]);
     try testing.expectEqualStrings(src[13 .. src.len - 1], seen[0][1]);
     for (0..2) |k| try testing.expectEqualStrings(seen[0][k], seen[1][k]);
-}
-
-test "span table: a hand-built Tiny compiles with no table" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const form = Tiny{ .int = 7 };
-    const compiled = try compileTiny(arena.allocator(), &form);
-    try testing.expectEqual(@as(usize, 0), compiled.spans.len);
-    try testing.expect(compiled.toRoutine("t").spanAt(0) == null);
 }

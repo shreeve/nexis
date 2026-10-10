@@ -7,7 +7,7 @@ specifies what the emitted bytecode does, `docs/MACROEXPAND.md` the
 Form → Form rewriter that runs first, `docs/FORMS.md` the Form schema.
 The frozen decisions it refines are `PLAN.md` §23 #19 (`recur`), #21
 (operand kinds) and #31 (the primitive core). It pins what each stage
-guarantees, not the Zig shape of `Tiny`, `Compiled` or the `Emitter`
+guarantees, not the Zig shape of `Tiny` or the `Emitter`
 (§11).
 
 ---
@@ -204,8 +204,7 @@ is an ordinary call.
   `UnsupportedFeature` (the expander lowers every surface matcher to
   `any`, MACROEXPAND.md §2b). The catch binding may be captured.
 - An integer literal outside the i48 fixnum range lowers to a bignum
-  constant; `IntegerOutOfFixnumRange` is only for a hand-built
-  `Tiny.int` outside it.
+  constant, so a `Tiny.int` is always a fixnum.
 
 **Errors**: `UnresolvedSymbol`, `MalformedForm`, `ExpectedSymbol`, `ExpectedVector`,
 `UnsupportedFeature`, `StackOverflow`.
@@ -927,8 +926,6 @@ not):
 | `MacroExpansionFailure` | every other expansion error: a malformed macro call, a macro that threw or returned a non-form (MACROEXPAND.md §8) |
 | `StackOverflow` | a form nested past the native stack budget (below) |
 | `ReaderFailure` | `compileSourceWith` could not parse or read its text |
-| `IntegerOutOfFixnumRange` | a hand-built `Tiny.int` outside i48 (§4.3) |
-| `UnsupportedForm` | `eval` given a value that is not a form (MACROEXPAND.md §1.2); the compiler never raises it |
 | `RequiredFileFailed`, `ControlTransferred` | not compile errors: the loader's run signals for a `require`d file, passed through under their own names (MACROEXPAND.md §8) |
 | `InternalCompilerBug` | an invariant the compiler believes impossible, reported instead of miscompiled |
 | `OutOfMemory` | |
@@ -971,8 +968,8 @@ is none), on the calling VM, a catchable value like any other throw
 - Lowering allocates every node as a `TinyNode{span, tiny}` stamped
   with its Form's span; a node lowering synthesizes (the `do` around a
   body, the constant 1 of an inlined `inc`) has none and inherits its
-  enclosing form's. A hand-built `Tiny` tree compiles without spans
-  (`compileTiny`).
+  enclosing form's. Every tree the `Emitter` takes is made of these
+  nodes.
 - The `Emitter` attributes every instruction to the innermost node
   being compiled: `compileExpr` sets the current span on entry and
   restores the parent's on exit, so an instruction a parent emits
@@ -1045,9 +1042,8 @@ end through every host macro and every `try` exit path.
 
 | Entry | What it does |
 |---|---|
-| `compileFormWith(allocator, form, options)` | Macroexpand, lower and emit one Form into a `Compiled` routine. The loader (`nexis run`, the REPL, `require`) and `eval` compile through it. |
+| `compileFormWith(allocator, form, options)` | Macroexpand, lower and emit one Form into a `vm.Routine` named `<top>`. The loader (`nexis run`, the REPL, `require`) and `eval` compile through it. |
 | `compileSourceWith(allocator, source, options)` | Parse and read the first form of `source`, then `compileFormWith`; `ReaderFailure` when it cannot. |
-| `compileTiny(allocator, tiny)` | Emit a hand-built `Tiny` tree: no namespace, no expansion, no span table. |
 
 `CompileOptions` (every field optional): `namespace`, `interner`,
 `host_macros`, `out_span`, `out_detail`, `io` (what a user macro's
@@ -1069,6 +1065,6 @@ top-level `do` one form at a time (MACROEXPAND.md §2b).
 
 ### 11. Left to the implementation
 
-The Zig shapes of `Tiny`, `Compiled`, the scope tables and the `Emitter`,
+The Zig shapes of `Tiny`, the scope tables and the `Emitter`,
 and the frame stack's backing storage, are not part of this contract;
 any representation that keeps the invariants above conforms.
