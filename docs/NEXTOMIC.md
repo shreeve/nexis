@@ -69,21 +69,18 @@ so a nexis release may refuse a store another release wrote
 data. The `sys` format number (§2.3) orders Nextomic's own layouts
 within one emdb format.
 
-Connect opens all twelve trees, reads the `sys` header and finds
-`:db/fulltext` in one read transaction, and caches the `TreeId`s for
-the connection's life (tree registration is the engine's one call that
-is not thread-safe, and it happens only here). A transaction then
-opens each tree on its first use of the handle (emdb INV-SUB03), so it
-reads the records of the trees it touches and no others. Only a store
-missing one of them takes a write transaction at connect: a new file is
-bootstrapped, a tree the file lacks is created, and `:db/fulltext` is
-minted (§2.4). One more write can follow the open: when the
-`nx/fulltext` rows are stale (§2.3 `"ft"`) and some attribute is
-full-text, `Conn.open` rebuilds them in a write transaction of its own
-that writes no datom, and skips the rebuild on a file it may only read
-or whose writer this process holds. So opening a complete store with
-current rows writes nothing, waits on no writer, and succeeds on a file
-the process may only read, where every `transact!` is `:db/read-only`.
+Connect opens all twelve trees and reads the `sys` header in one read
+transaction, and caches the `TreeId`s for the connection's life (tree
+registration is the engine's one call that is not thread-safe, and it
+happens only here). A transaction then opens each tree on its first use
+of the handle (emdb INV-SUB03), so it reads the records of the trees it
+touches and no others. Only a file holding none of the twelve takes a
+write transaction at connect, which creates them and bootstraps the
+store (§2.4) in one commit; a file holding some of them, or all twelve
+without the `"format"` header, is `:db/corrupted`, never bootstrapped
+again. So opening a store writes nothing, waits on no writer, and
+succeeds on a file the process may only read, where every `transact!`
+is `:db/read-only`.
 
 emdb's writer lock is per file and makes a second writer wait for the
 first to end. Every connection to one file in the process, and every
@@ -95,8 +92,8 @@ through one while another holds the file's write transaction is
 `:nextomic/nested` from Nextomic and `:db/busy` from `db/*`, never a
 wait on itself.
 
-Every commit, a transaction's and the one that creates, completes or
-re-tokenises a store at connect alike, is atomic and seen at once by
+Every commit, a transaction's and the one that creates a store at
+connect alike, is atomic and seen at once by
 every connection and process sharing the file; whether it syncs is the
 connection's durability (§3 "Durability", `docs/DB.md` §3.3). The file
 is opened with 4,096 reader slots (`db.reader_slots`, `docs/DB.md`
@@ -126,10 +123,11 @@ excision touched the entry the count and the entities it excised. A
 row is the entity less the previous row's (zigzag LEB), `a << 1 |
 added` (LEB), and `v` in the attribute's value type, which never
 changes: a long or an instant zigzag LEB, a double its 8 bytes, a
-boolean one byte, a keyword its ident id and a ref its eid (LEB), a
+boolean one byte, a keyword its ident id (LEB), a ref its `E(e)`, a
 uuid 16 bytes, a string or byte array of at most 96 bytes its length
-and bytes. A longer one is the mark 97 and its index encoding after
-the tag (prefix and hash, §2.2): its payload is read from the fact's
+(LEB) and bytes. A longer one is the mark 97, then the length (LEB)
+and bytes of its index encoding after the tag (prefix and hash,
+§2.2): its payload is read from the fact's
 EAVT or EAVT-h row when the entry is decoded, so the log never repeats
 it, and a damaged index page fails `tx-range` too. The flags say
 whether a row's entity is in the attribute partition (the schema
@@ -180,11 +178,14 @@ never trusted; a partition or `t` that would run past its range is
 
 | partition | range | source |
 |---|---|---|
-| attributes and idents | `1 .. 2^32-1` | `sys/"aid"`; an attribute entity's eid **is** its `a` |
+| attributes and idents | `1 .. 2^32-2` | `sys/"aid"`, a u32 that names the next id; an attribute entity's eid **is** its `a` |
 | user entities | `2^32 .. 2^46-1` | `sys/"eid"` |
 | transaction entities | `2^46 \| t` | the logical `t` of the transaction |
 
-`t` starts at 1 and increases by one per committed `transact!`. Because
+`t` starts at 1 and increases by one per committed `transact!`, and
+stays below 2^39: past it a transaction is `:db/map-full`, since a
+history key's `top` must start with a zero byte for the merged order of
+an inline value and the out-of-line value it prefixes (§2.2). Because
 `t` lives in the same file as the datoms and commits with them, a crash
 or an engine-level rollback can never leave `t` ahead of the data.
 
@@ -278,7 +279,7 @@ past 256 bytes bypasses the clue (a slower seek, not an error).
 | `"aid"` | u32 next attribute / ident id |
 | `"ig"` | u64 ident generation, bumped by every rename; absent reads as 0. A connection's ident cache remembers the generation it loaded under and reloads at the start of an operation when the store's has moved, so a rename in another connection or process is seen at once; it keeps what a read finds only when the read's snapshot is at that generation, so a read older than its own connection's rename (a query function that renames) never puts a retired name back |
 | `"sg"` | u64 schema generation, bumped by every transaction that writes a datom on an attribute-partition entity; absent reads as 0. A connection's schema cache serves a newer basis while the generation is the one it was built under and the txlog entries committed since hold no attribute-partition datom, since only data was committed; the entries settle it for a writer that leaves the generation alone, and each is read once per connection |
-| `"ft"` | `[fold:1][t:6]`: the case folding the `nx/fulltext` rows were written under (3, the tokenizer of §5 "fulltext") and the `t` they are current at; absent means rows that fold ASCII only. Bootstrap and every transaction stamp their `t`; a transaction that finds the stamp stale (another folding, or a `t` committed without a stamp) first rebuilds every row from the current values, as `Conn.open` does, and until a rebuild a search re-tokenises the values instead of reading the rows |
+| `"ft"` | `[fold:1][t:6]`: the case folding the `nx/fulltext` rows are written under (3, the tokenizer of §5 "fulltext") and the `t` they are current at, stamped by bootstrap and every transaction, and read by nothing: the rows are written in the commit of their values. The folding is part of the format: a build that folds otherwise writes another format number |
 | `"n"` `[a:4]` | u64 count of the current datoms of attribute `a`, at most `2^47 - 1` (no more than there are ids), kept by every transaction and excision; the planner's estimate (§5) |
 
 ### 2.4 Bootstrap
@@ -289,10 +290,8 @@ agree: the attributes `:db/ident`, `:db/valueType`, `:db/cardinality`,
 `:db/txInstant`, the idents `:db.type/{long double instant keyword
 ref string uuid bytes boolean}`, `:db.cardinality/{one many}`,
 `:db.unique/{identity value}`, and the attribute `:db/fulltext`
-(boolean, cardinality one) at id 22. Bootstrap is transaction `t = 1`.
-A store whose idents lack `:db/fulltext` receives it at open, in a
-transaction of its own at the store's next ident id, so its id is the
-one the store reports (`Store.fulltext_aid`), not 22.
+(boolean, cardinality one) at id 22. Bootstrap is transaction `t = 1`,
+and creates all twelve trees in the same commit.
 
 ### 2.5 Write order and page fill
 
@@ -360,8 +359,9 @@ so there is no queue; emdb's write lock is the transactor.
    tempid; under any other ref attribute it must name its entity with
    `:db/id` or a unique attribute, since nothing could reach it
    otherwise (`:nextomic/tx-data`). Map forms nest as deep as the
-   native stack allows (`stack.check`); past it the transaction aborts
-   with the VM's `:stack-overflow`. A reverse key `:ns/_attr` in a map
+   native stack allows (`stack.check`), and so does a lookup ref whose
+   value is a lookup ref; past it the transaction aborts with the VM's
+   `:stack-overflow`. A reverse key `:ns/_attr` in a map
    form asserts `[x :ns/attr e]` for each `x` under it: `{:db/id e
    :user/_friends x}` makes `x`, an entity or a map form of one, point
    at `e`, and a vector of them is one referrer each; the attribute must
@@ -375,8 +375,9 @@ so there is no queue; emdb's write lock is the transactor.
    the committed AVET tree. A unique-identity claim whose value is a
    tempid or a lookup ref upserts once the value is known: a tempid
    bound by its own identity, a lookup ref found in the tree or naming
-   an identity asserted anywhere in the same transaction; claims on an
-   entity the transaction creates unify their tempids. Remaining tempids
+   a unique `(a v)` asserted anywhere in the same transaction, on an
+   eid or on a tempid however it is bound; claims on an entity the
+   transaction creates unify their tempids. Remaining tempids
    take eids from `sys/"eid"`, read once and bumped once; each must be
    the entity of some assertion (`:db/add`, a map form's attribute, a
    cas), since a tempid only in value positions or retractions (or a
@@ -386,7 +387,9 @@ so there is no queue; emdb's write lock is the transactor.
    attribute. A lookup ref names the committed holder of its `(a v)`,
    else the entity a unique assertion of the same tx-data puts `(a v)`
    on, wherever that assertion stands; otherwise it is
-   `:nextomic/no-entity`.
+   `:nextomic/no-entity`. The one exception is the entity of a
+   `:db/ident` assertion, settled before the transaction's unique
+   assertions: a lookup ref there names the committed holder alone.
 4. **Expand**: a card-one assertion whose current value differs writes
    the retraction of the old value and the assertion of the new one in
    this `t`; asserting an already-current datom writes nothing; two
@@ -428,7 +431,15 @@ so there is no queue; emdb's write lock is the transactor.
    gains `:db/unique`, `:db/index true`, `:db/fulltext true` or
    `:db/isComponent true`: on an entity that is not an attribute and
    does not become one (an enum ident, a half-written attribute map)
-   each is `:nextomic/tx-data`. What may change afterwards:
+   each is `:nextomic/tx-data`. The six schema attributes
+   (`:db/valueType`, `:db/cardinality`, `:db/unique`, `:db/index`,
+   `:db/isComponent`, `:db/fulltext`) describe attributes: asserted on
+   a user or transaction entity (a map form without `:db/ident`) any
+   of them is `:nextomic/tx-data` naming it. `:db/valueType`,
+   `:db/cardinality` and `:db/unique` take their enumeration's idents
+   (`:db.type/*`, `:db.cardinality/*`, `:db.unique/*`); any other
+   keyword is `:nextomic/value-type` naming the attribute and the
+   keyword, and mints nothing. What may change afterwards:
    - `:db/valueType` never (`:nextomic/conflict`).
    - `:db/cardinality`: one → many always; many → one while no entity
      holds two values, in the tree or in the transaction, otherwise
@@ -467,7 +478,10 @@ so there is no queue; emdb's write lock is the transactor.
      no datom; the transaction's entry holds only its `:db/txInstant`.
      An ident on a user-partition entity is `:nextomic/conflict`, and
      so are two renames of one entity in one transaction (two values
-     of its card-one `:db/ident`), which retire neither name. An
+     of its card-one `:db/ident`), which retire neither name. The
+     bootstrap idents (ids 1 to 22, §2.4) are never renamed:
+     `:nextomic/schema`, since every build knows them by id and name
+     alike. An
      attribute's name never has a name part starting with `_`
      (`:ns/_name`), which a map form and a pull pattern read as the
      reverse of `:ns/name`: a new attribute or a rename to one is
@@ -929,10 +943,9 @@ token, as are `ΣΟΦΙΑΣ` and `σοφιας`; a byte that is not UTF-8 stays 
 it is, and no accent or normalization is removed. A folded run longer
 than 255 bytes is not a token, and a needle without tokens matches
 nothing. Indexing and search fold through one tokenizer. The plain view
-at the newest basis intersects the `nx/fulltext` rows of the tokens
-when they are current (§2.3 `"ft"`), then reads the matching values
-from EAVT; an as-of, since or history view, or one over stale rows,
-re-tokenises the attribute's values under that view, so it answers
+at the newest basis intersects the `nx/fulltext` rows of the tokens,
+then reads the matching values from EAVT; an as-of, since or history
+view re-tokenises the attribute's values under that view, so it answers
 with the values its time held.
 An attribute without `:db/fulltext` at the basis is `:nextomic/tx-data`
 naming it; an unknown one `:nextomic/unknown-attribute`; a needle that
@@ -1166,8 +1179,8 @@ gives the place and the trace.
 | `:nextomic/basis-in-future` | a db-value newer than its file (§4) | none |
 | `:nextomic/closed` | an operation through a released connection or an ended `with` scope | none |
 | `:nextomic/busy` | `release` while an operation is in flight | none |
-| `:nextomic/tx-data` | malformed tx-data, a lookup ref on a non-unique attribute (as an entity or a ref value), a nested map nothing could reach, a tempid no assertion stands on, a unique card-many attribute, `fulltext` or `index-range` on an attribute without the flag | `:attr` when an attribute is at fault |
-| `:nextomic/schema` | a schema change the attribute's data or type refuses, or the retraction of an ident | `:attr`; `:e`, the entity holding two values, when many → one is refused |
+| `:nextomic/tx-data` | malformed tx-data, a lookup ref on a non-unique attribute (as an entity or a ref value), a nested map nothing could reach, a tempid no assertion stands on, a unique card-many attribute, `fulltext` or `index-range` on an attribute without the flag | `:attr` when an attribute is at fault; `:value`, the form, op, entity reference or tempid as the program wrote it, when one is refused |
+| `:nextomic/schema` | a schema change the attribute's data or type refuses, the retraction of an ident, or the rename of a bootstrap ident | `:attr`; `:e`, the entity holding two values, when many → one is refused |
 | `:nextomic/history-view` | `entity` or `pull` on a history db | none |
 | `:nextomic/nested` | `transact!`, `with` or `excise!` while the file's write transaction is held (a `with` scope, a transaction function, another connection to the same file) | none |
 | `:nextomic/tx-fn` | a transaction function that cannot run | the message names the unbound symbol, or the depth limit and its value |
@@ -1175,7 +1188,7 @@ gives the place and the trace.
 | `:nextomic/query-syntax` | a query the parser or planner refuses, or an unbound function name | `:clause`, the index into `:where`, when inside a clause. The message names what is at fault: the symbol, section, source or binding it does not take, the variable bound twice, the rule a call names with its arity and the count the call passes. A scoping refusal names the variable at fault: a `:find` or `:with` variable nothing binds, the one an `or` branch mentions and another does not, the join variable an `or-join` branch or a rule body leaves unbound, the one a `not` body has that nothing outside binds, the argument, function-position, `not-join` or required `or-join` variable no clause ever binds |
 | `:nextomic/pull-syntax` | a bad pull pattern (from `pull`, `pull-many` or a find element) | `:clause`, the index of the spec; the message names the element, option or attribute at fault |
 | `:kind-mismatch`, `:invalid-argument`, `:arity-mismatch` | the VM's own errors for an argument of the wrong kind (a db-value where a connection belongs), an unknown index, `:sync` or `:durability` option or a negative `t`, or a wrong argument count | as every runtime error's (`docs/VM.md` §13) |
-| `:stack-overflow` | tx-data, a query or a pull pattern nested past the native stack guard | as every runtime error's |
+| `:stack-overflow` | tx-data, a lookup ref (one whose value is a lookup ref, in tx-data or any read), a query or a pull pattern nested past the native stack guard | as every runtime error's |
 | `:db/*` | an engine failure, through `db.failureName` (`:db/key-too-large`, `:db/map-full`, `:db/read-only`, `:db/open-failed`, ...); a store whose bytes do not decode, or name an ident it lacks, or a page that fails the engine's check, is `:db/corrupted` | none; a store of another format names both formats in the message and its own as `:format` |
 
 ---
@@ -1192,7 +1205,7 @@ src/nextomic/
   schema.zig     Schema from attribute datoms as-of a basis, per-attribute counts
   transact.zig   §3
   excise.zig     §4 "Excision": the tree deletes and the txlog rewrite
-  fulltext.zig   the case-folding tokenizer and the nx/fulltext rows: put, delete, search, rebuild
+  fulltext.zig   the case-folding tokenizer and the nx/fulltext rows: put, delete, search
   db.zig         Conn, DbValue, datoms, entity, entid/ident, tx-range
   handle.zig     heap bodies of the three value kinds
   marshal.zig    VM values to and from datom values: the entity, value and cell contracts
@@ -1240,8 +1253,13 @@ checked after every commit); the corpora
 `test/integration/nextomic_q.zig` and `nextomic_pull.zig` against naive
 evaluators over the shared fixture `nextomic_fx.zig`, again over a
 churned store in its current, as-of, since and history views;
+`nextomic_store.zig` (the store, db-values and the transaction
+protocol against store files: bootstrap, batches, the merged and folded
+scans, every view, tempids, upserts, the unique and schema rules,
+`with`, excision, durability, the caches);
 `nextomic_fn.zig` (transaction functions, cas, schema alteration,
-excision, full-text, the refusal of another format);
+excision, full-text, the refusal of another format, lookup-ref upserts,
+the native stack and `t` bounds);
 `nextomic_size.zig` (the bytes every tree of a fixed history holds,
 pinned, and the pages it takes, bounded); `nextomic_entity.zig` (the
 lazy entity through the pipeline and under the collector's stress
@@ -1253,9 +1271,9 @@ end-to-end scripts `test/nextomic/*.nx`, each diffed against its
 
 ## 10. Where Nextomic wins, and where it does not
 
-Wins, by construction: reads straight off the mapping with no
-deserialization; empty-value index leaves; history as a range filter;
-one file, one process, backup by transaction number. The measured
+Wins, by construction: index scans compare key bytes in place in the
+mapping, decoding only the datoms they return; empty-value index leaves; history in trees of its
+own, merged with the current ones; one file, one process. The measured
 numbers are `docs/PERF.md` §3.7.
 
 Queries scale with their clauses (§5): ordering n clauses takes O(n)

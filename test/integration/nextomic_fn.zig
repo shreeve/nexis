@@ -14,7 +14,6 @@ const value = nx.value;
 const testing = std.testing;
 const Value = value.Value;
 const Fault = nextomic.db.Fault;
-const boot = nextomic.boot;
 
 const Fx = @import("nextomic_fx.zig").Fx;
 const harness = @import("harness");
@@ -95,7 +94,6 @@ test "cas swaps on a match and names the mismatch" {
     // A cas inside a call form.
     try testing.expectError(error.Cas, fx.transactFn(try a.print("[[:db.fn/cas {d} :person/age 31 33] [:db.fn/cas {d} :person/age 31 34]]", .{ ann, ann }), &fault));
     try testing.expectEqual(@as(u64, r2.t), (try fx.db()).basis);
-    _ = boot;
 }
 
 test "a renamed attribute answers to its new ident in every view and query" {
@@ -311,13 +309,10 @@ fn count(v: Value) usize {
     return nx.champ.setCount(v);
 }
 
-test "full-text stays in step under assert, retract, backfill and excision, on a store that gained :db/fulltext at open" {
-    const fx = try Fx.initWithoutFulltext("fn_fulltext");
+test "full-text stays in step under assert, retract, backfill and excision" {
+    const fx = try Fx.init("fn_fulltext");
     defer fx.deinit();
     const a = fx.arena();
-    // The mint took the store's next ident id, as its own transaction.
-    try testing.expectEqual(boot.fulltext, fx.conn().store.fulltext_aid);
-    try testing.expectEqual(@as(u64, 2), (try fx.db()).basis);
     try testing.expectEqual(@as(usize, 0), try tokenRows(fx));
 
     _ = try fx.transact(
@@ -372,25 +367,14 @@ test "full-text stays in step under assert, retract, backfill and excision, on a
     try testing.expectEqual(@as(usize, 0), count(try fx.q(backfilled, "[:find ?v :where [(fulltext $ :doc/body \"red\") [[?e ?v]]]]")));
 }
 
-/// Leave the tokens tree as another folding would: no stamp,
-/// and a row under an unfolded token for `e`'s value `text`.
-fn staleFulltext(fx: *Fx, a: u32, e: u64, text: []const u8) !void {
-    const store = fx.conn().store;
-    const txn = try store.beginWrite(.none);
-    errdefer txn.abort();
-    _ = try txn.delFromTree(store.trees.sys, "ft");
-    try txn.putInTree(store.trees.fulltext, try nextomic.fulltext.rowKey(fx.arena(), a, "cafÉ", e, nextomic.key.hash128(text)), &.{});
-    try txn.commit();
-}
-
-test "full-text folds case across scripts; rows of another folding are searched exactly and rebuilt at connect and by a transaction" {
+test "full-text folds case across scripts" {
     const fx = try Fx.init("fn_fulltext_fold");
     defer fx.deinit();
     _ = try fx.transact(
         \\[{:db/ident :doc/title :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/fulltext true}
         \\ {:db/ident :doc/n :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
     );
-    const r = try fx.transact(
+    _ = try fx.transact(
         \\[{:db/id "a" :doc/title "Café au lait"} {:db/id "b" :doc/title "CAFÉ NOIR"}
         \\ {:db/id "c" :doc/title "ΣΟΦΙΑ"} {:db/id "d" :doc/title "σοφιας"} {:db/id "e" :doc/title "ПРИВЕТ мир"}]
     );
@@ -405,37 +389,12 @@ test "full-text folds case across scripts; rows of another folding are searched 
         .{ .needle = "привет", .hits = 1 },
         .{ .needle = "Мир", .hits = 1 },
     };
-    const a = fx.arena();
-    const title = try fx.conn().db();
-    const title_id = (try title.entid(a, .{ .ident = try fx.kwId("doc/title") })).?;
-    const check = struct {
-        fn run(f: *Fx, list: []const @TypeOf(cases[0])) !void {
-            const dbv = try f.db();
-            for (list) |c| {
-                errdefer std.debug.print("needle {s}\n", .{c.needle});
-                const src = try f.arena().print("[:find ?e :where [(fulltext $ :doc/title \"{s}\") [[?e ?v]]]]", .{c.needle});
-                try testing.expectEqual(c.hits, count(try f.q(dbv, src)));
-            }
-        }
-    }.run;
-    try check(fx, &cases);
-
-    // Rows another folding wrote: searches re-tokenise until the next
-    // connect rebuilds them.
-    const b = r.tempids[1].eid;
-    try staleFulltext(fx, @intCast(title_id), b, "CAFÉ NOIR");
-    try testing.expectEqual(@as(usize, 10), try tokenRows(fx));
-    try check(fx, &cases);
-    try fx.tc.reopen();
-    try testing.expectEqual(@as(usize, 9), try tokenRows(fx));
-    try check(fx, &cases);
-
-    // A transaction rebuilds them too, before it writes its own.
-    try staleFulltext(fx, @intCast(title_id), b, "CAFÉ NOIR");
-    _ = try fx.transact("[{:doc/n 1 :doc/title \"Crème brûlée\"}]");
-    try testing.expectEqual(@as(usize, 11), try tokenRows(fx));
-    try check(fx, &cases);
-    try testing.expectEqual(@as(usize, 1), count(try fx.q(try fx.db(), "[:find ?e :where [(fulltext $ :doc/title \"CRÈME BRÛLÉE\") [[?e ?v]]]]")));
+    const dbv = try fx.db();
+    for (cases) |c| {
+        errdefer std.debug.print("needle {s}\n", .{c.needle});
+        const src = try fx.arena().print("[:find ?e :where [(fulltext $ :doc/title \"{s}\") [[?e ?v]]]]", .{c.needle});
+        try testing.expectEqual(c.hits, count(try fx.q(dbv, src)));
+    }
 }
 
 test "a store of another format is refused at connect, naming the format it holds" {
@@ -462,4 +421,74 @@ test "a store of another format is refused at connect, naming the format it hold
     );
     defer testing.allocator.free(src);
     try harness.expectResult(&program, src, try program.run(src), "[:db/corrupted 2 Nextomic store format 2; this build reads format 3. Recreate the store or re-import its data (docs/NEXTOMIC.md §2)]");
+}
+
+test "a lookup ref nested past the native stack is StackOverflow in tx-data and in every read" {
+    const fx = try Fx.init("fn_deep_lookup");
+    defer fx.deinit();
+    _ = try fx.transact(
+        \\[{:db/ident :n/parent :db/valueType :db.type/ref :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+        \\ {:db/ident :n/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}]
+    );
+    // [:n/parent [:n/parent ... [:n/name "x"]]], a lookup ref whose value
+    // is a lookup ref, 5000 deep.
+    var v = try fx.read("[:n/name \"x\"]");
+    const parent = try fx.kw("n/parent");
+    for (0..5000) |_| v = try nx.vector.fromSlice(&fx.heap, &.{ parent, v });
+    nx.stack.arm(64 * 1024);
+    defer nx.stack.arm(nx.stack.main_thread_budget);
+    const tx = try nx.vector.fromSlice(&fx.heap, &.{try nx.vector.fromSlice(&fx.heap, &.{ try fx.kw("db/add"), try fx.str("a"), parent, v })});
+    try testing.expectError(error.StackOverflow, nextomic.transact.transact(fx.conn(), fx.arena(), tx, .{}));
+    var rd = try (try fx.db()).beginRead();
+    defer rd.close();
+    var fault: Fault = .{};
+    try testing.expectError(error.StackOverflow, nextomic.marshal.entity(&rd, fx.arena(), v, &fault));
+}
+
+fn tempidOf(r: nextomic.Report, name: []const u8) !u64 {
+    for (r.tempids) |b| if (b.key == .string and std.mem.eql(u8, b.key.string, name)) return b.eid;
+    return error.TestUnexpectedResult;
+}
+
+test "a lookup ref value upserts through any unique assertion of the transaction" {
+    const fx = try Fx.init("fn_lookup_upsert");
+    defer fx.deinit();
+    const a = fx.arena();
+    _ = try fx.transact(
+        \\[{:db/ident :u/email :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+        \\ {:db/ident :u/alt :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+        \\ {:db/ident :u/code :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/unique :db.unique/value}
+        \\ {:db/ident :u/key :db/valueType :db.type/ref :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+        \\ {:db/ident :u/n :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+    );
+    const r = try fx.transact("[{:db/id \"x\" :u/email \"x\"} {:db/id \"y\" :u/key \"x\" :u/n 1}]");
+    const x = try tempidOf(r, "x");
+    const y = try tempidOf(r, "y");
+    // The identity the lookup ref names is asserted on an explicit eid.
+    const ra = try fx.transact(try a.print("[[:db/add {d} :u/alt \"alt\"] {{:db/id \"t\" :u/key [:u/alt \"alt\"] :u/n 2}}]", .{x}));
+    try testing.expectEqual(y, try tempidOf(ra, "t"));
+    // A unique value on a tempid that upserts through another identity.
+    const rb = try fx.transact("[{:db/id \"w\" :u/email \"x\" :u/code \"cx\"} {:db/id \"t\" :u/key [:u/code \"cx\"] :u/n 4}]");
+    try testing.expectEqual(x, try tempidOf(rb, "w"));
+    try testing.expectEqual(y, try tempidOf(rb, "t"));
+    // A unique value on a new entity: the claim on it is new too.
+    const rc = try fx.transact("[{:db/id \"z\" :u/code \"c1\" :u/email \"z\"} {:db/id \"t\" :u/key [:u/code \"c1\"] :u/n 3}]");
+    const z = try tempidOf(rc, "z");
+    const t = try tempidOf(rc, "t");
+    try testing.expect(z != x and z != y and t != x and t != y and t != z);
+    const n = try fx.q(try fx.db(), "[:find ?n :where [?e :u/n ?n]]");
+    try testing.expectEqual(@as(usize, 2), count(n));
+}
+
+test "a transaction past the last t the merged order allows is map-full" {
+    const fx = try Fx.init("fn_t_limit");
+    defer fx.deinit();
+    const store = fx.conn().store;
+    {
+        const txn = try store.beginWrite(.none);
+        errdefer txn.abort();
+        try store.writeT(txn, nextomic.key.t_limit - 1);
+        try txn.commit();
+    }
+    try testing.expectError(error.DatabaseFull, fx.transact("[{:db/doc \"one too many\"}]"));
 }

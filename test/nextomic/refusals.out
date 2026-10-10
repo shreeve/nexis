@@ -1,0 +1,31 @@
+{:error :nextomic/tx-data, :message "a new attribute needs :db/valueType and :db/cardinality", :attr :x/z}
+{:error :nextomic/tx-data, :message "a unique attribute is cardinality one", :attr :x/w}
+{:error :nextomic/tx-data, :message "a lookup ref needs a unique attribute", :attr :u/age}
+{:error :nextomic/tx-data, :message ":db.fn/cas takes a cardinality-one attribute", :attr :u/tags}
+{:error :nextomic/tx-data, :message "a reverse ref needs a ref attribute", :attr :u/age}
+{:error :nextomic/tx-data, :message "a nested map under a non-component ref needs :db/id or a unique attribute", :attr :u/friend}
+{:error :nextomic/tx-data, :message "an entity is an id, a tempid, a lookup ref, an ident or \"datomic.tx\"", :value nil}
+{:error :nextomic/tx-data, :message "a tempid no assertion stands on names no entity", :value "lonely"}
+{:error :nextomic/tx-data, :message "unknown op; one of :db/add, :db/retract, :db/retractEntity, :db.fn/call, :db.fn/cas", :value :db/frob}
+{:error :nextomic/value-type, :message ":u/email takes a :db.type/string, not [:u/email \"x\"]", :attr :u/email, :value [:u/email "x"]}
+{:error :nextomic/tx-data, :message "an attribute is a keyword or an id", :value "u/age"}
+{:error :nextomic/tx-data, :message "a form is a vector, a list or a map", :value :not-a-form}
+{:error :nextomic/value-type, :message ":db/valueType does not take :db.cardinality/one", :attr :db/valueType, :value :db.cardinality/one}
+{:error :nextomic/value-type, :message ":db/valueType does not take :db.cardinality/one", :attr :db/valueType, :value :db.cardinality/one}
+{:error :nextomic/value-type, :message ":db/cardinality does not take :db.type/long", :attr :db/cardinality, :value :db.type/long}
+{:error :nextomic/value-type, :message ":db/unique does not take :db.cardinality/one", :attr :db/unique, :value :db.cardinality/one}
+{:error :nextomic/value-type, :message ":db/valueType does not take :db.type/strin", :attr :db/valueType, :value :db.type/strin}
+ok a refused enum keyword is never minted
+{:error :nextomic/tx-data, :message "a schema attribute is asserted on an attribute only; an attribute map needs :db/ident", :attr :db/unique}
+{:error :nextomic/tx-data, :message "a schema attribute is asserted on an attribute only; an attribute map needs :db/ident", :attr :db/valueType}
+{:error :nextomic/tx-data, :message "a schema attribute is asserted on an attribute only; an attribute map needs :db/ident", :attr :db/index}
+{:error :nextomic/tx-data, :message "a schema attribute is asserted on an attribute only; an attribute map needs :db/ident", :attr :db/isComponent}
+{:error :nextomic/tx-data, :message "a schema attribute is asserted on an attribute only; an attribute map needs :db/ident", :attr :db/fulltext}
+{:error :nextomic/tx-data, :message "a schema attribute is asserted on an attribute only; an attribute map needs :db/ident", :attr :db/index}
+ok no user entity carries a schema attribute
+{:error :nextomic/schema, :message "a bootstrap ident is never renamed", :attr :db/fulltext}
+{:error :nextomic/schema, :message "a bootstrap ident is never renamed", :attr :db.type/string}
+{:error :nextomic/schema, :message "a bootstrap ident is never renamed", :attr :db/ident}
+ok asserting a bootstrap ident's own name is a no-op
+ok the bootstrap idents keep their names
+ok a lookup ref by attribute id resolves in a read

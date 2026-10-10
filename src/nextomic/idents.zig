@@ -130,12 +130,6 @@ pub const Idents = struct {
         try self.rememberRead(txn, intern_id, id);
         return intern_id;
     }
-
-    /// Text of ident `id`; the slice is owned by the VM interner.
-    pub fn nameOf(self: *Idents, txn: *Txn, id: u32) !?[]const u8 {
-        const k = (try self.internOf(txn, id)) orelse return null;
-        return self.interner.keywordName(k);
-    }
 };
 
 /// Ident resolution inside one write transaction: looks through this
@@ -284,7 +278,7 @@ test "bootstrap idents resolve both ways and new ones mint after commit" {
         defer txn.abort();
         try testing.expectEqual(@as(?u32, store_mod.boot.ident), try idents.idOf(txn, k_ident));
         try testing.expect((try idents.idOf(txn, k_color)) == null);
-        try testing.expectEqualStrings("db.type/ref", (try idents.nameOf(txn, store_mod.boot.type_ref)).?);
+        try testing.expectEqualStrings("db.type/ref", interner.keywordName((try idents.internOf(txn, store_mod.boot.type_ref)).?));
         try testing.expect((try idents.internOf(txn, 4000)) == null);
     }
     // An aborted mint leaves no trace in the cache or the counter.
