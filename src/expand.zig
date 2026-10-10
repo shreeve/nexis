@@ -1279,24 +1279,16 @@ fn formValue(ctx: *ExpandContext, form: *const Form) ExpandError!value_mod.Value
     try checkStack();
     const heap = try ctx.heapForArgs();
     const oom = ExpandError.OutOfMemory;
+    if (scalarValue(heap, ctx.interner, ctx.allocator, form.datum)) |scalar| {
+        if (scalar) |v| return v;
+    } else |err| return switch (err) {
+        error.OutOfMemory => oom,
+        error.StackOverflow => ExpandError.ExpansionDepthExceeded,
+        error.Unsupported => unreachable,
+        error.Malformed => ctx.fail(form.origin, "{s} that makes no value", .{describeForm(form)}),
+    };
     return switch (form.datum) {
-        .nil => value_mod.nilValue(),
-        .bool_ => |b| value_mod.fromBool(b),
-        .int => |n| value_mod.fromFixnum(n) orelse (bignum_mod.fromI64(heap, n) catch return oom),
-        .bigint => |text| (bignum_mod.parseDecimal(heap, text) catch return oom) orelse ctx.fail(form.origin, "malformed integer {s}", .{text}),
-        .real => |f| value_mod.fromFloat(f),
-        .char => |c| value_mod.fromChar(c) orelse ctx.fail(form.origin, "no char U+{X}", .{c}),
-        .string => |bytes| string_mod.fromBytes(heap, bytes) catch return oom,
-        // The reader compiled it once already, so it compiles here.
-        .regex => |text| switch (regex_mod.make(heap, ctx.allocator, text) catch |err| return switch (err) {
-            error.OutOfMemory => oom,
-            error.StackOverflow => ExpandError.ExpansionDepthExceeded,
-        }) {
-            .ok => |p| p,
-            .err => |e| ctx.fail(form.origin, "{s}", .{e.msg}),
-        },
-        .symbol => |name| ctx.interner.internQualifiedSymbol(name.ns, name.name) catch return oom,
-        .keyword => |name| ctx.interner.internQualifiedKeyword(name.ns, name.name) catch return oom,
+        .nil, .bool_, .int, .bigint, .real, .char, .string, .regex, .symbol, .keyword => unreachable,
         .list, .vector, .set, .map => |items| blk: {
             if (form.datum == .list) if (sortedMarker(items)) |set| break :blk try sortedValue(ctx, form, set, items[1..]);
             const values = try ctx.allocator.alloc(value_mod.Value, items.len);
@@ -1325,6 +1317,33 @@ fn formValue(ctx: *ExpandContext, form: *const Form) ExpandError!value_mod.Value
             break :blk target;
         },
         .syntax_quote, .unquote, .unquote_splicing => ctx.fail(form.origin, "{s} is not data a macro can take", .{describeForm(form)}),
+    };
+}
+
+pub const ScalarError = error{ OutOfMemory, StackOverflow, Unsupported, Malformed };
+
+/// The value of a scalar datum, as `formToValue` and the compiler's
+/// literals make it, a string, bignum or regex on `heap` and a symbol
+/// or keyword interned; null for any other datum. Without a heap or an
+/// interner a datum that needs one is `Unsupported`; a datum that names
+/// no value (a char past Unicode, a regex that does not compile), which
+/// the reader never makes, is `Malformed`.
+pub fn scalarValue(heap: ?*heap_mod.Heap, interner: ?*intern_mod.Interner, scratch: Allocator, datum: Datum) ScalarError!?value_mod.Value {
+    return switch (datum) {
+        .nil => value_mod.nilValue(),
+        .bool_ => |b| value_mod.fromBool(b),
+        .int => |n| value_mod.fromFixnum(n) orelse bignum_mod.fromI64(heap orelse return error.Unsupported, n) catch error.OutOfMemory,
+        .bigint => |text| (bignum_mod.parseDecimal(heap orelse return error.Unsupported, text) catch return error.OutOfMemory) orelse error.Malformed,
+        .real => |f| value_mod.fromFloat(f),
+        .char => |c| value_mod.fromChar(c) orelse error.Malformed,
+        .string => |bytes| string_mod.fromBytes(heap orelse return error.Unsupported, bytes) catch error.OutOfMemory,
+        .regex => |text| switch (try regex_mod.make(heap orelse return error.Unsupported, scratch, text)) {
+            .ok => |p| p,
+            .err => error.Malformed,
+        },
+        .symbol => |name| (interner orelse return error.Unsupported).internQualifiedSymbol(name.ns, name.name) catch error.OutOfMemory,
+        .keyword => |name| (interner orelse return error.Unsupported).internQualifiedKeyword(name.ns, name.name) catch error.OutOfMemory,
+        else => null,
     };
 }
 

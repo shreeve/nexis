@@ -1802,8 +1802,8 @@ fn lowerDatum(
     return switch (form.datum) {
         .nil => try allocTiny(allocator, .nil),
         .bool_ => |b| try allocTiny(allocator, .{ .bool = b }),
-        .int => |n| try lowerInt(allocator, n, ctx),
-        .bigint => |text| try lowerBigInt(allocator, text, ctx),
+        .int => |n| if (value_mod.isFixnumRange(n)) try allocTiny(allocator, .{ .int = n }) else try lowerScalar(allocator, form, ctx),
+        .bigint, .real, .char, .string, .regex, .keyword => try lowerScalar(allocator, form, ctx),
         .symbol => |name| blk: {
             // Qualified symbols `ns/name` lower to
             // `Tiny.qualified_symbol`; compileSymbol handles
@@ -1829,46 +1829,6 @@ fn lowerDatum(
             break :blk try allocTiny(allocator, .{ .symbol = name.name });
         },
         .list => |items| try lowerList(allocator, items, ctx),
-        // Bare keywords are self-evaluating per Clojure
-        // semantics. Lowers to Tiny.literal via the Interner.
-        // Without an Interner, falls back to UnsupportedFeature.
-        // A qualified keyword interns its full `ns/name` text, the
-        // same way qualified symbols do.
-        .keyword => |name| blk: {
-            const interner = ctx.interner orelse return CompileError.UnsupportedFeature;
-            const v = interner.internQualifiedKeyword(name.ns, name.name) catch return CompileError.OutOfMemory;
-            break :blk try allocTiny(allocator, .{ .literal = v });
-        },
-        // Floats and chars are immediates: they lower straight
-        // to `Tiny.literal` with no interner or heap involved.
-        .real => |f| try allocTiny(allocator, .{ .literal = value_mod.fromFloat(f) }),
-        .char => |c| try allocTiny(allocator, .{
-            .literal = value_mod.fromChar(c) orelse return CompileError.MalformedForm,
-        }),
-        // String literals lower through the heap plumbed into
-        // LowerCtx. The Value goes into `Tiny.literal`; the heap
-        // is the same one routines and closures use, so the
-        // string lifetime tracks the artifact. Without a heap the
-        // form raises UnsupportedFeature.
-        .string => |bytes| blk: {
-            const h = ctx.heap orelse return CompileError.UnsupportedFeature;
-            const v = string_mod.fromBytes(h, bytes) catch return CompileError.OutOfMemory;
-            break :blk try allocTiny(allocator, .{ .literal = v });
-        },
-        // A regex literal is a pattern constant of the routine, as a
-        // string is, so each evaluation of one `#"..."` gives the same
-        // pattern, as Clojure's constant does (docs/REGEX.md §10).
-        .regex => |text| blk: {
-            const h = ctx.heap orelse return CompileError.UnsupportedFeature;
-            const made = regex_mod.make(h, allocator, text) catch |err| return switch (err) {
-                error.OutOfMemory => CompileError.OutOfMemory,
-                error.StackOverflow => CompileError.StackOverflow,
-            };
-            break :blk try allocTiny(allocator, .{ .literal = switch (made) {
-                .ok => |p| p,
-                .err => return CompileError.MalformedForm,
-            } });
-        },
         // `{k1 v1 ...}`, `#{a b}` and `[a b]` as expressions: each
         // item is an expression, evaluated left to right.
         .map => |items| try lowerColl(allocator, .map, items, ctx),
@@ -2072,12 +2032,8 @@ fn constValue(t: *const Tiny) CompileError!?Value {
 fn lowerQuoted(allocator: std.mem.Allocator, payload: *const reader_mod.Form, ctx: LowerCtx) CompileError!*Tiny {
     try stack.check();
     switch (payload.datum) {
-        .nil, .bool_, .int, .bigint, .real, .char, .string, .regex, .keyword => return lowerDatum(allocator, payload, ctx),
-        .symbol => |name| {
-            const interner = ctx.interner orelse return CompileError.UnsupportedFeature;
-            const v = interner.internQualifiedSymbol(name.ns, name.name) catch return CompileError.OutOfMemory;
-            return allocTiny(allocator, .{ .literal = v });
-        },
+        .nil, .bool_, .int => return lowerDatum(allocator, payload, ctx),
+        .bigint, .real, .char, .string, .regex, .keyword, .symbol => return lowerScalar(allocator, payload, ctx),
         else => {},
     }
     var expander = expand_mod.ExpandContext{
@@ -2094,24 +2050,19 @@ fn lowerQuoted(allocator: std.mem.Allocator, payload: *const reader_mod.Form, ct
     return allocTiny(allocator, .{ .literal = v });
 }
 
-/// An integer literal: `Tiny.int` in the fixnum range, otherwise a
-/// bignum `Tiny.literal` on the heap plumbed into `LowerCtx`
-/// (without a heap the literal is `UnsupportedFeature`, as a string
-/// literal is).
-fn lowerInt(allocator: std.mem.Allocator, n: i64, ctx: LowerCtx) CompileError!*Tiny {
-    if (value_mod.isFixnumRange(n)) return allocTiny(allocator, .{ .int = n });
-    const h = ctx.heap orelse return CompileError.UnsupportedFeature;
-    const v = bignum_mod.fromI64(h, n) catch return CompileError.OutOfMemory;
-    return allocTiny(allocator, .{ .literal = v });
-}
-
-/// A `bigint` literal (the reader's canonical decimal text) as a
-/// bignum `Tiny.literal`.
-fn lowerBigInt(allocator: std.mem.Allocator, text: []const u8, ctx: LowerCtx) CompileError!*Tiny {
-    const h = ctx.heap orelse return CompileError.UnsupportedFeature;
-    const parsed = bignum_mod.parseDecimal(h, text) catch return CompileError.OutOfMemory;
-    const v = parsed orelse return CompileError.MalformedForm;
-    return allocTiny(allocator, .{ .literal = v });
+/// A self-evaluating scalar as a `Tiny.literal` (`expand.scalarValue`):
+/// a keyword interned, a string, regex or integer past the fixnum
+/// range on the lowering heap, so that each evaluation of a literal
+/// gives the same constant (docs/REGEX.md §10). Without the interner
+/// or heap it needs, `UnsupportedFeature`.
+fn lowerScalar(allocator: std.mem.Allocator, form: *const reader_mod.Form, ctx: LowerCtx) CompileError!*Tiny {
+    const v = expand_mod.scalarValue(ctx.heap, ctx.interner, allocator, form.datum) catch |err| return switch (err) {
+        error.OutOfMemory => CompileError.OutOfMemory,
+        error.StackOverflow => CompileError.StackOverflow,
+        error.Unsupported => CompileError.UnsupportedFeature,
+        error.Malformed => CompileError.MalformedForm,
+    };
+    return allocTiny(allocator, .{ .literal = v.? });
 }
 
 /// The inlined core fn `name` is at `argc` arguments, if any.
