@@ -198,7 +198,7 @@ is `UnserializableKind`: the comparator is code.
 | `record` (35), `protocol` (36), `protocol_fn` (37) | no | Type and protocol ids are dense per-VM numbers (`docs/PROTOCOLS.md` §0). |
 | `nextomic_conn` (38), `nextomic_db` (39), `nextomic_entity` (40) | no | They name a Nextomic connection the VM owns (`docs/NEXTOMIC.md` §6). |
 | `regex` (44), `matcher` (45) | no | Identity kinds: a decoded pattern could never be `=` to the one encoded, and EDN has no regex (`docs/REGEX.md` §8). |
-| `byte_vector` (22), `error_` (28), `meta_symbol` (29) | no | Reserved numbers; never constructed. |
+| `byte_vector` (22), 28 (no kind), `meta_symbol` (29) | no | Reserved numbers; never constructed. |
 
 Encoding any kind marked no is `UnserializableKind`. Decoding any byte
 outside the set, whether it names a kind marked no (or 43) or no kind at

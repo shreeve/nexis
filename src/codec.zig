@@ -1215,7 +1215,10 @@ test "decode: every kind byte outside the serializable set is MalformedPayload" 
     const serializable = [_]Kind{ .nil, .false_, .true_, .char, .fixnum, .float, .inst, .keyword, .symbol, .string, .bignum, .uuid, .persistent_map, .persistent_set, .persistent_vector, .list, .typed_vector, .sorted_map, .sorted_set };
     for (0..256) |b| {
         const byte: u8 = @intCast(b);
-        if (std.mem.findScalar(Kind, &serializable, @fromBackingInt(byte)) != null) continue;
+        const is_serializable = for (serializable) |k| {
+            if (@backingInt(k) == byte) break true;
+        } else false;
+        if (is_serializable) continue;
         try testing.expectError(error.MalformedPayload, decode(&ctx.heap, &ctx.interner, &.{ 1, 0, byte }, &synthHash, &synthEq));
     }
 }

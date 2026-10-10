@@ -4064,7 +4064,7 @@ fn isClassKeyword(name: []const u8) bool {
     return switch (kinds[0]) {
         // nil has no class, a record's is a symbol, and the rest are
         // reserved or never escape.
-        .nil, .record, .byte_vector, .error_, .meta_symbol, .cell_internal => false,
+        .nil, .record, .byte_vector, .meta_symbol, .cell_internal => false,
         else => |k| std.mem.eql(u8, className(k), name),
     };
 }

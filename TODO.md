@@ -133,10 +133,7 @@ files; each is a few lines.
 
 28. **Small rows left:** a fulltext needle with an over-long token
     (`nextomic/fulltext.zig` drops it from the needle, so the search
-    widens; a decision, not a deletion), and the reserved `Kind` name
-    `.error_` (kind 28 is one of three reserved wire tags, documented as
-    a set in VALUE.md, CODEC.md, GC.md and SEMANTICS.md §Kinds; the one
-    use is a `false` arm in `stdlib.zig`).
+    widens; a decision, not a deletion).
 29. **The test and doc pass the revamp deferred:** `eval_pipeline`'s
     superseded early cases and its fresh VM per case (31 s of the gate),
     the duplicated pins, `docs/PERF.md`'s superseded tables, test
