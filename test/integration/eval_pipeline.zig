@@ -8760,3 +8760,55 @@ test "nexis.pprint lays out within the dynamic *print-right-margin*" {
         \\(binding [nexis.pprint/*print-right-margin* 10] (nexis.pprint/pprint-str [1 2 3 4 5 6 7 8]))
     , "[1 2 3 4 5\n 6 7 8]");
 }
+
+// =============================================================================
+// A lazy body that forces its own block (LAZY.md §4, re-entrance)
+// =============================================================================
+
+test "a lazy body that forces its own block raises :stack-overflow and ends the seq there" {
+    try expectOutputProgram(
+        \\(def flag (atom true))
+        \\(declare s)
+        \\(def s (map (fn [x]
+        \\              (when @flag (reset! flag false) (dorun 20 s))
+        \\              (dotimes [_ 50] (vec (range 20)))
+        \\              (str "v" x))
+        \\            (vec (range 64))))
+        \\[(try (first s) (catch :stack-overflow e (:error e))) (seq s)]
+    , "[:stack-overflow nil]");
+    try expectOutputProgram(
+        \\(declare t)
+        \\(def t (filter (fn [x] (try (first t) (catch :stack-overflow e nil)) (even? x)) (vec (range 40))))
+        \\[(take 3 t) (count t)]
+    , "[(0 2 4) 20]");
+}
+
+test "sequence with a transducer takes any number of colls" {
+    try expectOutput("[(count (first (apply sequence (map vector) (repeat 40 [1])))) (apply sequence (map +) (repeat 34 [1 2]))]", "[40 (34 68)]");
+}
+
+test "db: a collection frees the closed connections nothing names" {
+    var store = try SeamStore.init("closed-conns");
+    defer store.deinit();
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const base = nx.db.connectionCount();
+    const steps = [_][]const u8{
+        \\(do (def kept (db/open "@STORE@"))
+        \\    (def r (db/ref kept :t "k"))
+        \\    (db/close kept)
+        \\    (dotimes [i 2000] (db/close (db/open "@STORE@"))))
+        ,
+        \\[(try (db/get-key r) (catch any e (:error e))) (db/close kept)]
+    };
+    var last = value_mod.nilValue();
+    for (steps) |step| {
+        const src = try store.source(step);
+        defer testing.allocator.free(src);
+        last = try program.run(src);
+        program.v.collectGarbage();
+        try testing.expect(nx.db.connectionCount() < base + 8);
+    }
+    try harness.expectResult(&program, steps[1], last, "[:db-closed nil]");
+}

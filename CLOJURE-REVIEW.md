@@ -57,7 +57,7 @@ complete from the start; `core.clj`'s two-stage bootstrap (a trivial
 
 `ATransientMap.ensureEditable` checks ownership on every operation, and
 `persistent!` ends it. nexis transients check an owner token on every
-operation and freeze on `persistent!`. As in Clojure, an
+operation and freeze on `persistent!` (`docs/TRANSIENT.md` §5). As in Clojure, an
 operation edits the nodes the transient owns in place and copies a
 shared node once; the token lives in the node header's hash field,
 which an internal node does not use (`docs/TRANSIENT.md`).
@@ -217,9 +217,11 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | a lazy seq a local holds | let go as it is walked (locals clearing) | let go as it is walked, but for the cases `docs/LAZY.md` §9 lists (a last read in place, a local a closure captures, a native that walks without consuming) | `docs/LAZY.md` §9, `docs/COMPILER.md` §4.9 |
 | `(apply f (range))` | can stay lazy | does not end: `apply` realizes its last argument | `docs/LAZY.md` §9 |
 | `(str (map inc [1]))` | `"clojure.lang.LazySeq@..."` | `"(2)"` | `docs/LAZY.md` §9 |
+| `compare` of two strings | UTF-16 code-unit order (`String.compareTo`) | code-point order, the order of their UTF-8 bytes, which matches nexis's code-point string indexes; the two differ between U+E000–U+FFFF and the supplementary planes: `(compare "\uffff" "😀")` is 10178 in Clojure, −1 in nexis | `docs/SORTED.md` §6 |
 | a lazy key of a map of up to eight entries (`assoc`, `frequencies`, `group-by`) | left unrealized: the array map compares and hashes nothing | realized when the map takes it, its throw raised by that call, as a hash set's in both | `docs/LAZY.md` §9 |
 | a lazy seq nested in a value `=` or `hash` compares, whose body makes much garbage | collected while the body runs | nothing is collected until the body returns (it realizes in isolation, under `gc_hold`), so memory grows with the body's garbage | `docs/LAZY.md` §9 |
 | a `lazy-seq` body that throws, walked again | `LazySeq.force` calls the body again, a `^:once` fn whose captured locals it had read are cleared: a body that reads its seq first (every core sequence function's) ends the seq there, one that reads no captured local runs again whole, one that uses a cleared local otherwise throws a `NullPointerException` | ends the seq at the block in every case, as babashka; `realized?` false until that walk, as both | `docs/LAZY.md` §4 |
+| a lazy body that forces its own seq before it returns (`(map f v)` whose `f` walks the seq it is producing) | runs the body again inside itself: a body that does so once, under a flag, computes its elements twice; one that always does ends in `StackOverflowError` | the inner walk raises `:stack-overflow` at once, which ends the seq at the block unless the body catches it | `docs/LAZY.md` §4 |
 | a `sequence` step that throws, walked again | goes on from the advanced source and transducer, dropping the chunk it was filling: `(3 4)` for a `(comp (map f) (take 4))` over `(range 10)` whose `f` throws once at 2 | ends the seq at the block: `()` | `docs/LAZY.md` §9 |
 | `(empty record)` | throws | `{}`: a record is a map to collection functions | `docs/PROTOCOLS.md` |
 | `extend-type`, `extend-protocol` | a class | a kind keyword (`:fixnum`, `:string`, `:vector`, `:any`), `nil`, a record name, or a common Clojure class name standing for its kinds (`String`, `Long`, `Object` as `:any`) | `docs/PROTOCOLS.md` |

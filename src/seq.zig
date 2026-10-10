@@ -144,10 +144,12 @@ const steps = [_]Step{
 };
 
 /// Whether `v` is a `reduced` value: the record type the VM registers
-/// for it (`VM.reduced_type_id`).
-fn isReduced(vm: *VM, v: Value) bool {
+/// for it (`VM.reduced_type_id`). The kind first: a fold's accumulator
+/// is rarely a record.
+pub fn isReduced(vm: *VM, v: Value) bool {
+    if (v.kind() != .record) return false;
     const id = vm.home().reduced_type_id orelse return false;
-    return v.kind() == .record and record_mod.typeId(v) == id;
+    return record_mod.typeId(v) == id;
 }
 
 /// The transient vector a step accumulates into, rooted in the block's
@@ -171,7 +173,11 @@ fn stepSequence(vm: *VM, lz: Value) VmError!Value {
     try scope.push(a[1]);
     var cur = a[1];
     var done = false;
-    var args: [lazy.chunk_size + 1]Value = undefined;
+    // `rf`'s arguments: the accumulator and an input, or the elements
+    // of an input tuple, as many as there are colls.
+    var inline_args: [8]Value = undefined;
+    var args: []Value = &inline_args;
+    defer if (args.len > inline_args.len) vm.allocator.free(args);
     // Pull inputs until a chunk's worth of outputs waits, the source
     // ends, or `rf` stops the reduction.
     while (true) {
@@ -184,15 +190,19 @@ fn stepSequence(vm: *VM, lz: Value) VmError!Value {
             break;
         }
         const fr = firstRest(cur);
-        args[0] = acc;
         var argc: usize = 2;
         if (a[3].isTruthy()) {
             const tuple = fr.first;
             const k = vector_mod.count(tuple);
-            if (k + 1 > args.len) return VmError.ArityMismatch;
+            if (k + 1 > args.len) {
+                const grown = vm.allocator.alloc(Value, k + 1) catch return VmError.OutOfMemory;
+                if (args.len > inline_args.len) vm.allocator.free(args);
+                args = grown;
+            }
             for (0..k) |i| args[1 + i] = vector_mod.nth(tuple, i);
             argc = k + 1;
         } else args[1] = fr.first;
+        args[0] = acc;
         const r = try vm.callValue(a[0], args[0..argc]);
         cur = fr.rest;
         if (isReduced(vm, r)) {
@@ -427,25 +437,15 @@ fn stepCycle(vm: *VM, lz: Value) VmError!Value {
     return lazy.cons(vm.ensureHeap(), fr.first, more) catch VmError.OutOfMemory;
 }
 
-/// What the chunked one-function producers do with each element.
-const Sieve = enum {
-    map,
-    filter,
-    remove,
-    keep,
-    map_indexed,
-    keep_indexed,
-
-    fn op(comptime self: Sieve) u16 {
-        return switch (self) {
-            .map => op_map,
-            .filter => op_filter,
-            .remove => op_remove,
-            .keep => op_keep,
-            .map_indexed => op_map_indexed,
-            .keep_indexed => op_keep_indexed,
-        };
-    }
+/// What the chunked one-function producers do with each element: the
+/// op of their blocks.
+const Sieve = enum(u16) {
+    map = op_map,
+    filter = op_filter,
+    remove = op_remove,
+    keep = op_keep,
+    map_indexed = op_map_indexed,
+    keep_indexed = op_keep_indexed,
 
     fn indexed(comptime self: Sieve) bool {
         return self == .map_indexed or self == .keep_indexed;
@@ -523,7 +523,7 @@ fn stepSieve(comptime mode: Sieve) Step {
                         } else for (ch.items, out) |x, *slot| {
                             slot.* = (try apply(mode, &cb, &index, x)).?;
                         }
-                        const following = try make(vm, mode.op(), &nextArgs(mode, a[0], ch.after, index));
+                        const following = try make(vm, @backingInt(mode), &nextArgs(mode, a[0], ch.after, index));
                         lazy.finishChunked(c, ch.items.len, following);
                         return c;
                     },
@@ -553,7 +553,7 @@ fn stepSieve(comptime mode: Sieve) Step {
                 };
                 // `Heap.alloc` never collects: the kept values need no
                 // root while the chunk and the next block are made.
-                const following = try make(vm, mode.op(), &nextArgs(mode, a[0], ch.after, index));
+                const following = try make(vm, @backingInt(mode), &nextArgs(mode, a[0], ch.after, index));
                 if (n == 0) return following;
                 return lazy.chunkedOf(heap, buf[0..n], following) catch VmError.OutOfMemory;
             }
@@ -561,7 +561,7 @@ fn stepSieve(comptime mode: Sieve) Step {
             const kept = try apply(mode, &cb, &index, fr.first);
             // `Heap.alloc` never collects: the kept value needs no root
             // while the next block is made.
-            const following = try make(vm, mode.op(), &nextArgs(mode, a[0], fr.rest, index));
+            const following = try make(vm, @backingInt(mode), &nextArgs(mode, a[0], fr.rest, index));
             const y = kept orelse return following;
             return lazy.cons(heap, y, following) catch VmError.OutOfMemory;
         }
@@ -762,11 +762,18 @@ pub fn force(vm: *VM, lz: Value) VmError!Value {
     stack_guard.check() catch return VmError.StackOverflow;
     var cur = forwardEnd(lz);
     const raw: Value = while (true) {
-        if (lazy.state(cur) == .realized) break lazy.result(cur);
+        switch (lazy.state(cur)) {
+            .realized => break lazy.result(cur),
+            // Its own body, or one it runs, forces it (§4, re-entrance).
+            .running => return VmError.StackOverflow,
+            else => {},
+        }
+        lazy.setRunning(cur, true);
         const r = steps[lazy.op(cur)](vm, cur) catch |err| {
             endAfterThrow(vm, cur);
             return err;
         };
+        lazy.setRunning(cur, false);
         if (r.kind() != .lazy_seq or lazy.shapeOf(r) != .lazy) break r;
         if (lazy.state(r) == .realized) break lazy.result(r);
         // A body that returns its own block, or one before it in the
@@ -791,9 +798,9 @@ pub fn force(vm: *VM, lz: Value) VmError!Value {
 /// `lz`, whose step threw, ends the seq there on the next walk: it
 /// forwards to an empty block, its own state dropped, and stays
 /// unrealized until that walk, as Clojure's `LazySeq` stays (LAZY.md
-/// §4). A re-entrant force may have realized it meanwhile.
+/// §4).
 fn endAfterThrow(vm: *VM, lz: Value) void {
-    if (lazy.state(lz) != .unrealized) return;
+    lazy.setRunning(lz, false);
     const nil = value_mod.nilValue();
     if (make(vm, op_concat, &.{ nil, nil })) |end| lazy.setForwarding(lz, end) else |_| lazy.setRealized(lz, nil);
 }
@@ -951,7 +958,7 @@ fn realizeAllFound(vm: *VM, root: Value) VmError!bool {
 fn pushParts(vm: *VM, v: Value, work: *std.ArrayList(Value), found: *bool) VmError!void {
     switch (v.kind()) {
         .persistent_map, .sorted_map, .record => {
-            var it = champOrSorted(v);
+            var it = sorted_mod.MapEntries.init(if (v.kind() == .record) record_mod.fieldsOf(v) else v);
             while (it.next()) |e| {
                 for ([_]Value{ e.key, e.value }) |x| if (mayHoldLazy(x.kind())) {
                     if (x.kind() == .lazy_seq) found.* = true;
@@ -1083,32 +1090,6 @@ fn mayHoldLazy(k: Kind) bool {
     return switch (k) {
         .lazy_seq, .list, .persistent_vector, .persistent_map, .persistent_set, .sorted_map, .sorted_set, .record => true,
         else => false,
-    };
-}
-
-const Entries = union(enum) {
-    champ: champ_mod.MapIter,
-    sorted: sorted_mod.Iter,
-
-    fn next(self: *Entries) ?struct { key: Value, value: Value } {
-        switch (self.*) {
-            .champ => |*it| {
-                const e = it.next() orelse return null;
-                return .{ .key = e.key, .value = e.value };
-            },
-            .sorted => |*it| {
-                const e = it.next() orelse return null;
-                return .{ .key = e.key, .value = e.value };
-            },
-        }
-    }
-};
-
-fn champOrSorted(v: Value) Entries {
-    return switch (v.kind()) {
-        .persistent_map => .{ .champ = champ_mod.mapIter(v) },
-        .record => .{ .champ = champ_mod.mapIter(record_mod.fieldsOf(v)) },
-        else => .{ .sorted = sorted_mod.Iter.init(v, true) },
     };
 }
 

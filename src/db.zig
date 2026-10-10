@@ -1,50 +1,8 @@
-//! db.zig — durable identities + emdb integration.
-//!
-//! Authoritative spec: `docs/DB.md`. Derivative from PLAN §23 #6,
-//! #7 (explicit transactions; durable refs are identities),
-//! `docs/CODEC.md` (value-bytes serialization), `docs/VALUE.md`
-//! §2.2 (kind 26 `durable_ref`), `docs/SEMANTICS.md` §2.6 / §3.2
-//! (identity-triple equality + hash).
-//!
-//! Responsibilities:
-//!   - `StoreFile`: the one `emdb.Env` of a store file in this
-//!     process, shared by every connection and Nextomic store of it.
-//!   - `Connection` type over a `StoreFile` with a `store_id` hashed
-//!     from the file's canonical path (DB.md §2).
-//!   - `durable_ref` heap Value kind (VALUE.md §2.2 kind 26) with
-//!     self-contained identity triple (store_id, tree_name,
-//!     key_bytes) and an advisory non-identity `conn: ?*Connection`
-//!     pointer.
-//!   - `WriteTxn` / `ReadTxn` wrappers around `emdb.Txn`, and the
-//!     `Handle` the language holds one by, which `close` and the
-//!     collector end.
-//!   - `Walk`: a tree walk that a write under it cannot disturb.
-//!   - `put` / `get` / `del` by `(tree_name, key_bytes, value)` —
-//!     keys are **opaque byte slices**, values
-//!     are codec-encoded via `src/codec.zig`.
-//!   - `putRef` / `getRef` / `delRef` ref-based convenience.
-//!   - Per-kind hash / equality helpers consumed by
-//!     `src/dispatch.zig` and `src/gc.zig`.
-//!
-//! Scope (DB.md §1): explicit-transaction primitives. No `alter!`,
-//! no as-of, no with-tx macro live here.
-//!
-//! Module graph (one-way terminal):
-//!
-//!     src/db.zig
-//!     ├── @import("std")
-//!     ├── @import("value.zig")
-//!     ├── @import("heap.zig")
-//!     ├── @import("intern.zig")
-//!     ├── @import("hash.zig")
-//!     ├── @import("codec.zig")
-//!     └── @import("emdb")
-//!
-//! Importers (DB.md §11): `dispatch.zig` / `gc.zig` at their
-//! `.durable_ref` arms, `gc.zig` to mark and sweep transaction
-//! handles, `format.zig` to print refs and handles, `stdlib.zig` for
-//! the natives, and Nextomic for `StoreFile` and the geometry
-//! constants.
+//! db.zig — store files, `db/*` connections, transactions and
+//! durable refs over emdb (docs/DB.md): the one environment of a store
+//! file in the process (`StoreFile`, §3.1), which Nextomic shares;
+//! connections, transaction handles and tree walks (§3); the
+//! `durable_ref` heap kind and its identity hash and equality (§4, §7).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -170,19 +128,20 @@ pub const StoreFile = struct {
 
     var open_files: ?*StoreFile = null;
 
-    /// The open file at `path`, or the file opened (or created) now
-    /// with `options` and the pinned geometry: `page_size`,
+    /// The open file at `path`, or the file opened (or created) now on
+    /// `allocator` with the pinned geometry: `page_size`,
     /// `max_named_trees`, `reader_slots`, `initial_map_size` and
-    /// `map_grow_step`, whatever `options` says. A file this process
-    /// may read but not write opens read-only.
-    pub fn acquire(path: [*:0]const u8, env_options: emdb.EnvOptions) !*StoreFile {
-        var options = env_options;
-        options.pageSize = page_size;
-        options.maxNamedTrees = max_named_trees;
-        options.maxReaders = reader_slots;
-        options.mapSize = initial_map_size;
-        options.growStep = map_grow_step;
-        const allocator = options.allocator;
+    /// `map_grow_step`. A file this process may read but not write
+    /// opens read-only.
+    pub fn acquire(path: [*:0]const u8, allocator: std.mem.Allocator) !*StoreFile {
+        const options: emdb.EnvOptions = .{
+            .allocator = allocator,
+            .pageSize = page_size,
+            .maxNamedTrees = max_named_trees,
+            .maxReaders = reader_slots,
+            .mapSize = initial_map_size,
+            .growStep = map_grow_step,
+        };
         const canonical = try canonicalPath(allocator, path);
         errdefer allocator.free(canonical);
         if (FileId.of(std.c.AT.FDCWD, canonical.ptr)) |id| {
@@ -465,16 +424,10 @@ fn canonicalPath(allocator: std.mem.Allocator, path: [*:0]const u8) ![:0]u8 {
 
 // =============================================================================
 // Connection (DB.md §3)
-//
-// NOT a runtime Value kind. Plain Zig struct allocated on the
-// caller's allocator. Caller owns the lifetime via explicit
-// `close()`. Multiple durable-refs may point at one Connection via
-// their advisory `conn` pointer; the Connection is not
-// reference-counted.
 // =============================================================================
 
 pub const Connection = struct {
-    /// Non-owning: caller guarantees lifetime ≥ Connection's.
+    /// What the connection is allocated on; it outlives the connection.
     allocator: std.mem.Allocator,
     heap: *Heap,
     interner: *Interner,
@@ -512,6 +465,15 @@ pub const Connection = struct {
     /// (`Durability.process`).
     durability: Durability,
 
+    /// Set by the collector's mark phase when it reaches a Value of the
+    /// connection, and by the sweep for a durable ref or a handle that
+    /// names it; cleared by the sweep.
+    reached: bool = false,
+    next: ?*Connection,
+
+    /// Every connection of the process, as `Handle.all`.
+    var all: ?*Connection = null;
+
     pub fn storeId(self: *const Connection) u128 {
         return (@as(u128, self.store_id_hi) << 64) | @as(u128, self.store_id_lo);
     }
@@ -547,10 +509,9 @@ pub const reader_slots: u32 = 4096;
 /// How a commit reaches the disk (DB.md §3.3). Every commit is atomic
 /// and seen at once by every connection and process sharing the file.
 pub const Durability = enum {
-    /// A commit syncs nothing; the file is synced once when its
-    /// connection closes, at `db/sync` and `nextomic/sync`, and when
-    /// the process ends. A crash of the process loses nothing; a crash
-    /// of the system can lose the commits since the last sync.
+    /// A commit syncs nothing; the file is synced when its connection
+    /// closes, at `db/sync` and `nextomic/sync`, and when the process
+    /// ends. What a crash of the system can lose is DB.md §3.3's.
     commit,
     /// Every commit syncs data and meta: it is on the disk when it
     /// returns. The default.
@@ -560,18 +521,12 @@ pub const Durability = enum {
         return std.meta.stringToEnum(Durability, text);
     }
 
-    /// The durability `NEXIS_DURABILITY`'s text names, `durable` when
-    /// it is unset. `bin/nexis` refuses any other value at start, so an
-    /// unknown one reaches here only from an embedding, and reads as
-    /// unset.
-    pub fn fromEnv(text: ?[]const u8) Durability {
-        return parse(text orelse return .durable) orelse .durable;
-    }
-
-    /// The process's: `NEXIS_DURABILITY` (`fromEnv`).
+    /// The process's: the durability `NEXIS_DURABILITY` names,
+    /// `durable` when it is unset. `bin/nexis` refuses any other value
+    /// at start, so an unknown one reaches here only from an embedding,
+    /// and reads as unset.
     pub fn process() Durability {
-        const text = std.c.getenv("NEXIS_DURABILITY") orelse return fromEnv(null);
-        return fromEnv(std.mem.span(text));
+        return parse(std.mem.span(std.c.getenv("NEXIS_DURABILITY") orelse return .durable)) orelse .durable;
     }
 
     pub fn syncOverride(self: Durability) emdb.SyncOverride {
@@ -582,19 +537,15 @@ pub const Durability = enum {
     }
 };
 
-/// Open (or create) a database file at `path`. `allocator` /
-/// `heap` / `interner` are non-owning references; caller
-/// guarantees their lifetimes. `options` is passed through to
-/// `emdb.Env.open` with the geometry `StoreFile.acquire` pins; a file already open in this process is
-/// shared as it is (`StoreFile`).
-pub fn open(
-    allocator: std.mem.Allocator,
-    heap: *Heap,
-    interner: *Interner,
-    path: [*:0]const u8,
-    options: emdb.EnvOptions,
-) !Connection {
-    const file = try StoreFile.acquire(path, options);
+/// Open (or create) the store at `path` (DB.md §3); a file already
+/// open in this process is shared as it is (`StoreFile`). The
+/// connection lives on `allocator`, which with `heap` and `interner`
+/// outlives it, until the first collection on `heap` that finds it
+/// closed and unreached (`sweepHandles`) or `shutdown`.
+pub fn open(allocator: std.mem.Allocator, heap: *Heap, interner: *Interner, path: [*:0]const u8) !*Connection {
+    const file = try StoreFile.acquire(path, allocator);
+    errdefer file.release();
+    const self = try allocator.create(Connection);
 
     // store_id = two xxHash3-64 halves over the canonical path, the
     // second salted so the halves are independent.
@@ -604,7 +555,7 @@ pub fn open(
     hasher.update(file.path);
     const hash_hi = hasher.final();
 
-    return Connection{
+    self.* = .{
         .allocator = allocator,
         .heap = heap,
         .interner = interner,
@@ -614,14 +565,21 @@ pub fn open(
         .open_flag = true,
         .tree_ids = .empty,
         .durability = Durability.process(),
+        .next = Connection.all,
     };
+    Connection.all = self;
+    // Neither the struct nor the file's environment is on the heap, so
+    // a loop of opens and closes would never bring the collection that
+    // frees them: each open counts as a page of heap allocation.
+    heap.allocated_since_collect += page_size;
+    return self;
 }
 
 /// Close the connection, aborting every transaction the language
 /// holds on it (DB.md §3), and sync the file when a commit left it
 /// unsynced and no sync of it has failed (`StoreFile.closingSync`). A
-/// closed connection stays a valid struct: refs and handles that name
-/// it read `open_flag` and report it closed. A second close does
+/// closed connection stays a valid struct while anything names it:
+/// refs and handles that do read `open_flag` and report it closed. A second close does
 /// nothing. A close while a native holds one of the connection's
 /// transactions for a callback, or while a Zig-level transaction is
 /// open, is refused, so no emdb transaction outlives its env. A sync
@@ -652,9 +610,35 @@ pub fn sync(self: *Connection) !void {
     try self.file.sync();
 }
 
-/// Teardown of the whole VM, when nothing can use the connection
-/// again: end and free its handles and close it whatever is open.
+/// Teardown, when nothing can use the connection again: end and free
+/// its handles, close it whatever is open, and free it.
 pub fn shutdown(self: *Connection) void {
+    var link = &Connection.all;
+    while (link.*) |c| : (link = &c.next) {
+        if (c == self) {
+            link.* = self.next;
+            break;
+        }
+    }
+    destroy(self);
+}
+
+/// `shutdown` of every connection on `heap`: the VM's teardown and
+/// `exit`.
+pub fn shutdownHeap(heap: *Heap) void {
+    var link = &Connection.all;
+    while (link.*) |c| {
+        if (c.heap != heap) {
+            link = &c.next;
+            continue;
+        }
+        link.* = c.next;
+        destroy(c);
+    }
+}
+
+/// `shutdown` of a connection already off `Connection.all`.
+fn destroy(self: *Connection) void {
     var link = &Handle.all;
     while (link.*) |h| {
         if (h.conn() != self) {
@@ -666,6 +650,7 @@ pub fn shutdown(self: *Connection) void {
         self.allocator.destroy(h);
     }
     release(self);
+    self.allocator.destroy(self);
 }
 
 fn release(self: *Connection) void {
@@ -804,23 +789,33 @@ pub fn handleOf(v: Value) *Handle {
     return @ptrFromInt(v.payload);
 }
 
-/// The collector reached a Value of the handle (GC.md §5).
-pub fn markHandle(v: Value) void {
-    handleOf(v).reached = true;
+/// The collector reached `v`, a Value of no heap block (GC.md §5): a
+/// transaction handle or a connection is flagged for the sweep.
+pub fn mark(v: Value) void {
+    switch (v.kind()) {
+        .db_write_txn, .db_read_txn => handleOf(v).reached = true,
+        .db_connection => @as(*Connection, @ptrFromInt(v.payload)).reached = true,
+        else => {},
+    }
 }
 
 /// After a mark phase over `heap`: end and free every handle of a
 /// connection on `heap` that no Value reached, unless a native holds
-/// it, and let every held snapshot go (DB.md §3.4). `complete` is false
-/// when the marks are incomplete, which only clears them. Ending a
-/// transaction allocates nothing on the heap.
+/// it; free every closed connection on `heap` that no Value, marked
+/// durable ref or remaining handle names; and let every held snapshot
+/// go (DB.md §3.2, §3.4). `complete` is false when the marks are
+/// incomplete, which only clears them. Nothing here allocates on the
+/// heap.
 pub fn sweepHandles(heap: *Heap, complete: bool) void {
     StoreFile.dropAllHeld();
     var link = &Handle.all;
     while (link.*) |h| {
         const c = h.conn();
         if (c.heap != heap or !complete or h.reached or h.held != 0) {
-            if (c.heap == heap) h.reached = false;
+            if (c.heap == heap) {
+                h.reached = false;
+                c.reached = true;
+            }
             link = &h.next;
             continue;
         }
@@ -828,6 +823,36 @@ pub fn sweepHandles(heap: *Heap, complete: bool) void {
         link.* = h.next;
         c.allocator.destroy(h);
     }
+    if (complete and unreachedClosed(heap)) {
+        // A durable ref is a leaf the collector does not trace, so the
+        // marked ones are looked through for the connections they name.
+        const Refs = struct {
+            pub fn visit(_: @This(), b: *HeapHeader) void {
+                if (b.kind != @backingInt(Kind.durable_ref) or !b.isMarked()) return;
+                if (bodyOf(b).conn) |c| c.reached = true;
+            }
+        };
+        heap.forEachLive(Refs{});
+    }
+    var conns = &Connection.all;
+    while (conns.*) |c| {
+        if (c.heap == heap and complete and !c.open_flag and !c.reached) {
+            conns.* = c.next;
+            c.allocator.destroy(c);
+            continue;
+        }
+        if (c.heap == heap) c.reached = false;
+        conns = &c.next;
+    }
+}
+
+/// Whether a closed connection on `heap` is so far unreached.
+fn unreachedClosed(heap: *Heap) bool {
+    var it = Connection.all;
+    while (it) |c| : (it = c.next) {
+        if (c.heap == heap and !c.open_flag and !c.reached) return true;
+    }
+    return false;
 }
 
 /// Whether a handle a collection on `conn`'s heap could end holds a
@@ -840,6 +865,14 @@ pub fn collectableHandles(conn: *const Connection) bool {
         if (h.active and h.held == 0 and c.heap == conn.heap and c.file == conn.file) return true;
     }
     return false;
+}
+
+/// Connections alive in the process, closed or not.
+pub fn connectionCount() usize {
+    var n: usize = 0;
+    var it = Connection.all;
+    while (it) |c| : (it = c.next) n += 1;
+    return n;
 }
 
 /// Handles alive in the process, ended or not.
@@ -1056,31 +1089,9 @@ pub fn put(
     try txn.inner.putInTree(tree_id, key_bytes, encoded);
 }
 
-/// Read a value by `(tree_name, key_bytes)`. Accepts either a
-/// `*WriteTxn` or `*ReadTxn` via duck-typing (both have
-/// `.conn: *Connection` and `.inner: *emdb.Txn`).
-///
-/// `elementHash` / `elementEq` are the hash and equality functions
-/// the codec uses to rebuild decoded map / set / vector collections.
-/// They MUST be the authoritative runtime hash and equality for all
-/// codec-serializable kinds — callers almost always pass
-/// `&dispatch.hashValue, &dispatch.equal`.
-///
-/// Why the caller passes them instead of `src/db.zig` importing
-/// `src/dispatch.zig` directly: `dispatch.zig` already imports
-/// `db.zig` (for the `.durable_ref` arms), so `db.zig` importing
-/// `dispatch.zig` would create a module-graph cycle. The
-/// parameterized seam keeps the graph one-way terminal while
-/// letting production callers supply full dispatch semantics. Inline
-/// tests that work with a restricted Value alphabet may pass
-/// narrower stand-ins.
-///
-/// Using non-dispatch callbacks is unsound for decoded CHAMP-shaped
-/// maps / sets (>8 entries with heap-kind keys): the internal trie
-/// placement depends on hash bits, and a subsequent lookup through
-/// `dispatch.hashValue` would miss entries placed under an
-/// alternative hash. Small array-maps (≤8 entries) tolerate
-/// mismatched callbacks because they probe purely via equality.
+/// The value under `(tree_name, key_bytes)` in either transaction
+/// kind, decoded with the hash and equality `elementHash` and
+/// `elementEq`, which must agree with dispatch's (DB.md §5).
 pub fn get(
     txn: anytype,
     tree_name: []const u8,
@@ -1258,9 +1269,6 @@ pub fn delRef(txn: *WriteTxn, r: Value) !bool {
 
 // =============================================================================
 // Per-kind hash / equality (DB.md §7)
-//
-// Consumed by `src/dispatch.zig` at the `.durable_ref` arm and by
-// `src/gc.zig` at the same arm.
 // =============================================================================
 
 /// Identity-triple hash: the store id's two halves, then xxHash3 over
@@ -1293,27 +1301,15 @@ pub fn refsEqual(a: *HeapHeader, b: *HeapHeader) bool {
     return std.mem.eql(u8, a_bytes[0..total_len], b_bytes[0..total_len]);
 }
 
+/// Syncs the engine has issued in this process (data and meta alike),
+/// for the tests of durability.
+pub fn engineSyncs() u64 {
+    return emdb.platform.File.syncCalls.load(.monotonic);
+}
+
 // =============================================================================
 // Inline tests
 // =============================================================================
-
-/// A store path in a fresh directory under `.zig-cache/tmp/`, so
-/// concurrent runs never share a file; `cleanupDb` removes the
-/// directory with the store in it.
-fn tmpDbPath(allocator: std.mem.Allocator, suffix: []const u8) ![:0]u8 {
-    var tmp = std.testing.tmpDir(.{});
-    tmp.dir.close(std.testing.io);
-    tmp.parent_dir.close(std.testing.io);
-    return allocator.printSentinel(".zig-cache/tmp/{s}/{s}.emdb", .{ tmp.sub_path, suffix }, 0);
-}
-
-fn cleanupDb(path: [:0]const u8) void {
-    const dir = std.Io.Dir.path.dirname(path) orelse return;
-    std.Io.Dir.cwd().deleteTree(std.testing.io, dir) catch {};
-}
-
-const synthHash = Value.hashImmediate;
-const synthEq = value.testEqual;
 
 test "failureName: every emdb error nexis can meet has its keyword; every decode error is :codec-failed" {
     // The engine's errors no nexis call can return: options nexis pins
@@ -1344,1082 +1340,12 @@ test "failureName: every emdb error nexis can meet has its keyword; every decode
     }
 }
 
-test "DurableRefBody layout: 32 bytes header" {
-    try testing.expectEqual(@as(usize, 32), @sizeOf(DurableRefBody));
-}
-
-test "open / close: round-trip with a tiny file" {
-    const path = try tmpDbPath(testing.allocator, "open_close");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&conn);
-
-    try testing.expect(conn.open_flag);
-    const sid = conn.storeId();
-    try testing.expect(sid != 0);
-}
-
-test "open: store_id comes from the canonical path, however the path is spelled" {
-    const path = try tmpDbPath(testing.allocator, "canon");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    var a = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    const sid = a.storeId();
-    try testing.expect(std.Io.Dir.path.isAbsolute(a.file.path));
-    try close(&a);
-    const dotted = try testing.allocator.printSentinel("./{s}", .{path}, 0);
-    defer testing.allocator.free(dotted);
-    var b = try open(testing.allocator, &heap, &interner, dotted.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&b);
-    try testing.expectEqual(sid, b.storeId());
-}
-
-test "open: every spelling of one file shares its environment; a second writer is refused, never waited on" {
-    const path = try tmpDbPath(testing.allocator, "shared");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    var a = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&a);
-    const dotted = try testing.allocator.printSentinel("./{s}", .{path}, 0);
-    defer testing.allocator.free(dotted);
-    const link = try testing.allocator.printSentinel("{s}/link.emdb", .{std.Io.Dir.path.dirname(path).?}, 0);
-    defer testing.allocator.free(link);
-    try std.Io.Dir.cwd().symLink(testing.io, std.Io.Dir.path.basename(path), link, .{});
-
-    var same = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&same);
-    var b = try open(testing.allocator, &heap, &interner, dotted.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&b);
-    var c = try open(testing.allocator, &heap, &interner, link.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&c);
-    // Checked before any second write begins: on separate environments
-    // it would wait on this thread's own lock.
-    try testing.expect(same.file == a.file and b.file == a.file and c.file == a.file);
-    try testing.expectEqual(@as(u32, 4), a.file.refs);
-    try testing.expectEqual(a.storeId(), c.storeId());
-    // One lock file, beside the file the link names.
-    const link_lock = try testing.allocator.printSentinel("{s}-lock", .{link}, 0);
-    defer testing.allocator.free(link_lock);
-    try testing.expect(std.c.access(link_lock.ptr, std.c.F_OK) != 0);
-
-    var w = try beginWrite(&a);
-    try testing.expectError(error.WriterActive, beginWrite(&same));
-    try testing.expectError(error.WriterActive, beginWrite(&c));
-    try put(&w, "t", "k", value.fromFixnum(1).?);
-    try commit(&w);
-
-    // The file stays open while any connection holds it.
-    try close(&a);
-    try close(&same);
-    var r = try beginRead(&c);
-    const got = try get(&r, "t", "k", synthHash, synthEq);
-    abortRead(&r);
-    try testing.expectEqual(@as(i64, 1), got.?.asFixnum());
-    var w2 = try beginWrite(&b);
-    try commit(&w2);
-}
-
-test "open: a copy of a store is another file, written beside the original" {
-    const path = try tmpDbPath(testing.allocator, "original");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    var a = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&a);
-    var w = try beginWrite(&a);
-    try put(&w, "t", "k", value.fromFixnum(1).?);
-    try commit(&w);
-    const copy = try testing.allocator.printSentinel("{s}/copy.emdb", .{std.Io.Dir.path.dirname(path).?}, 0);
-    defer testing.allocator.free(copy);
-    try std.Io.Dir.cwd().copyFile(path, std.Io.Dir.cwd(), copy, testing.io, .{});
-
-    var b = try open(testing.allocator, &heap, &interner, copy.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&b);
-    try testing.expect(a.file != b.file);
-    try testing.expect(a.storeId() != b.storeId());
-    var wa = try beginWrite(&a);
-    var wb = try beginWrite(&b);
-    try put(&wa, "t", "k", value.fromFixnum(2).?);
-    try put(&wb, "t", "k", value.fromFixnum(3).?);
-    try commit(&wa);
-    try commit(&wb);
-    var ra = try beginRead(&a);
-    defer abortRead(&ra);
-    var rb = try beginRead(&b);
-    defer abortRead(&rb);
-    try testing.expectEqual(@as(i64, 2), (try get(&ra, "t", "k", synthHash, synthEq)).?.asFixnum());
-    try testing.expectEqual(@as(i64, 3), (try get(&rb, "t", "k", synthHash, synthEq)).?.asFixnum());
-}
-
-test "open: a store file with a second hard link is refused under either name" {
-    const path = try tmpDbPath(testing.allocator, "linked");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    var a = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&a);
-    const other = try testing.allocator.printSentinel("{s}/other.emdb", .{std.Io.Dir.path.dirname(path).?}, 0);
-    defer testing.allocator.free(other);
-    try testing.expectEqual(@as(c_int, 0), std.c.link(path.ptr, other.ptr));
-    // Already open here, and not yet open anywhere: both refused.
-    try testing.expectError(error.HardLinked, open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator }));
-    try close(&a);
-    try testing.expectError(error.HardLinked, open(testing.allocator, &heap, &interner, other.ptr, .{ .allocator = testing.allocator }));
-    try testing.expectError(error.HardLinked, open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator }));
-    try testing.expectEqualStrings("db/hard-linked", failureName(error.HardLinked));
-    // A directory has links of its own, and is no store.
-    const dir = try testing.allocator.dupeSentinel(u8, std.Io.Dir.path.dirname(path).?, 0);
-    defer testing.allocator.free(dir);
-    try testing.expectError(error.OpenFailed, open(testing.allocator, &heap, &interner, dir.ptr, .{ .allocator = testing.allocator }));
-    // One name again: the file opens.
-    try testing.expectEqual(@as(c_int, 0), std.c.unlink(other.ptr));
-    var b = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&b);
-}
-
-test "open: a symlink to no file creates the file it names, and the lock file is named after that file" {
-    const path = try tmpDbPath(testing.allocator, "target");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-    const link = try testing.allocator.printSentinel("{s}/dangling.emdb", .{std.Io.Dir.path.dirname(path).?}, 0);
-    defer testing.allocator.free(link);
-    try std.Io.Dir.cwd().symLink(testing.io, std.Io.Dir.path.basename(path), link, .{});
-
-    var a = try open(testing.allocator, &heap, &interner, link.ptr, .{ .allocator = testing.allocator });
-    const sid = a.storeId();
-    var w = try beginWrite(&a);
-    try put(&w, "t", "k", value.fromFixnum(1).?);
-    try commit(&w);
-    try close(&a);
-    const link_lock = try testing.allocator.printSentinel("{s}-lock", .{link}, 0);
-    defer testing.allocator.free(link_lock);
-    try testing.expect(std.c.access(link_lock.ptr, std.c.F_OK) != 0);
-    var b = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&b);
-    try testing.expectEqual(sid, b.storeId());
-}
-
-test "open: a symlink or a non-regular file where the lock file goes is refused, and what it names is left alone" {
-    const path = try tmpDbPath(testing.allocator, "planted");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-    const dir = std.Io.Dir.path.dirname(path).?;
-    const victim = try testing.allocator.printSentinel("{s}/victim.txt", .{dir}, 0);
-    defer testing.allocator.free(victim);
-    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = victim, .data = "precious\n" });
-    const lock = try testing.allocator.printSentinel("{s}-lock", .{path}, 0);
-    defer testing.allocator.free(lock);
-    try std.Io.Dir.cwd().symLink(testing.io, "victim.txt", lock, .{});
-    try testing.expectError(error.OpenFailed, open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator }));
-    const kept = try std.Io.Dir.cwd().readFileAlloc(testing.io, victim, testing.allocator, .unlimited);
-    defer testing.allocator.free(kept);
-    try testing.expectEqualStrings("precious\n", kept);
-
-    try testing.expectEqual(@as(c_int, 0), std.c.unlink(lock.ptr));
-    try std.Io.Dir.cwd().createDir(testing.io, lock, .default_dir);
-    try testing.expectError(error.OpenFailed, open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator }));
-}
-
-test "open: a file this process may only read opens read-only; a write is TxnReadOnly" {
-    const path = try tmpDbPath(testing.allocator, "readonly");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-    {
-        var a = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-        defer shutdown(&a);
-        var w = try beginWrite(&a);
-        try put(&w, "t", "k", value.fromFixnum(7).?);
-        try commit(&w);
-    }
-    try testing.expectEqual(@as(c_int, 0), std.c.chmod(path.ptr, 0o444));
-    defer _ = std.c.chmod(path.ptr, 0o644);
-    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&conn);
-    var r = try beginRead(&conn);
-    defer abortRead(&r);
-    try testing.expectEqual(@as(i64, 7), (try get(&r, "t", "k", synthHash, synthEq)).?.asFixnum());
-    try testing.expectError(error.TxnReadOnly, beginWrite(&conn));
-}
-
-test "close: a refusal ends none of the language's transactions" {
-    const path = try tmpDbPath(testing.allocator, "close_refused");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&conn);
-    const h = try Handle.create(.{ .read = try beginRead(&conn) });
-    var zig_level = try beginRead(&conn);
-    try testing.expectError(DbError.TransactionsOpen, close(&conn));
-    try testing.expect(h.active);
-    abortRead(&zig_level);
-    try close(&conn);
-    try testing.expect(!h.active);
-}
-
-test "has: whether a key is present, its value never read" {
-    const path = try tmpDbPath(testing.allocator, "has");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&conn);
-    {
-        // Bytes no decoder takes.
-        const txn = try conn.file.env.beginWriteWith(.{ .sync = .none });
-        try txn.putInTree(try txn.openTree("t", true), "k", "\xff\xff");
-        try txn.commit();
-    }
-    var r = try beginRead(&conn);
-    defer abortRead(&r);
-    try testing.expect(try has(&r, "t", "k"));
-    try testing.expect(!try has(&r, "t", "j"));
-    try testing.expect(!try has(&r, "none", "k"));
-    if (get(&r, "t", "k", synthHash, synthEq)) |_| return error.TestUnexpectedResult else |_| {}
-}
-
-test "close: refused while a transaction is open; the connection stays a closed struct" {
-    const path = try tmpDbPath(testing.allocator, "close_busy");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&conn);
-    var rtxn = try beginRead(&conn);
-    try testing.expectError(DbError.TransactionsOpen, close(&conn));
-    abortRead(&rtxn);
-    try close(&conn);
-    try close(&conn);
-    try testing.expect(!conn.open_flag);
-    try testing.expectError(DbError.ConnectionUnavailable, beginRead(&conn));
-}
-
-/// Syncs the engine has issued in this process (data and meta alike),
-/// for the tests of durability.
-pub fn engineSyncs() u64 {
-    return emdb.platform.File.syncCalls.load(.monotonic);
-}
-
 test "Durability: parses its two names and nothing else" {
     try testing.expectEqual(Durability.commit, Durability.parse("commit").?);
     try testing.expectEqual(Durability.durable, Durability.parse("durable").?);
     for ([_][]const u8{ "", "batch", "batched", "Durable", "commit " }) |text| {
         try testing.expect(Durability.parse(text) == null);
     }
-}
-
-test "Durability: a process that names none syncs every commit" {
-    try testing.expectEqual(Durability.durable, Durability.fromEnv(null));
-    try testing.expectEqual(Durability.durable, Durability.fromEnv("batch"));
-    try testing.expectEqual(Durability.commit, Durability.fromEnv("commit"));
-    try testing.expectEqual(Durability.durable, Durability.fromEnv("durable"));
-}
-
-test "durability commit: a commit is seen at once and syncs nothing; close syncs the file once" {
-    const path = try tmpDbPath(testing.allocator, "commit_mode");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    var a = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&a);
-    a.durability = .commit;
-    var b = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&b);
-
-    const before = engineSyncs();
-    var w = try beginWrite(&a);
-    try put(&w, "t", "k", value.fromFixnum(7).?);
-    try commit(&w);
-    try testing.expectEqual(before, engineSyncs());
-    try testing.expect(a.file.unsynced);
-    {
-        var r = try beginRead(&b);
-        defer abortRead(&r);
-        try testing.expectEqual(@as(i64, 7), (try get(&r, "t", "k", synthHash, synthEq)).?.asFixnum());
-    }
-    // An abort writes nothing, so it leaves nothing more to sync.
-    var aborted = try beginWrite(&a);
-    abortWrite(&aborted);
-    try close(&a);
-    try testing.expectEqual(before + 1, engineSyncs());
-    try testing.expect(!b.file.unsynced);
-    try close(&b);
-    try testing.expectEqual(before + 1, engineSyncs());
-}
-
-test "durability durable: every commit syncs, which leaves nothing for close; a read-only program never syncs" {
-    const path = try tmpDbPath(testing.allocator, "durable_mode");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&conn);
-    conn.durability = .commit;
-    var w = try beginWrite(&conn);
-    try put(&w, "t", "k", value.fromFixnum(1).?);
-    try commit(&w);
-    try testing.expect(conn.file.unsynced);
-    // A durable commit makes every commit before it durable too.
-    conn.durability = .durable;
-    const before = engineSyncs();
-    w = try beginWrite(&conn);
-    try put(&w, "t", "k", value.fromFixnum(2).?);
-    try commit(&w);
-    try testing.expect(engineSyncs() > before);
-    try testing.expect(!conn.file.unsynced);
-    const after_commit = engineSyncs();
-    try close(&conn);
-    try testing.expectEqual(after_commit, engineSyncs());
-
-    var reader = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&reader);
-    var r = try beginRead(&reader);
-    try testing.expectEqual(@as(i64, 2), (try get(&r, "t", "k", synthHash, synthEq)).?.asFixnum());
-    abortRead(&r);
-    try close(&reader);
-    try testing.expectEqual(after_commit, engineSyncs());
-}
-
-/// Fails the meta sync of the next commit on the data file `fd`: once
-/// the commit is published, `fd` names a pipe, which no sync takes,
-/// until `restore`.
-const MetaSyncFailure = struct {
-    fd: std.c.fd_t,
-    saved: std.c.fd_t = -1,
-    pipe: [2]std.c.fd_t = undefined,
-
-    fn notify(ctx: *anyopaque, step: emdb.txn.CommitStep) void {
-        const self: *MetaSyncFailure = @ptrCast(@alignCast(ctx));
-        if (step != .metaWritten) return;
-        self.saved = std.c.dup(self.fd);
-        _ = std.c.dup2(self.pipe[0], self.fd);
-    }
-
-    fn restore(self: *MetaSyncFailure) void {
-        _ = std.c.dup2(self.saved, self.fd);
-        for ([_]std.c.fd_t{ self.saved, self.pipe[0], self.pipe[1] }) |fd| _ = std.c.close(fd);
-    }
-};
-
-test "durability durable: after a commit's meta sync fails, the file syncs nothing until it is reopened, and keeps the commits that published" {
-    const path = try tmpDbPath(testing.allocator, "meta_sync");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&conn);
-    conn.durability = .durable;
-    // A second holder shares the file's environment, and its failure.
-    var other = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&other);
-    other.durability = .commit;
-
-    var failure = MetaSyncFailure{ .fd = conn.file.env.inner.dataFile.fd };
-    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&failure.pipe));
-    conn.file.env.inner.commitObserver = .{ .ctx = &failure, .notify = MetaSyncFailure.notify };
-    var w = try beginWrite(&conn);
-    try put(&w, "t", "a", value.fromFixnum(5).?);
-    const committed = commit(&w);
-    conn.file.env.inner.commitObserver = null;
-    failure.restore();
-    try testing.expectError(error.DurabilityUnknown, committed);
-    try testing.expectEqualStrings("db/durability-unknown", failureName(error.DurabilityUnknown));
-    try testing.expect(conn.file.unsynced);
-    try testing.expect(conn.file.syncFailed());
-
-    // Nothing syncs again: a sync fails on every connection, and a
-    // commit that would sync fails before it writes anything, while one
-    // that syncs nothing commits.
-    const before = engineSyncs();
-    try testing.expectError(error.SyncFailed, sync(&conn));
-    try testing.expectError(error.SyncFailed, sync(&other));
-    try testing.expectEqualStrings("db/sync-failed", failureName(error.SyncFailed));
-    w = try beginWrite(&conn);
-    try put(&w, "t", "b", value.fromFixnum(6).?);
-    try testing.expectError(error.SyncFailed, commit(&w));
-    try testing.expectEqual(@as(u32, 0), conn.open_txns);
-    w = try beginWrite(&other);
-    try put(&w, "t", "c", value.fromFixnum(7).?);
-    try commit(&w);
-    {
-        var r = try beginRead(&conn);
-        defer abortRead(&r);
-        try testing.expectEqual(@as(i64, 5), (try get(&r, "t", "a", synthHash, synthEq)).?.asFixnum());
-        try testing.expect((try get(&r, "t", "b", synthHash, synthEq)) == null);
-        try testing.expectEqual(@as(i64, 7), (try get(&r, "t", "c", synthHash, synthEq)).?.asFixnum());
-    }
-
-    // A close syncs nothing and raises nothing. A connection opened
-    // while another holds the file shares its environment, so its
-    // syncs fail too; the last close lets the environment go.
-    try close(&conn);
-    conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    try testing.expectError(error.SyncFailed, sync(&conn));
-    try close(&conn);
-    StoreFile.syncAll();
-    try close(&other);
-    try testing.expectEqual(before, engineSyncs());
-
-    // Reopened, the file syncs again and holds exactly the commits
-    // that published.
-    conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    conn.durability = .durable;
-    try testing.expect(!conn.file.syncFailed());
-    {
-        var r = try beginRead(&conn);
-        defer abortRead(&r);
-        try testing.expectEqual(@as(i64, 5), (try get(&r, "t", "a", synthHash, synthEq)).?.asFixnum());
-        try testing.expect((try get(&r, "t", "b", synthHash, synthEq)) == null);
-        try testing.expectEqual(@as(i64, 7), (try get(&r, "t", "c", synthHash, synthEq)).?.asFixnum());
-    }
-    w = try beginWrite(&conn);
-    try put(&w, "t", "b", value.fromFixnum(6).?);
-    try commit(&w);
-    try testing.expect(engineSyncs() > before);
-    try sync(&conn);
-    try close(&conn);
-}
-
-test "syncAll: one sync for each file written without one; shutdown syncs a file it releases last" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-    var paths: [3][:0]u8 = undefined;
-    var conns: [3]Connection = undefined;
-    for (&paths, &conns, 0..) |*p, *c, i| {
-        p.* = try tmpDbPath(testing.allocator, &.{'a' + @as(u8, @intCast(i))});
-        c.* = try open(testing.allocator, &heap, &interner, p.*.ptr, .{ .allocator = testing.allocator });
-        c.durability = .commit;
-    }
-    defer for (&paths, &conns) |p, *c| {
-        shutdown(c);
-        cleanupDb(p);
-        testing.allocator.free(p);
-    };
-    for (conns[0..2]) |*c| {
-        var w = try beginWrite(c);
-        try put(&w, "t", "k", value.fromFixnum(1).?);
-        try commit(&w);
-    }
-    const before = engineSyncs();
-    StoreFile.syncAll();
-    try testing.expectEqual(before + 2, engineSyncs());
-    StoreFile.syncAll();
-    try testing.expectEqual(before + 2, engineSyncs());
-
-    var w = try beginWrite(&conns[2]);
-    try put(&w, "t", "k", value.fromFixnum(1).?);
-    try commit(&w);
-    shutdown(&conns[2]);
-    try testing.expectEqual(before + 3, engineSyncs());
-}
-
-test "held snapshot: kept while it is the latest commit; a commit passing it, a write, a collection and the last release let it go" {
-    const path = try tmpDbPath(testing.allocator, "held");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&conn);
-    const file = conn.file;
-    try testing.expect(file.takeHeld() == null);
-
-    // Kept, and handed out again while no commit has passed it.
-    const first = try file.env.beginRead();
-    file.keep(first);
-    try testing.expectEqual(first, file.takeHeld().?);
-    try testing.expect(file.takeHeld() == null);
-    // One is held at a time: a second read ends.
-    const second = try file.env.beginRead();
-    file.keep(first);
-    file.keep(second);
-    try testing.expectEqual(first, file.held.?);
-
-    // A commit the file's own writer did not begin, as another
-    // process's is, passes it: the next take ends it.
-    const other = try file.env.beginWriteWith(.{ .sync = .none });
-    try other.putInTree(try other.openTree("t", true), "a", "b");
-    try other.commit();
-    try testing.expect(file.takeHeld() == null);
-    try testing.expect(file.held == null);
-
-    // A read that a commit passed while it ran is not kept.
-    const stale = try file.env.beginRead();
-    var w = try beginWrite(&conn);
-    try put(&w, "t", "k", value.fromFixnum(1).?);
-    try commit(&w);
-    file.keep(stale);
-    try testing.expect(file.held == null);
-
-    // This process's own write lets it go before it begins.
-    file.keep(try file.env.beginRead());
-    try testing.expect(file.held != null);
-    w = try beginWrite(&conn);
-    try testing.expect(file.held == null);
-    abortWrite(&w);
-
-    // So does a collection's sweep.
-    file.keep(try file.env.beginRead());
-    sweepHandles(&heap, true);
-    try testing.expect(file.held == null);
-
-    // The last release ends one still held (the allocator and emdb
-    // would report a transaction outliving its environment).
-    file.keep(try file.env.beginRead());
-    try testing.expect(file.held != null);
-}
-
-test "durability commit: a commit survives its process ending without a sync or a close" {
-    const path = try tmpDbPath(testing.allocator, "crash");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    // The child commits and ends at once, as a killed process does:
-    // no sync, no close, no exit handlers.
-    const pid = std.c.fork();
-    try testing.expect(pid >= 0);
-    if (pid == 0) {
-        var conn = open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator }) catch std.c._exit(1);
-        conn.durability = .commit;
-        var w = beginWrite(&conn) catch std.c._exit(2);
-        put(&w, "t", "k", value.fromFixnum(42).?) catch std.c._exit(3);
-        const before = engineSyncs();
-        commit(&w) catch std.c._exit(4);
-        std.c._exit(if (engineSyncs() == before) 0 else 5);
-    }
-    var status: c_int = 0;
-    try testing.expectEqual(pid, std.c.waitpid(pid, &status, 0));
-    try testing.expectEqual(@as(c_int, 0), status);
-
-    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&conn);
-    var r = try beginRead(&conn);
-    defer abortRead(&r);
-    try testing.expectEqual(@as(i64, 42), (try get(&r, "t", "k", synthHash, synthEq)).?.asFixnum());
-}
-
-test "open: a new store has 16 KiB pages and the pinned tree capacity" {
-    const path = try tmpDbPath(testing.allocator, "pagesize");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    // Caller-supplied geometry does not leak through.
-    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{
-        .allocator = testing.allocator,
-        .pageSize = 4096,
-        .maxNamedTrees = 8,
-    });
-    defer shutdown(&conn);
-
-    try testing.expectEqual(page_size, conn.file.env.info().pageSize);
-    try testing.expectEqual(page_size, conn.file.env.options.pageSize);
-    try testing.expectEqual(max_named_trees, conn.file.env.options.maxNamedTrees);
-    try testing.expectEqual(emdb.btree.maxKeySize(page_size), conn.file.env.maxKeySize());
-    try testing.expectEqual(map_grow_step, conn.file.env.options.growStep);
-    try testing.expect(conn.file.env.info().mapSize <= initial_map_size);
-}
-
-test "open: the reader table has reader_slots slots, so more than emdb's default 126 reads run at once" {
-    const path = try tmpDbPath(testing.allocator, "readers");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator, .maxReaders = 8 });
-    defer shutdown(&conn);
-    try testing.expectEqual(reader_slots, conn.file.env.info().maxReaders);
-    var reads: [200]ReadTxn = undefined;
-    for (&reads) |*r| r.* = try beginRead(&conn);
-    for (&reads) |*r| abortRead(r);
-}
-
-test "open: failure in a missing directory releases everything it took" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    // `std.testing.allocator` reports the leak if the canonical path
-    // survives the failed open, and the double free if it is
-    // released twice.
-    const path: [:0]const u8 = "test_nexis_db_no_such_dir/missing/store.emdb";
-    try testing.expectError(
-        error.OpenFailed,
-        open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator }),
-    );
-}
-
-test "open: a file that is not an emdb store is refused without leaking" {
-    const path = try tmpDbPath(testing.allocator, "notastore");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    // Two pages of 0xFF: a non-zero size with no valid meta page.
-    {
-        const io = std.testing.io;
-        const file = try std.Io.Dir.cwd().createFile(io, path, .{});
-        defer file.close(io);
-        const junk: [2 * page_size]u8 = @splat(0xFF);
-        try file.writeStreamingAll(io, &junk);
-    }
-
-    if (open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator })) |conn| {
-        var opened = conn;
-        shutdown(&opened);
-        return error.TestUnexpectedResult;
-    } else |_| {}
-}
-
-test "put / get / del: single-tree round-trip of a scalar" {
-    const path = try tmpDbPath(testing.allocator, "putget");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&conn);
-
-    var wtxn = try beginWrite(&conn);
-    try put(&wtxn, "users", "alice", value.fromFixnum(42).?);
-    try commit(&wtxn);
-
-    var rtxn = try beginRead(&conn);
-    defer abortRead(&rtxn);
-    const got = try get(&rtxn, "users", "alice", &synthHash, &synthEq);
-    try testing.expect(got != null);
-    try testing.expect(got.?.kind() == .fixnum);
-    try testing.expectEqual(@as(i64, 42), got.?.asFixnum());
-
-    // Absent key.
-    const miss = try get(&rtxn, "users", "bob", &synthHash, &synthEq);
-    try testing.expect(miss == null);
-}
-
-test "put / get: multiple named trees are independent" {
-    const path = try tmpDbPath(testing.allocator, "multitree");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&conn);
-
-    var wtxn = try beginWrite(&conn);
-    try put(&wtxn, "treeA", "k0", value.fromFixnum(1).?);
-    try put(&wtxn, "treeB", "k0", value.fromFixnum(2).?);
-    try put(&wtxn, "treeC", "k0", value.fromFixnum(3).?);
-    try commit(&wtxn);
-
-    var rtxn = try beginRead(&conn);
-    defer abortRead(&rtxn);
-    try testing.expectEqual(@as(i64, 1), (try get(&rtxn, "treeA", "k0", &synthHash, &synthEq)).?.asFixnum());
-    try testing.expectEqual(@as(i64, 2), (try get(&rtxn, "treeB", "k0", &synthHash, &synthEq)).?.asFixnum());
-    try testing.expectEqual(@as(i64, 3), (try get(&rtxn, "treeC", "k0", &synthHash, &synthEq)).?.asFixnum());
-}
-
-test "del: removes the key, subsequent get returns null" {
-    const path = try tmpDbPath(testing.allocator, "del");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&conn);
-
-    var wtxn = try beginWrite(&conn);
-    try put(&wtxn, "t", "k", value.fromFixnum(99).?);
-    try commit(&wtxn);
-
-    var wtxn2 = try beginWrite(&conn);
-    const removed = try del(&wtxn2, "t", "k");
-    try testing.expect(removed);
-    try commit(&wtxn2);
-
-    var rtxn = try beginRead(&conn);
-    defer abortRead(&rtxn);
-    try testing.expect((try get(&rtxn, "t", "k", &synthHash, &synthEq)) == null);
-}
-
-test "treeId: one handle per name, remembered across transactions, loaded once per transaction" {
-    const path = try tmpDbPath(testing.allocator, "treeids");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&conn);
-
-    // Unknown tree, no create: nothing resolved, nothing cached.
-    {
-        var rtxn = try beginRead(&conn);
-        defer abortRead(&rtxn);
-        try testing.expect((try treeId(&rtxn, "users", false)) == null);
-        try testing.expectEqual(@as(usize, 0), conn.tree_ids.count());
-    }
-
-    var first_id: emdb.TreeId = undefined;
-    {
-        var wtxn = try beginWrite(&conn);
-        first_id = (try treeId(&wtxn, "users", true)).?;
-        try testing.expect(wtxn.opened.isSet(first_id));
-        try testing.expectEqual(first_id, (try treeId(&wtxn, "users", true)).?);
-        try put(&wtxn, "users", "alice", value.fromFixnum(1).?);
-        try commit(&wtxn);
-    }
-    try testing.expectEqual(@as(usize, 1), conn.tree_ids.count());
-    try testing.expectEqual(first_id, conn.tree_ids.get("users").?);
-
-    // A later transaction starts with nothing loaded and resolves
-    // the same handle.
-    {
-        var rtxn = try beginRead(&conn);
-        defer abortRead(&rtxn);
-        try testing.expect(!rtxn.opened.isSet(first_id));
-        try testing.expectEqual(first_id, (try treeId(&rtxn, "users", false)).?);
-        try testing.expect(rtxn.opened.isSet(first_id));
-        try testing.expectEqual(@as(i64, 1), (try get(&rtxn, "users", "alice", &synthHash, &synthEq)).?.asFixnum());
-    }
-    try testing.expectEqual(@as(usize, 1), conn.tree_ids.count());
-}
-
-test "treeId: a tree created by an aborted transaction reads as empty afterwards" {
-    const path = try tmpDbPath(testing.allocator, "treeabort");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&conn);
-
-    {
-        var wtxn = try beginWrite(&conn);
-        try put(&wtxn, "scratch", "k", value.fromFixnum(7).?);
-        abortWrite(&wtxn);
-    }
-    {
-        var rtxn = try beginRead(&conn);
-        defer abortRead(&rtxn);
-        try testing.expect((try get(&rtxn, "scratch", "k", &synthHash, &synthEq)) == null);
-    }
-    {
-        var wtxn = try beginWrite(&conn);
-        defer abortWrite(&wtxn);
-        try testing.expect(!(try del(&wtxn, "scratch", "k")));
-    }
-}
-
-/// A store at `path` whose tree `t` holds `a`, a value of `big` bytes
-/// of `x` on overflow pages under `b`, and `c`; with `damage`, one byte
-/// in the middle of `b`'s value is changed on the disk, so its page
-/// fails its check.
-fn walkStore(path: [:0]const u8, big: usize, damage: bool) !void {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-    {
-        var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-        defer shutdown(&conn);
-        const txn = try conn.file.env.beginWriteWith(.{ .sync = .none });
-        errdefer txn.abort();
-        const t = try txn.openTree("t", true);
-        const bytes = try testing.allocator.alloc(u8, big);
-        defer testing.allocator.free(bytes);
-        @memset(bytes, 'x');
-        try txn.putInTree(t, "a", "1");
-        try txn.putInTree(t, "b", bytes);
-        try txn.putInTree(t, "c", "3");
-        try txn.commit();
-    }
-    if (!damage) return;
-    const io = testing.io;
-    const data = try std.Io.Dir.cwd().readFileAlloc(io, path, testing.allocator, .unlimited);
-    defer testing.allocator.free(data);
-    const run: [64]u8 = @splat('x');
-    const at = std.mem.find(u8, data, &run).? + big / 2;
-    const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
-    defer file.close(io);
-    try file.writePositionalAll(io, "y", at);
-}
-
-test "Walk: a page that fails its check ends the walk with its error, never as a shorter walk" {
-    const path = try tmpDbPath(testing.allocator, "walk_damaged");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-    try walkStore(path, 1 << 20, true);
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&conn);
-
-    var r = try beginRead(&conn);
-    defer abortRead(&r);
-    var walk: Walk = undefined;
-    try testing.expect(try walk.begin(&r, "t"));
-    defer walk.end();
-    try testing.expectEqualStrings("a", (try walk.first(null)).?.key);
-    try testing.expectError(error.InvalidPage, walk.next());
-
-    // A write under a walk copies the rest of it, and meets the same page.
-    var w = try beginWrite(&conn);
-    defer abortWrite(&w);
-    var over: Walk = undefined;
-    try testing.expect(try over.begin(&w, "t"));
-    defer over.end();
-    _ = (try over.first(null)).?;
-    try testing.expectError(error.InvalidPage, put(&w, "u", "k", value.fromFixnum(1).?));
-}
-
-test "Walk: a write to any tree of the transaction copies the rest first; values come whole from overflow pages" {
-    const path = try tmpDbPath(testing.allocator, "walk_copy");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-    try walkStore(path, 3 * page_size, false);
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&conn);
-
-    var w = try beginWrite(&conn);
-    defer abortWrite(&w);
-    var walk: Walk = undefined;
-    try testing.expect(try walk.begin(&w, "t"));
-    defer walk.end();
-    try testing.expectEqualStrings("1", (try walk.first(null)).?.value);
-    try testing.expect(walk.rest == null);
-    // Another tree: the cursor may not step past a change anywhere in
-    // the transaction (emdb API-C06A).
-    try put(&w, "u", "k", value.fromFixnum(1).?);
-    try testing.expect(walk.rest != null);
-    try testing.expect(try del(&w, "t", "c"));
-    const b = (try walk.next()).?;
-    try testing.expectEqualStrings("b", b.key);
-    try testing.expectEqual(@as(usize, 3 * page_size), b.value.len);
-    try testing.expect(std.mem.allEqual(u8, b.value, 'x'));
-    try testing.expectEqualStrings("c", (try walk.next()).?.key);
-    try testing.expect(try walk.next() == null);
-}
-
-test "put / get: container values (list, map, set) codec round-trip" {
-    const list_mod = @import("coll/list.zig");
-    const champ = @import("coll/champ.zig");
-
-    const path = try tmpDbPath(testing.allocator, "containers");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&conn);
-
-    // List
-    const lst = try list_mod.fromSlice(&heap, &.{
-        value.fromFixnum(1).?,
-        value.fromFixnum(2).?,
-        value.fromFixnum(3).?,
-    });
-    // Map (use interned keywords so codec can emit textual form).
-    const kw = try interner.internKeywordValue("alpha");
-    var m = try champ.mapEmpty(&heap);
-    m = try champ.mapAssoc(&heap, m, kw, value.fromFixnum(100).?, &synthHash, &synthEq);
-
-    // Set
-    var s = try champ.setEmpty(&heap);
-    s = try champ.setConj(&heap, s, value.fromFixnum(10).?, &synthHash, &synthEq);
-    s = try champ.setConj(&heap, s, value.fromFixnum(20).?, &synthHash, &synthEq);
-
-    var wtxn = try beginWrite(&conn);
-    try put(&wtxn, "objects", "list", lst);
-    try put(&wtxn, "objects", "map", m);
-    try put(&wtxn, "objects", "set", s);
-    try commit(&wtxn);
-
-    var rtxn = try beginRead(&conn);
-    defer abortRead(&rtxn);
-
-    const got_lst = try get(&rtxn, "objects", "list", &synthHash, &synthEq);
-    try testing.expect(got_lst != null and got_lst.?.kind() == .list);
-    try testing.expectEqual(@as(usize, 3), list_mod.count(got_lst.?));
-
-    const got_m = try get(&rtxn, "objects", "map", &synthHash, &synthEq);
-    try testing.expect(got_m != null and got_m.?.kind() == .persistent_map);
-    try testing.expectEqual(@as(usize, 1), champ.mapCount(got_m.?));
-
-    const got_s = try get(&rtxn, "objects", "set", &synthHash, &synthEq);
-    try testing.expect(got_s != null and got_s.?.kind() == .persistent_set);
-    try testing.expectEqual(@as(usize, 2), champ.setCount(got_s.?));
-}
-
-test "reopen-connection readback: values survive conn close/reopen" {
-    const path = try tmpDbPath(testing.allocator, "reopen");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    // Session 1: write.
-    {
-        var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-        defer shutdown(&conn);
-
-        var wtxn = try beginWrite(&conn);
-        try put(&wtxn, "persistent", "answer", value.fromFixnum(42).?);
-        try put(&wtxn, "persistent", "pi", value.fromFloat(3.14));
-        try commit(&wtxn);
-    }
-
-    // Session 2: reopen + read.
-    {
-        var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-        defer shutdown(&conn);
-
-        var rtxn = try beginRead(&conn);
-        defer abortRead(&rtxn);
-        const ans = try get(&rtxn, "persistent", "answer", &synthHash, &synthEq);
-        try testing.expect(ans != null and ans.?.kind() == .fixnum);
-        try testing.expectEqual(@as(i64, 42), ans.?.asFixnum());
-
-        const pi = try get(&rtxn, "persistent", "pi", &synthHash, &synthEq);
-        try testing.expect(pi != null and pi.?.kind() == .float);
-        try testing.expectEqual(@as(f64, 3.14), pi.?.asFloat());
-    }
-}
-
-// ---- durable_ref Value kind ----
-
-test "ref: identity triple populated; conn pointer attached" {
-    const path = try tmpDbPath(testing.allocator, "refinit");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&conn);
-
-    const r = try ref(&heap, &conn, "users", "alice");
-    try testing.expect(r.kind() == .durable_ref);
-    try testing.expectEqual(conn.storeId(), refStoreId(r));
-    try testing.expectEqualStrings("users", refTreeName(r));
-    try testing.expectEqualStrings("alice", refKeyBytes(r));
-    try testing.expectEqual(@as(?*Connection, &conn), refConn(r));
 }
 
 test "refFromBytes: conn is null; identity triple preserved" {
@@ -2460,106 +1386,4 @@ test "hashHeader: equal identity triples → equal hash; different → (almost c
 
     try testing.expectEqual(hashHeader(refHeader(r1)), hashHeader(refHeader(r2)));
     try testing.expect(hashHeader(refHeader(r1)) != hashHeader(refHeader(r3)));
-}
-
-test "putRef / getRef / delRef: round-trip via ref" {
-    const path = try tmpDbPath(testing.allocator, "refio");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&conn);
-
-    const r = try ref(&heap, &conn, "users", "alice");
-
-    var wtxn = try beginWrite(&conn);
-    try putRef(&wtxn, r, value.fromFixnum(123).?);
-    try commit(&wtxn);
-
-    {
-        var rtxn = try beginRead(&conn);
-        defer abortRead(&rtxn);
-        const got = try getRef(&rtxn, r, &synthHash, &synthEq);
-        try testing.expect(got != null and got.?.kind() == .fixnum);
-        try testing.expectEqual(@as(i64, 123), got.?.asFixnum());
-    }
-
-    var wtxn2 = try beginWrite(&conn);
-    const removed = try delRef(&wtxn2, r);
-    try testing.expect(removed);
-    try commit(&wtxn2);
-}
-
-test "getRef: nullconn ref → ConnectionUnavailable" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const path = try tmpDbPath(testing.allocator, "nullconn");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&conn);
-
-    // Ref constructed from bytes (no conn).
-    const r = try refFromBytes(&heap, 999, "t", "k");
-
-    var rtxn = try beginRead(&conn);
-    defer abortRead(&rtxn);
-    try testing.expectError(DbError.ConnectionUnavailable, getRef(&rtxn, r, &synthHash, &synthEq));
-}
-
-test "getRef: cross-store ref → StoreMismatch" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const path = try tmpDbPath(testing.allocator, "xstore");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&conn);
-
-    // Ref tagged with a DIFFERENT store_id than conn's, and a
-    // different (fake) Connection pointer. `assertRefMatchesConn`
-    // should detect the store_id mismatch.
-    var fake_conn = conn; // same struct, so same storeId and conn-pointer match
-    fake_conn.store_id_lo = 0xBAD_BAD_BAD_BAD_0000;
-    // Construct a ref referencing the fake_conn (different
-    // store_id + different pointer identity).
-    const r = try ref(&heap, &fake_conn, "t", "k");
-
-    var rtxn = try beginRead(&conn);
-    defer abortRead(&rtxn);
-    try testing.expectError(DbError.StoreMismatch, getRef(&rtxn, r, &synthHash, &synthEq));
-}
-
-test "invalid tree name / key: surfaces InvalidTreeName / InvalidKey" {
-    const path = try tmpDbPath(testing.allocator, "invalid");
-    defer testing.allocator.free(path);
-    defer cleanupDb(path);
-
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var interner = Interner.init(testing.allocator);
-    defer interner.deinit();
-
-    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
-    defer shutdown(&conn);
-
-    var wtxn = try beginWrite(&conn);
-    defer abortWrite(&wtxn);
-    try testing.expectError(DbError.InvalidTreeName, put(&wtxn, "", "k", value.nilValue()));
-    try testing.expectError(DbError.InvalidKey, put(&wtxn, "t", "", value.nilValue()));
 }
