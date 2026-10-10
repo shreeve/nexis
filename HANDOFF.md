@@ -51,7 +51,7 @@ with no server, readable by any number of processes
 git status                        # clean
 zig build install                 # bin/nexis
 ./bin/nexis --help                # usage and the namespaces available without a file
-./bin/nexis --version             # nexis 0.2.0
+./bin/nexis --version             # nexis 0.3.0
 zig build test --summary all      # the gate
 ```
 
@@ -86,7 +86,7 @@ permission is read-only Contents on `shreeve/emdb`. Without the secret
 every job fails at that checkout, and pull requests from forks never
 receive it.
 
-The release is `build.zig.zon`'s `.version`, 0.2.0, which `nexis
+The release is `build.zig.zon`'s `.version`, 0.3.0, which `nexis
 --version` prints (`docs/TOOLING.md` §1). `.github/workflows/release.yml`
 publishes one: on a pushed tag `v` and that version, it builds the
 optimized `bin/nexis` for `x86_64-linux-musl` (x86-64-v2),
