@@ -792,6 +792,13 @@ const Emitter = struct {
 
     /// `SlotOverflow`, with `LowerDiag.detail` naming this routine
     /// and the limit it reached, `what` (COMPILER.md §7).
+    /// `err`, saying why when nothing has yet (COMPILER.md §7).
+    fn fail(self: *const Emitter, err: CompileError, comptime fmt: []const u8, args: anytype) CompileError {
+        const d = self.diag orelse return err;
+        if (d.detail == null) d.detail = self.allocator.print(fmt, args) catch return CompileError.OutOfMemory;
+        return err;
+    }
+
     fn limit(self: *const Emitter, comptime what: []const u8) CompileError {
         const d = self.diag orelse return CompileError.SlotOverflow;
         if (d.detail != null) return CompileError.SlotOverflow;
@@ -2167,26 +2174,24 @@ const ParsedParams = struct {
 
 fn parseParams(
     allocator: std.mem.Allocator,
-    param_vector_items: []const *reader_mod.Form,
+    vector: *const reader_mod.Form,
+    diag: ?*LowerDiag,
 ) CompileError!ParsedParams {
-    // Scan for the `&` separator. Validation:
-    //   - at most one `&`
-    //   - `&` followed by exactly one symbol
-    //   - no symbols after the rest param
+    const param_vector_items = try expectVector(vector);
     var amp_pos: ?usize = null;
     for (param_vector_items, 0..) |item, i| {
         if (item.datum == .symbol and
             item.datum.symbol.ns == null and
             std.mem.eql(u8, item.datum.symbol.name, "&"))
         {
-            if (amp_pos != null) return CompileError.MalformedForm;
+            if (amp_pos != null) return malformed(allocator, diag, vector.origin, "fn: & appears twice", .{});
             amp_pos = i;
         }
     }
     if (amp_pos) |pos| {
         // `& rest` form. Expect exactly `pos + 2` items
         // (the `&` itself + one rest symbol).
-        if (pos + 2 != param_vector_items.len) return CompileError.MalformedForm;
+        if (pos + 2 != param_vector_items.len) return malformed(allocator, diag, vector.origin, "fn: & takes exactly one parameter after it", .{});
         const rest_name = try expectUnqualifiedSymbol(param_vector_items[pos + 1]);
         const params = try allocator.alloc([]const u8, pos);
         for (param_vector_items[0..pos], 0..) |item, i| {
@@ -2258,7 +2263,7 @@ fn lowerFnStar(
         self_name = try expectUnqualifiedSymbol(args[0]);
         pos = 1;
     }
-    const parsed = try parseClauses(allocator, args[pos..]);
+    const parsed = try parseClauses(allocator, args[pos..], ctx.diag);
 
     // The self-name belongs to the enclosing scope, so the bodies'
     // references to it are captures of a placeholder cell.
@@ -2289,11 +2294,11 @@ const ParsedClause = struct {
 /// The clauses keep Clojure's rules (COMPILER.md §5.5): no two take
 /// the same fixed count, at most one has a rest parameter, and its
 /// fixed count is at least every other clause's.
-fn parseClauses(allocator: std.mem.Allocator, forms: []const *reader_mod.Form) CompileError![]const ParsedClause {
+fn parseClauses(allocator: std.mem.Allocator, forms: []const *reader_mod.Form, diag: ?*LowerDiag) CompileError![]const ParsedClause {
     if (forms.len == 0) return CompileError.ExpectedVector;
     if (forms[0].datum != .list) {
         const one = try allocator.alloc(ParsedClause, 1);
-        one[0] = .{ .params = try parseParams(allocator, try expectVector(forms[0])), .body = forms[1..] };
+        one[0] = .{ .params = try parseParams(allocator, forms[0], diag), .body = forms[1..] };
         return one;
     }
     const clauses = try allocator.alloc(ParsedClause, forms.len);
@@ -2304,20 +2309,31 @@ fn parseClauses(allocator: std.mem.Allocator, forms: []const *reader_mod.Form) C
             else => return CompileError.MalformedForm,
         };
         if (items.len == 0) return CompileError.MalformedForm;
-        c.* = .{ .params = try parseParams(allocator, try expectVector(items[0])), .body = items[1..] };
+        c.* = .{ .params = try parseParams(allocator, items[0], diag), .body = items[1..] };
         const fixed = c.params.params.len;
         if (c.params.rest_param != null) {
-            if (rest_fixed != null) return CompileError.MalformedForm;
+            if (rest_fixed != null) return malformed(allocator, diag, form.origin, "fn: at most one overload clause may be variadic", .{});
             rest_fixed = fixed;
         }
         for (clauses[0..i]) |before| {
-            if (before.params.rest_param == null and c.params.rest_param == null and before.params.params.len == fixed) return CompileError.MalformedForm;
+            if (before.params.rest_param == null and c.params.rest_param == null and before.params.params.len == fixed)
+                return malformed(allocator, diag, form.origin, "fn: two overload clauses take {d} argument{s}", .{ fixed, if (fixed == 1) "" else "s" });
         }
     }
-    if (rest_fixed) |r| for (clauses) |c| {
-        if (c.params.rest_param == null and c.params.params.len > r) return CompileError.MalformedForm;
+    if (rest_fixed) |r| for (forms, clauses) |form, c| {
+        if (c.params.rest_param == null and c.params.params.len > r)
+            return malformed(allocator, diag, form.origin, "fn: a fixed arity of {d} is above the variadic clause's {d}", .{ c.params.params.len, r });
     };
     return clauses;
+}
+
+/// `MalformedForm` at `span`, saying why (COMPILER.md §7).
+fn malformed(allocator: std.mem.Allocator, diag: ?*LowerDiag, span: reader_mod.SrcSpan, comptime fmt: []const u8, args: anytype) CompileError {
+    const d = diag orelse return CompileError.MalformedForm;
+    if (d.detail != null) return CompileError.MalformedForm;
+    d.span = span;
+    d.detail = allocator.print(fmt, args) catch return CompileError.OutOfMemory;
+    return CompileError.MalformedForm;
 }
 
 /// The fixed arities a self-call may name (COMPILER.md §5.5): every
@@ -2388,7 +2404,7 @@ fn lowerLetFnStar(
         };
         if (entry_items.len < 2) return CompileError.MalformedForm;
         const name = try expectUnqualifiedSymbol(entry_items[0]);
-        parsed[i] = try parseClauses(allocator, entry_items[1..]);
+        parsed[i] = try parseClauses(allocator, entry_items[1..], ctx.diag);
         try ctx.bind(allocator, name, &names_captured, null);
         bindings[i] = .{ .name = name, .clauses = &.{}, .span = entry.origin };
     }
@@ -3788,8 +3804,9 @@ fn compileRecur(
     args: []const *const Tiny,
     recur_target: ?*const RecurTarget,
 ) CompileError!void {
-    const target = recur_target orelse return CompileError.RecurOutsideTail;
-    if (args.len != target.binding_slots.len) return CompileError.RecurArityMismatch;
+    const target = recur_target orelse return e.fail(CompileError.RecurOutsideTail, "recur is only in tail position", .{});
+    if (args.len != target.binding_slots.len)
+        return e.fail(CompileError.RecurArityMismatch, "recur takes {d} argument{s}, got {d}", .{ target.binding_slots.len, if (target.binding_slots.len == 1) "" else "s", args.len });
 
     const n = args.len;
     const reads = try e.allocator.alloc(bool, n * n);

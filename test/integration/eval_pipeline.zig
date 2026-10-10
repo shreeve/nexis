@@ -1182,8 +1182,12 @@ test "multi-arity fn: anonymous, named and letfn clauses dispatch by argc" {
     try expectOutput("(letfn [(f [[a b]] (+ a b))] (f [1 2]))", "3");
     try expectOutput("(let [f (fn ([[a b]] (+ a b)) ([m k] (get m k)))] [(f [1 2]) (f {:k 3} :k)])", "[3 3]");
     try expectOutput("(try ((fn ([x] x)) 1 2) (catch any e e))", "{:error :arity-mismatch, :message fn takes 1 argument, got 2, :fn test-form}");
-    try expectProgramError("(fn ([x] 1) ([x] 2))", compile.CompileError.MacroExpansionFailure);
-    try expectProgramError("(fn ([x y] 1) ([x & r] 2))", compile.CompileError.MacroExpansionFailure);
+    try expectLoadFailure("(fn ([x] 1) ([x] 2))", "compile error: fn: two overload clauses take 1 argument", "([x] 2)");
+    try expectLoadFailure("(fn ([x y] 1) ([x & r] 2))", "compile error: fn: a fixed arity of 2 is above the variadic clause's 1", "([x y] 1)");
+    try expectLoadFailure("(fn* ([x] x) ([x] x))", "compile error: fn: two overload clauses take 1 argument", "([x] x)");
+    try expectLoadFailure("(fn [a & b c] a)", "compile error: fn: & takes exactly one parameter after it", "[a & b c]");
+    try expectLoadFailure("(loop [i 0] (recur 1 2))", "compile error: recur takes 1 argument, got 2", "(recur 1 2)");
+    try expectLoadFailure("(do (recur) 1)", "compile error: recur is only in tail position", "(recur)");
 }
 
 test "multi-arity fn: each clause is called at its count through every path" {
@@ -5757,7 +5761,7 @@ test "protocol methods: several arities, in either Clojure spelling, dispatch by
         \\(try (m (->R 1) 2) (catch any e e))
     , "{:error :arity-mismatch, :message fn takes 1 argument, got 2, :fn test-form}");
     // The same arity twice is the fn overload error.
-    try expectMacroFailure("(defprotocol P (m [s]))", "(defrecord R [a] P (m [this] 1) (m [that] 2))", "fn: two overload clauses take 1 arguments", "(m [that] 2)");
+    try expectLoadFailure("(defprotocol P (m [s])) (defrecord R [a] P (m [this] 1) (m [that] 2))", "compile error: fn: two overload clauses take 1 argument", "(m [that] 2)");
     try expectMacroFailure("(defprotocol P (m [s]))", "(extend-type :string P (m ([s] 1) [s]))", "expected the method's parameter vector or its arities ([params] body...), not a vector", "[s]");
 }
 
@@ -7264,7 +7268,7 @@ test "eval: a compile error is a catchable map; a throw inside the form is an or
     // The message is the compiler's sentence, the CompileError's name
     // in words when it has none; :kind is the name.
     try expectOutput("(try (eval '(nope 1)) (catch :compile-error e [(:error e) (:message e) (:form e) (:kind e)]))", "[:compile-error unable to resolve symbol: nope (nope 1) UnresolvedSymbol]");
-    try expectOutput("(try (eval '(recur 1)) (catch :compile-error e [(:kind e) (:message e)]))", "[RecurOutsideTail recur outside tail]");
+    try expectOutput("(try (eval '(recur 1)) (catch :compile-error e [(:kind e) (:message e)]))", "[RecurOutsideTail recur is only in tail position]");
     try expectOutput("(try (eval '(quote)) (catch :compile-error e [(:kind e) (:message e)]))", "[MalformedForm malformed form]");
     try expectOutput("(try (eval '(let* [x] x)) (catch :compile-error e [(:kind e) (:message e)]))", "[MacroExpansionFailure let*: the binding vector needs an even number of forms]");
     try expectOutput("(try (eval (list 'a (fn [] 1))) (catch :compile-error e [(:kind e) (:message e)]))", "[UnsupportedForm unsupported form]");

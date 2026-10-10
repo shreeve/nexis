@@ -1752,34 +1752,16 @@ fn renameHead(ctx: *ExpandContext, call_form: *const Form, args: []const *Form, 
 
 /// Overload clauses `([params] body...)+` of `fn`, `defn` or a
 /// `letfn` binding as `fn*`'s own clauses, each through `fnClause`
-/// (COMPILER.md §5.5). Clojure's clause rules are checked here, so a
-/// failure names the clause at fault.
+/// (COMPILER.md §5.5), whose lowering checks Clojure's clause rules.
 fn multiArityFn(b: Builder, name: []const *Form, clauses: []const *Form) ExpandError!*Form {
     const ctx = b.ctx;
-    var fixed_arities: std.ArrayList(usize) = .empty;
-    var variadic: ?usize = null;
     const out = try ctx.allocator.alloc(*Form, clauses.len);
     for (clauses, out) |clause, *o| {
         if (clause.datum != .list or clause.datum.list.len == 0) return ctx.fail(clause.origin, "fn: expected an overload clause ([params] body...), not {s}", .{describeForm(clause)});
         const params_form = try stripParams(ctx, clause.datum.list[0]);
         if (params_form.datum != .vector) return ctx.fail(params_form.origin, "fn: expected a parameter vector, got {s}", .{describeForm(params_form)});
-        const params = params_form.datum.vector;
-        const fixed = for (params, 0..) |p, i| {
-            if (isSym(p, "&")) break i;
-        } else params.len;
-        if (fixed < params.len) {
-            if (variadic != null) return ctx.fail(clause.origin, "fn: at most one overload clause may be variadic", .{});
-            if (fixed + 2 != params.len) return ctx.fail(params_form.origin, "fn: & takes exactly one parameter after it", .{});
-            variadic = fixed;
-        } else {
-            for (fixed_arities.items) |a| if (a == fixed) return ctx.fail(clause.origin, "fn: two overload clauses take {d} arguments", .{fixed});
-            try fixed_arities.append(ctx.allocator, fixed);
-        }
         o.* = try makeList(ctx, try fnClause(b, params_form, clause.datum.list[1..]), clause.origin);
     }
-    if (variadic) |v| for (fixed_arities.items) |a| {
-        if (a > v) return ctx.fail(b.origin, "fn: a fixed arity of {d} is above the variadic clause's {d}", .{ a, v });
-    };
     return b.list(.{ "fn*", name, out });
 }
 

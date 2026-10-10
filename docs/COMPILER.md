@@ -596,9 +596,10 @@ when §4.4 allows it. The body compiles as `do`.
   captured parameter, rest included, is boxed at function entry.
 - `fn*` takes one parameter vector and its body, or one or more
   clauses `([params...] body...)`, as Clojure's `fn*` does. The clauses
-  keep Clojure's rules, else `MalformedForm`: no two take the same
-  fixed count, at most one has a rest parameter, and its fixed count
-  is at least every other clause's.
+  keep Clojure's rules, else `MalformedForm` at the clause at fault,
+  saying which: no two take the same fixed count, at most one has a
+  rest parameter, and its fixed count is at least every other
+  clause's; `&` takes exactly one parameter after it.
 
 **Clauses.** Each clause compiles into a routine of its own, in a
 child Emitter of its own, so a clause is an ordinary `fn*` body for
@@ -920,7 +921,7 @@ not):
 | `MalformedForm` | a special form of the wrong shape (`(if)`, `(quote)`, an odd `#%map`) |
 | `ExpectedSymbol`, `ExpectedVector` | a binding name that is not a symbol; a binding or parameter spec that is not a vector |
 | `UnsupportedFeature` | a non-`any` catch matcher; a syntax-quote, `#(...)`, `@x` or `^meta` datum reaching lowering, a syntax-quote or unquote inside a quote; a quoted symbol or keyword without an interner, a string, bignum or quoted compound without a heap |
-| `RecurOutsideTail`, `RecurArityMismatch` | §4.4 |
+| `RecurOutsideTail`, `RecurArityMismatch` | §4.4; the sentence says which, and for the count what the target takes |
 | `SlotOverflow` | the limits of §4.4 that remain: slots live at once, upvalues |
 | `MacroDepthExceeded` | 256 expansions in a row (MACROEXPAND.md §6) |
 | `MacroExpansionFailure` | every other expansion error: a malformed macro call, a macro that threw or returned a non-form (MACROEXPAND.md §8) |
