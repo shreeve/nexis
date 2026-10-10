@@ -439,21 +439,30 @@ pub const Loader = struct {
 
         const rel_path = try nsNameToRelPath(self.allocator, ns_name);
         defer self.allocator.free(rel_path);
-        const path = (try searchLoadPaths(self.allocator, self.io, self.load_paths, rel_path)) orelse {
+        // The text and the path outlive the load: every routine
+        // compiled from the file points at them for its error
+        // reports (TOOLING.md §1). The first load path holding the
+        // file is the one read.
+        const path, const file = for (self.load_paths) |dir| {
+            const candidate = try std.Io.Dir.path.join(self.allocator, &.{ dir, rel_path });
+            const bytes = std.Io.Dir.cwd().readFileAlloc(self.io, candidate, self.persistent_allocator, .unlimited) catch |err| {
+                if (err == error.FileNotFound) {
+                    self.allocator.free(candidate);
+                    continue;
+                }
+                defer self.allocator.free(candidate);
+                if (err == error.OutOfMemory) return LoadError.OutOfMemory;
+                try self.diagnose(.{ .label = "" }, "require: cannot read {s}: {s}", .{ candidate, @errorName(err) });
+                return LoadError.LoadFailed;
+            };
+            break .{ candidate, bytes };
+        } else {
             if (expand_mod.namespaceHint(ns_name)) |hint| {
                 try self.diagnose(.{ .label = "" }, "require: no file {s} on the load path; {s}", .{ rel_path, hint });
             } else try self.diagnose(.{ .label = "" }, "require: no file {s} on the load path", .{rel_path});
             return LoadError.LoadFailed;
         };
         defer self.allocator.free(path);
-
-        // The text and the path outlive the load: every routine
-        // compiled from the file points at them for its error
-        // reports (TOOLING.md §1).
-        const file = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.persistent_allocator, .unlimited) catch |err| {
-            try self.diagnose(.{ .label = "" }, "require: cannot read {s}: {s}", .{ path, @errorName(err) });
-            return LoadError.LoadFailed;
-        };
         const source = if (std.mem.startsWith(u8, file, byte_order_mark)) file[byte_order_mark.len..] else file;
         const info = try self.persistent_allocator.create(vm_mod.SourceInfo);
         info.* = .{ .path = try self.persistent_allocator.dupe(u8, path), .text = source };
@@ -515,20 +524,6 @@ fn nsNameToRelPath(allocator: std.mem.Allocator, ns_name: []const u8) ![]u8 {
     };
     @memcpy(buf[ns_name.len..], ".nx");
     return buf;
-}
-
-/// The first of `load_paths` holding `rel_path`, joined; the caller
-/// owns it.
-fn searchLoadPaths(allocator: std.mem.Allocator, io: std.Io, load_paths: []const []const u8, rel_path: []const u8) !?[]u8 {
-    for (load_paths) |dir| {
-        const candidate = try std.Io.Dir.path.join(allocator, &.{ dir, rel_path });
-        std.Io.Dir.cwd().access(io, candidate, .{}) catch {
-            allocator.free(candidate);
-            continue;
-        };
-        return candidate;
-    }
-    return null;
 }
 
 /// Whether `forms` opens with `(ns NAME ...)`, `^meta` on NAME allowed.
