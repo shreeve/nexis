@@ -102,8 +102,8 @@ const rows = .{
     .{ "ident", 2, 2, &fnIdent, "[db x]", "Returns the ident keyword of the entity x, an eid or ident, in db, or\n  nil when it has none." },
     .{ "datoms", 2, 7, &fnDatoms, "[db index] [db index c1] [db index c1 c2] [db index c1 c2 c3] [db index c1 c2 c3 tx] [db index c1 c2 c3 tx added]", "Returns a vector of the datoms [e a v t added] of db in the order of\n  index, :eavt, :aevt, :avet or :vaet, matching the components given\n  in that index's order, then tx and added; nil matches anything.\n  Another index is :invalid-argument." },
     .{ "index-range", 4, 4, &fnIndexRange, "[db attr start end]", "Returns a vector of the AVET datoms of the indexed or unique attribute\n  attr whose value v has start <= v < end, in value order; a nil bound\n  is open. Another attribute is :nextomic/tx-data." },
-    .{ "as-of", 2, 2, &fnAsOf, "[db t]", "Returns the view of db as of the transaction t, a t or a transaction\n  entity id: what the transactions up to t asserted and did not\n  retract. Of repeated bounds the older holds. A negative t is\n  :invalid-argument." },
-    .{ "since", 2, 2, &fnSince, "[db t]", "Returns the view of db holding only what the transactions after t, a\n  t or a transaction entity id, asserted and did not retract: an entity\n  untouched since t is invisible. Of repeated bounds the newer holds." },
+    .{ "as-of", 2, 2, &fnAsOf, "[db t]", "Returns the view of db as of the transaction t, a t, a transaction\n  entity id or an inst (the last transaction at or before it; none\n  before the first): what the transactions up to t asserted and did not\n  retract. Of repeated bounds the older holds. A negative t is\n  :invalid-argument." },
+    .{ "since", 2, 2, &fnSince, "[db t]", "Returns the view of db holding only what the transactions after t, a\n  t, a transaction entity id or an inst, asserted and did not retract: an entity\n  untouched since t is invisible. Of repeated bounds the newer holds." },
     .{ "history", 1, 1, &fnHistory, "[db]", "Returns the history view of db: every assertion and retraction up to\n  its basis, each datom with its added flag. q and datoms read it;\n  entity and pull are :nextomic/history-view." },
     .{ "tx-range", 1, 3, &fnTxRange, "[conn] [conn from] [conn from to]", "Returns a vector of the log's entries {:t t :instant inst :data\n  [datoms]} for from <= t < to, oldest first, :instant the\n  transaction's instant; a nil or missing bound is open. An entry an\n  excision touched carries :excised [e ...]." },
     .{ "schema", 1, 1, &fnSchema, "[db]", "Returns a map of each attribute's ident to its definition as db's\n  basis saw it: :db/id, :db/ident, :db/valueType, :db/cardinality,\n  :db/index, :db/isComponent and :db/fulltext, with :db/unique and\n  :db/doc when the attribute has them." },
@@ -1214,6 +1214,14 @@ fn tArg(v: Value) !u64 {
     return key.txOfEntity(u) orelse u;
 }
 
+/// `as-of` and `since` also take an instant: the `t` of the last
+/// transaction at or before it, 0 before the first (§4).
+fn timeArg(d: DbValue, v: Value) !u64 {
+    if (v.kind() != .inst) return tArg(v);
+    if (d.gen != d.conn.gen) return error.Closed;
+    return db_mod.txAtInstant(d.conn, v.asInstMs());
+}
+
 fn fnAsOf(vm: *VM, args: []const Value) VmError!Value {
     return timeView(vm, args, .as_of) catch |err| fail(vm, err);
 }
@@ -1229,8 +1237,8 @@ fn fnHistory(vm: *VM, args: []const Value) VmError!Value {
 fn timeView(vm: *VM, args: []const Value, mode: enum { as_of, since, history }) !Value {
     const d = try dbOf(args[0]);
     const view = switch (mode) {
-        .as_of => d.asOf(try tArg(args[1])),
-        .since => d.sinceT(try tArg(args[1])),
+        .as_of => d.asOf(try timeArg(d, args[1])),
+        .since => d.sinceT(try timeArg(d, args[1])),
         .history => d.withHistory(),
     };
     return boxDb(vm.ensureHeap(), view);
