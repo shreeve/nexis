@@ -250,16 +250,10 @@ const Binding = struct {
     refs: u32 = 0,
 };
 
-/// How a lexical binding is realized in the current routine's
-/// frame. A binding lowering marks as captured is boxed where it
-/// is bound and is a `.cell_slot`; every other binding is a
-/// `.direct_slot`.
-///
-/// Same-frame read dispatch (in `compileSymbol`):
-///   .direct_slot(s)  → emit `mov:move dst, slot(s)`
-///   .cell_slot(s)    → emit `closure:get-cell dst, slot(s)`
-///   .upvalue(u)      → emit `mov:move dst, u:u` (resolve(u)
-///                      deref's the cell at runtime)
+/// How a lexical binding is held in the current routine's frame: a
+/// binding lowering marked captured is boxed where it is bound and is
+/// a `.cell_slot`, an enclosing routine's an `.upvalue`, any other a
+/// `.direct_slot` (COMPILER.md §6.1).
 const BindingRef = union(enum) {
     /// Ordinary slot; binding's value lives directly in
     /// `slot[s]`. Most bindings stay here.
@@ -317,30 +311,17 @@ fn ScopeTable(comptime T: type) type {
     };
 }
 
-/// Routine-level capture cache entry. Maps a captured name to its upvalue index, so repeat references
-/// to the same outer name from different lexical scopes share
-/// a single upvalue/descriptor entry.
+/// A captured name and its upvalue, so every reference to the name
+/// shares one upvalue.
 const CapturedName = struct {
     name: []const u8,
     upvalue: u12,
 };
 
-/// Where `(recur args...)` should jump and which slots it
-/// rebinds. Threaded through `compileExpr` in tail position.
-///
-/// Lifetime: the struct (and the slices it points to) is owned
-/// by whichever compile* function established the target —
-/// `compileLoopStar` or `compileFn`. Body compilation must
-/// complete before the owning function returns.
-///
-/// Tail-position propagation rules (per COMPILER.md §4.4):
-///   - `if` then/else: propagate the outer target
-///   - `do` last expr, `let*` body, `letfn*` body: propagate
-///   - `fn*` body: RESET to a new fn target (NEVER propagate
-///     across function boundaries — `recur` inside a nested fn
-///     must NOT escape to the outer loop/fn)
-///   - `loop*` body: REPLACE with new loop target
-///   - all other positions: pass `null` (recur invalid here)
+/// Where `(recur args...)` jumps and which slots it rebinds, passed
+/// to the forms in tail position (COMPILER.md §4.4): a `loop*` or
+/// `fn*` sets it, `if`, `do`, `let*` and `letfn*` pass it on, and
+/// every other position passes null.
 const RecurTarget = struct {
     entry_pc: u32,
     /// The slots `recur` rebinds, in argument order: a loop's
@@ -389,102 +370,23 @@ const BottomTest = struct {
 // Errors
 // =============================================================================
 
+/// The compiler's errors; COMPILER.md §7 says when each is raised.
 pub const CompileError = error{
-    /// A routine needs more than 4096 slots live at once or more
-    /// than 4096 upvalues, the two limits the 12-bit slot and
-    /// upvalue operands leave (COMPILER.md §4.4); `LowerDiag.detail`
-    /// names the routine and the limit.
     SlotOverflow,
-
-    /// A symbol resolves to nothing COMPILER.md §4.3 classifies: no
-    /// local, upvalue, namespace Var or name the file or line
-    /// defines. Without a namespace, anything that is not a local
-    /// or an upvalue raises this.
     UnresolvedSymbol,
-
-    /// `(recur ...)` appears in a position that is not a tail
-    /// position of an enclosing `loop*` or `fn*` body. Per
-    /// COMPILER.md §4.4, §5.6 + VM.md §11: `recur` MUST
-    /// be in tail position to preserve the constant-stack
-    /// guarantee.
     RecurOutsideTail,
-
-    /// `(recur ...)` has a different argument count than the
-    /// target's binding count. Per VM.md §11 + COMPILER.md
-    /// §5.6. Caught at compile time (no runtime arity
-    /// revalidation — recur is not a call opcode).
     RecurArityMismatch,
-
-    /// A feature is recognized but not lowered. Raised for a
-    /// non-`any` catch matcher, quoted symbols /
-    /// keywords / strings without an Interner or Heap, and
-    /// `reader.Form` datums that only the expander consumes
-    /// (syntax-quote, unquote, `#(...)`, `@x`, `^{...}`
-    /// metadata) reaching the lowerer. Trapping loudly is better
-    /// than emitting subtly-wrong code.
     UnsupportedFeature,
-
-    /// The parser or reader rejected the source string given to
-    /// `compileSourceWith`.
-    /// Bucketed error wrapping any error from `parser.parseForm`
-    /// / `reader.readOneForm`; the reader's own ErrorKind is not
-    /// carried through.
     ReaderFailure,
-
-    /// A list form (call or special form) has the wrong shape.
-    /// Emitted for malformed `(if)`, `(quote)`,
-    /// `(let* ...)` without a binding vector, etc. Covers
-    /// arity and structural errors that the reader accepted
-    /// as syntactically valid lists but the compiler rejects
-    /// as semantically malformed.
     MalformedForm,
-
-    /// Macroexpansion exceeded the depth limit (256 per
-    /// MACROEXPAND.md §6). Almost always an infinite macro
-    /// loop. Distinct from `MacroExpansionFailure` because
-    /// users debugging macros want this signaled clearly.
     MacroDepthExceeded,
-
-    /// Bucket for all other macroexpand errors — malformed
-    /// macro call, macro returned a non-Form, etc. The original
-    /// variant is not carried through; `out_span` carries the
-    /// form's span.
     MacroExpansionFailure,
-
-    /// A `require` in the form ran a file whose form failed at run
-    /// time with no handler in force. The failure is a runtime
-    /// error, not a compile error: the VM's `traced_error` names
-    /// it and `error_trace` locates it (TOOLING.md §1).
     RequiredFileFailed,
-
-    /// A `require` in the form ran a file whose form threw, and a
-    /// handler in the running program took the throw: the VM has
-    /// already unwound to that handler. Reaches only `eval`, which
-    /// returns it as the VM signal of the same name.
     ControlTransferred,
-
-    /// A position required a symbol but got something else
-    /// (e.g., `(let* [1 2] body)` — binding name `1` is not
-    /// a symbol; `(def 42 ...)` — def name `42` is not a
-    /// symbol).
     ExpectedSymbol,
-
-    /// A position required a vector but got something else
-    /// (e.g., `(let* (x 1) body)` — binding spec is a list,
-    /// not a vector; `(fn* (x) body)` — param spec is a
-    /// list, not a vector).
     ExpectedVector,
-
-    /// A compiler invariant was violated: the compiler reached a
-    /// state it believes impossible, such as a closure capturing a
-    /// binding lowering did not mark captured. Reported as an
-    /// error rather than miscompiled.
     InternalCompilerBug,
-
-    /// The form nests deeper than the native stack's budget allows
-    /// lowering or emitting it (`stack.check`, VM.md §13.1).
     StackOverflow,
-
     OutOfMemory,
 };
 
@@ -539,23 +441,10 @@ const Scratch = struct { lo: u12, dst: u12 };
 /// of its own while its neighbours run (COMPILER.md §4.4).
 const HeldVar = struct { var_: *vm.Var, slot: u12 };
 
-/// `Emitter` accumulates a routine's bytecode, constants, slot
-/// count, and active lexical scope as a tree of `compileExpr`
-/// calls runs, turned into a `vm.Routine` by `finish()`.
-///
-/// **Slot allocation**: a stack (`slot_top`); `compileExpr` frees
-/// what a node allocated once the node is compiled.
-///
-/// **Constant pool**: one entry per identical Value (COMPILER.md
-/// §4.4).
-///
-/// **Lexical scope**: a `ScopeTable` of each local's `BindingRef`.
-/// Bindings are made at let* binding-time (after the RHS is compiled,
-/// per COMPILER.md §4.3's strict left-of-self rule) and unmade at
-/// let-body exit via `defer scope.restore(mark)`, `defer` so an error
-/// mid-body leaves no scope behind for a recovering caller. Nested
-/// function compilation resolves free names through the `parent`
-/// chain (capture analysis at function boundaries).
+/// One routine's code, pools, slots and lexical scope as
+/// `compileExpr` builds them, turned into a `vm.Routine` by `finish`.
+/// A nested `fn*` compiles in a child Emitter whose free names
+/// resolve through `parent` (COMPILER.md §4.4, §6).
 const Emitter = struct {
     /// Scratch: what compiling needs and nothing after it.
     allocator: std.mem.Allocator,
@@ -582,52 +471,22 @@ const Emitter = struct {
     slot_top: u16 = 0,
     /// The most slots live at once: the routine's frame size.
     slot_count: u16 = 0,
-    /// Pointer to the enclosing routine's Emitter, or null for the
-    /// top-level routine. Capture discovery walks the parent
-    /// chain in `resolveOrCapture`. Synchronous compilation
-    /// guarantees the parent pointer remains valid throughout
-    /// child compilation (parent is blocked in its
-    /// `compileFn` call).
+    /// The enclosing routine's Emitter, null at top level; capture
+    /// walks it (`resolveOrCapture`).
     parent: ?*Emitter = null,
-    /// Captures THIS routine has registered (in
-    /// upvalue-index order). Each entry is a `CaptureSource`
-    /// describing how to source the cell from the PARENT
-    /// frame when the parent's `closure:make` runs. The
-    /// list grows in `resolveOrCapture` as inner functions
-    /// discover free-variable references. At `compileFn`
-    /// finalization, the parent builds a `CaptureDescriptor`
-    /// from `child.captures` and registers it in its own
-    /// `capture_descs` table.
+    /// How the parent's `closure:make` sources each upvalue, in
+    /// upvalue order (COMPILER.md §6.1).
     captures: std.ArrayList(vm.CaptureSource) = .empty,
-    /// Routine-level cache of captured names → upvalue-index.
-    /// Separate from
-    /// `scope` so inner `let_star` scope restoration cannot
-    /// pop a captured-binding entry. Without this, the same
-    /// outer name referenced in two unrelated inner scopes
-    /// would be captured twice (two upvalue indices, two
-    /// descriptor sources, double-allocated cell pointer in
-    /// the closure). Lexical locals take precedence (resolved
-    /// via `scope` first), so shadowing is preserved.
+    /// The names captured so far with their upvalues, kept apart from
+    /// `scope`, so a name captured in two inner scopes takes one
+    /// upvalue and a scope's restore cannot drop it.
     captured_names: std.ArrayList(CapturedName) = .empty,
-    /// Per-routine Var table. The compiler appends
-    /// to this when it sees a `def`, a `(var x)`, or a
-    /// symbol-fall-through-to-Var resolution. Index in this
-    /// list becomes the V operand index in emitted bytecode.
-    /// Routines built from a child Emitter (compileFn) carry
-    /// their own table independent of the parent's; Vars are
-    /// global per-namespace and only the index encoding is
-    /// per-routine.
+    /// The Vars `v` operands index, the routine's own.
     var_table: std.ArrayList(*vm.Var) = .empty,
-    /// Namespace used for `def` / `var` / symbol fall-through.
-    /// `null` means no namespace was given;
-    /// in that case `def`/`var_ref` raise `UnresolvedSymbol`
-    /// and unresolved symbols stay unresolved. Child Emitters
-    /// inherit the parent's namespace pointer.
+    /// Where Vars resolve; null, in a test, for none.
     namespace: ?*vm.Namespace = null,
-    /// The span the next emitted instruction is attributed to:
-    /// that of the innermost form being compiled, set on entry to
-    /// `compileExpr` and restored on exit, so an instruction a
-    /// parent emits after its children carries the parent's span.
+    /// The span the next instruction carries, the innermost node's
+    /// (`enterNode`).
     current_span: ?reader_mod.SrcSpan = null,
     /// The run-length table `emit` grows: a new entry whenever
     /// `current_span` differs from the last entry's.
@@ -673,9 +532,7 @@ const Emitter = struct {
         self.var_table.deinit(self.allocator);
     }
 
-    /// Look up a name in the routine-level capture cache.
-    /// Returns the existing upvalue index if this routine has
-    /// already captured `name`; null otherwise.
+    /// The upvalue this routine already captured `name` as.
     fn lookupCapturedName(self: *const Emitter, name: []const u8) ?u12 {
         for (self.captured_names.items) |c| {
             if (std.mem.eql(u8, c.name, name)) return c.upvalue;
@@ -691,64 +548,25 @@ const Emitter = struct {
         try self.scope.bind(self.allocator, name, if (captured) .{ .cell_slot = slot } else .{ .direct_slot = slot });
     }
 
-    /// Resolve `name` to a `BindingRef` via innermost-shadow
-    /// lookup of ONLY the current Emitter's scope. Returns null
-    /// if no binding matches; callers walk the parent chain via
-    /// `resolveOrCapture` if appropriate. Returns the full
-    /// BindingRef so callers can dispatch on direct/cell/upvalue
-    /// at emit time.
+    /// `name`'s innermost binding in this routine's own scope.
     fn resolveLocalRef(self: *const Emitter, name: []const u8) ?BindingRef {
         return self.scope.lookup(name);
     }
 
-    /// Walk self, then parents, to resolve `name` into a
-    /// `BindingRef` suitable for emit-time dispatch in
-    /// `compileSymbol`. If found in self.scope, returns the
-    /// ref directly. If found in a parent, performs the capture
-    /// dance per COMPILER.md §6.1: registers `self.captures`
-    /// (recording how to source the cell from parent), pushes
-    /// the binding into self.scope as `.upvalue(u)` so
-    /// subsequent references in the same routine resolve
-    /// directly, returns `.upvalue(u)`. Recurses transitively
-    /// for grandparent-and-beyond captures (each level
-    /// captures from its own parent so the chain delivers a
-    /// cell pointer to the innermost level).
-    ///
-    /// Lowering marked every binding a closure captures, so it is
-    /// a `.cell_slot` (or, further out, an `.upvalue`) by the time
-    /// a child resolves it here; a `.direct_slot` would be a
-    /// compiler bug. Nothing boxes a binding mid-codegen.
-    ///
-    /// Returns `UnresolvedSymbol` if no enclosing scope (up
-    /// the entire parent chain) has the name.
+    /// `name` as this routine reaches it: its own binding, an upvalue
+    /// it already captured, or a new upvalue over the binding an
+    /// enclosing routine reaches it as, each level capturing from its
+    /// parent (COMPILER.md §6.1). Lowering marked every captured
+    /// binding, so a parent's `.direct_slot` here is a compiler bug.
     fn resolveOrCapture(self: *Emitter, name: []const u8) CompileError!BindingRef {
-        // 1. Lexical scope, innermost-first. Lexical locals
-        // (params, let_star bindings) shadow any captures with
-        // the same name, preserving lexical scope semantics.
         if (self.resolveLocalRef(name)) |ref| return ref;
-        // 2. Routine-level capture cache. If THIS routine has
-        // already captured `name` (from a sibling scope, or
-        // earlier in the body), reuse the existing upvalue index
-        // instead of registering a new one. This avoids the
-        // "synthetic upvalue popped by inner let_star scope
-        // restoration" hazard.
         if (self.lookupCapturedName(name)) |u| return .{ .upvalue = u };
-        // 3. Walk the parent chain.
         const parent = self.parent orelse return CompileError.UnresolvedSymbol;
-        const parent_ref = try parent.resolveOrCapture(name);
-        // 4. How the parent's frame supplies the cell.
-        const source: vm.CaptureSource = switch (parent_ref) {
+        const source: vm.CaptureSource = switch (try parent.resolveOrCapture(name)) {
             .cell_slot => |s| .{ .local_cell_slot = s },
             .upvalue => |u| .{ .inherited_upvalue = u },
             .direct_slot => return CompileError.InternalCompilerBug,
         };
-        // 5. Register the capture. Append the source to
-        // self.captures (in upvalue-index order) AND record
-        // the name → upvalue mapping in captured_names so
-        // subsequent lookups dedupe. NOT pushed into self.scope
-        // because scope is for lexical bindings only — a
-        // capture there could be popped by inner let_star
-        // scope restoration.
         const u_idx_usize = self.captures.items.len;
         if (u_idx_usize >= max_operands) return self.limit("captured locals");
         const u_idx: u12 = @intCast(u_idx_usize);
@@ -862,16 +680,8 @@ const Emitter = struct {
         return idx;
     }
 
-    /// Get-or-create a V operand index for `name` in
-    /// the current routine's var_table. Interns the Var in the
-    /// namespace (creating an unbound Var if absent), then
-    /// dedup-appends to var_table. Returns the V operand index.
-    /// Requires `self.namespace != null`; callers should check
-    /// first and surface `UnresolvedSymbol` otherwise.
-    ///
-    /// Dedup: a routine that references `x` twice gets ONE
-    /// var_table entry (same V index). Matches the const-pool
-    /// dedup pattern.
+    /// The `v` operand index of the namespace's Var `name`, interned
+    /// unbound when absent, one entry per Var.
     fn addVarRef(self: *Emitter, name: []const u8) CompileError!u32 {
         const ns = self.namespace orelse return CompileError.InternalCompilerBug;
         // Lookup walks the parent chain (auto-refer fallback to
@@ -1555,19 +1365,8 @@ fn emitRoutine(allocator: std.mem.Allocator, form: *const Tiny, opts: EmitOption
 // Form → Tiny lowering
 // =============================================================================
 //
-// `lowerForm` converts a `reader.Form` tree into a `Tiny` IR tree on the
-// passed allocator. The Tiny tree is then compiled via the backend
-// (`emitRoutine`), so the entire codegen pipeline
-// (RecurTarget threading, variadic rest, Var fall-through, etc.) runs
-// on the one Tiny path. Lowering also marks every binding a closure
-// captures (`Lexical`).
-//
-// Lowering covers literals, symbols, list dispatch (ordinary calls,
-// special forms, the inlined core fns when not shadowed),
-// binding/fn forms (let*, fn*, letfn*, loop*, recur), var forms
-// (def, var), try/throw, quote, and collection literals. The
-// lexical bindings in force (`LowerCtx.lexicals`) decide shadowing
-// for intrinsic dispatch.
+// `lowerForm` turns a Form into the `Tiny` tree the Emitter compiles,
+// and marks every binding a closure captures (COMPILER.md §4.3).
 
 /// Allocate and initialize a Tiny node on the given allocator.
 /// Used by `lowerForm` to build the IR tree. The arena passed to
@@ -2429,13 +2228,8 @@ fn lowerLetFnStar(
 // Form var-form lowering
 // =============================================================================
 //
-// `def`, `(var x)`. The backend (Tiny.def,
-// Tiny.var_ref) handles forward references, identity-stable
-// rebind, and the named-fn placeholder pattern. This layer is
-// purely Form-side dispatch + structural validation.
-//
-// A `def` binds no lexical name: a Var is not lexical.
-// `namesCore` consults the namespace and the declared names instead.
+// A `def` binds no lexical name: `namesCore` consults the namespace
+// and the declared names instead.
 
 /// `(def name)` or `(def name value)`. Per Tiny.def shape, the
 /// value is optional (declare-only).
@@ -2475,19 +2269,8 @@ fn lowerVarRef(
     return try allocTiny(allocator, .{ .var_ref = .{ .ns = sym.ns, .name = sym.name } });
 }
 
-/// Lower `(try body+ (catch any binding handler+) (finally ...)?)`.
-/// The only catch matcher at this level is `any`; the expander
-/// lowers keyword matchers and several clauses onto it.
-///
-/// Form syntax:
-///   (try body... (catch any binding handler...))
-///   (try body... (catch any binding handler...) (finally ...))
-///
-/// Enforcement:
-///   - Exactly one body+catch+optional-finally shape.
-///   - catch matcher MUST be the unqualified symbol `any`;
-///     anything else is UnsupportedFeature.
-///   - catch binding MUST be an unqualified symbol.
+/// `(try body... (catch any binding handler...) (finally ...)?)`, the
+/// primitive the expander makes of every `try` (MACROEXPAND.md §2b).
 fn lowerTry(
     allocator: std.mem.Allocator,
     args: []const *reader_mod.Form,
@@ -3459,32 +3242,12 @@ fn qualifiedVarIndex(e: *Emitter, ns_prefix: []const u8, name: []const u8) Compi
 }
 
 fn compileSymbol(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
-    // Symbol resolution order for the Tiny backend (the Form
-    // frontend sits ABOVE this; resolution itself lives here):
-    //   1. local (this routine) → dispatch on BindingRef
-    //      (.direct_slot / .cell_slot / .upvalue)
-    //   2. captured upvalue (parent chain) → resolve.upvalue
-    //      + capture (bindings are boxed where they are bound,
-    //      so BindingRef is stable across all control-flow paths)
-    //   3. namespace Var (if namespace exists) → var:load-var
-    //      (lazy-interns unbound Vars so forward references
-    //      work)
-    //   4. otherwise `UnresolvedSymbol`
-    //
-    // Form lowering does NOT resolve symbols to slots
-    // — it preserves names and dispatches operator-position
-    // special forms / intrinsics. Slot resolution happens here.
+    // A local, a captured upvalue, else the namespace's Var
+    // (COMPILER.md §4.3).
     const ref = e.resolveOrCapture(name) catch |err| switch (err) {
-        // Lexical resolution failed; try the
-        // namespace before giving up. Critical that this is
-        // ONLY done for UnresolvedSymbol — other errors
-        // (SlotOverflow, OutOfMemory, InternalCompilerBug)
-        // are real bugs and must propagate untouched.
         CompileError.UnresolvedSymbol => {
             if (e.namespace) |_| {
-                // Intern (or get existing) Var, add to var_table,
-                // emit var:load-var. The Var may be unbound at
-                // compile time; runtime traps :unbound-var if so.
+                // An unbound Var traps :unbound-var when it runs.
                 const idx = try e.addVarRef(name);
                 try e.emit(vm.asm_.varLoadVar(dst, idx));
                 return;
@@ -3514,17 +3277,8 @@ fn compileSymbol(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
     }
 }
 
-/// Lower `(def name value?)`. Interns the Var in the current
-/// namespace itself (creating an unbound Var if absent; a referred
-/// Var of the same name is shadowed, never rebound), stores the
-/// value, read in place where it can be, as its root
-/// (`var:store-var`), and yields the Var object (`var:var-object`).
-///
-/// Without a Namespace (`e.namespace == null`), `def` raises
-/// `UnresolvedSymbol`.
-///
-/// `(def x)` (no value) is a forward-declaration: the Var is
-/// interned and stays as it was.
+/// `(def name value?)` (COMPILER.md §5.8): the namespace's own Var,
+/// its root the value when there is one, the Var itself the value.
 fn compileDef(
     e: *Emitter,
     name: []const u8,
@@ -3733,20 +3487,10 @@ fn compileThrow(e: *Emitter, value: *const Tiny) CompileError!void {
     try e.emit(vm.asm_.throwOp(try compileOperand(e, value, true)));
 }
 
-/// Lower `(loop* [b1 v1 b2 v2 ...] body)` per COMPILER.md §5.7
-/// + VM.md §11.
-///
-/// Same as `let*` for binding setup (sequential RHS visibility,
-/// captured bindings boxed as they are bound). After the bindings
-/// are set up, mark the entry PC and compile the body with a
-/// loop `RecurTarget` so any `(recur ...)` in tail position
-/// rebinds the loop slots and jumps back to entry.
-///
-/// Entry-PC placement: AFTER the
-/// binding setup + captured-binding boxing prelude. Jumping
-/// back must NOT re-evaluate initial RHSs and must NOT re-box
-/// the binding slots — the recur path handles cell installation
-/// directly.
+/// `(loop* [b v ...] body)` (COMPILER.md §5.7): the bindings as
+/// `let*`'s, then the body under a target whose entry is after them,
+/// so a `recur` neither runs an initial value nor boxes a binding
+/// again.
 fn compileLoopStar(
     e: *Emitter,
     bindings: []const Binding,
@@ -3764,7 +3508,6 @@ fn compileLoopStar(
     for (bindings, captured_mask) |b, *c| c.* = b.captured;
     try bindSequential(e, bindings, binding_slots);
 
-    // 4. Mark entry PC (AFTER box-local prelude).
     const entry_pc = try e.nextPc();
     const names = try e.allocator.alloc([]const u8, bindings.len);
     defer e.allocator.free(names);
@@ -3781,10 +3524,7 @@ fn compileLoopStar(
         .numeric = numeric,
     };
 
-    // 5. Compile body with the loop target installed. The
-    // body REPLACES (not propagates) any outer recur target —
-    // a recur inside the body always targets THIS loop, not an
-    // enclosing one (nested-loop rule).
+    // A `recur` in the body targets this loop, never an outer one.
     try compileExpr(e, body, dst, &loop_target);
 }
 
@@ -4274,25 +4014,8 @@ fn compileClause(parent: *Emitter, f: FnSpec, clause: Clause, shared: *Captures)
     return routine;
 }
 
-/// Lower `letfn*` per COMPILER.md §5.6b: mutually-recursive
-/// function bindings via the placeholder-cell pattern.
-///
-/// Sequence (COMPILER.md §5.6b):
-///   1. Allocate placeholder cells: `closure:new-cell` for
-///      each binding's name. Push each into scope as
-///      `.cell_slot`.
-///   2. For each binding, compile its fn body (constructing
-///      a closure via `closure:make`). Each fn body is
-///      compiled in a child Emitter, so references to letfn*
-///      names are captured from the parent's `.cell_slot`s
-///      and read at runtime as upvalues (cell deref via the
-///      U-operand). The letfn* body itself sees the
-///      bindings as same-frame `.cell_slot` reads
-///      (`closure:get-cell`).
-///   3. For each binding, init the cell with the
-///      constructed closure: `closure:init-cell s_cell, s_closure`.
-///   4. Compile body (with all letfn* bindings still in
-///      scope).
+/// `letfn*` (COMPILER.md §5.6b): a cell per name, then each function
+/// capturing the cells, then the cells filled, then the body.
 fn compileLetFnStar(
     e: *Emitter,
     bindings: []const FnBinding,
@@ -4303,10 +4026,7 @@ fn compileLetFnStar(
     const scope_mark = e.scope.mark();
     defer e.scope.restore(scope_mark);
 
-    // 1. Allocate placeholder cells for each binding;
-    // push each into scope as .cell_slot. Cells must exist
-    // BEFORE any closure:make so the cap_desc local_cell_slot
-    // sources can reference them.
+    // The cells exist before any closure:make captures them.
     const cell_slots = try e.allocator.alloc(u12, bindings.len);
     defer e.allocator.free(cell_slots);
     for (bindings, cell_slots) |b, *s| {
@@ -4315,10 +4035,6 @@ fn compileLetFnStar(
         try e.scope.bind(e.allocator, b.name, .{ .cell_slot = s.* });
     }
 
-    // 2. Compile each fn (constructing closures). We
-    // allocate a fresh result slot for each closure value.
-    // The fn bodies see all letfn* names in scope (as
-    // .cell_slot via the entries we just pushed).
     const closure_slots = try e.allocator.alloc(u12, bindings.len);
     defer e.allocator.free(closure_slots);
     const outer_span = e.current_span;
@@ -4326,25 +4042,15 @@ fn compileLetFnStar(
         e.current_span = b.span;
         const cs = try e.allocSlot();
         closure_slots[i] = cs;
-        // compileFn handles the named case via the
-        // placeholder pattern when the body references its
-        // own name. For letfn*, we don't pass `b.name` as
-        // the fn's self-name because the binding-name's cell
-        // is already in scope (so the fn body's references
-        // resolve via parent-chain capture); using the
-        // self-name machinery here would double-allocate.
+        // No self-name: the name's cell is already in scope.
         try compileFn(e, .{ .display_name = b.name, .clauses = b.clauses }, cs);
     }
     e.current_span = outer_span;
 
-    // 3. Init each cell with its closure.
     for (bindings, 0..) |_, i| {
         try e.emit(vm.asm_.closureInitCell(cell_slots[i], vm.Operand.slot(closure_slots[i])));
     }
 
-    // 4. Compile body in the now-fully-bound scope. Body
-    // is in tail position relative to the enclosing form; inherit
-    // recur target.
     try compileExpr(e, body, dst, recur_target);
 }
 
