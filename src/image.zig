@@ -76,7 +76,7 @@ const UpvalCell = vm_mod.UpvalCell;
 pub const Source = struct { ns: []const u8, info: vm_mod.SourceInfo };
 
 const magic = "nexisimg";
-const version: u32 = 2;
+const version: u32 = 3;
 
 // The structs the image carries field by field. A field added to one
 // of them must be carried (or deliberately left at its default) here
@@ -154,11 +154,8 @@ pub fn matches(bytes: []const u8, sources: []const Source) bool {
 const RefTag = enum(u8) { nil, immediate, keyword, symbol, object, native, var_ };
 const ObjTag = enum(u8) { cell, atom, string, bignum, regex, vector, empty_list, cons, map, set, function, protocol, protocol_fn, record };
 const EntryTag = enum(u8) {
-    /// The namespace's own Var, keyed by its name.
-    own,
-    /// Another namespace's Var keyed by that Var's own name storage:
-    /// a Clojure library namespace standing for a nexis one.
-    shared,
+    /// A Var keyed by its own name storage: the namespace's own.
+    named,
     /// Another namespace's Var under a name of this namespace.
     referral,
 };
@@ -550,7 +547,7 @@ const Writer = struct {
     fn entry(w: *Writer, out: *Out, ns: *Namespace, key: []const u8, v: *Var, states: *u32) WriteError!void {
         const keyed_by_name = key.ptr == v.name.ptr;
         const own = keyed_by_name and v.ns.ptr == ns.name.ptr;
-        try out.byte(@backingInt(if (own) EntryTag.own else if (keyed_by_name) EntryTag.shared else EntryTag.referral));
+        try out.byte(@backingInt(if (keyed_by_name) EntryTag.named else EntryTag.referral));
         try out.int(u32, try w.varIndex(v));
         if (!keyed_by_name) try out.str(key);
         if (!own or w.natives.untouched(v)) return;
