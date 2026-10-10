@@ -325,7 +325,7 @@ so a second expansion of the same source yields a different name.
 The counter is process-wide, not per context: a generated name may
 become a Var later forms see, so two expansions never share a name.
 Host macros that need a fresh name (`and`, `or`, `case`, `condp`,
-`for`, overloaded `fn`, destructuring, `try`) call `ctx.gensym`.
+overloaded `fn`, destructuring, `try`) call `ctx.gensym`.
 
 ## 4b. SrcSpan / provenance for synthetic forms
 
@@ -421,8 +421,7 @@ any binding (`COMPILER.md` §4.3), and every core function a host
 macro's output calls is the qualified `nexis.core/name` (§10b):
 destructuring uses `nexis.core/nth`, `nthnext`, `get` and `seq?`,
 and a keyword or symbol key looks itself up, which nothing binds;
-`case` `=`; `for`
-`seq`, `first`, `next` and `conj`; `defrecord` `get` and `=`;
+`case` `=`; `defrecord` `=`, and a field is a keyword lookup;
 `case` and `condp` report through `str`; `@x` is `deref`, in a
 macro's arguments too. So
 `(let [nth (fn [& _] :captured)] (let [[a b] [1 2]] [a b]))` is
@@ -431,10 +430,10 @@ nothing. A qualified `nexis.core/+` is still inlined (`COMPILER.md`
 §4.3), so the qualification costs nothing. The macros a host macro's
 output invokes are qualified the same way, since a local or an
 ns-local macro or Var of the name would otherwise capture the head
-(§3): `nexis.core/let` (destructuring in `fn`, `loop`, `for` and
-record methods), `nexis.core/fn` (`defn`, method impls),
+(§3): `nexis.core/let` (destructuring in `fn`, `loop` and record
+methods), `nexis.core/fn` (`defn`, method impls),
 `nexis.core/defn` and
-`nexis.core/and` (`defrecord`), so `(defn f [let] (for [[a b] xs]
+`nexis.core/and` (`defrecord`), so `(defn f [let] (fn [[a b]]
 [let a b]))` and `(defmacro and ...)` before a `defrecord` work as in
 Clojure. Only special-form heads (`let*`, `fn*`, `loop*`, `if`, `do`,
 `def`, `recur`, `throw`, `quote`, `var`) and the clause words

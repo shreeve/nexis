@@ -32,11 +32,8 @@ const Allocator = std.mem.Allocator;
 // Types
 // =============================================================================
 
-/// Errors specific to macroexpansion. Mapped to CompileError
-/// variants by the caller (compile.zig):
-///   ExpansionDepthExceeded → CompileError.MacroDepthExceeded
-///   everything else        → CompileError.MacroExpansionFailure
-///   OutOfMemory            → CompileError.OutOfMemory
+/// Errors of macroexpansion; the compiler maps each to a
+/// `CompileError` (COMPILER.md §7).
 pub const ExpandError = error{
     ExpansionDepthExceeded,
     MalformedMacroCall,
@@ -62,12 +59,8 @@ pub const CompileEvalContext = struct {
     eval: *const fn (user_data: *anyopaque, form: *const Form, failure: *?Failure) anyerror!value_mod.Value,
 };
 
-/// Callback used by `(require ...)` to load a namespace from
-/// disk. Set by the CLI / test harness.
-/// The callback is responsible for ALL file-loading concerns
-/// (path resolution, parsing, compilation, evaluation, registry
-/// updates, cycle detection). The expander just decodes the
-/// `(require ...)` arg and dispatches.
+/// How `require` loads a namespace: the loader's, which finds,
+/// reads, compiles and runs its file once.
 pub const LoadCallback = struct {
     user_data: *anyopaque,
     load: *const fn (user_data: *anyopaque, ns_name: []const u8) anyerror!void,
@@ -85,38 +78,20 @@ pub const Failure = struct {
 pub const ExpandContext = struct {
     allocator: Allocator,
     interner: *intern_mod.Interner,
-    /// Macro registry. May be empty (no host expansion fires).
     host_macros: *const HostMacroTable,
-    /// Namespace for user-defmacro lookup. When
-    /// expanding `(my-fn ...)`, if `my-fn` resolves to a Var
-    /// whose `.macro = true`, dispatch as a user macro instead
-    /// of an ordinary call. Null = no namespace = no user
-    /// macros (useful for tests that exercise host-macro-only
-    /// expansion).
+    /// Where user macros and Vars are looked up; null, in a test,
+    /// for none.
     namespace: ?*vm_mod.Namespace = null,
-    /// Compile-time eval callback. Set by
-    /// `compile.zig` when building the ExpandContext. The
-    /// `defmacro` handler uses this to compile + evaluate the
-    /// macro fn's body via a fresh sub-VM. Null = `defmacro`
-    /// raises MacroExpansionFailure.
+    /// How `defmacro` runs its definition; null refuses `defmacro`.
     compile_eval: ?CompileEvalContext = null,
-    /// When set, `(ns NAME)` special form switches
-    /// the current namespace via `registry.switchTo(NAME)`. The
-    /// CLI sets this; ad-hoc tests can leave it null (in which
-    /// case `(ns NAME)` raises MalformedMacroCall).
+    /// What `ns` switches and `require` refers into; null refuses
+    /// both.
     registry: ?*vm_mod.NamespaceRegistry = null,
-    /// When set, `(require ...)` special form calls
-    /// through this callback to load a namespace from disk.
-    /// Null = `(require ...)` raises MalformedMacroCall (useful
-    /// for tests that compile in-memory only).
+    /// How `require` loads a namespace; null refuses loading.
     load_callback: ?LoadCallback = null,
-    /// The heap macro arguments and quoted data are built on: the
-    /// calling VM's, which the compiler passes whenever a namespace
-    /// registry carries one and the run-time hooks (`macroexpand-1`,
-    /// `read-string`) always pass, so the macro sub-VM's allocations
-    /// and the values it returns live where the VM's Vars can hold
-    /// them. Null only in a test that expands no user macro and
-    /// converts no form to data.
+    /// The VM heap macro arguments and quoted data are built on, so
+    /// the values a macro's sub-VM makes live where Vars can hold
+    /// them; null only in a test that turns no form into data.
     value_heap: ?*heap_mod.Heap = null,
     /// The calling VM's `io`, given to a user macro's sub-VM so the
     /// macro body can print; null leaves the sub-VM without one.
@@ -175,18 +150,16 @@ pub const ExpandContext = struct {
 /// does (docs/STDLIB.md §1).
 pub var gensym_counter: u64 = 0;
 
-/// Host-Zig macro callback. Takes the call form (head + args)
-/// and produces a rewritten form. The result is then re-fed to
-/// `expandForm` (so macro-of-macros works automatically).
+/// A host macro: the call form and its arguments to the form it
+/// expands to, which is expanded again.
 pub const MacroFn = *const fn (
     ctx: *ExpandContext,
     call_form: *const Form,
     args: []const *Form,
 ) ExpandError!*Form;
 
-/// Maps unqualified symbol name → MacroFn. `defaultMacros`
-/// builds the standard table (let/fn/defn/when/cond/and/or/...);
-/// an empty table disables host expansion.
+/// The host macros by name (`defaultMacros`); empty in a test of
+/// expansion without them.
 pub const HostMacroTable = std.StringHashMapUnmanaged(MacroFn);
 
 /// The names one binding form (`let*`, `loop*`, `fn*`, `letfn*`, a
@@ -221,14 +194,8 @@ pub const MAX_EXPANSION_DEPTH: u32 = 256;
 // Public entry
 // =============================================================================
 
-/// Walk a single Form, expanding any macro calls found in
-/// operator position. Returns the transformed Form (which may
-/// share subtrees with the input — Form trees are immutable
-/// from this layer's POV). The output is suitable for direct
-/// consumption by `compile.lowerForm`.
-///
-/// Empty `ctx.host_macros` table → output structurally identical
-/// to input.
+/// `form` with every macro call in it expanded (§2), sharing the
+/// subtrees that did not change.
 pub fn expandForm(ctx: *ExpandContext, form: *const Form) ExpandError!*Form {
     return expandFormDepth(ctx, form, 0);
 }
@@ -379,11 +346,8 @@ fn expandFormDepth(ctx: *ExpandContext, form: *const Form, depth: u32) ExpandErr
     };
 }
 
-/// Cast a `*const Form` to `*Form`. The Form tree is arena-
-/// owned and immutable from the expander's POV — when we
-/// "pass through" a form we return the same pointer. The Tiny
-/// lowerer also expects `*Form`. Cast safety: the lowerer
-/// reads the form; nothing in the pipeline writes back to it.
+/// A form passed through unchanged: no stage writes a Form once
+/// it is built.
 inline fn mutCast(form: *const Form) *Form {
     return @constCast(form);
 }
@@ -692,32 +656,11 @@ fn withVarMeta(ctx: *ExpandContext, def_form: *Form, meta_items: []const *Form, 
     return b.list(.{ "let*", try b.vec(.{ v, def_form }), try b.list(.{ "nexis.core/reset-meta!", v, meta }), v });
 }
 
-/// Expand `(try body* (catch MATCHER BINDING handler*)* (finally
-/// body*)?)` onto the compiler's primitive, which takes exactly one
-/// `(catch any g ...)`:
-///
-///   (try body...
-///     (catch any g#
-///       (if (nexis.internal/#%catch-matches? g# :tag) (let* [b1 g#] h1...)
-///       (if ... (let* [bn g#] hn...)
-///       (throw g#))))
-///     (finally ...)?)
-///
-/// A MATCHER is `any` (every value, no test), a keyword TAG, which
-/// matches a thrown value equal to TAG or a map whose `:error` entry
-/// is TAG (the shape of Nextomic's error maps and the
-/// no-matching-clause map), or, for code written for Clojure, a
-/// class name or `:default`: a class that names a nexis error
-/// (`ArithmeticException`, `catchTags`) matches those error tags, and
-/// any other (`Exception`, `Throwable`) every value, as `any` does:
-/// nexis has no classes.
-/// Clauses are tried in order; a value no clause matches is
-/// rethrown, so it unwinds through the `finally` to the enclosing
-/// `try`. With no clause at all the handler is the rethrow, which
-/// is finally-only `try`; with neither catch nor finally the form is
-/// `(do body...)`. The body, each handler (with its binding in
-/// scope) and the finally body are expanded; matchers and bindings
-/// are not.
+/// `(try body* (catch MATCHER BINDING handler*)* (finally body*)?)`
+/// onto the compiler's primitive, which takes exactly one `(catch any
+/// g ...)` whose handler tries the clauses in order and rethrows a
+/// value none takes (§2b, `try`). The body, each handler and the
+/// finally body expand; matchers and bindings do not.
 fn expandTry(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) ExpandError!*Form {
     const b = Builder{ .ctx = ctx, .origin = list_form.origin };
     // Body forms, then catch clauses, then an optional finally.
@@ -915,22 +858,10 @@ const Walk = struct {
 // =============================================================================
 //
 // `ns`, `require` and `defmacro` take effect at expansion time, so
-// the forms after them in the same file see the namespace, the
-// loaded code and the macro. A user macro runs in a sub-VM on its
-// arguments as data (`formToValue`), and its result becomes a form
-// again (`valueToForm`) that is expanded in its place.
+// the forms after them in the same file see them (§2b).
 
-/// `(ns NAME docstring? attr-map? clause*)` switches the registry's
-/// current namespace to NAME at expansion time, creating it (with
-/// `nexis.core` referred) if needed, then runs each
-/// `(:require spec*)` clause as `require` runs its specs, in the new
-/// namespace. `(:refer-clojure :exclude [names])` interns each name
-/// that `nexis.core` or the host macro table holds as an unbound Var
-/// of the namespace, so the name is the namespace's own from then
-/// on; `:only` and `:rename` are refused. `(:gen-class ...)` is
-/// accepted and does nothing (there is no class to generate). The
-/// docstring and attribute map are accepted and not kept. The form
-/// is replaced by nil.
+/// `(ns NAME docstring? attr-map? clause*)`, at expansion time, and
+/// replaced by nil (§2b).
 fn expandNs(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) ExpandError!*Form {
     const origin = list_form.origin;
     if (items.len < 2) return ctx.fail(origin, "ns: expected a namespace name", .{});
@@ -990,21 +921,8 @@ fn referClojure(ctx: *ExpandContext, reg: *vm_mod.NamespaceRegistry, opts: []con
 }
 
 /// `(require spec*)` loads and refers at expansion time, through
-/// `ctx.load_callback`, and is replaced by nil. Each spec, quoted or
-/// not, is a namespace symbol or `[ns-name option*]`:
-///
-///   :as alias          `alias/x` names `ns-name/x`
-///   :as-alias alias    the alias alone; nothing is loaded
-///   :refer [x y]       `x` and `y` name those Vars here
-///   :refer :all        so does every public Var of the namespace
-///   :rename {x z}      a referred `x` is named `z` here
-///
-/// A prefix list, `[prefix suffix...]` or `(prefix suffix...)`,
-/// requires each suffix spec under `prefix.` (`requirePrefixList`).
-/// A keyword spec (`:reload`, `:reload-all`, `:verbose`) is a flag
-/// and changes nothing. What a namespace name loads, including the
-/// Clojure library names that stand for nexis namespaces, is the
-/// loader's (`loader.zig`).
+/// `ctx.load_callback`, and is replaced by nil (§2b). What a
+/// namespace name loads is the loader's.
 fn expandRequire(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) ExpandError!*Form {
     if (items.len < 2) return ctx.fail(list_form.origin, "require: expected a namespace", .{});
     for (items[1..]) |spec| try requireSpec(ctx, spec, .apply);
@@ -1687,20 +1605,8 @@ const Builder = struct {
 // Host core macros (MACROEXPAND.md §10)
 // =============================================================================
 //
-// Each macro fn matches `MacroFn`:
-//   fn(ctx, call_form, args) ExpandError!*Form
-//
-// Conventions:
-//   - The macro's NAME is registered in `defaultMacros()` and
-//     resolved by the expander; the fn itself never sees the
-//     head symbol — only the args.
-//   - All synthetic Forms use `call_form.origin` per
-//     MACROEXPAND.md §4b.
-//   - Malformed shapes raise `MalformedMacroCall` which the
-//     compile layer buckets as `MacroExpansionFailure`.
-//   - Output forms are re-fed to the expander (see
-//     `expandList`), so a macro may expand to another macro
-//     call.
+// Each builds its output at the call's span (§4b) and the expander
+// expands that output again.
 
 // ---- let / fn / loop and destructuring --------------------------
 //
@@ -1827,19 +1733,9 @@ fn renameHead(ctx: *ExpandContext, call_form: *const Form, args: []const *Form, 
 }
 
 /// Overload clauses `([params] body...)+` of `fn`, `defn` or a
-/// `letfn` binding lowered to `fn*`'s own clauses, each through
-/// `fnClause`:
-///
-///   (fn* name? ([p1'] b1') ([p1' p2'] b2') ([p1' & r'] bv'))
-///
-/// The compiler makes each clause a routine of its own over one arity
-/// table, and a call enters the clause its count picks
-/// (COMPILER.md §5.5), so a `recur` in a clause re-enters that clause
-/// with its own arity (a variadic clause's rest parameter receives one
-/// seq) and a pattern parameter destructures again after it. At most
-/// one clause is variadic, its fixed count is not below any fixed
-/// arity, and no fixed arity repeats (Clojure's rules); the check here
-/// names the clause at fault.
+/// `letfn` binding as `fn*`'s own clauses, each through `fnClause`
+/// (COMPILER.md §5.5). Clojure's clause rules are checked here, so a
+/// failure names the clause at fault.
 fn multiArityFn(b: Builder, name: []const *Form, clauses: []const *Form) ExpandError!*Form {
     const ctx = b.ctx;
     var fixed_arities: std.ArrayList(usize) = .empty;
@@ -2084,17 +1980,7 @@ fn defnParts(ctx: *ExpandContext, call_form: *const Form, args: []const *Form, p
     return .{ .name = named.name, .fn_tail = tail, .meta = meta.items };
 }
 
-// ---- when / when-not / and / or / cond ------------------------
-//
-//   (when t body...)      => (if t (do body...) nil)
-//   (when-not t body...)  => (if t nil (do body...))
-//   (and) => true   (and x) => x   (and x y ...) => (let* [g x] (if g <and of y ...> g))
-//   (or)  => nil    (or x)  => x   (or x y ...)  => (let* [g x] (if g g <or of y ...>))
-//   (cond t1 e1 t2 e2 ...) => (if t1 e1 (if t2 e2 ... nil))
-//
-// `and` and `or` return the deciding value itself and bind the
-// first operand to a gensym so it is evaluated once. `cond` has no
-// `:else` case: a keyword test is truthy.
+// ---- when / when-not / and / or / cond (§10) ------------------------
 
 fn expandWhen(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
     if (args.len < 1) return ctx.fail(call_form.origin, "when: expected a test", .{});
@@ -2152,33 +2038,11 @@ fn isTruthyLiteral(form: *const Form) bool {
     };
 }
 
-// ---- case / condp ------------------------------------------------
+// ---- case / condp (§10) ------------------------------------------------
 //
-//   (case e k1 v1 k2 v2 ... default?), fewer than three constants
-//     => (let* [g e] (if (= g 'k1) v1 (if (= g 'k2) v2 ... terminal)))
-//   three or more, no two of which could be `=` while spelled
-//   differently: one hashed lookup of the clause's index in a
-//   constant map, then fixnum compares, each one instruction
-//     => (let* [g e i (get '{k1 0 k2 1 ...} g -1)]
-//          (if (== i 0) v1 (if (== i 1) v2 ... terminal)))
-//     (without `g` when there is a default: e goes straight to get)
-//   (condp pred e c1 v1 ... default?)
-//     => (let* [p pred g e] (if (p c1 g) v1 ... terminal))
-//   a clause `c :>> f` calls `f` on the predicate's truthy result.
-//
-// A `case` key is a constant, never evaluated: a symbol key is that
-// symbol, a vector or map key that literal, and a list key `(k1 k2)`
-// groups alternatives. The terminal is the trailing odd form when
-// there is one, else the throw of `{:error :no-matching-clause
-// :message "No matching clause: <e>" :value e}` (Clojure's
-// IllegalArgumentException carries the same message). The dispatch
-// value, and condp's predicate, are evaluated once. The map's lookup
-// is `=`'s equality (dispatch.equal and its hash). Two constants
-// that are `=` but spelled differently (`[1]` and a grouped `(1)`)
-// would be one key of the map, where the chain lets the first clause
-// win, so a case with two compound constants (or two bignums) keeps
-// the chain. The map lists the constants in clause order, so they
-// are interned in source order.
+// Fewer than three constants, or two that could be `=` while spelled
+// differently, make a chain of `=` tests; otherwise one hashed lookup
+// of the clause's index in a constant map, then fixnum compares.
 
 fn expandCase(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
     if (args.len == 0) return ctx.fail(call_form.origin, "case: expected an expression", .{});
@@ -2323,48 +2187,9 @@ fn noMatchThrow(b: Builder, g: *Form) ExpandError!*Form {
     return b.list(.{ "throw", try b.map(.{ ":error", ":no-matching-clause", ":message", try b.list(.{ "nexis.core/str", message, g }), ":value", g }) });
 }
 
-// ---- for ----------------------------------------------------
-//
-// Eager `for`: `(for [pattern src modifiers... ...] body)` fills a
-// vector and returns it as a seq (a list; `()` when empty), as
-// Clojure's lazy `for` prints. Each binding pair may be followed by `:let [bindings]`,
-// `:when test` and `:while test`, in any number and order; a
-// pattern destructures through `let`. One loop per binding pair,
-// nested, carrying the vector as its accumulator:
-//
-//   (loop* [s# (seq src) acc# <outer acc or []>]
-//     (if s#
-//       (let [pattern (first s#)]
-//         <modifiers, innermost first:
-//            :let [b]  → (let [b] inner)
-//            :when t   → (if t inner (recur (next s#) acc#))
-//            :while t  → (if t inner acc#)
-//          where inner is (recur (next s#) <next loop over acc#>)
-//          or, at the last pair, (recur (next s#) (conj acc# body))>)
-//       acc#))
-//
-// `:while` ends the loop it modifies (its accumulator is returned
-// as is), `:when` skips the element, and both see the pattern and
-// any earlier `:let`.
-
 // ---- defrecord / defprotocol / extend-type / extend-protocol ----
 //
 // PROTOCOLS.md §4.
-//
-//   (defrecord Counter [n] IFoo (bar [this y] ...) IBar (baz [this] ...))
-//   → (do
-//       (def Counter-type-id (nexis.internal/#%register-record-type "<ns>/Counter" [:n]))
-//       (defn ->Counter [n] (nexis.internal/#%make-record Counter-type-id {:n n}))
-//       (defn map->Counter [m] (nexis.internal/#%make-record Counter-type-id m [:n]))
-//       (defn Counter? [x] (and (nexis.internal/#%record? x)
-//                               (= Counter-type-id (nexis.internal/#%record-type-id x))))
-//       (nexis.internal/#%extend-record-impl IFoo :bar Counter-type-id (fn [this y] ...))
-//       (nexis.internal/#%extend-record-impl IBar :baz Counter-type-id (fn [this] ...))
-//       (def Counter '<ns>.Counter)
-//       Counter)
-//
-// After the field vector, a bare symbol names the protocol the method
-// clauses `(name [params] body...)` that follow implement.
 
 /// The Vars `(defrecord T [...])` defines besides `T` itself. The
 /// compiler's `DeclaredNames` reads the same table, so a form may
@@ -2955,7 +2780,6 @@ pub fn defaultMacros(allocator: Allocator) ExpandError!HostMacroTable {
     try table.put(allocator, "->>", thread(.last));
     try table.put(allocator, "case", expandCase);
     try table.put(allocator, "condp", expandCondp);
-    // defrecord (records + inline protocol clauses).
     try table.put(allocator, "defrecord", expandDefrecord);
     try table.put(allocator, "defprotocol", expandDefprotocol);
     try table.put(allocator, "extend-type", expandExtendType);
