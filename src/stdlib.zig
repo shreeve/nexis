@@ -294,7 +294,7 @@ const core_rows = .{
     .{ "some", 2, 2, &fnSome, .consumes, "[pred coll]", "Returns the first truthy (pred x) for x in coll, else nil; stops at\n  the first one." },
     .{ "every?", 2, 2, &fnEveryQ, .consumes, "[pred coll]", "Returns true if (pred x) is truthy for every x in coll, true for an\n  empty coll; stops at the first falsy one." },
     .{ "count", 1, 1, fnCountLeaf, .consuming_leaf, fnCount, "[coll]", "Returns the number of items in coll; 0 for nil. A string counts code\n  points, not bytes; a lazy seq is realized to its end." },
-    .{ "nth", 2, 3, &fnNth, .leaf, &fnNthGeneral, "[coll index] [coll index not-found]", "Returns the item at index of coll, a string's char by code point. Out\n  of range, returns not-found, or without one is\n  :index-out-of-bounds; nil coll gives not-found (nil). A lazy seq is\n  realized as far as index." },
+    .{ "nth", 2, 3, nthNative(true), .leaf, nthNative(false), "[coll index] [coll index not-found]", "Returns the item at index of coll, a string's char by code point. Out\n  of range, returns not-found, or without one is\n  :index-out-of-bounds; nil coll gives not-found (nil). A lazy seq is\n  realized as far as index." },
     .{ "empty?", 1, 1, &fnEmptyQ, "[coll]", "Returns true if coll has no items; true for nil." },
     .{ "identity", 1, 1, &fnIdentity, .leaf, "[x]", "Returns x." },
     .{ "nil?", 1, 1, kindIs(&.{.nil}), .leaf, "[x]", "Returns true if x is nil, false otherwise." },
@@ -306,10 +306,10 @@ const core_rows = .{
     .{ "+", 0, null, &fnAdd, .leaf, "[] [x] [x y] [x y & more]", "Returns the sum of the nums; (+) is 0. An integer result past the\n  fixnum range is a bignum, never an overflow; a float operand makes\n  the result a float." },
     .{ "-", 1, null, &fnSub, .leaf, "[x] [x y] [x y & more]", "With one arg, returns its negation; otherwise x minus each later\n  arg in turn. Integers promote to bignums, as + does." },
     .{ "*", 0, null, &fnMul, .leaf, "[] [x] [x y] [x y & more]", "Returns the product of the nums; (*) is 1. Integers promote to\n  bignums, as + does." },
-    .{ "/", 1, null, &fnDiv, "[x] [x y] [x y & more]", "With one arg, returns its reciprocal; otherwise x divided by each\n  later arg in turn. There are no ratios: integers that do not divide\n  give the nearest double, (/ 7 2) is 3.5. A zero divisor of any kind\n  is :divide-by-zero." },
-    .{ "quot", 2, 2, bind(binaryNum, &vm_mod.numQuot), "[num div]", "Returns the quotient of num by div, truncated toward zero. A zero\n  div is :divide-by-zero." },
-    .{ "rem", 2, 2, bind(binaryNum, &vm_mod.numRem), "[num div]", "Returns the remainder of num by div under truncated division; it\n  has num's sign. A zero div is :divide-by-zero." },
-    .{ "mod", 2, 2, bind(binaryNum, &vm_mod.numMod), "[num div]", "Returns the modulus of num by div under floored division; it has\n  div's sign. A zero div is :divide-by-zero." },
+    .{ "/", 1, null, &fnDiv, .leaf, "[x] [x y] [x y & more]", "With one arg, returns its reciprocal; otherwise x divided by each\n  later arg in turn. There are no ratios: integers that do not divide\n  give the nearest double, (/ 7 2) is 3.5. A zero divisor of any kind\n  is :divide-by-zero." },
+    .{ "quot", 2, 2, bind(binaryNum, &vm_mod.numQuot), .leaf, "[num div]", "Returns the quotient of num by div, truncated toward zero. A zero\n  div is :divide-by-zero." },
+    .{ "rem", 2, 2, bind(binaryNum, &vm_mod.numRem), .leaf, "[num div]", "Returns the remainder of num by div under truncated division; it\n  has num's sign. A zero div is :divide-by-zero." },
+    .{ "mod", 2, 2, bind(binaryNum, &vm_mod.numMod), .leaf, "[num div]", "Returns the modulus of num by div under floored division; it has\n  div's sign. A zero div is :divide-by-zero." },
     .{ "<", 1, null, bind(chainCompare, .lt), .leaf, "[x] [x y] [x y & more]", "Returns true if the nums are in strictly increasing order. Exact\n  across integers of any size; false against NaN." },
     .{ "<=", 1, null, bind(chainCompare, .lte), .leaf, "[x] [x y] [x y & more]", "Returns true if the nums are in nondecreasing order. Exact across\n  integers of any size; false against NaN." },
     .{ ">", 1, null, bind(chainCompare, .gt), .leaf, "[x] [x y] [x y & more]", "Returns true if the nums are in strictly decreasing order. Exact\n  across integers of any size; false against NaN." },
@@ -319,36 +319,36 @@ const core_rows = .{
     .{ "not=", 1, null, &fnNotEq, "[x] [x y] [x y & more]", "Returns (not (= x y & more))." },
     .{ "inc", 1, 1, &fnInc, .leaf, "[x]", "Returns x plus one, a bignum past the fixnum range." },
     .{ "dec", 1, 1, &fnDec, .leaf, "[x]", "Returns x minus one, a bignum past the fixnum range." },
-    .{ "long", 1, 1, &fnLong, "[x]", "Returns x as an integer of any size: a float's integer part (NaN is\n  0, an infinity :invalid-argument), a char's code point." },
-    .{ "int", 1, 1, castTo(i32), "[x]", "Returns x as long does, within the range of Java's int, else\n  :invalid-argument; NaN is 0, a char its code point." },
-    .{ "short", 1, 1, castTo(i16), "[x]", "Returns x as long does, within the range of Java's short, else\n  :invalid-argument; NaN is 0, a char its code point." },
-    .{ "byte", 1, 1, castTo(i8), "[x]", "Returns x as long does, within the range of Java's byte, else\n  :invalid-argument; NaN is 0, a char its code point." },
-    .{ "float", 1, 1, &fnFloat, "[x]", "Returns x as a double, within Java's float range, else\n  :invalid-argument. The one float type is 64-bit, so nothing is\n  rounded to single precision." },
-    .{ "char", 1, 1, &fnChar, "[x]", "Returns the char with the code point x; a char is itself. A value\n  that is not a Unicode scalar is :invalid-argument." },
+    .{ "long", 1, 1, &fnLong, .leaf, "[x]", "Returns x as an integer of any size: a float's integer part (NaN is\n  0, an infinity :invalid-argument), a char's code point." },
+    .{ "int", 1, 1, castTo(i32), .leaf, "[x]", "Returns x as long does, within the range of Java's int, else\n  :invalid-argument; NaN is 0, a char its code point." },
+    .{ "short", 1, 1, castTo(i16), .leaf, "[x]", "Returns x as long does, within the range of Java's short, else\n  :invalid-argument; NaN is 0, a char its code point." },
+    .{ "byte", 1, 1, castTo(i8), .leaf, "[x]", "Returns x as long does, within the range of Java's byte, else\n  :invalid-argument; NaN is 0, a char its code point." },
+    .{ "float", 1, 1, &fnFloat, .leaf, "[x]", "Returns x as a double, within Java's float range, else\n  :invalid-argument. The one float type is 64-bit, so nothing is\n  rounded to single precision." },
+    .{ "char", 1, 1, &fnChar, .leaf, "[x]", "Returns the char with the code point x; a char is itself. A value\n  that is not a Unicode scalar is :invalid-argument." },
     .{ "parse-long", 1, 1, &fnParseLong, "[s]", "Returns the integer s spells in full, an optional sign and ASCII\n  digits within 64 bits, else nil. A non-string is :kind-mismatch." },
     .{ "parse-double", 1, 1, &fnParseDouble, "[s]", "Returns the double s spells as Java's Double/valueOf reads it, else\n  nil. A non-string is :kind-mismatch." },
-    .{ "bit-and", 2, null, bind(bitFold, .@"and"), "[x y] [x y & more]", "Returns the bitwise and of the integers, as 64-bit two's\n  complement; an integer past 64 bits is :arithmetic-overflow." },
-    .{ "bit-or", 2, null, bind(bitFold, .@"or"), "[x y] [x y & more]", "Returns the bitwise or of the integers, as 64-bit two's complement;\n  an integer past 64 bits is :arithmetic-overflow." },
-    .{ "bit-xor", 2, null, bind(bitFold, .xor), "[x y] [x y & more]", "Returns the bitwise exclusive or of the integers, as 64-bit two's\n  complement; an integer past 64 bits is :arithmetic-overflow." },
-    .{ "bit-not", 1, 1, &fnBitNot, "[x]", "Returns the bitwise complement of x, as 64-bit two's complement." },
-    .{ "bit-shift-left", 2, 2, &fnBitShiftLeft, "[x n]", "Returns x shifted left n bits within 64 bits; n uses its low six\n  bits." },
-    .{ "bit-shift-right", 2, 2, &fnBitShiftRight, "[x n]", "Returns x shifted right n bits, keeping its sign; n uses its low six\n  bits." },
-    .{ "unsigned-bit-shift-right", 2, 2, &fnUnsignedBitShiftRight, "[x n]", "Returns x, as 64 unsigned bits, shifted right n bits with zeros\n  shifted in; n uses its low six bits." },
-    .{ "bit-test", 2, 2, &fnBitTest, "[x n]", "Returns true if bit n of x is set." },
-    .{ "bit-set", 2, 2, &fnBitSet, "[x n]", "Returns x with bit n set." },
-    .{ "bit-clear", 2, 2, &fnBitClear, "[x n]", "Returns x with bit n cleared." },
+    .{ "bit-and", 2, null, bind(bitFold, .@"and"), .leaf, "[x y] [x y & more]", "Returns the bitwise and of the integers, as 64-bit two's\n  complement; an integer past 64 bits is :arithmetic-overflow." },
+    .{ "bit-or", 2, null, bind(bitFold, .@"or"), .leaf, "[x y] [x y & more]", "Returns the bitwise or of the integers, as 64-bit two's complement;\n  an integer past 64 bits is :arithmetic-overflow." },
+    .{ "bit-xor", 2, null, bind(bitFold, .xor), .leaf, "[x y] [x y & more]", "Returns the bitwise exclusive or of the integers, as 64-bit two's\n  complement; an integer past 64 bits is :arithmetic-overflow." },
+    .{ "bit-not", 1, 1, &fnBitNot, .leaf, "[x]", "Returns the bitwise complement of x, as 64-bit two's complement." },
+    .{ "bit-shift-left", 2, 2, &fnBitShiftLeft, .leaf, "[x n]", "Returns x shifted left n bits within 64 bits; n uses its low six\n  bits." },
+    .{ "bit-shift-right", 2, 2, &fnBitShiftRight, .leaf, "[x n]", "Returns x shifted right n bits, keeping its sign; n uses its low six\n  bits." },
+    .{ "unsigned-bit-shift-right", 2, 2, &fnUnsignedBitShiftRight, .leaf, "[x n]", "Returns x, as 64 unsigned bits, shifted right n bits with zeros\n  shifted in; n uses its low six bits." },
+    .{ "bit-test", 2, 2, &fnBitTest, .leaf, "[x n]", "Returns true if bit n of x is set." },
+    .{ "bit-set", 2, 2, &fnBitSet, .leaf, "[x n]", "Returns x with bit n set." },
+    .{ "bit-clear", 2, 2, &fnBitClear, .leaf, "[x n]", "Returns x with bit n cleared." },
     .{ "rand", 0, 1, &fnRand, "[] [n]", "Returns a random double in [0, n), n defaulting to 1." },
     .{ "rand-int", 1, 1, &fnRandInt, "[n]", "Returns a random integer in [0, n), in (n, 0] for a negative n, 0\n  for 0." },
     .{ "format", 1, null, &fnFormat, "[fmt & args]", "Returns fmt with each % conversion replaced by the next arg, a subset\n  of Java's Formatter: %s, %d, %f, %x, %X, %c, %n and %%, with the -\n  and 0 flags, a width, and a precision for %s and %f. Anything else\n  is :invalid-argument; an arg of the wrong kind :kind-mismatch." },
-    .{ "double", 1, 1, &fnDouble, "[x]", "Returns the double nearest the number x." },
+    .{ "double", 1, 1, &fnDouble, .leaf, "[x]", "Returns the double nearest the number x." },
     .{ "max", 1, null, bind(extremum, true), .leaf, "[x] [x y] [x y & more]", "Returns the greatest of the nums; NaN if any is NaN." },
     .{ "min", 1, null, bind(extremum, false), .leaf, "[x] [x y] [x y & more]", "Returns the least of the nums; NaN if any is NaN." },
-    .{ "abs", 1, 1, &fnAbs, "[a]", "Returns the absolute value of a, a bignum past the fixnum range." },
-    .{ "number?", 1, 1, &fnNumberQ, "[x]", "Returns true if x is a number: an integer or a float." },
-    .{ "integer?", 1, 1, &fnIntegerQ, "[n]", "Returns true if n is an integer, a fixnum or a bignum." },
-    .{ "float?", 1, 1, kindIs(&.{.float}), "[n]", "Returns true if n is a float." },
-    .{ "NaN?", 1, 1, &fnNanQ, "[num]", "Returns true if num is NaN. A non-number is :kind-mismatch." },
-    .{ "infinite?", 1, 1, &fnInfiniteQ, "[num]", "Returns true if num is positive or negative infinity. A non-number\n  is :kind-mismatch." },
+    .{ "abs", 1, 1, &fnAbs, .leaf, "[a]", "Returns the absolute value of a, a bignum past the fixnum range." },
+    .{ "number?", 1, 1, &fnNumberQ, .leaf, "[x]", "Returns true if x is a number: an integer or a float." },
+    .{ "integer?", 1, 1, &fnIntegerQ, .leaf, "[n]", "Returns true if n is an integer, a fixnum or a bignum." },
+    .{ "float?", 1, 1, kindIs(&.{.float}), .leaf, "[n]", "Returns true if n is a float." },
+    .{ "NaN?", 1, 1, &fnNanQ, .leaf, "[num]", "Returns true if num is NaN. A non-number is :kind-mismatch." },
+    .{ "infinite?", 1, 1, &fnInfiniteQ, .leaf, "[num]", "Returns true if num is positive or negative infinity. A non-number\n  is :kind-mismatch." },
     .{ "not", 1, 1, &fnNot, .leaf, "[x]", "Returns true if x is nil or false, false otherwise." },
     .{ "zero?", 1, 1, bind(signIs, .eq), .leaf, "[num]", "Returns true if num is zero (-0.0 included); false for NaN." },
     .{ "pos?", 1, 1, bind(signIs, .gt), .leaf, "[num]", "Returns true if num is greater than zero; false for NaN." },
@@ -394,9 +394,9 @@ const core_rows = .{
     .{ "min-key", 2, null, bind(keyExtremum, false), "[k x] [k x y] [k x y & more]", "Returns the x for which (k x), a number, is least; a tie goes to the\n  later x. A lone x is returned without calling k." },
     .{ "select-keys", 2, 2, &fnSelectKeys, .consumes, "[map keyseq]", "Returns a map of the entries of map whose keys are in keyseq. Of a\n  vector, the keys are indices." },
     .{ "find", 2, 2, &fnFind, "[map key]", "Returns the [k v] entry of map for key, nil when absent; k is the key\n  as map holds it. Of a vector, key is an index." },
-    .{ "key", 1, 1, bind(entryPart, 0), "[e]", "Returns the key of the map entry e, a [k v] vector." },
-    .{ "val", 1, 1, bind(entryPart, 1), "[e]", "Returns the val of the map entry e, a [k v] vector." },
-    .{ "peek", 1, 1, &fnPeek, "[coll]", "Returns the last item of a vector or the first of a list; nil when\n  coll is nil or empty." },
+    .{ "key", 1, 1, bind(entryPart, 0), .leaf, "[e]", "Returns the key of the map entry e, a [k v] vector." },
+    .{ "val", 1, 1, bind(entryPart, 1), .leaf, "[e]", "Returns the val of the map entry e, a [k v] vector." },
+    .{ "peek", 1, 1, &fnPeek, .leaf, "[coll]", "Returns the last item of a vector or the first of a list; nil when\n  coll is nil or empty." },
     .{ "pop", 1, 1, &fnPop, "[coll]", "Returns a vector without its last item or a list without its first;\n  nil for nil. An empty coll is :index-out-of-bounds." },
     .{ "empty", 1, 1, &fnEmpty, "[coll]", "Returns an empty collection of coll's kind with coll's metadata; {}\n  for a record, nil for anything that is not a collection, a string\n  included. A typed vector is :kind-mismatch." },
     .{ "not-empty", 1, 1, &fnNotEmpty, "[coll]", "Returns coll, or nil when it has no items." },
@@ -417,7 +417,7 @@ const core_rows = .{
     .{ "ex-message", 1, 1, &fnExMessage, "[ex]", "Returns the :message of the map ex: an ex-info map's message, or a\n  caught runtime error's sentence (\"+ expects numbers, got a string\").\n  nil for anything that is not a map." },
     // Early exit from a fold.
     .{ "reduced", 1, 1, &fnReduced, "[x]", "Wraps x so that reduce, and the reductions built on it, stop and\n  return x; deref reads x back." },
-    .{ "reduced?", 1, 1, &fnReducedQ, "[x]", "Returns true if x is the result of a call to reduced." },
+    .{ "reduced?", 1, 1, &fnReducedQ, .leaf, "[x]", "Returns true if x is the result of a call to reduced." },
     // The compiler at run time.
     .{ "macroexpand-1", 1, 1, &fnMacroexpand1, "[form]", "Returns form after one macro expansion step when it is a macro call,\n  else form itself. Nothing inside the result is expanded." },
     .{ "macroexpand", 1, 1, &fnMacroexpand, "[form]", "Repeats macroexpand-1 on form until its head is not a macro and\n  returns it. Subforms are left alone." },
@@ -435,7 +435,7 @@ const core_rows = .{
     .{ "var-set", 2, 2, &fnVarSet, "[x val]", "Sets the binding in force of the dynamic Var x to val and returns\n  val; set! expands to it. :not-dynamic for a Var that is not dynamic,\n  :no-thread-binding when no binding of it is in force." },
     .{ "thread-bound?", 0, null, &fnThreadBoundQ, "[& vars]", "Returns true if a binding of each of the vars is in force; true when\n  given none." },
     .{ "alter-var-root", 2, null, &fnAlterVarRoot, "[v f & args]", "Sets the root of the Var v to (apply f root args) and returns it; a\n  binding in force is left alone. An unbound Var's root is nil to f." },
-    .{ "boolean", 1, 1, &fnBoolean, "[x]", "Returns false for nil and false, true for anything else." },
+    .{ "boolean", 1, 1, &fnBoolean, .leaf, "[x]", "Returns false for nil and false, true for anything else." },
     .{ "list?", 1, 1, kindIs(&.{.list}), .leaf, "[x]", "Returns true if x is a list. Unlike Clojure, a seq realized as a\n  list, such as (seq [1 2]) or (keys m), is one; a lazy seq is not." },
     .{ "seq?", 1, 1, kindPredicate(isSeq), .leaf, "[x]", "Returns true if x is a seq: a list or a lazy seq. A vector, map,\n  set or string is not, though seq of one is." },
     .{ "vector?", 1, 1, kindIs(&.{.persistent_vector}), .leaf, "[x]", "Returns true if x is a persistent vector, a map entry included; a\n  typed vector or a transient is not." },
@@ -451,7 +451,7 @@ const core_rows = .{
     .{ "fn?", 1, 1, kindPredicate(isFn), .leaf, "[x]", "Returns true if x is a function: a fn, a native function or a\n  protocol method. A callable keyword or collection is not (ifn?)." },
     .{ "ifn?", 1, 1, kindPredicate(isIfn), .leaf, "[x]", "Returns true if x can be called as a function: a function, a Var,\n  a keyword, a symbol, a vector, a map or set (hash or sorted), or a\n  transient." },
     .{ "counted?", 1, 1, kindPredicate(isCounted), .leaf, "[x]", "Returns true if x is a list, vector, map, set, record, typed vector\n  or transient; false of nil, a string and a lazy seq." },
-    .{ "delay?", 1, 1, &fnDelayQ, "[x]", "Returns true if x is a delay." },
+    .{ "delay?", 1, 1, &fnDelayQ, .leaf, "[x]", "Returns true if x is a delay." },
     // Lazy seqs (docs/LAZY.md).
     .{ "realized?", 1, 1, &fnRealizedQ, "[x]", "Returns true if x, a lazy seq, has run its body, or x, a delay,\n  has been forced; anything else is :kind-mismatch." },
     .{ "doall", 1, 2, &fnDoall, "[coll] [n coll]", "Walks coll, realizing a lazy seq (only its first n steps with n),\n  and returns coll itself." },
@@ -484,7 +484,7 @@ const core_rows = .{
     .{ "hash-set", 0, null, &fnHashSet, "[& keys]", "Returns a hash set of the keys." },
     .{ "set", 1, 1, &fnSet, "[coll]", "Returns a hash set of the elements of coll, any seqable; a set\n  comes back itself, without its metadata." },
     .{ "subvec", 2, 3, &fnSubvec, "[v start] [v start end]", "Returns a vector of the elements of v from start (inclusive) to end\n  (exclusive, the count by default); bounds outside 0..count, or\n  start past end, are :index-out-of-bounds." },
-    .{ "identical?", 2, 2, &fnIdenticalQ, "[x y]", "Returns true if x and y are the same value bit for bit: the same\n  immediate (a fixnum, float, char, keyword, ...) or the same heap\n  object." },
+    .{ "identical?", 2, 2, &fnIdenticalQ, .leaf, "[x y]", "Returns true if x and y are the same value bit for bit: the same\n  immediate (a fixnum, float, char, keyword, ...) or the same heap\n  object." },
     .{ "assoc", 3, null, &fnAssocLeaf, .leaf, &fnAssoc, "[map key val] [map key val & kvs]", "Returns map with each key mapped to its val. Of a vector, key is an\n  index up to the count (the count appends); nil makes a map." },
     .{ "dissoc", 1, null, &fnDissoc, "[map] [map key] [map key & ks]", "Returns map, a map or record, without the keys; nil gives nil." },
     .{ "get", 2, 3, &fnGetLeaf, .leaf, &fnGet, "[map key] [map key not-found]", "Returns the value mapped to key in map, else not-found (nil). A\n  vector or string takes an index; a value that is no collection has\n  no entries, so get never throws for the kind of map." },
@@ -517,13 +517,13 @@ const core_rows = .{
     .{ "i64-vector", 1, 1, &fnI64Vector, .consumes, "[coll]", "Returns an i64 typed vector of the integers in coll, any seqable; a\n  non-integer, or one beyond 64 bits, is :kind-mismatch." },
     .{ "f64-vector", 1, 1, &fnF64Vector, .consumes, "[coll]", "Returns an f64 typed vector of the numbers in coll, any seqable;\n  an integer widens to the nearest double." },
     .{ "typed-vector?", 1, 1, kindIs(&.{.typed_vector}), .leaf, "[x]", "Returns true if x is a typed vector, i64 or f64. A typed vector is\n  not vector?, coll? or sequential?, and is not callable." },
-    .{ "typed-vector-type", 1, 1, &fnTypedVectorType, "[tv]", "Returns :i64 or :f64, the element type of the typed vector tv." },
+    .{ "typed-vector-type", 1, 1, &fnTypedVectorType, .leaf, "[tv]", "Returns :i64 or :f64, the element type of the typed vector tv." },
     // Atoms: identity-valued in-memory mutable cells (docs/ATOM.md).
     // `deref` is `fnDbDeref`, which takes a var, atom, durable ref
     // or reduced; `db_natives` installs it again as `db/deref`.
     .{ "deref", 1, 1, &fnDbDeref, "[ref]", deref_doc },
     .{ "atom", 1, null, &fnAtom, "[x] [x & options]", "Returns an atom holding x. The options are :meta m, its metadata,\n  and :validator f, which every new value, x included, must satisfy\n  (else :invalid-reference-state)." },
-    .{ "atom?", 1, 1, kindIs(&.{.atom}), "[x]", "Returns true if x is an atom." },
+    .{ "atom?", 1, 1, kindIs(&.{.atom}), .leaf, "[x]", "Returns true if x is an atom." },
     .{ "reset!", 2, 2, &fnResetBang, "[atom newval]", "Sets the value of atom to newval once the validator accepts it,\n  runs the watches and returns newval." },
     .{ "swap!", 2, null, bind(swapImpl, false), "[atom f] [atom f x] [atom f x y] [atom f x y & args]", "Sets the value of atom to (apply f old-value args) and returns it.\n  f runs once, with no retry: changing atom from inside f is\n  :atom-re-entry, and a throw leaves atom unchanged." },
     .{ "swap-vals!", 2, null, bind(swapImpl, true), "[atom f] [atom f x] [atom f x y] [atom f x y & args]", "Swaps as swap! does and returns [old new]." },
@@ -537,7 +537,7 @@ const core_rows = .{
     // Core string ops. Indexing semantics are by Unicode scalar
     // (codepoint), NOT byte; see `docs/STDLIB.md` §2.
     .{ "str", 0, null, &fnStrLeaf, .leaf, &fnStr, "[] [x] [x & ys]", "Returns the text of the args concatenated: nil is empty, a string\n  or char is itself, anything else as pr-str prints it, so a string\n  inside a collection keeps its quotes." },
-    .{ "string?", 1, 1, kindIs(&.{.string}), "[x]", "Returns true if x is a string." },
+    .{ "string?", 1, 1, kindIs(&.{.string}), .leaf, "[x]", "Returns true if x is a string." },
     .{ "subs", 2, 3, &fnSubs, "[s start] [s start end]", "Returns the substring of s from start (inclusive) to end (exclusive,\n  the count by default), indexed by code point; bounds outside the\n  string, or start past end, are :index-out-of-bounds." },
     // Regular expressions (docs/REGEX.md §9); `re-seq` is core.nx's.
     .{ "re-pattern", 1, 1, &fnRePattern, "[s]", "Returns the pattern the string s compiles to; a pattern is itself.\n  Java's syntax without backreferences or lookaround, matched in\n  linear time; an invalid one throws :invalid-regex." },
@@ -896,71 +896,69 @@ fn countConsumed(vm: *VM, s: Value) VmError!usize {
     return n;
 }
 
-fn fnNth(vm: *VM, args: []const Value) VmError!Value {
-    const coll = args[0];
-    const idx_v = args[1];
-    const has_default = args.len > 2;
-    const default = if (has_default) args[2] else value_mod.nilValue();
-    if (idx_v.kind() != .fixnum) return VmError.KindMismatch;
-    // The receiver's kind is checked before the index's sign and the
-    // default: `(nth 123 -1 :d)` is `:kind-mismatch`.
-    switch (coll.kind()) {
-        .nil, .list, .persistent_vector, .typed_vector, .string => {},
-        .transient => if (coll.subkind() != transient_mod.subkind_transient_vector) return VmError.KindMismatch,
-        // Walking a lazy seq may run code: not in a leaf (VM.md §6).
-        .lazy_seq => return VmError.NeedsReentry,
-        else => return VmError.KindMismatch,
-    }
-    const idx = idx_v.asFixnum();
-    if (idx >= 0) {
-        const u_idx: usize = @intCast(idx);
-        // Each element is returned by a statement of its own, so it is
-        // stored where the caller reads it, not merged in a temporary
-        // and copied on (docs/VM.md §8).
-        switch (coll.kind()) {
-            .nil => return default,
-            .list => {
-                const at = list_mod.drop(coll, u_idx);
-                if (!list_mod.isEmpty(at)) return list_mod.head(at);
-            },
-            .persistent_vector => if (u_idx < vector_mod.count(coll)) return vector_mod.nth(coll, u_idx),
-            .transient => if (u_idx < try transientCount(vm, coll)) {
-                return transient_mod.vectorNthBang(coll, u_idx) catch |err| return transientFailure(vm, err);
-            },
-            .typed_vector => if (typed_vector_mod.nth(vm.ensureHeap(), coll, u_idx)) |x| {
-                return x;
-            } else |err| switch (err) {
-                error.IndexOutOfBounds => {},
-                error.OutOfMemory => return VmError.OutOfMemory,
-            },
-            // A string's char at code point `i`, indexed by Unicode
-            // scalar to match `(count s)`; malformed UTF-8 is
-            // `:utf8-error`.
-            .string => if (string_mod.codepointAt(coll, u_idx)) |scalar| {
-                const c = value_mod.fromChar(scalar) orelse return VmError.Utf8Error;
-                return c;
-            } else |err| switch (err) {
-                error.OutOfBounds => {},
-                error.InvalidUtf8 => return VmError.Utf8Error,
-            },
-            else => return VmError.KindMismatch,
+/// `nth` (`leaf`), and `nth` called other than as a leaf, which walks
+/// a lazy seq as far as the index (`seq.nthOf` computes an unrealized
+/// range's element).
+fn nthNative(comptime leaf: bool) Native {
+    return &struct {
+        fn call(vm: *VM, args: []const Value) VmError!Value {
+            const coll = args[0];
+            const idx_v = args[1];
+            const has_default = args.len > 2;
+            const default = if (has_default) args[2] else value_mod.nilValue();
+            if (idx_v.kind() != .fixnum) return VmError.KindMismatch;
+            const idx = idx_v.asFixnum();
+            // The receiver's kind is checked before the index's sign and
+            // the default: `(nth 123 -1 :d)` is `:kind-mismatch`.
+            switch (coll.kind()) {
+                .nil, .list, .persistent_vector, .typed_vector, .string => {},
+                .transient => if (coll.subkind() != transient_mod.subkind_transient_vector) return VmError.KindMismatch,
+                // Walking a lazy seq may run code: not in a leaf (VM.md §6).
+                .lazy_seq => {
+                    if (leaf) return VmError.NeedsReentry;
+                    const found = if (idx < 0) null else try seq_mod.nthOf(vm, coll, @intCast(idx));
+                    return found orelse if (has_default) default else VmError.IndexOutOfBounds;
+                },
+                else => return VmError.KindMismatch,
+            }
+            if (idx >= 0) {
+                const u_idx: usize = @intCast(idx);
+                // Each element is returned by a statement of its own, so
+                // it is stored where the caller reads it, not merged in a
+                // temporary and copied on (docs/VM.md §8).
+                switch (coll.kind()) {
+                    .nil => return default,
+                    .list => {
+                        const at = list_mod.drop(coll, u_idx);
+                        if (!list_mod.isEmpty(at)) return list_mod.head(at);
+                    },
+                    .persistent_vector => if (u_idx < vector_mod.count(coll)) return vector_mod.nth(coll, u_idx),
+                    .transient => if (u_idx < try transientCount(vm, coll)) {
+                        return transient_mod.vectorNthBang(coll, u_idx) catch |err| return transientFailure(vm, err);
+                    },
+                    .typed_vector => if (typed_vector_mod.nth(vm.ensureHeap(), coll, u_idx)) |x| {
+                        return x;
+                    } else |err| switch (err) {
+                        error.IndexOutOfBounds => {},
+                        error.OutOfMemory => return VmError.OutOfMemory,
+                    },
+                    // A string's char at code point `i`, indexed by Unicode
+                    // scalar to match `(count s)`; malformed UTF-8 is
+                    // `:utf8-error`.
+                    .string => if (string_mod.codepointAt(coll, u_idx)) |scalar| {
+                        const c = value_mod.fromChar(scalar) orelse return VmError.Utf8Error;
+                        return c;
+                    } else |err| switch (err) {
+                        error.OutOfBounds => {},
+                        error.InvalidUtf8 => return VmError.Utf8Error,
+                    },
+                    else => return VmError.KindMismatch,
+                }
+            }
+            if (has_default) return default;
+            return VmError.IndexOutOfBounds;
         }
-    }
-    if (has_default) return default;
-    return VmError.IndexOutOfBounds;
-}
-
-/// `nth` called other than as a leaf: a lazy seq is walked, realizing
-/// as far as the index; everything else is the leaf's.
-fn fnNthGeneral(vm: *VM, args: []const Value) VmError!Value {
-    const coll = args[0];
-    if (coll.kind() != .lazy_seq) return fnNth(vm, args);
-    // `seq.nthOf` computes an unrealized range's element.
-    if (args[1].kind() != .fixnum) return VmError.KindMismatch;
-    const has_default = args.len > 2;
-    const idx = args[1].asFixnum();
-    const found = if (idx < 0) null else try seq_mod.nthOf(vm, coll, @intCast(idx));
-    return found orelse if (has_default) args[2] else VmError.IndexOutOfBounds;
+    }.call;
 }
 
 fn fnEmptyQ(vm: *VM, args: []const Value) VmError!Value {
@@ -1627,23 +1625,23 @@ fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
     try scope.push(value_mod.nilValue());
     const heap = vm.ensureHeap();
     switch (p) {
-        .range => |r| {
-            const n = seq_mod.rangeCount(r.start, r.end, r.step);
-            var x = r.start;
-            var acc = init orelse blk: {
-                x += r.step;
-                break :blk value_mod.fromFixnum(r.start).?;
-            };
+        // A repeat of a count is a range of step 0.
+        inline .range, .repeat_n => |r, tag| {
+            const first, const step, const n: u64 = if (tag == .range)
+                .{ value_mod.fromFixnum(r.start).?, r.step, seq_mod.rangeCount(r.start, r.end, r.step) }
+            else
+                .{ r.x, 0, @intCast(r.n) };
+            var acc = init orelse first;
             var i: u64 = if (init == null) 1 else 0;
             // The calls in batches over the elements left (VM.md §6),
             // which stop after a record.
             while (i < n) {
                 vm.roots.items[scope.base] = acc;
-                const folded = try cb.foldRange(acc, value_mod.fromFixnum(x).?, r.step, @intCast(n - i));
+                const x = if (tag == .range) value_mod.fromFixnum(r.start + step * @as(i64, @intCast(i))).? else first;
+                const folded = try cb.foldRange(acc, x, step, @intCast(n - i));
                 acc = folded.acc;
                 if (isReduced(vm, acc)) return reducedValue(acc);
                 i += folded.used;
-                x += r.step * @as(i64, @intCast(folded.used));
             }
             return acc;
         },
@@ -1673,18 +1671,6 @@ fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
                 acc = try cb.call2(acc, x);
                 if (isReduced(vm, acc)) return reducedValue(acc);
             }
-        },
-        .repeat_n => |r| {
-            var acc = init orelse r.x;
-            var i: i64 = if (init == null) 1 else 0;
-            while (i < r.n) {
-                vm.roots.items[scope.base] = acc;
-                const folded = try cb.foldRange(acc, r.x, 0, @intCast(r.n - i));
-                acc = folded.acc;
-                if (isReduced(vm, acc)) return reducedValue(acc);
-                i += @intCast(folded.used);
-            }
-            return acc;
         },
         // `x` and its successor wait in a second root slot while `f`
         // runs, as `Iterate.reduce` walks.
@@ -4089,9 +4075,9 @@ fn fnMmLookup(vm: *VM, args: []const Value) VmError!Value {
         else => return VmError.KindMismatch,
     };
     const pair = atom_mod.getValue(args[0]);
-    const cached = try fnNth(vm, &.{ pair, value_mod.fromFixnum(0).? });
+    const cached = try nthNative(false)(vm, &.{ pair, value_mod.fromFixnum(0).? });
     if (cached.tag != h.tag or cached.payload != h.payload) return value_mod.nilValue();
-    return fnGet(vm, &.{ try fnNth(vm, &.{ pair, value_mod.fromFixnum(1).? }), args[2] });
+    return fnGet(vm, &.{ try nthNative(false)(vm, &.{ pair, value_mod.fromFixnum(1).? }), args[2] });
 }
 
 /// `#%mm-lookup` as a leaf: it refuses a dispatch value on the heap,
