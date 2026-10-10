@@ -34,10 +34,15 @@
      (reduce intersection (first bubbled) (rest bubbled)))))
 
 (defn difference
-  "Returns the set s without the elements of any of the sets. s must
-  be a set, else :kind-mismatch."
-  [s & sets]
-  (reduce (fn [acc t] (reduce disj acc t)) s sets))
+  "Returns the set s1 without the elements of any of the other sets,
+  walking the smaller of each pair. s1 must be a set, else
+  :kind-mismatch."
+  ([s1] s1)
+  ([s1 s2]
+   (if (< (count s1) (count s2))
+     (reduce (fn [result item] (if (contains? s2 item) (disj result item) result)) s1 s1)
+     (reduce disj s1 s2)))
+  ([s1 s2 & sets] (reduce difference s1 (conj sets s2))))
 
 (defn subset?
   "Returns true if every element of a is in b."

@@ -8,12 +8,10 @@
 //! targets as pcs, and the span table (VM.md §5) as `; line:col`
 //! annotations where the span changes.
 //!
-//! The opcode names live in the tables below, one per dispatched
-//! group, indexed by variant number. A test walks every variant
-//! enum `vm.zig` defines and fails when a variant has no name here,
-//! so an opcode cannot be added without one. The decoders are the
-//! VM's own (`Inst`, `Operand`, `Group`); nothing here is consulted
-//! while instructions execute.
+//! The opcode names are the tags of `vm.zig`'s group and variant
+//! enums, and what each operand is comes from the verifier's
+//! `Routine.shapeOf`, so a new opcode needs nothing here. Nothing here
+//! is consulted while instructions execute.
 
 const std = @import("std");
 const vm = @import("vm.zig");
@@ -31,76 +29,43 @@ const Writer = std.Io.Writer;
 // Names
 // =============================================================================
 
-/// Every group of VM.md §10 by number. A group the VM does not
-/// dispatch still has a name so its instructions disassemble.
-const group_names = [_][]const u8{
-    "jump", "cmp", "math", "mov", "call", "closure", "var", "coll", "transient", "hash", "tx", "ctrl", "io", "simd",
-};
-
-const jump_names = [_]?[]const u8{ "jmp", "if-true", "if-false" };
-const cmp_names = [_]?[]const u8{ "lt", "lte", "gt", "gte", "eq-num" };
-const math_names = [_]?[]const u8{ "add", "sub", "mul", "div", "idiv", "mod", "pow", "neg", "abs" };
-const mov_names = [_]?[]const u8{ "move", "load-const", "load-nil", "load-true", "load-false", "move-clear" };
-const call_names = [_]?[]const u8{ "call", "tailcall", "return", "return-nil", "self", "lookup", "lookup-or" };
-const closure_names = [_]?[]const u8{ "make", "box-local", "new-cell", "init-cell", "get-cell" };
-const var_names = [_]?[]const u8{ "load-var", "store-var", "var-object" };
-const coll_names = [_]?[]const u8{ "list", "concat", "vector", "map", "set" };
-const ctrl_names = [_]?[]const u8{ "try-enter", "try-exit", "finally-exit", "throw", null, "halt" };
-
 /// The name of group number `group`, or null for a number outside
 /// VM.md §10.
 fn groupName(group: u6) ?[]const u8 {
-    if (group >= group_names.len) return null;
-    return group_names[group];
+    return tagName(vm.Group, group);
 }
 
 /// The name of `variant` within `group`, or null when the group
 /// defines no such variant.
 fn variantName(group: vm.Group, variant: u6) ?[]const u8 {
-    const table: []const ?[]const u8 = switch (group) {
-        .jump => &jump_names,
-        .cmp => &cmp_names,
-        .math => &math_names,
-        .mov => &mov_names,
-        .call => &call_names,
-        .closure => &closure_names,
-        .var_ => &var_names,
-        .coll => &coll_names,
-        .ctrl => &ctrl_names,
-        .transient, .hash, .tx, .io, .simd => &.{},
-        _ => &.{},
-    };
-    if (variant >= table.len) return null;
-    return table[variant];
-}
-
-/// Whether operand B of an instruction is a raw immediate (VM.md
-/// §4.5): an argument count whose kind bits the handler ignores.
-fn immediateB(group: vm.Group, variant: u6) bool {
     return switch (group) {
-        .call => variant == @backingInt(vm.Call.call) or variant == @backingInt(vm.Call.tailcall) or variant == @backingInt(vm.Call.self_),
-        .coll => true,
-        else => false,
-    };
-}
-
-/// What an instruction's wide field names (VM.md §3), or null when
-/// it has operands B and C instead.
-const Wide = enum { pc, constant, var_, capture, try_ };
-
-fn wideField(group: vm.Group, variant: u6) ?Wide {
-    return switch (group) {
-        .jump => .pc,
-        .ctrl => switch (@as(vm.CtrlOp, @fromBackingInt(@intCast(variant)))) {
-            .try_enter => .try_,
-            .try_exit => .pc,
-            else => null,
-        },
-        .mov => if (variant == @backingInt(vm.Mov.load_const)) .constant else null,
-        .var_ => .var_,
-        .closure => if (variant == @backingInt(vm.Closure_.make)) .capture else null,
+        .jump => tagName(vm.Jump, variant),
+        .cmp => tagName(vm.Cmp, variant),
+        .math => tagName(vm.Math, variant),
+        .mov => tagName(vm.Mov, variant),
+        .call => tagName(vm.Call, variant),
+        .closure => tagName(vm.Closure_, variant),
+        .var_ => tagName(vm.VarOp, variant),
+        .coll => tagName(vm.CollOp, variant),
+        .ctrl => tagName(vm.CtrlOp, variant),
         else => null,
     };
+}
+
+/// The tag of `E` numbered `n` as bytecode spells it: `-` for `_`,
+/// without a trailing `_` (`eq-num`, `self`, `var`).
+fn tagName(comptime E: type, n: u6) ?[]const u8 {
+    const info = @typeInfo(E).@"enum";
+    inline for (info.field_names, info.field_values) |name, value| if (value == n) return comptime spelled(name);
+    return null;
+}
+
+fn spelled(comptime tag: []const u8) []const u8 {
+    const trimmed = std.mem.trimEnd(u8, tag, "_");
+    var buf: [trimmed.len]u8 = trimmed[0..trimmed.len].*;
+    std.mem.replaceScalar(u8, &buf, '_', '-');
+    const name = buf;
+    return &name;
 }
 
 // =============================================================================
@@ -156,14 +121,13 @@ fn disassembleRoutine(routine: *const vm.Routine, interner: ?*const intern_mod.I
         try writer.print("  {d:0>4}  ", .{pc});
         try writeOpcode(inst, writer);
         try writer.writeAll("  ");
-        const group: vm.Group = @fromBackingInt(@intCast(inst.group));
-        const variant = if (quickOf(inst)) |q| q.base else inst.variant;
+        const shape = vm.Routine.shapeOf(vm.VM.opIndex(inst)) orelse vm.Routine.Shape{};
         try writeOperand(inst.a, routine, interner, false, writer);
         try writer.writeAll("  ");
-        if (wideField(group, variant)) |wide| {
+        if (shape.wide) |wide| {
             try writeWide(wide, inst.wide(), routine, interner, writer);
         } else {
-            try writeOperand(inst.b, routine, interner, immediateB(group, variant), writer);
+            try writeOperand(inst.b, routine, interner, shape.b == .raw, writer);
             try writer.writeAll("  ");
             try writeOperand(inst.c, routine, interner, false, writer);
         }
@@ -181,11 +145,6 @@ fn disassembleRoutine(routine: *const vm.Routine, interner: ?*const intern_mod.I
         }
         try writer.writeAll("\n");
     }
-}
-
-/// The quickened variant `inst` carries (VM.md §10.10), if any.
-fn quickOf(inst: vm.Inst) ?vm.Quick {
-    return vm.Quick.of(@as(u12, inst.group) | @as(u12, inst.variant) << 6);
 }
 
 /// What a quickened variant's name adds to its base's: the operand
@@ -220,10 +179,7 @@ fn formSuffix(q: vm.Quick) []const u8 {
 /// variant prints its number after `?`.
 fn writeOpcode(inst: vm.Inst, writer: *Writer) Writer.Error!void {
     var buf: [32]u8 = undefined;
-    const text = opcodeName(@as(u12, inst.group) | @as(u12, inst.variant) << 6, &buf);
-    try writer.writeAll(text);
-    var pad: usize = text.len;
-    while (pad < 18) : (pad += 1) try writer.writeAll(" ");
+    try writer.print("{s: <18}", .{opcodeName(vm.VM.opIndex(inst), &buf)});
 }
 
 /// The name of the opcode at index `op` (group | variant << 6), in
@@ -256,7 +212,7 @@ pub fn opcodeName(op: u12, buf: []u8) []const u8 {
 /// capture descriptor as `#N<routine NAME>[...]` with where each
 /// captured cell comes from, `sN` for a cell in this frame's slot N
 /// and `uN` for this closure's upvalue N (VM.md §6).
-fn writeWide(wide: Wide, w: u32, routine: *const vm.Routine, interner: ?*const intern_mod.Interner, writer: *Writer) Writer.Error!void {
+fn writeWide(wide: vm.Routine.WideRole, w: u32, routine: *const vm.Routine, interner: ?*const intern_mod.Interner, writer: *Writer) Writer.Error!void {
     switch (wide) {
         .pc => try writer.print("j{d:0>4}", .{w}),
         .constant => try writeConst(w, routine, interner, writer),
@@ -366,45 +322,14 @@ fn writeConstant(v: value_mod.Value, interner: ?*const intern_mod.Interner, writ
 
 const testing = std.testing;
 
-test "every group the VM defines has a name" {
-    for (std.meta.tags(vm.Group)) |g| {
-        const name = groupName(@backingInt(g)) orelse return error.TestFailed;
-        // `var_` is spelled `var` in bytecode listings; every other
-        // group name is its tag.
-        const expected = if (g == .var_) "var" else @tagName(g);
-        try testing.expectEqualStrings(expected, name);
-    }
-    try testing.expect(groupName(group_names.len) == null);
-}
-
-/// Every named variant of each dispatched group's enum has a name,
-/// and the tables name nothing the enums do not define.
-fn expectVariantsNamed(comptime E: type, group: vm.Group) !void {
-    var highest: u6 = 0;
-    for (std.meta.tags(E)) |e| {
-        const v: u6 = @intCast(@backingInt(e));
-        try testing.expect(variantName(group, v) != null);
-        if (v > highest) highest = v;
-    }
-    var v: u6 = 0;
-    while (v <= highest) : (v += 1) {
-        const defined = std.enums.tagName(E, @as(E, @fromBackingInt(@intCast(v)))) != null;
-        try testing.expectEqual(defined, variantName(group, v) != null);
-    }
-    try testing.expect(variantName(group, highest + 1) == null);
-}
-
-test "every variant of every dispatched group has a name, and nothing else does" {
-    try expectVariantsNamed(vm.Jump, .jump);
-    try expectVariantsNamed(vm.Cmp, .cmp);
-    try expectVariantsNamed(vm.Math, .math);
-    try expectVariantsNamed(vm.Mov, .mov);
-    try expectVariantsNamed(vm.Call, .call);
-    try expectVariantsNamed(vm.Closure_, .closure);
-    try expectVariantsNamed(vm.VarOp, .var_);
-    try expectVariantsNamed(vm.CollOp, .coll);
-    try expectVariantsNamed(vm.CtrlOp, .ctrl);
-    try testing.expect(variantName(.transient, 0) == null);
+test "every group and variant is named as bytecode spells it" {
+    try testing.expectEqualStrings("var", groupName(@backingInt(vm.Group.var_)).?);
+    try testing.expect(groupName(14) == null);
+    try testing.expectEqualStrings("eq-num", variantName(.cmp, @backingInt(vm.Cmp.eq_num)).?);
+    try testing.expectEqualStrings("return", variantName(.call, @backingInt(vm.Call.@"return")).?);
+    try testing.expectEqualStrings("self", variantName(.call, @backingInt(vm.Call.self_)).?);
+    try testing.expectEqualStrings("halt", variantName(.ctrl, @backingInt(vm.CtrlOp.halt_)).?);
+    try testing.expect(variantName(.ctrl, 4) == null);
     try testing.expect(variantName(.simd, 0) == null);
 }
 

@@ -7,24 +7,22 @@
 //!     fixed for the file's life.
 //!   - All twelve trees are opened at open and their `TreeId`s are
 //!     cached for the store's life (tree registration is the only
-//!     non-thread-safe engine call). A complete store opens in a read
-//!     transaction; a write transaction creates a tree absent from the
-//!     file, so a store written without one gains it.
+//!     non-thread-safe engine call). A store opens in a read
+//!     transaction; a write transaction runs only to create the trees
+//!     of a file that holds none and bootstrap them, all in one commit,
+//!     so a file holding some of them, or the trees without their
+//!     header, is `error.Corrupted`.
 //!   - Every store and `db/*` connection of one file in this process
 //!     shares the file's one environment (`db.StoreFile`), so a second
 //!     writer is `error.WriterActive`, never a wait on this process's own
 //!     writer lock.
 //!   - `sys["t"]` is the last committed logical transaction number and
 //!     commits atomically with the datoms it counts.
-//!   - Bootstrap ids are fixed (`boot`): a store created by any build has
-//!     `:db/ident` at 1, `:db.unique/value` at 21 and `:db/fulltext` at
-//!     22, and a reopened store reads the same ids back from the file. A
-//!     store whose idents lack `:db/fulltext` receives it at open, minted
-//!     at the store's next ident id in a transaction of its own, and the
-//!     id it took is `fulltext_aid`.
+//!   - Bootstrap ids are fixed (`boot`): every store has `:db/ident` at
+//!     1, `:db.unique/value` at 21 and `:db/fulltext` at 22.
 //!   - A current fact's latest assertion lives in the current trees
-//!     alone, whose values are `[t:6]`, `nx/eavt`'s followed by an
-//!     out-of-line value's payload. The history trees hold every other
+//!     alone, whose values are its `t` as a LEB128, `nx/eavt`'s
+//!     followed by an out-of-line value's payload. The history trees hold every other
 //!     row (H1: a fact's history rows alternate assertion and
 //!     retraction, and end with a retraction); their values are empty
 //!     but on an `nx/eavt-h` assertion row of an out-of-line value,
@@ -108,13 +106,8 @@ pub const SyncMode = enum {
 };
 
 pub const Options = struct {
-    /// How the commit that creates, bootstraps or completes the store
-    /// syncs.
+    /// How the commit that creates and bootstraps the store syncs.
     sync: SyncMode = .full,
-    /// False leaves `:db/fulltext` out of the bootstrap, making a store
-    /// as one written without the attribute, for the test of its mint
-    /// at open.
-    fulltext_attr: bool = true,
     /// Given the format of a store refused as another format's
     /// (`error.Format`).
     refused_format: ?*u16 = null,
@@ -150,7 +143,6 @@ pub const boot = struct {
     // Unique idents.
     pub const unique_identity: u32 = 20;
     pub const unique_value: u32 = 21;
-    /// The `:db/fulltext` attribute, in a store bootstrapped with it.
     pub const fulltext: u32 = 22;
     /// First id minted after bootstrap.
     pub const next_aid: u32 = 23;
@@ -182,9 +174,6 @@ pub const boot = struct {
         .{ .id = unique_value, .name = "db.unique/value" },
         .{ .id = fulltext, .name = "db/fulltext" },
     };
-    /// The idents through `unique_value`: the bootstrap without
-    /// `:db/fulltext`.
-    pub const idents_without_fulltext = idents[0 .. idents.len - 1];
     /// The idents that are entities without a value type: the
     /// `:db.type/*`, `:db.cardinality/*` and `:db.unique/*`
     /// enumerations, each bootstrapped by its `:db/ident` datom alone.
@@ -208,18 +197,12 @@ pub const boot = struct {
         .{ .id = tx_instant, .type_ident = type_instant, .indexed = true },
         .{ .id = fulltext, .type_ident = type_boolean },
     };
-    /// The ident and attribute datoms of `:db/fulltext`.
-    pub const fulltext_attr: Attr = attrs[attrs.len - 1];
-    /// The attributes through `:db/txInstant`: the bootstrap without
-    /// `:db/fulltext`.
-    pub const attrs_without_fulltext = attrs[0 .. attrs.len - 1];
 
     comptime {
         // The txlog codec rebuilds a transaction's instant datom.
         std.debug.assert(tx_instant == datom_mod.tx_instant_attr);
         // `idents[i]` carries id `i + 1`, so the enumerations slice by id.
         for (idents, 1..) |id, i| std.debug.assert(id.id == i);
-        std.debug.assert(fulltext_attr.id == fulltext);
         std.debug.assert(enum_idents[0].id == type_long and enum_idents[enum_idents.len - 1].id == unique_value);
     }
 
@@ -245,11 +228,8 @@ pub const boot = struct {
 // =============================================================================
 
 /// The case folding `nx/fulltext` rows are written under (fulltext.zig
-/// `fold`); 1, folding ASCII only, is what a store without a stamp
-/// holds.
+/// `fold`), part of the format (NEXTOMIC.md §2.3 `"ft"`).
 pub const fulltext_fold: u8 = 3;
-
-pub const FulltextStamp = struct { fold: u8, t: u64 };
 
 pub const Store = struct {
     allocator: Allocator,
@@ -258,39 +238,41 @@ pub const Store = struct {
     file: *db_layer.StoreFile,
     trees: Trees,
     uuid: [16]u8,
-    /// The id of the `:db/fulltext` attribute in this store.
-    fulltext_aid: u32,
 
-    /// Open or create the store at `path`. The store is heap-allocated
-    /// so it never moves while transactions reference it. A store that
-    /// has every tree, its header and `:db/fulltext` opens in a read
-    /// transaction alone; a write transaction runs only to create,
-    /// bootstrap or complete one. A file this process may not write
-    /// opens read-only.
+    /// Open the store at `path`, creating and bootstrapping it in a
+    /// file that holds none of its trees. The store is heap-allocated
+    /// so it never moves while transactions reference it. A store opens
+    /// in a read transaction alone, so a file this process may not
+    /// write opens read-only.
     pub fn open(allocator: Allocator, path: [*:0]const u8, options: Options) !*Store {
         const self = try allocator.create(Store);
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
-            .file = try db_layer.StoreFile.acquire(path, .{ .allocator = allocator }),
+            .file = try db_layer.StoreFile.acquire(path, allocator),
             .trees = undefined,
             .uuid = @splat(0),
-            .fulltext_aid = boot.fulltext,
         };
         errdefer self.file.release();
 
-        if (!try self.openComplete(options.refused_format)) {
-            const txn = try self.file.beginWrite(.{ .sync = options.sync.override() });
-            errdefer txn.abort();
-            try self.openTrees(txn);
-            if (try self.sysGet(txn, "format")) |_| {
+        {
+            const txn = try self.file.env.beginRead();
+            defer txn.abort();
+            if (try self.findTrees(txn)) {
                 try self.readHeader(txn, options.refused_format);
-                try self.ensureFulltextAttr(txn);
-            } else {
-                try self.bootstrap(txn, options.fulltext_attr);
+                return self;
             }
-            try self.file.commit(txn);
         }
+        const txn = try self.file.beginWrite(.{ .sync = options.sync.override() });
+        errdefer txn.abort();
+        // Another process may have bootstrapped the file since the read.
+        if (try self.findTrees(txn)) {
+            try self.readHeader(txn, options.refused_format);
+        } else {
+            try self.createTrees(txn);
+            try self.bootstrap(txn);
+        }
+        try self.file.commit(txn);
         return self;
     }
 
@@ -301,26 +283,26 @@ pub const Store = struct {
         self.allocator.destroy(self);
     }
 
-    /// Open the trees, header and `:db/fulltext` id of a complete store
-    /// in a read transaction; false when anything is missing.
-    fn openComplete(self: *Store, refused_format: ?*u16) !bool {
-        const txn = try self.file.env.beginRead();
-        defer txn.abort();
+    /// Open the twelve trees in `txn`: true when the file holds all of
+    /// them, false when it holds none. Bootstrap creates all twelve in
+    /// one commit, so a file holding some is `error.Corrupted`.
+    fn findTrees(self: *Store, txn: *Txn) !bool {
         var ids: [tree_names.len]TreeId = undefined;
-        for (tree_names, 0..) |name, i| {
-            ids[i] = txn.openTree(name, false) catch |err| switch (err) {
-                error.NotFound => return false,
+        var found: usize = 0;
+        for (tree_names, &ids) |name, *id| {
+            id.* = txn.openTree(name, false) catch |err| switch (err) {
+                error.NotFound => continue,
                 else => return err,
             };
+            found += 1;
         }
+        if (found == 0) return false;
+        if (found < ids.len) return error.Corrupted;
         self.setTrees(ids);
-        if ((try self.sysGet(txn, "format")) == null) return false;
-        try self.readHeader(txn, refused_format);
-        self.fulltext_aid = (try self.identIdByName(txn, "db/fulltext")) orelse return false;
         return true;
     }
 
-    fn openTrees(self: *Store, txn: *Txn) !void {
+    fn createTrees(self: *Store, txn: *Txn) !void {
         var ids: [tree_names.len]TreeId = undefined;
         for (tree_names, 0..) |name, i| {
             ids[i] = try txn.openTree(name, true);
@@ -367,14 +349,6 @@ pub const Store = struct {
         return self.file.env.beginRead();
     }
 
-    /// Begin a read-only child of the open write transaction `parent`,
-    /// seeing its uncommitted state. The parent refuses mutations and
-    /// commit until the child is finished.
-    pub fn beginReadChild(self: *Store, parent: *Txn) !*Txn {
-        _ = self;
-        return parent.beginReadChild();
-    }
-
     /// Begin the write transaction: `error.WriterActive` while any store
     /// or `db/*` connection of the file holds it
     /// (`db.StoreFile.beginWrite`).
@@ -410,8 +384,11 @@ pub const Store = struct {
         try txn.putInTree(self.trees.sys, name, bytes);
     }
 
-    fn sysGetInt(self: *Store, txn: *Txn, name: []const u8, comptime width: usize) !u64 {
-        const raw = (try self.sysGet(txn, name)) orelse return error.Corrupted;
+    /// The big-endian integer `sys` holds under `name` in `width`
+    /// bytes, or `absent` when it holds none; absent with no default,
+    /// or of another width, it is `error.Corrupted`.
+    fn sysGetInt(self: *Store, txn: *Txn, name: []const u8, comptime width: usize, absent: ?u64) !u64 {
+        const raw = (try self.sysGet(txn, name)) orelse return absent orelse error.Corrupted;
         if (raw.len != width) return error.Corrupted;
         return std.mem.readInt(@Int(.unsigned, width * 8), raw[0..width], .big);
     }
@@ -424,7 +401,7 @@ pub const Store = struct {
 
     /// Last committed logical transaction number.
     pub fn readT(self: *Store, txn: *Txn) !u64 {
-        const t = try self.sysGetInt(txn, "t", 6);
+        const t = try self.sysGetInt(txn, "t", 6, null);
         return if (t >= key.tx_partition_bit) error.Corrupted else t;
     }
 
@@ -434,7 +411,7 @@ pub const Store = struct {
 
     /// Next user entity id.
     pub fn readNextEid(self: *Store, txn: *Txn) !u64 {
-        const eid = try self.sysGetInt(txn, "eid", 6);
+        const eid = try self.sysGetInt(txn, "eid", 6, null);
         return if (eid < key.user_partition_start or eid > key.user_partition_end) error.Corrupted else eid;
     }
 
@@ -442,10 +419,11 @@ pub const Store = struct {
         try self.sysPutInt(txn, "eid", 6, eid);
     }
 
-    /// Next attribute / ident id.
+    /// Next attribute / ident id: past the bootstrap's, which an id
+    /// minted again would collide with.
     pub fn readNextAid(self: *Store, txn: *Txn) !u32 {
-        const aid = try self.sysGetInt(txn, "aid", 4);
-        return if (aid == 0) error.Corrupted else @intCast(aid);
+        const aid = try self.sysGetInt(txn, "aid", 4, null);
+        return if (aid < boot.next_aid) error.Corrupted else @intCast(aid);
     }
 
     pub fn writeNextAid(self: *Store, txn: *Txn, aid: u32) !void {
@@ -461,19 +439,13 @@ pub const Store = struct {
 
     /// Number of current datoms of attribute `a` (AEVT entries).
     pub fn attrCount(self: *Store, txn: *Txn, a: u32) !u64 {
-        const k = countKey(a);
-        const raw = (try self.sysGet(txn, &k)) orelse return 0;
-        if (raw.len != 8) return error.Corrupted;
+        const n = try self.sysGetInt(txn, &countKey(a), 8, 0);
         // No attribute holds more current datoms than there are ids.
-        const n = std.mem.readInt(u64, raw[0..8], .big);
         return if (n > key.id_max) error.Corrupted else n;
     }
 
     pub fn writeAttrCount(self: *Store, txn: *Txn, a: u32, n: u64) !void {
-        const k = countKey(a);
-        var buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &buf, n, .big);
-        try self.sysPut(txn, &k, &buf);
+        try self.sysPutInt(txn, &countKey(a), 8, n);
     }
 
     // ── idents ────────────────────────────────────────────────────
@@ -501,7 +473,7 @@ pub const Store = struct {
 
     pub fn identNameById(self: *Store, txn: *Txn, id: u32) !?[]const u8 {
         var k: [1 + key.attr_len]u8 = undefined;
-        k[0] = 0x01;
+        k[0] = ident_by_id;
         key.writeAttr(k[1..], id);
         return txn.getFromTree(self.trees.idents, &k);
     }
@@ -560,25 +532,17 @@ pub const Store = struct {
     /// may have moved. Absent in a store with no renames, which reads
     /// as 0.
     pub fn readIdentGen(self: *Store, txn: *Txn) !u64 {
-        const raw = (try self.sysGet(txn, "ig")) orelse return 0;
-        if (raw.len != 8) return error.Corrupted;
-        return std.mem.readInt(u64, raw[0..8], .big);
+        return self.sysGetInt(txn, "ig", 8, 0);
     }
 
     fn writeIdentGen(self: *Store, txn: *Txn, gen: u64) !void {
         try self.sysPutInt(txn, "ig", 8, gen);
     }
 
-    /// The `nx/fulltext` stamp: the folding its rows were written under
-    /// and the `t` they are current at; null when absent (rows that
-    /// fold ASCII only).
-    pub fn readFulltextStamp(self: *Store, txn: *Txn) !?FulltextStamp {
-        const raw = (try self.sysGet(txn, "ft")) orelse return null;
-        if (raw.len != 1 + key.id_len) return error.Corrupted;
-        return .{ .fold = raw[0], .t = try key.readT(raw[1..][0..key.id_len]) };
-    }
-
-    /// Stamp the rows current at `t` under `fulltext_fold`.
+    /// Stamp the `nx/fulltext` rows current at `t` under
+    /// `fulltext_fold`. Nothing reads the stamp: every store this build
+    /// opens writes its rows in the same commit as their values, under
+    /// this folding, so it is the format's bytes alone (NEXTOMIC.md §2.3).
     pub fn writeFulltextStamp(self: *Store, txn: *Txn, t: u64) !void {
         var buf: [1 + key.id_len]u8 = undefined;
         buf[0] = fulltext_fold;
@@ -586,18 +550,10 @@ pub const Store = struct {
         try self.sysPut(txn, "ft", &buf);
     }
 
-    /// Whether the rows are this build's folding, current at `t`.
-    pub fn fulltextFresh(self: *Store, txn: *Txn, t: u64) !bool {
-        const stamp = (try self.readFulltextStamp(txn)) orelse return false;
-        return stamp.fold == fulltext_fold and stamp.t == t;
-    }
-
     /// Schema generation: bumped by every transaction that writes a
     /// datom on an attribute-partition entity; absent reads as 0.
     pub fn readSchemaGen(self: *Store, txn: *Txn) !u64 {
-        const raw = (try self.sysGet(txn, "sg")) orelse return 0;
-        if (raw.len != 8) return error.Corrupted;
-        return std.mem.readInt(u64, raw[0..8], .big);
+        return self.sysGetInt(txn, "sg", 8, 0);
     }
 
     pub fn bumpSchemaGen(self: *Store, txn: *Txn) !void {
@@ -608,13 +564,13 @@ pub const Store = struct {
 
     pub fn putTxlog(self: *Store, txn: *Txn, t: u64, bytes: []const u8) !void {
         var buf: [key.ordered_max]u8 = undefined;
-        try txn.putInTree(self.trees.txlog, key.writeTxlogKey(&buf, t), bytes);
+        try txn.putInTree(self.trees.txlog, key.writeOrdered(&buf, t), bytes);
     }
 
     /// The full entry (multi-page values are assembled).
     pub fn getTxlog(self: *Store, txn: *Txn, t: u64) !?[]const u8 {
         var buf: [key.ordered_max]u8 = undefined;
-        return txn.getFromTree(self.trees.txlog, key.writeTxlogKey(&buf, t));
+        return txn.getFromTree(self.trees.txlog, key.writeOrdered(&buf, t));
     }
 
     // ── datoms ────────────────────────────────────────────────────
@@ -648,6 +604,10 @@ pub const Store = struct {
     /// reads what the history passes write. Scratch lives in `arena`.
     pub fn writeBatch(self: *Store, txn: *Txn, t: u64, batch: []const Prepared, arena: Allocator) !void {
         if (batch.len == 0) return;
+        // Only a retraction writes a history tree.
+        const retracts = for (batch) |p| {
+            if (!p.added) break true;
+        } else false;
         // The keys of one index, packed end to end and reused for the
         // next; an index a datom is absent from gets an empty key.
         var total: usize = 0;
@@ -679,7 +639,7 @@ pub const Store = struct {
             }
             const w: TreeWrite = .{ .index = index, .t = t, .batch = batch, .keys = packed_keys, .sorted = sorted[0..n], .priors = priors };
             try self.writeTree(txn, w, false, arena);
-            try self.writeTree(txn, w, true, arena);
+            if (retracts) try self.writeTree(txn, w, true, arena);
         }
     }
 
@@ -779,12 +739,8 @@ pub const Store = struct {
     /// into `arena`: its current EAVT value after `t`; null when the
     /// fact is not current.
     pub fn currentPayload(self: *Store, txn: *Txn, e: u64, a: u32, vbytes: []const u8, arena: Allocator) !?[]const u8 {
-        if (vbytes.len > key.max_val_len) return error.Corrupted;
         var buf: [key.max_key_len]u8 = undefined;
-        var fba = std.heap.FixedBufferAllocator.init(&buf);
-        var k: std.ArrayList(u8) = try .initCapacity(fba.allocator(), buf.len);
-        try key.packKey(&k, fba.allocator(), .eavt, e, a, vbytes, null);
-        const row = (try txn.getFromTree(self.trees.cur(.eavt), k.items)) orelse return null;
+        const row = (try txn.getFromTree(self.trees.cur(.eavt), try eavtKey(&buf, e, a, vbytes, null))) orelse return null;
         const cur = try key.readCurrent(row);
         if (cur.rest.len == 0) return error.Corrupted;
         return try arena.dupe(u8, cur.rest);
@@ -794,15 +750,15 @@ pub const Store = struct {
     /// an assertion's EAVT-h value, or, for a retraction, which holds
     /// nothing, the value of the row before it, the assertion it
     /// retracts. Borrows the transaction's snapshot.
-    pub fn historyPayload(self: *Store, txn: *Txn, e: u64, a: u32, vbytes: []const u8, top: key.Top, arena: Allocator) ![]const u8 {
-        const k = try key.keyBytes(arena, .eavt, e, a, vbytes, top);
+    pub fn historyPayload(self: *Store, txn: *Txn, e: u64, a: u32, vbytes: []const u8, top: key.Top) ![]const u8 {
+        var buf: [key.max_key_len]u8 = undefined;
+        const k = try eavtKey(&buf, e, a, vbytes, top);
         var c = try txn.openCursorForTree(self.trees.hist(.eavt));
-        _ = c.set(k) orelse {
+        const at = c.set(k) orelse {
             try ended(&c);
             return error.Corrupted;
         };
-        const row = if (top.added) c.current() else c.prev();
-        const found = row orelse {
+        const found = (if (top.added) at else c.prev()) orelse {
             try ended(&c);
             return error.Corrupted;
         };
@@ -810,6 +766,19 @@ pub const Store = struct {
         if (found.key.len != k.len or !std.mem.eql(u8, found.key[0..fact_len], k[0..fact_len])) return error.Corrupted;
         if (!(try key.readTop(found.key[fact_len..][0..key.top_len])).added or found.value.len == 0) return error.Corrupted;
         return found.value;
+    }
+
+    /// The EAVT key of `(e a v)`, a history key when `top` is given, in
+    /// `buf`. A value section past `key.max_val_len`, which only damaged
+    /// bytes give, is `error.Corrupted`.
+    fn eavtKey(buf: *[key.max_key_len]u8, e: u64, a: u32, vbytes: []const u8, top: ?key.Top) ![]const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(buf);
+        var k: std.ArrayList(u8) = try .initCapacity(fba.allocator(), buf.len);
+        key.packKey(&k, fba.allocator(), .eavt, e, a, vbytes, top) catch |err| return switch (err) {
+            error.OutOfMemory => error.Corrupted,
+            else => err,
+        };
+        return k.items;
     }
 
     // ── scans ─────────────────────────────────────────────────────
@@ -900,16 +869,17 @@ pub const Store = struct {
     /// sibling) sort alike in both trees: `top` starts with a zero byte
     /// below `t = 2^39`, and a fact that continues a shorter one has an
     /// escape (`0xFF`) or the out-of-line mark (`0x01`) there
-    /// (NEXTOMIC.md §2.2). A current row whose fact's history rows do
-    /// not end with a retraction older than it breaks H1 and is
-    /// `error.Corrupted`.
+    /// (NEXTOMIC.md §2.2). A fact's rows that break H1 are
+    /// `error.Corrupted`: history that starts with a retraction, does
+    /// not alternate in ascending `t`, or ends in an assertion, and a
+    /// current row not newer than its fact's last retraction.
     pub const MergedScan = struct {
         cur: Scan,
         hist: Scan,
         cur_row: ?KeyValue = null,
         hist_row: ?KeyValue = null,
-        /// The last history row read, against which a current row is
-        /// checked.
+        /// The last history row read while its fact is open, which the
+        /// fact's next row, or its end, is checked against.
         last: ?HistoryRow = null,
 
         pub fn next(self: *MergedScan) !?HistoryRow {
@@ -923,15 +893,34 @@ pub const Store = struct {
                     self.hist_row = null;
                     const top = try key.readTop(h.key[fact.len..][0..key.top_len]);
                     const r: HistoryRow = .{ .fact = fact, .t = top.t, .added = top.added };
+                    try self.follow(r);
                     self.last = r;
                     return r;
                 }
             }
-            const row = c orelse return null;
+            const row = c orelse {
+                if (self.last) |l| if (l.added) return error.Corrupted;
+                self.last = null;
+                return null;
+            };
             self.cur_row = null;
             const r: HistoryRow = .{ .fact = row.key, .t = (try key.readCurrent(row.value)).t, .added = true, .current = true };
-            if (self.last) |l| if ((l.added or l.t >= r.t) and std.mem.eql(u8, l.fact, r.fact)) return error.Corrupted;
+            try self.follow(r);
+            // The current row closes its fact.
+            self.last = null;
             return r;
+        }
+
+        /// Check that `r` continues the open fact's timeline, or opens a
+        /// new fact once the last one ended on a retraction.
+        fn follow(self: *const MergedScan, r: HistoryRow) !void {
+            const l = self.last orelse {
+                if (!r.added) return error.Corrupted;
+                return;
+            };
+            if (std.mem.eql(u8, l.fact, r.fact)) {
+                if (l.added == r.added or l.t >= r.t) return error.Corrupted;
+            } else if (l.added or !r.added) return error.Corrupted;
         }
     };
 
@@ -1040,7 +1029,10 @@ pub const Store = struct {
 
     // ── bootstrap (§2.4) ──────────────────────────────────────────
 
-    fn bootstrap(self: *Store, txn: *Txn, with_fulltext: bool) !void {
+    /// The bootstrap transaction, `t = 1` (§2.4): the header, the
+    /// idents, the attributes' datoms and the transaction's instant,
+    /// with their counts, txlog entry and counters.
+    fn bootstrap(self: *Store, txn: *Txn) !void {
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -1049,92 +1041,53 @@ pub const Store = struct {
         std.Io.Threaded.global_single_threaded.io().random(&self.uuid);
         try self.sysPut(txn, "uuid", &self.uuid);
 
-        const idents = if (with_fulltext) &boot.idents else boot.idents_without_fulltext;
-        const attrs = if (with_fulltext) &boot.attrs else boot.attrs_without_fulltext;
-        for (idents) |id| try self.putIdent(txn, id.name, id.id);
+        for (boot.idents) |id| try self.putIdent(txn, id.name, id.id);
 
         var datoms: std.ArrayList(Datom) = .empty;
         const now = nowMillis();
-        for (attrs) |a| try appendAttrDatoms(arena, &datoms, a, boot.t);
+        for (boot.attrs) |a| try appendAttrDatoms(arena, &datoms, a);
         for (boot.enum_idents) |id| {
             try datoms.append(arena, .{ .e = id.id, .a = boot.ident, .v = .{ .keyword = id.id }, .t = boot.t, .added = true });
         }
         try datoms.append(arena, .{ .e = key.txEntity(boot.t), .a = boot.tx_instant, .v = .{ .instant = now }, .t = boot.t, .added = true });
-        try self.writeSystemTransaction(txn, arena, boot.t, now, datoms.items);
 
+        const batch = try arena.alloc(Prepared, datoms.items.len);
+        var counts: std.AutoHashMapUnmanaged(u32, u64) = .empty;
+        for (datoms.items, batch) |d, *p| {
+            p.* = .{
+                .e = d.e,
+                .a = d.a,
+                .vbytes = try key.valBytes(arena, d.v),
+                .added = true,
+                .avet = d.a == boot.ident or d.a == boot.tx_instant,
+                .vaet = false,
+            };
+            const g = try counts.getOrPut(arena, d.a);
+            if (!g.found_existing) g.value_ptr.* = 0;
+            g.value_ptr.* += 1;
+        }
+        try self.writeBatch(txn, boot.t, batch, arena);
+        var it = counts.iterator();
+        while (it.next()) |e| try self.writeAttrCount(txn, e.key_ptr.*, e.value_ptr.*);
+
+        try self.putTxlog(txn, boot.t, try datom_mod.encodeTxlog(arena, boot.t, now, datoms.items, &.{}));
+        try self.writeT(txn, boot.t);
+        try self.bumpSchemaGen(txn);
+        // No attribute is full-text yet: the empty tree is current.
+        try self.writeFulltextStamp(txn, boot.t);
         try self.writeNextEid(txn, key.user_partition_start);
-        try self.writeNextAid(txn, if (with_fulltext) boot.next_aid else boot.fulltext);
+        try self.writeNextAid(txn, boot.next_aid);
     }
 
     /// The ident, value type, cardinality, unique and index datoms of a
-    /// bootstrap attribute at `t`.
-    fn appendAttrDatoms(arena: Allocator, datoms: *std.ArrayList(Datom), a: boot.Attr, t: u64) !void {
+    /// bootstrap attribute.
+    fn appendAttrDatoms(arena: Allocator, datoms: *std.ArrayList(Datom), a: boot.Attr) !void {
+        const t = boot.t;
         try datoms.append(arena, .{ .e = a.id, .a = boot.ident, .v = .{ .keyword = a.id }, .t = t, .added = true });
         try datoms.append(arena, .{ .e = a.id, .a = boot.value_type, .v = .{ .keyword = a.type_ident }, .t = t, .added = true });
         try datoms.append(arena, .{ .e = a.id, .a = boot.cardinality, .v = .{ .keyword = if (a.many) boot.card_many else boot.card_one }, .t = t, .added = true });
         if (a.unique_ident) |u| try datoms.append(arena, .{ .e = a.id, .a = boot.unique, .v = .{ .keyword = u }, .t = t, .added = true });
         if (a.indexed) try datoms.append(arena, .{ .e = a.id, .a = boot.index, .v = .{ .boolean = true }, .t = t, .added = true });
-    }
-
-    /// Write assertions the store makes on its own behalf as
-    /// transaction `t`: the index trees, the counts, the txlog entry and
-    /// `sys["t"]`. Every keyword value is an ident already in
-    /// `nx/idents`.
-    fn writeSystemTransaction(self: *Store, txn: *Txn, arena: Allocator, t: u64, now: i64, datoms: []const Datom) !void {
-        const batch = try arena.alloc(Prepared, datoms.len);
-        for (datoms, 0..) |d, i| {
-            const avet = d.a == boot.ident or d.a == boot.tx_instant;
-            batch[i] = .{
-                .e = d.e,
-                .a = d.a,
-                .vbytes = try key.valBytes(arena, d.v),
-                .added = true,
-                .avet = avet,
-                .vaet = false,
-            };
-        }
-        try self.writeBatch(txn, t, batch, arena);
-
-        var counts = std.AutoHashMapUnmanaged(u32, u64).empty;
-        for (datoms) |d| {
-            const g = try counts.getOrPut(arena, d.a);
-            if (!g.found_existing) g.value_ptr.* = 0;
-            g.value_ptr.* += 1;
-        }
-        var it = counts.iterator();
-        while (it.next()) |e| try self.writeAttrCount(txn, e.key_ptr.*, (try self.attrCount(txn, e.key_ptr.*)) + e.value_ptr.*);
-
-        try self.putTxlog(txn, t, try datom_mod.encodeTxlog(arena, t, now, datoms, &.{}));
-        try self.writeT(txn, t);
-        try self.bumpSchemaGen(txn);
-        // No attribute is full-text yet: the empty tree is current.
-        try self.writeFulltextStamp(txn, t);
-    }
-
-    /// A store whose idents lack `:db/fulltext` receives the attribute
-    /// as a transaction of its own at the store's next ident id.
-    fn ensureFulltextAttr(self: *Store, txn: *Txn) !void {
-        if (try self.identIdByName(txn, "db/fulltext")) |id| {
-            self.fulltext_aid = id;
-            return;
-        }
-        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-        const id = try self.readNextAid(txn);
-        if (id == std.math.maxInt(u32)) return error.DatabaseFull;
-        const t = (try self.readT(txn)) + 1;
-        if (t >= key.tx_partition_bit) return error.DatabaseFull;
-        try self.putIdent(txn, "db/fulltext", id);
-        var attr = boot.fulltext_attr;
-        attr.id = id;
-        var datoms: std.ArrayList(Datom) = .empty;
-        const now = nowMillis();
-        try appendAttrDatoms(arena, &datoms, attr, t);
-        try datoms.append(arena, .{ .e = key.txEntity(t), .a = boot.tx_instant, .v = .{ .instant = now }, .t = t, .added = true });
-        try self.writeSystemTransaction(txn, arena, t, now, datoms.items);
-        try self.writeNextAid(txn, id + 1);
-        self.fulltext_aid = id;
     }
 };
 
@@ -1172,557 +1125,6 @@ pub const TestDir = struct {
     }
 };
 
-const repeat = @import("../string.zig").repeat;
-
-test "a count, a fulltext stamp or a t read out of its range is Corrupted" {
-    var td = try TestDir.init("store_ranges");
-    defer td.deinit();
-    const store = try Store.open(testing.allocator, td.path.ptr, .{});
-    defer store.close();
-    const txn = try store.beginWrite(.none);
-    defer txn.abort();
-    // No attribute holds more current datoms than there are ids.
-    try store.writeAttrCount(txn, boot.doc, key.id_max + 1);
-    try testing.expectError(error.Corrupted, store.attrCount(txn, boot.doc));
-    var stamp: [1 + key.id_len]u8 = undefined;
-    stamp[0] = fulltext_fold;
-    key.writeId(stamp[1..][0..key.id_len], key.tx_partition_bit | 1);
-    try store.sysPut(txn, "ft", &stamp);
-    try testing.expectError(error.Corrupted, store.readFulltextStamp(txn));
-    var raw: [key.id_len]u8 = undefined;
-    key.writeId(&raw, key.tx_partition_bit);
-    try testing.expectError(error.Corrupted, key.readT(&raw));
-    key.writeId(&raw, key.tx_partition_bit - 1);
-    try testing.expectEqual(key.tx_partition_bit - 1, try key.readT(&raw));
-}
-
-test "a page that fails its check ends a scan with an error, never early" {
-    var td = try TestDir.init("store_damaged");
-    defer td.deinit();
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const fact = try key.keyBytes(arena, .eavt, boot.doc, boot.ident, try key.valBytes(arena, .{ .keyword = boot.doc }), null);
-    (try Store.open(testing.allocator, td.path.ptr, .{})).close();
-    // One byte flipped in the page holding :db/doc's ident row: the
-    // nx/eavt leaf fails its checksum.
-    const io = testing.io;
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, td.path, arena, .unlimited);
-    var at: usize = 0;
-    var damaged: usize = 0;
-    while (std.mem.findPos(u8, bytes, at, fact)) |i| : (at = i + fact.len) {
-        bytes[i + fact.len - 1] ^= 0xFF;
-        damaged += 1;
-    }
-    try testing.expect(damaged >= 1);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = td.path, .data = bytes });
-
-    const store = try Store.open(testing.allocator, td.path.ptr, .{});
-    defer store.close();
-    const txn = try store.beginRead();
-    defer txn.abort();
-    var s = try Store.scan(txn, store.trees.cur(.eavt), &.{});
-    try testing.expectError(error.InvalidPage, s.next());
-    var f = try Store.foldScan(txn, store.trees, .eavt, &.{}, null, .{ .as_of = 1 });
-    try testing.expectError(error.InvalidPage, f.next());
-    try testing.expectError(error.InvalidPage, store.currentPayload(txn, boot.doc, boot.ident, (try key.unpackKey(.eavt, false, fact)).v, arena));
-}
-
-test "open bootstraps once and reopen finds the same ids" {
-    var td = try TestDir.init("store_boot");
-    defer td.deinit();
-
-    var uuid: [16]u8 = undefined;
-    {
-        const store = try Store.open(testing.allocator, td.path.ptr, .{});
-        defer store.close();
-        uuid = store.uuid;
-        const txn = try store.beginRead();
-        defer txn.abort();
-        try testing.expectEqual(@as(u64, 1), try store.readT(txn));
-        try testing.expectEqual(key.user_partition_start, try store.readNextEid(txn));
-        try testing.expectEqual(boot.next_aid, try store.readNextAid(txn));
-        try testing.expectEqual(@as(?u32, boot.ident), try store.identIdByName(txn, "db/ident"));
-        try testing.expectEqual(@as(?u32, boot.unique_value), try store.identIdByName(txn, "db.unique/value"));
-        try testing.expectEqualStrings("db.type/string", (try store.identNameById(txn, boot.type_string)).?);
-        try testing.expectEqual(@as(u64, boot.idents.len), try store.attrCount(txn, boot.ident));
-        try testing.expect((try store.getTxlog(txn, 1)) != null);
-    }
-    {
-        const store = try Store.open(testing.allocator, td.path.ptr, .{});
-        defer store.close();
-        try testing.expectEqualSlices(u8, &uuid, &store.uuid);
-        const txn = try store.beginRead();
-        defer txn.abort();
-        try testing.expectEqual(@as(u64, 1), try store.readT(txn));
-        try testing.expectEqual(@as(?u32, boot.ident), try store.identIdByName(txn, "db/ident"));
-        try testing.expectEqual(@as(u64, boot.idents.len), try store.attrCount(txn, boot.ident));
-    }
-}
-
-test "a new store file starts small and grows a step at a time" {
-    var td = try TestDir.init("store_map");
-    defer td.deinit();
-    const store = try Store.open(testing.allocator, td.path.ptr, .{});
-    defer store.close();
-    try testing.expectEqual(db_layer.initial_map_size, store.file.env.info().mapSize);
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    // Payloads past the first size grow the file in whole steps.
-    const payload = try arena.alloc(u8, 4096);
-    @memset(payload, 'x');
-    const batch = try arena.alloc(Store.Prepared, 512);
-    for (batch, 0..) |*p, i| p.* = .{ .e = (1 << 33) + i, .a = 100, .vbytes = try key.valBytes(arena, .{ .long = 0 }), .payload = payload, .added = true, .avet = false, .vaet = false };
-    const txn = try store.beginWrite(.none);
-    errdefer txn.abort();
-    try store.writeBatch(txn, 2, batch, arena);
-    try txn.commit();
-    const grown = store.file.env.info().mapSize;
-    try testing.expect(grown > db_layer.initial_map_size and grown < 64 << 20);
-    try testing.expectEqual(0, (grown - db_layer.initial_map_size) % db_layer.map_grow_step);
-}
-
-test "a store without :db/fulltext receives it at open, at its next ident id" {
-    var td = try TestDir.init("store_fulltext_open");
-    defer td.deinit();
-    {
-        const store = try Store.open(testing.allocator, td.path.ptr, .{ .fulltext_attr = false });
-        defer store.close();
-        const txn = try store.beginRead();
-        defer txn.abort();
-        try testing.expect((try store.identIdByName(txn, "db/fulltext")) == null);
-        try testing.expectEqual(boot.fulltext, try store.readNextAid(txn));
-        try testing.expectEqual(@as(u64, 1), try store.readT(txn));
-    }
-    {
-        const store = try Store.open(testing.allocator, td.path.ptr, .{});
-        defer store.close();
-        try testing.expectEqual(boot.fulltext, store.fulltext_aid);
-        const txn = try store.beginRead();
-        defer txn.abort();
-        try testing.expectEqual(@as(?u32, boot.fulltext), try store.identIdByName(txn, "db/fulltext"));
-        try testing.expectEqual(boot.next_aid, try store.readNextAid(txn));
-        try testing.expectEqual(@as(u64, 2), try store.readT(txn));
-        try testing.expect((try store.getTxlog(txn, 2)) != null);
-        try testing.expectEqual(@as(u64, boot.idents.len), try store.attrCount(txn, boot.ident));
-        const prefix = try key.prefixBytes(testing.allocator, .eavt, .{ .e = boot.fulltext });
-        defer testing.allocator.free(prefix);
-        var s = try Store.scan(txn, store.trees.cur(.eavt), prefix);
-        var n: usize = 0;
-        while (try s.next()) |_| n += 1;
-        try testing.expectEqual(@as(usize, 3), n);
-    }
-    // Opening again mints nothing more.
-    {
-        const store = try Store.open(testing.allocator, td.path.ptr, .{});
-        defer store.close();
-        const txn = try store.beginRead();
-        defer txn.abort();
-        try testing.expectEqual(@as(u64, 2), try store.readT(txn));
-        try testing.expectEqual(boot.next_aid, try store.readNextAid(txn));
-    }
-}
-
-test "a store whose next ident id is taken mints :db/fulltext past it" {
-    var td = try TestDir.init("store_fulltext_taken");
-    defer td.deinit();
-    {
-        const store = try Store.open(testing.allocator, td.path.ptr, .{ .fulltext_attr = false });
-        defer store.close();
-        const txn = try store.beginWrite(.none);
-        try store.putIdent(txn, "user/name", boot.fulltext);
-        try store.writeNextAid(txn, boot.fulltext + 1);
-        try txn.commit();
-    }
-    const store = try Store.open(testing.allocator, td.path.ptr, .{});
-    defer store.close();
-    try testing.expectEqual(boot.fulltext + 1, store.fulltext_aid);
-    const txn = try store.beginRead();
-    defer txn.abort();
-    try testing.expectEqual(@as(?u32, boot.fulltext + 1), try store.identIdByName(txn, "db/fulltext"));
-    try testing.expectEqual(@as(?u32, boot.fulltext), try store.identIdByName(txn, "user/name"));
-    try testing.expectEqual(boot.fulltext + 2, try store.readNextAid(txn));
-}
-
-test "bootstrap datoms are in every index they belong to" {
-    var td = try TestDir.init("store_idx");
-    defer td.deinit();
-    const store = try Store.open(testing.allocator, td.path.ptr, .{});
-    defer store.close();
-    const txn = try store.beginRead();
-    defer txn.abort();
-
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    // EAVT [1]: :db/ident has ident, valueType, cardinality, unique, index.
-    const p = try key.prefixBytes(arena, .eavt, .{ .e = boot.ident });
-    var s = try Store.scan(txn, store.trees.cur(.eavt), p);
-    var n: usize = 0;
-    while (try s.next()) |kv| : (n += 1) {
-        const cur = try key.readCurrent(kv.value);
-        try testing.expectEqual(@as(u64, 1), cur.t);
-        try testing.expectEqual(@as(usize, 0), cur.rest.len);
-    }
-    try testing.expectEqual(@as(usize, 5), n);
-
-    // AVET [:db/ident] holds every ident; [:db/valueType] is not indexed.
-    const pa = try key.prefixBytes(arena, .avet, .{ .a = boot.ident });
-    var sa = try Store.scan(txn, store.trees.cur(.avet), pa);
-    n = 0;
-    while (try sa.next()) |_| n += 1;
-    try testing.expectEqual(@as(usize, boot.idents.len), n);
-    const pv = try key.prefixBytes(arena, .avet, .{ .a = boot.value_type });
-    var sv = try Store.scan(txn, store.trees.cur(.avet), pv);
-    try testing.expect((try sv.next()) == null);
-
-    // Nothing is retired yet: the history trees are empty.
-    for (store.trees.history) |tree| try testing.expectEqual(@as(u64, 0), try Store.treeEntries(txn, tree));
-
-    // Empty prefix walks the whole tree.
-    var all = try Store.scan(txn, store.trees.cur(.aevt), &.{});
-    n = 0;
-    while (try all.next()) |_| n += 1;
-    try testing.expect(n > boot.idents.len);
-}
-
-test "abort leaves nothing behind" {
-    var td = try TestDir.init("store_abort");
-    defer td.deinit();
-    const store = try Store.open(testing.allocator, td.path.ptr, .{});
-    defer store.close();
-    {
-        const txn = try store.beginWrite(.none);
-        try store.writeT(txn, 99);
-        try store.putIdent(txn, "gone", 1000);
-        txn.abort();
-    }
-    const txn = try store.beginRead();
-    defer txn.abort();
-    try testing.expectEqual(@as(u64, 1), try store.readT(txn));
-    try testing.expect((try store.identIdByName(txn, "gone")) == null);
-}
-
-test "fold keeps the newest in-window row per fact and drops retractions" {
-    var td = try TestDir.init("store_fold");
-    defer td.deinit();
-    const store = try Store.open(testing.allocator, td.path.ptr, .{});
-    defer store.close();
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    // Entity 2^33, attribute 100: v=1 asserted at t=2, retracted at t=3,
-    // v=2 asserted at t=3, v=2 retracted at t=5; attribute 101: v=7 at t=4.
-    const e: u64 = 1 << 33;
-    const v1 = try key.valBytes(arena, .{ .long = 1 });
-    const v2 = try key.valBytes(arena, .{ .long = 2 });
-    const v7 = try key.valBytes(arena, .{ .long = 7 });
-    {
-        const txn = try store.beginWrite(.none);
-        try store.writeBatch(txn, 2, &.{.{ .e = e, .a = 100, .vbytes = v1, .added = true, .avet = false, .vaet = false }}, arena);
-        try store.writeBatch(txn, 3, &.{
-            .{ .e = e, .a = 100, .vbytes = v1, .added = false, .avet = false, .vaet = false },
-            .{ .e = e, .a = 100, .vbytes = v2, .added = true, .avet = false, .vaet = false },
-        }, arena);
-        try store.writeBatch(txn, 4, &.{.{ .e = e, .a = 101, .vbytes = v7, .added = true, .avet = false, .vaet = false }}, arena);
-        try store.writeBatch(txn, 5, &.{.{ .e = e, .a = 100, .vbytes = v2, .added = false, .avet = false, .vaet = false }}, arena);
-        try txn.commit();
-    }
-    const txn = try store.beginRead();
-    defer txn.abort();
-    const prefix = try key.prefixBytes(arena, .eavt, .{ .e = e });
-    const end = (try key.successor(arena, prefix)).?;
-
-    const Expect = struct { window: Store.Window, facts: []const u64 };
-    const cases = [_]Expect{
-        .{ .window = .{ .as_of = 1 }, .facts = &.{} },
-        .{ .window = .{ .as_of = 2 }, .facts = &.{1} },
-        .{ .window = .{ .as_of = 3 }, .facts = &.{2} },
-        .{ .window = .{ .as_of = 4 }, .facts = &.{ 2, 7 } },
-        .{ .window = .{ .as_of = 5 }, .facts = &.{7} },
-        .{ .window = .{ .since = .{ .after = 3, .upto = 5 } }, .facts = &.{7} },
-        .{ .window = .{ .since = .{ .after = 2, .upto = 4 } }, .facts = &.{ 2, 7 } },
-        .{ .window = .{ .since = .{ .after = 4, .upto = 5 } }, .facts = &.{} },
-    };
-    for (cases) |c| {
-        var fs = try Store.foldScan(txn, store.trees, .eavt, prefix, end, c.window);
-        var got: std.ArrayList(u64) = .empty;
-        while (try fs.next()) |r| {
-            try testing.expect(r.added);
-            const parts = try key.unpackKey(.eavt, false, r.fact);
-            const kv = try key.decodeVal(arena, parts.v);
-            try got.append(arena, @intCast(kv.val.long));
-        }
-        try testing.expectEqualSlices(u64, c.facts, got.items);
-    }
-    // History mode sees all five rows in t order with their flags.
-    var all = try Store.foldScan(txn, store.trees, .eavt, prefix, end, .{ .all = .{ .after = 0, .upto = 5 } });
-    var n: usize = 0;
-    var adds: usize = 0;
-    while (try all.next()) |r| {
-        n += 1;
-        if (r.added) adds += 1;
-    }
-    try testing.expectEqual(@as(usize, 5), n);
-    try testing.expectEqual(@as(usize, 3), adds);
-    // Current trees hold only attribute 101 now.
-    var cur = try Store.scan(txn, store.trees.cur(.eavt), prefix);
-    const only = (try cur.next()).?;
-    try testing.expectEqual(@as(u32, 101), (try key.unpackKey(.eavt, false, only.key)).a);
-    try testing.expect((try cur.next()) == null);
-}
-
-test "batches written between existing keys fill their leaves" {
-    var td = try TestDir.init("store_fill");
-    defer td.deinit();
-    const store = try Store.open(testing.allocator, td.path.ptr, .{});
-    defer store.close();
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    // New entities land before the bootstrap transaction's entity in
-    // EAVT and attribute 100's between attribute 8's and 101's in AEVT;
-    // attribute 101's are appended past AEVT's last key.
-    var k: u64 = 0;
-    for (0..16) |t| {
-        const batch = try arena.alloc(Store.Prepared, 5000);
-        for (0..2500) |j| {
-            const e = (1 << 33) + k;
-            const name = try arena.print("name-{d}", .{k});
-            batch[2 * j] = .{ .e = e, .a = 100, .vbytes = try key.valBytes(arena, .{ .long = @intCast(k) }), .added = true, .avet = false, .vaet = false };
-            batch[2 * j + 1] = .{ .e = e, .a = 101, .vbytes = try key.valBytes(arena, .{ .string = name }), .added = true, .avet = false, .vaet = false };
-            k += 1;
-        }
-        const txn = try store.beginWrite(.none);
-        errdefer txn.abort();
-        try store.writeBatch(txn, t + 2, batch, arena);
-        try txn.commit();
-    }
-    const txn = try store.beginRead();
-    defer txn.abort();
-    for ([_]Index{ .eavt, .aevt }) |index| {
-        try testing.expect((try Store.treeSize(txn, store.trees.cur(index), testing.allocator)).fill() > 0.75);
-        // New facts retire nothing.
-        try testing.expectEqual(@as(u64, 0), try Store.treeEntries(txn, store.trees.hist(index)));
-    }
-}
-
-test "a batch holds what writing its datoms one at a time holds" {
-    var tds = [2]TestDir{ try TestDir.init("store_order_batch"), try TestDir.init("store_order_single") };
-    defer for (&tds) |*td| td.deinit();
-    const batched = try Store.open(testing.allocator, tds[0].path.ptr, .{});
-    defer batched.close();
-    const single = try Store.open(testing.allocator, tds[1].path.ptr, .{});
-    defer single.close();
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var prng = std.Random.DefaultPrng.init(0x6e78_6f72_6465_7200);
-    const rand = prng.random();
-
-    // Batches of up to 4000 datoms over a few thousand facts, most of
-    // them assertions of facts not current, the rest retractions of
-    // current ones, each fact at most once a batch, as a transaction
-    // writes them.
-    var current: std.AutoHashMapUnmanaged(u64, void) = .empty;
-    for (0..30) |i| {
-        const t = i + 2;
-        var in_batch: std.AutoHashMapUnmanaged(u64, void) = .empty;
-        var list: std.ArrayList(Store.Prepared) = .empty;
-        for (0..rand.intRangeAtMost(usize, 1, 4000)) |_| {
-            const a = rand.intRangeAtMost(u32, 100, 102);
-            const x = rand.uintLessThan(u64, 3000);
-            const e_off = rand.uintLessThan(u64, 3000);
-            const id = (e_off * 4 + (a - 100)) * 4096 + (if (a == 102) x else x % 50);
-            if ((try in_batch.getOrPut(arena, id)).found_existing) continue;
-            const held = current.contains(id);
-            if (held and rand.uintLessThan(u8, 4) != 0) continue;
-            if (held) _ = current.remove(id) else try current.put(arena, id, {});
-            const v: key.Val = if (a == 102) .{ .ref = (1 << 33) + x } else .{ .long = @intCast(x % 50) };
-            try list.append(arena, .{
-                .e = (1 << 33) + e_off,
-                .a = a,
-                .vbytes = try key.valBytes(arena, v),
-                .added = !held,
-                .avet = a == 101,
-                .vaet = a == 102,
-            });
-        }
-        const batch = list.items;
-        for ([_]*Store{ batched, single }) |store| {
-            const txn = try store.beginWrite(.none);
-            errdefer txn.abort();
-            if (store == batched) {
-                try store.writeBatch(txn, t, batch, arena);
-            } else for (batch) |p| try store.writeBatch(txn, t, &.{p}, arena);
-            try txn.commit();
-        }
-    }
-    const txns = [2]*Txn{ try batched.beginRead(), try single.beginRead() };
-    defer for (txns) |txn| txn.abort();
-    for (0..4) |ix| for ([_]bool{ false, true }) |history| {
-        const index: Index = @fromBackingInt(@intCast(ix));
-        // The bootstrap's datoms differ in their instants: compare the
-        // keys the batches can hold.
-        const from = try key.prefixBytes(arena, index, switch (index) {
-            .eavt => .{ .e = 1 << 33 },
-            .vaet => .{ .v = try key.valBytes(arena, .{ .ref = 1 << 33 }) },
-            else => .{ .a = 100 },
-        });
-        const to: ?[]const u8 = if (index == .eavt) try key.prefixBytes(arena, .eavt, .{ .e = key.tx_partition_bit }) else null;
-        var scans: [2]Store.Scan = undefined;
-        for (&scans, txns, [_]*Store{ batched, single }) |*sc, txn, store|
-            sc.* = try Store.scanRange(txn, if (history) store.trees.hist(index) else store.trees.cur(index), from, to);
-        while (try scans[0].next()) |x| {
-            const y = (try scans[1].next()) orelse return error.TestUnexpectedResult;
-            try testing.expectEqualSlices(u8, y.key, x.key);
-            try testing.expectEqualSlices(u8, y.value, x.value);
-        }
-        try testing.expect((try scans[1].next()) == null);
-    };
-}
-
-test "an out-of-line value is stored once in the index trees, beside its current row or on its retired assertion" {
-    var td = try TestDir.init("store_payload");
-    defer td.deinit();
-    const store = try Store.open(testing.allocator, td.path.ptr, .{});
-    defer store.close();
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const e: u64 = 1 << 33;
-    const long = repeat("a string long enough to leave its index keys for a payload of its own, ", 3);
-    const v = try key.valBytes(arena, .{ .string = long });
-    const cur_key = try key.keyBytes(arena, .eavt, e, 101, v, null);
-    {
-        const txn = try store.beginWrite(.none);
-        errdefer txn.abort();
-        try store.writeBatch(txn, 3, &.{.{ .e = e, .a = 101, .vbytes = v, .payload = long, .added = true, .avet = false, .vaet = false }}, arena);
-        try txn.commit();
-    }
-    {
-        // Current: the payload follows `t` in the EAVT value, and the
-        // history trees hold nothing.
-        const txn = try store.beginRead();
-        defer txn.abort();
-        try testing.expectEqualStrings(long, (try key.readCurrent((try txn.getFromTree(store.trees.cur(.eavt), cur_key)).?)).rest);
-        try testing.expectEqual(@as(u64, 0), try Store.treeEntries(txn, store.trees.hist(.eavt)));
-        try testing.expectEqualStrings(long, (try store.currentPayload(txn, e, 101, v, arena)).?);
-    }
-    {
-        const txn = try store.beginWrite(.none);
-        errdefer txn.abort();
-        try store.writeBatch(txn, 4, &.{.{ .e = e, .a = 101, .vbytes = v, .payload = long, .added = false, .avet = false, .vaet = false }}, arena);
-        try txn.commit();
-    }
-    {
-        // Retracted: the assertion moves to EAVT-h with its payload, and
-        // the retraction's row beside it holds nothing.
-        const txn = try store.beginRead();
-        defer txn.abort();
-        try testing.expect((try store.currentPayload(txn, e, 101, v, arena)) == null);
-        try testing.expectEqual(@as(u64, 2), try Store.treeEntries(txn, store.trees.hist(.eavt)));
-        try testing.expectEqualStrings(long, (try txn.getFromTree(store.trees.hist(.eavt), try key.keyBytes(arena, .eavt, e, 101, v, .{ .t = 3, .added = true }))).?);
-        try testing.expectEqual(0, (try txn.getFromTree(store.trees.hist(.eavt), try key.keyBytes(arena, .eavt, e, 101, v, .{ .t = 4, .added = false }))).?.len);
-        try testing.expectEqualStrings(long, try store.historyPayload(txn, e, 101, v, .{ .t = 3, .added = true }, arena));
-        try testing.expectEqualStrings(long, try store.historyPayload(txn, e, 101, v, .{ .t = 4, .added = false }, arena));
-    }
-    {
-        const w = try store.beginWrite(.none);
-        errdefer w.abort();
-        try store.writeBatch(w, 5, &.{.{ .e = e, .a = 101, .vbytes = v, .payload = long, .added = true, .avet = false, .vaet = false }}, arena);
-        try w.commit();
-    }
-    const again = try store.beginRead();
-    defer again.abort();
-    try testing.expectEqualStrings(long, (try key.readCurrent((try again.getFromTree(store.trees.cur(.eavt), cur_key)).?)).rest);
-    try testing.expectEqual(@as(u64, 2), try Store.treeEntries(again, store.trees.hist(.eavt)));
-}
-
-test "a retraction of a fact that is not current is Corrupted" {
-    var td = try TestDir.init("store_retract_absent");
-    defer td.deinit();
-    const store = try Store.open(testing.allocator, td.path.ptr, .{});
-    defer store.close();
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const txn = try store.beginWrite(.none);
-    defer txn.abort();
-    try testing.expectError(error.Corrupted, store.writeBatch(txn, 2, &.{.{ .e = 1 << 33, .a = 100, .vbytes = try key.valBytes(arena, .{ .long = 1 }), .added = false, .avet = false, .vaet = false }}, arena));
-}
-
-test "a store opens at this build's format alone and names any other" {
-    var td = try TestDir.init("store_format");
-    defer td.deinit();
-    (try Store.open(testing.allocator, td.path.ptr, .{})).close();
-    for ([_]u16{ 1, 2, 4, format_version }) |f| {
-        {
-            const file = try db_layer.StoreFile.acquire(td.path.ptr, .{ .allocator = testing.allocator });
-            defer file.release();
-            const txn = try file.beginWrite(.{});
-            errdefer txn.abort();
-            var buf: [2]u8 = undefined;
-            std.mem.writeInt(u16, &buf, f, .big);
-            try txn.putInTree(try txn.openTree("nx/sys", false), "format", &buf);
-            try file.commit(txn);
-        }
-        var found: u16 = 0;
-        if (f == format_version) {
-            const store = try Store.open(testing.allocator, td.path.ptr, .{ .refused_format = &found });
-            store.close();
-            try testing.expectEqual(0, found);
-        } else {
-            try testing.expectError(error.Format, Store.open(testing.allocator, td.path.ptr, .{ .refused_format = &found }));
-            try testing.expectEqual(f, found);
-        }
-    }
-}
-
-test "renaming an ident retires the old name and bumps the generation" {
-    var td = try TestDir.init("store_rename");
-    defer td.deinit();
-    const store = try Store.open(testing.allocator, td.path.ptr, .{});
-    defer store.close();
-    {
-        const txn = try store.beginWrite(.none);
-        try testing.expectEqual(@as(u64, 0), try store.readIdentGen(txn));
-        try store.putIdent(txn, "user/email", boot.next_aid);
-        try store.renameIdent(txn, boot.next_aid, "user/mail");
-        try txn.commit();
-    }
-    const txn = try store.beginRead();
-    defer txn.abort();
-    try testing.expect((try store.identIdByName(txn, "user/email")) == null);
-    try testing.expectEqual(@as(?u32, boot.next_aid), try store.retiredIdentId(txn, "user/email"));
-    try testing.expectEqual(@as(?u32, boot.next_aid), try store.identIdByName(txn, "user/mail"));
-    try testing.expect((try store.retiredIdentId(txn, "user/mail")) == null);
-    try testing.expectEqualStrings("user/mail", (try store.identNameById(txn, boot.next_aid)).?);
-    try testing.expectEqual(@as(u64, 1), try store.readIdentGen(txn));
-}
-
-test "long ident names use the heap path" {
-    var td = try TestDir.init("store_longname");
-    defer td.deinit();
-    const store = try Store.open(testing.allocator, td.path.ptr, .{});
-    defer store.close();
-    const long_name = "ns/" ++ @as([400]u8, @splat('x'));
-    {
-        const txn = try store.beginWrite(.none);
-        try store.putIdent(txn, long_name, 5000);
-        try txn.commit();
-    }
-    const txn = try store.beginRead();
-    defer txn.abort();
-    try testing.expectEqual(@as(?u32, 5000), try store.identIdByName(txn, long_name));
-    try testing.expectEqualStrings(long_name, (try store.identNameById(txn, 5000)).?);
-}
-
 test "sys counters outside their partitions are corrupt" {
     var td = try TestDir.init("store_sys_range");
     defer td.deinit();
@@ -1738,184 +1140,7 @@ test "sys counters outside their partitions are corrupt" {
     try testing.expectError(error.Corrupted, store.readNextEid(txn));
     try store.sysPutInt(txn, "aid", 4, 0);
     try testing.expectError(error.Corrupted, store.readNextAid(txn));
-}
-
-test "reopening a complete store writes nothing, so a read-only file opens" {
-    var td = try TestDir.init("store_open_read");
-    defer td.deinit();
-    const committed = blk: {
-        const store = try Store.open(testing.allocator, td.path.ptr, .{});
-        defer store.close();
-        const txn = try store.beginRead();
-        defer txn.abort();
-        break :blk txn.txnId;
-    };
-    {
-        const store = try Store.open(testing.allocator, td.path.ptr, .{});
-        defer store.close();
-        const txn = try store.beginRead();
-        defer txn.abort();
-        try testing.expectEqual(committed, txn.txnId);
-    }
-    try testing.expectEqual(@as(c_int, 0), std.c.chmod(td.path.ptr, 0o444));
-    defer _ = std.c.chmod(td.path.ptr, 0o644);
-    const store = try Store.open(testing.allocator, td.path.ptr, .{});
-    defer store.close();
-    {
-        const txn = try store.beginRead();
-        defer txn.abort();
-        try testing.expectEqual(@as(u64, 1), try store.readT(txn));
-    }
-    try testing.expectError(error.TxnReadOnly, store.beginWrite(.none));
-}
-
-test "a second store on the same file refuses to write while the first does" {
-    var td = try TestDir.init("store_same_file");
-    defer td.deinit();
-    const a = try Store.open(testing.allocator, td.path.ptr, .{});
-    defer a.close();
-    const b = try Store.open(testing.allocator, td.path.ptr, .{});
-    defer b.close();
-    // One environment, checked before a second write begins: on two,
-    // emdb's writer lock would wait for `a`, which this thread holds.
-    try testing.expect(a.file == b.file);
-    const txn = try a.beginWrite(.none);
-    try testing.expectError(error.WriterActive, b.beginWrite(.none));
-    txn.abort();
-    const again = try b.beginWrite(.none);
-    again.abort();
-}
-
-test "a db/* connection and a store of one file share one writer" {
-    var td = try TestDir.init("store_db_layer");
-    defer td.deinit();
-    const store = try Store.open(testing.allocator, td.path.ptr, .{});
-    defer store.close();
-    const file = try db_layer.StoreFile.acquire(td.path.ptr, .{ .allocator = testing.allocator });
-    defer file.release();
-    try testing.expect(file == store.file);
-    const kv = try file.beginWrite(.{});
-    try testing.expectError(error.WriterActive, store.beginWrite(.none));
-    kv.abort();
-    const txn = try store.beginWrite(.none);
-    try testing.expectError(error.WriterActive, file.beginWrite(.{}));
-    txn.abort();
-}
-
-test "a copy of a store file is another file: its uuid is shared, its writer is not" {
-    var td = try TestDir.init("store_copied");
-    defer td.deinit();
-    const a = try Store.open(testing.allocator, td.path.ptr, .{});
-    defer a.close();
-    const copy = try testing.allocator.printSentinel("{s}/copy.emdb", .{std.Io.Dir.path.dirname(td.path).?}, 0);
-    defer testing.allocator.free(copy);
-    try std.Io.Dir.cwd().copyFile(td.path, std.Io.Dir.cwd(), copy, testing.io, .{});
-    const b = try Store.open(testing.allocator, copy.ptr, .{});
-    defer b.close();
-    try testing.expectEqualSlices(u8, &a.uuid, &b.uuid);
-    try testing.expect(a.file != b.file);
-    const ta = try a.beginWrite(.none);
-    defer ta.abort();
-    const tb = try b.beginWrite(.none);
-    tb.abort();
-}
-
-test "a merged scan orders facts by their bytes, each fact's history before its current row" {
-    var td = try TestDir.init("store_merged");
-    defer td.deinit();
-    const store = try Store.open(testing.allocator, td.path.ptr, .{});
-    defer store.close();
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    // Facts that prefix one another: "a", "a\x00", "a\x00b", a 64-byte
-    // inline string and its out-of-line sibling, each with rows in
-    // the current tree, the history tree or both.
-    const e: u64 = 1 << 33;
-    const inline64 = &@as([key.prefix_len]u8, @splat('x'));
-    const long = inline64 ++ "and more, past the inline limit of ninety-six bytes, so out of line";
-    const Row = struct { v: []const u8, t: u64, added: bool, current: bool };
-    const rows = [_]Row{
-        .{ .v = "a", .t = 2, .added = true, .current = false },
-        .{ .v = "a", .t = 3, .added = false, .current = false },
-        .{ .v = "a", .t = 5, .added = true, .current = true },
-        .{ .v = "a\x00", .t = 2, .added = true, .current = false },
-        .{ .v = "a\x00", .t = 6, .added = false, .current = false },
-        .{ .v = "a\x00b", .t = 4, .added = true, .current = true },
-        .{ .v = inline64, .t = 7, .added = true, .current = true },
-        .{ .v = long, .t = 3, .added = true, .current = false },
-        .{ .v = long, .t = 8, .added = false, .current = false },
-        .{ .v = long, .t = 9, .added = true, .current = true },
-        .{ .v = "z", .t = 2, .added = true, .current = true },
-    };
-    {
-        const txn = try store.beginWrite(.none);
-        errdefer txn.abort();
-        for (rows) |r| {
-            const vb = try key.valBytes(arena, .{ .string = r.v });
-            inline for (.{ Index.eavt, Index.avet }) |ix| {
-                if (r.current) {
-                    var tb: [key.t_value_max]u8 = undefined;
-                    try txn.putInTree(store.trees.cur(ix), try key.keyBytes(arena, ix, e, 100, vb, null), key.writeCurrentT(&tb, r.t));
-                } else {
-                    try txn.putInTree(store.trees.hist(ix), try key.keyBytes(arena, ix, e, 100, vb, .{ .t = r.t, .added = r.added }), &.{});
-                }
-            }
-        }
-        try txn.commit();
-    }
-    const txn = try store.beginRead();
-    defer txn.abort();
-    inline for (.{ Index.eavt, Index.avet }) |ix| {
-        const prefix = try key.prefixBytes(arena, ix, if (ix == .eavt) .{ .e = e } else .{ .a = 100 });
-        const end = try key.successor(arena, prefix);
-        var m = try Store.mergedScan(txn, store.trees, ix, prefix, end);
-        // Every row, in the order `rows` lists them; in AVET, where the
-        // entity follows the value, the out-of-line value's rows come
-        // before its 64-byte inline sibling's (NEXTOMIC.md §2.2).
-        const order: []const usize = if (ix == .eavt) &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 } else &.{ 0, 1, 2, 3, 4, 5, 7, 8, 9, 6, 10 };
-        for (order) |r| {
-            const want = rows[r];
-            const got = (try m.next()) orelse return error.TestUnexpectedResult;
-            const parts = try key.unpackKey(ix, false, got.fact);
-            try testing.expectEqualSlices(u8, try key.valBytes(arena, .{ .string = want.v }), parts.v);
-            try testing.expectEqual(want.t, got.t);
-            try testing.expectEqual(want.added, got.added);
-            try testing.expectEqual(want.current, got.current);
-        }
-        try testing.expect((try m.next()) == null);
-        // As of 6: "a" (asserted again at 5) and the out-of-line
-        // value (asserted at 3) and "z"; "a\x00" went at 6, and "a\x00b"
-        // came at 4.
-        var f = try Store.foldScan(txn, store.trees, ix, prefix, end, .{ .as_of = 6 });
-        var n: usize = 0;
-        while (try f.next()) |r| : (n += 1) try testing.expect(r.added and r.t <= 6);
-        try testing.expectEqual(@as(usize, 4), n);
-    }
-}
-
-test "a current row after a history row that is not an older retraction breaks H1" {
-    var td = try TestDir.init("store_h1");
-    defer td.deinit();
-    const store = try Store.open(testing.allocator, td.path.ptr, .{});
-    defer store.close();
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const e: u64 = 1 << 33;
-    const vb = try key.valBytes(arena, .{ .long = 1 });
-    // The current assertion at 5 after a retained assertion at 3, and
-    // after a retraction at 6.
-    for ([_]key.Top{ .{ .t = 3, .added = true }, .{ .t = 6, .added = false } }) |top| {
-        const txn = try store.beginWrite(.none);
-        defer txn.abort();
-        var tb: [key.t_value_max]u8 = undefined;
-        try txn.putInTree(store.trees.cur(.eavt), try key.keyBytes(arena, .eavt, e, 100, vb, null), key.writeCurrentT(&tb, 5));
-        try txn.putInTree(store.trees.hist(.eavt), try key.keyBytes(arena, .eavt, e, 100, vb, top), &.{});
-        const prefix = try key.prefixBytes(arena, .eavt, .{ .e = e });
-        var m = try Store.mergedScan(txn, store.trees, .eavt, prefix, try key.successor(arena, prefix));
-        _ = try m.next();
-        try testing.expectError(error.Corrupted, m.next());
-    }
+    // Below the bootstrap's: the next mint would reuse a bootstrap id.
+    try store.sysPutInt(txn, "aid", 4, boot.fulltext);
+    try testing.expectError(error.Corrupted, store.readNextAid(txn));
 }

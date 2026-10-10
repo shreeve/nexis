@@ -16,7 +16,7 @@ samples are the committed goldens under `test/golden/cli/`, which
 | `nexis -e EXPR [ARG...]` | Evaluates EXPR's forms (reported as `<-e>`) and prints each value that is not nil, as `prn` does. |
 | `nexis repl` | The read-eval-print loop below. |
 | `nexis test FILE...` | Reads every file (one that cannot be read stops it before any runs, exit 2), runs each (restoring the current namespace after each), then `(nexis.test/run-all-tests)` (§3); exit 1 when an assertion failed or a test threw. A file's own definitions cannot change the exit status. `require` searches the working directory, then each file's directory. |
-| `nexis doc NAME` | Prints what `(doc NAME)` prints (STDLIB.md §10) on stdout: the documentation of a function, macro, special form or namespace. A NAME that names nothing is `nexis: no documentation for NAME` on stderr, exit 1; one that cannot be a symbol (empty, starting with a digit or `:`, or holding whitespace, a bracket, a quote or a reader macro character) is ``nexis: doc takes a symbol (try `nexis --help`)``, exit 1. |
+| `nexis doc NAME` | Prints what `(doc NAME)` prints (STDLIB.md §10) on stdout: the documentation of a function, macro, special form or namespace. A NAME that names nothing is `nexis: no documentation for NAME` on stderr, exit 1; one that does not read as one symbol (`-1`, `nil`, `a/b/c`, `(exit 7)`) is ``nexis: doc takes a symbol (try `nexis --help`)``, exit 1. |
 | `nexis disasm FILE`, `nexis --disasm FILE` | §2. |
 | `nexis --help`, `nexis -h` | The usage text, on stdout, exit 0. With no arguments, a command missing its FILE, or an argument `repl`, `disasm`, `--help` or `--version` takes no more of, the same text on stderr and exit 1; an unknown command is ``nexis: unknown command 'X' (try `nexis --help`)``, exit 1. |
 | `nexis --version`, `nexis -V` | `nexis 0.2.0`: `nexis` and its version, on stdout, exit 0. The version is `build.zig.zon`'s `.version`, which the build passes to the CLI as the `version` build option. |
@@ -202,10 +202,13 @@ nexis: test/golden/cli/divide-by-zero.nx:5:3: runtime error: DivideByZero
   argument, got 0`). An uncaught throw is `UncaughtThrow` followed by
   the thrown value as `pr-str` prints it (`runtime error:
   UncaughtThrow {:error :negative, :value -3}`, `uncaught-throw.err`,
-  whose `throw` spans two lines and is underlined on its first); an
-  error map a handler rethrew is printed without the place keys it
-  carries (`:fn`, `:file`, `:line`, `:column`; VM.md §13), which the
-  header and the trace show (`VM.withoutPlace`). An
+  whose `throw` spans two lines and is underlined on its first). An
+  error map's place keys (`:fn`, `:file`, `:line`, `:column`; VM.md
+  §13) are left out when they name the frame the trace shows the
+  error raised in, the innermost running the program's code, which
+  the header and the trace then show; a map the program built, or one
+  a handler changed (`(throw (assoc e :k v))`, reported at that
+  throw), is printed whole. An
   error or a thrown value that leaves through a `finally`, a `catch`
   no clause of which matches, or a `catch` that throws it again is
   reported where it was raised, with its detail and the frames it left,
@@ -261,18 +264,18 @@ build; `test/golden/cli/multi-arity.disasm` pins one. `test/golden/cli/sum10.dis
 pins the listing of `test/examples/pins/sum10.nx`:
 
 ```
-routine <top> (test/examples/pins/sum10.nx:4:1) slots=6 arity=0 upvalues=0
-  0000  var:load-var        s1  v0=nexis.core/println  ; 4:2
-  0001  mov:load-const      s3  c0=0  ; 5:13
-  0002  mov:load-const      s4  c0=0  ; 5:19
-  0003  cmp:lt.sc+if-false  s5  s3  c1=10  ; 6:9
-  0004  jump:if-false       s5  j0009  ; 6:5
-  0005  math:add.ss         s4  s4  s3  ; 7:22
-  0006  math:add.sc+lt.sc+if-true  s3  s3  c2=1  ; 7:14
-  0007  cmp:lt.sc+if-true   s5  s3  c1=10  ; 6:9
-  0008  jump:if-true        s5  j0005  ; 6:5
-  0009  mov:move-clear      s2  s4  -  ; 8:7
-  0010  call:call           s1  #1  s0  ; 4:1
+routine <top> (test/examples/pins/sum10.nx:5:1) slots=6 arity=0 upvalues=0
+  0000  var:load-var        s1  v0=nexis.core/println  ; 5:2
+  0001  mov:load-const      s3  c0=0  ; 6:13
+  0002  mov:load-const      s4  c0=0  ; 6:19
+  0003  cmp:lt.sc+if-false  s5  s3  c1=10  ; 7:9
+  0004  jump:if-false       s5  j0009  ; 7:5
+  0005  math:add.ss         s4  s4  s3  ; 8:22
+  0006  math:add.sc+lt.sc+if-true  s3  s3  c2=1  ; 8:14
+  0007  cmp:lt.sc+if-true   s5  s3  c1=10  ; 7:9
+  0008  jump:if-true        s5  j0005  ; 7:5
+  0009  mov:move-clear      s2  s4  -  ; 9:7
+  0010  call:call           s1  #1  s0  ; 5:1
   0011  call:return.s       s0  -  -
 ```
 
@@ -299,8 +302,8 @@ clears its slot (COMPILER.md §4.9).
   space within 60 bytes and followed by ` ...` and, for a collection,
   its item count when longer (`c0=[0 1 2 ... 22 ...(5000 items)`); a
   var its namespace-qualified name (`v0=nexis.core/println`). Operand B of `call:call`,
-  `call:tailcall`, `call:self` and every `coll:*` is a raw immediate
-  (VM.md §4.5) and prints as `#n`. The wide field prints as what it names: a jump
+  `call:self` and every `coll:*` is a raw immediate (VM.md §4.5) and
+  prints as `#n`. The wide field prints as what it names: a jump
   or `try-exit` target as its pc (`j0009`), `mov:load-const`'s
   constant and a `var:*` Var as a `c` or `v` operand would,
   `try-enter`'s try as `#n<catch j0012 finally j0015>`, and
@@ -317,8 +320,10 @@ clears its slot (COMPILER.md §4.9).
 Macro expansion, `(ns ...)` and `(require ...)` take effect while the
 file compiles, but no form runs, so a macro that calls a function the
 same file defines cannot expand under `disasm`. The opcode names are
-tables in `src/disasm.zig`; a test walks every variant enum
-`src/vm.zig` defines and fails when one lacks a name.
+the tags of the group and variant enums in `src/vm.zig`, `_` spelled
+`-` and a trailing `_` dropped, and what each operand is, an immediate
+or a wide field, is what verification proves (`Routine.shapeOf`, VM.md
+§5).
 
 ### 3. Test runner (`src/stdlib/test.nx`, the `nexis.test` namespace)
 
@@ -347,12 +352,15 @@ the private helpers.
   `(catch MATCHER ...)` would take (a keyword tag, MACROEXPAND.md §2b,
   or `any`) and fails when `expr` returns, reporting the value; a
   throw the matcher does not take propagates and counts as an error.
+  `(is (thrown-with-msg? MATCHER re expr) msg?)` passes when, besides,
+  `re` finds a match in the thrown value's message (`ex-message`), and
+  fails reporting the pattern and the message when it does not.
   `(is expr msg?)` passes when `expr` is truthy. Every `is` returns
   whether it passed. The head is matched by name, so `t/thrown?` and
   `thrown?` are the same. `msg` is evaluated once, after the values,
   whether the assertion passes or fails, as in Clojure. An assertion
   is one call of a helper (`check=`, `check-truthy`; a
-  `thrown?` with a keyword tag is a `try` whose handler calls
+  `thrown?` or `thrown-with-msg?` is a `try` whose handler calls
   `check-thrown`) with the quoted form, the values and the message,
   so the judging and the reporting are compiled once, in
   `nexis.test`: `(is (= a 1))` as a function's body is seven
@@ -376,9 +384,9 @@ the private helpers.
   (`join-fixtures`, `compose-fixtures`). A fixture's throw is not a
   test's and propagates out of the run, as in Clojure.
 - `(run-tests)` runs the current namespace's tests in definition
-  order, `(run-tests 'my.ns)` a named namespace's, `(run-all-tests)`
-  every namespace that registered a test, in first-registration
-  order. Each returns `{:test n :pass n :fail n :error n}`: tests
+  order, `(run-tests 'my.ns 'other.ns)` the named namespaces',
+  `(run-all-tests)` every namespace that registered a test, in
+  first-registration order. Each returns `{:test n :pass n :fail n :error n}`: tests
   run, assertions passed, assertions failed, tests that threw. A
   test's throw is caught by `any` and counted as an error; the next
   test still runs. `(successful? summary)` is whether a summary has
@@ -413,7 +421,8 @@ lines; `zig build examples` runs the demo.
 
 **`nexis.pprint`** (`src/stdlib/pprint.nx`): `(pprint x)` prints `x`
 and a newline, `(pprint-str x)` returns the text. A collection whose
-`pr-str` fits within 72 columns from its indent prints on one line,
+`pr-str` fits within `*print-right-margin*` columns (dynamic, 72 at
+the root, as Clojure's) from its indent prints on one line,
 as `pr-str` prints it. A longer one breaks: a map one `key value`
 pair per line, separated by `,`, each value laid out from the column
 after its key; a vector, list or set of scalars filled line by line

@@ -16,7 +16,7 @@
 //!       returns `UnserializableKind`.
 //!   C4. **Corrupted-input defense**: 1000 trials of random bytes
 //!       fed to decode either succeed (producing some Value) or
-//!       return a `CodecError`; no panic, no crash, no memory
+//!       return a `codec.DecodeError`; no panic, no crash, no memory
 //!       corruption.
 //!   C5. **Hostile structure**: lengths and counts near 2^64 and
 //!       counts past the input, under nesting thousands of levels
@@ -229,7 +229,7 @@ test "C3: encoding a transient returns UnserializableKind" {
     };
     for (kinds) |v| {
         try std.testing.expectError(
-            codec.CodecError.UnserializableKind,
+            error.UnserializableKind,
             codec.encode(std.testing.allocator, &ctx.interner, v),
         );
     }
@@ -254,7 +254,7 @@ test "C4: 1000 random byte slices fed to decode never panic" {
         for (bytes) |*b| b.* = r.int(u8);
 
         // The call must either return a Value (valid decode) or a
-        // typed error (any CodecError or error propagated from the
+        // typed error (`codec.DecodeError`, including errors propagated from the
         // constructors). Under test allocator instrumentation, a
         // successful decode's allocations are cleaned up by
         // `ctx.heap.deinit()` at test teardown.

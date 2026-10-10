@@ -18,7 +18,7 @@ points. Costs:
 |---|---|
 | `nth`, `assoc` | O(log₃₂ n) path copy; O(1) in the tail |
 | `conj` | O(1) amortized: a new root, and the tail's next slot claimed or the tail copied with room to grow (§2); promotes a full tail into the trie, grows the root shift at capacity |
-| `pop` | O(1) while the tail holds more than one element; O(log₃₂ n) when the trie's last leaf becomes the tail |
+| `pop` | O(1) while the tail holds more than one element: a new root sharing the tail; O(log₃₂ n) when the trie's last leaf becomes the tail |
 | `fromSlice` | O(n), bottom-up, one allocation per node |
 | `count`, `isEmpty` | O(1) |
 
@@ -71,11 +71,15 @@ node with the new vector, so the source never sees the slot. Any other
 `conj` copies the tail into a block with room for the next power of
 two elements, claimed at the new length: a vector grown by `conj`
 copies its tail at lengths 1, 2, 3, 5, 9 and 17 and once per 32 after
-its first leaf, whose tails start with room for 32. `fromSlice`,
-`assoc` and `pop` build tails of exactly their length, which take no
-claim, and a tail a transient owns claims nothing. A claimed slot that
-a discarded vector wrote keeps its value alive as long as the node
-lives: the collector marks every slot of a tail's block (GC.md §5).
+its first leaf, whose tails start with room for 32. `assoc` in the
+tail copies it the same way, claimed at its length. `pop` shares the
+tail, one element shorter, and the claim past that length makes its
+next `conj` copy. `fromSlice` builds a tail of exactly its length,
+which takes no claim. A transient writes the tails it owns in place,
+whatever their claim, and claims each slot it writes. A claimed slot
+that a discarded vector wrote, and the element a `pop` drops, keep
+their values alive as long as the node lives, at most 31 of them: the
+collector marks every slot of a tail's block (GC.md §5).
 
 ---
 
@@ -139,6 +143,7 @@ stdlib's sequence iterator use it. It is internal, not a language API.
 | `conj(heap, v, elem) !Value` | append |
 | `assoc(heap, v, i, elem) !Value` | `i < count(v)` |
 | `pop(heap, v) !Value` | `v` non-empty; a one-element vector pops to the empty vector |
+| `chunkFrom(v, i) []const Value` | the elements from `i` to the end of the leaf or tail holding it, read in place (a list view's chunk, `docs/LIST.md` §1) |
 | `count(v) usize`, `isEmpty(v) bool` | |
 | `nth(v, i) Value` | panics in safe builds out of bounds |
 | `hashSeq(h, elementHash) u64` | §7 |
@@ -146,7 +151,7 @@ stdlib's sequence iterator use it. It is internal, not a language API.
 | `Cursor` | §4 |
 | `valueFromVectorHeader(h) Value` | the Value for a root header (the transient seam, `docs/TRANSIENT.md` §8) |
 | `copyRoot(heap, h)` | a copy of a root, without metadata, for a transient to own |
-| `conjInPlace(heap, root, elem, edit)`, `assocInPlace(heap, root, i, elem, edit)`, `popInPlace(heap, root, edit)` | the edits of a transient that owns `root` (`docs/TRANSIENT.md` §1): they write the root and the nodes whose header `hash` is `edit` in place, copy any other node on the path once, stamping the copy, and give the shape `conj`, `assoc` and `pop` give; an owned tail grows as `conj` grows a copied one (§2), and `pop` lets go of the element it drops |
+| `conjInPlace(heap, root, elem, edit)`, `assocInPlace(heap, root, i, elem, edit)`, `popInPlace(heap, root, edit)` | the edits of a transient that owns `root` (`docs/TRANSIENT.md` §1): they write the root and the nodes whose header `hash` is `edit` in place, copy any other node on the path once, stamping the copy, and give the shape `conj`, `assoc` and `pop` give; an owned tail grows as `conj` grows a copied one (§2), and `pop` lets go of the element it drops. Edit 0 owns no node: `conj`, `assoc` and `pop` are these edits of a fresh copy of the root, carrying its metadata |
 | `openTailInPlace(heap, root, edit) *[32]Value`, `closeTailInPlace(root, len)` | a builder's 32 `conjInPlace`s: for a root the edit owns whose tail is full, the tail joins the trie and a new owned tail's 32 slots, counted, are returned to be written in order; before the vector is read, `closeTailInPlace` sets the tail's length to `len` (1–32). A value in an open slot is reached by the collector at once, which marks every slot of a tail's block (§2) |
 | `trace(h, visitor)` | GC trace (`docs/GC.md` §5) |
 

@@ -36,8 +36,7 @@ const Allocator = std.mem.Allocator;
 // Widths and limits
 // =============================================================================
 
-/// Bytes of an entity id or a `t` in a fixed field: `sys`, the
-/// current trees' values, the txlog's keys.
+/// Bytes of an entity id or a `t` in a fixed field of `sys`.
 pub const id_len = 6;
 /// Bytes of an attribute or ident id in the `sys` and `nx/idents` trees.
 pub const attr_len = 4;
@@ -68,6 +67,11 @@ pub const user_partition_start: u64 = 1 << 32;
 pub const user_partition_end: u64 = 1 << 46;
 /// Transaction entities are `tx_partition_bit | t`, `t < 2^46`.
 pub const tx_partition_bit: u64 = 1 << 46;
+/// Every `t` a transaction takes stays below 2^39, so a history key's
+/// `top` starts with a zero byte, which the merged order of an inline
+/// value and the out-of-line value it prefixes needs
+/// (`Store.MergedScan`, NEXTOMIC.md §2.1).
+pub const t_limit: u64 = 1 << 39;
 
 /// Entity id of the transaction with logical number `t`.
 pub inline fn txEntity(t: u64) u64 {
@@ -116,15 +120,7 @@ pub const ValueType = enum(u8) {
 
     pub fn identName(self: ValueType) []const u8 {
         return switch (self) {
-            .boolean => "db.type/boolean",
-            .long => "db.type/long",
-            .double => "db.type/double",
-            .instant => "db.type/instant",
-            .keyword => "db.type/keyword",
-            .ref => "db.type/ref",
-            .string => "db.type/string",
-            .uuid => "db.type/uuid",
-            .bytes => "db.type/bytes",
+            inline else => |t| "db.type/" ++ @tagName(t),
         };
     }
 };
@@ -163,18 +159,7 @@ pub const Val = union(ValueType) {
 
     /// Value equality within one type; different types are never equal.
     pub fn eql(a: Val, b: Val) bool {
-        if (a.valueType() != b.valueType()) return false;
-        return switch (a) {
-            .boolean => |x| x == b.boolean,
-            .long => |x| x == b.long,
-            .double => |x| normalizeDouble(x) == normalizeDouble(b.double),
-            .instant => |x| x == b.instant,
-            .keyword => |x| x == b.keyword,
-            .ref => |x| x == b.ref,
-            .string => |x| std.mem.eql(u8, x, b.string),
-            .uuid => |x| std.mem.eql(u8, &x, &b.uuid),
-            .bytes => |x| std.mem.eql(u8, x, b.bytes),
-        };
+        return a.valueType() == b.valueType() and a.order(b) == .eq;
     }
 
     /// Total order matching the encoded byte order within one type.
@@ -304,11 +289,6 @@ pub fn readOrdered(in: []const u8) DecodeError!struct { n: u64, len: usize } {
     return .{ .n = n, .len = len };
 }
 
-/// `A(a)`, an attribute or ident id in an index key, appended.
-pub fn appendAttrKey(out: *std.ArrayList(u8), gpa: Allocator, a: u32) !void {
-    try appendOrdered(out, gpa, a);
-}
-
 /// `E(e)` in `buf`: the partition's class (1 attributes, 2 users, 3
 /// transactions) in the header's high nibble, the offset's byte count
 /// in its low, then the offset in the partition, big-endian, in as few
@@ -407,13 +387,8 @@ pub fn readCurrent(value: []const u8) DecodeError!Current {
     return error.Corrupted;
 }
 
-/// The `nx/txlog` key of transaction `t`: its ordered varint, so the log
-/// sorts by `t`.
-pub fn writeTxlogKey(buf: *[ordered_max]u8, t: u64) []const u8 {
-    return writeOrdered(buf, t);
-}
-
-/// The `t` an `nx/txlog` key names; anything but one ordered varint of a
+/// The `t` an `nx/txlog` key names, `t`'s ordered varint (`writeOrdered`)
+/// so the log sorts by `t`; anything but one ordered varint of a
 /// `t` below the transaction partition is `error.Corrupted`.
 pub fn readTxlogKey(k: []const u8) DecodeError!u64 {
     const r = try readOrdered(k);
@@ -554,7 +529,7 @@ pub fn encodeVal(out: *std.ArrayList(u8), gpa: Allocator, v: Val) EncodeError!vo
         },
         .keyword => |id| {
             try out.append(gpa, @backingInt(Tag.keyword));
-            try appendAttrKey(out, gpa, id);
+            try appendOrdered(out, gpa, id);
         },
         .ref => |eid| {
             try out.append(gpa, @backingInt(Tag.ref));
@@ -607,13 +582,19 @@ comptime {
     std.debug.assert(std.ArrayList(u8).growCapacity(max_key_len) + std.ArrayList(u8).growCapacity(0) <= scratch_len);
 }
 
-/// The sortable encoding of `v` as an owned slice.
-pub fn valBytes(gpa: Allocator, v: Val) EncodeError![]u8 {
+/// What `pack` appends given `args`, built in stack scratch and copied
+/// into `gpa` exactly.
+fn ownedBytes(gpa: Allocator, comptime pack: anytype, args: anytype) ![]u8 {
     var scratch: [scratch_len]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&scratch);
     var out: std.ArrayList(u8) = .empty;
-    try encodeVal(&out, fba.allocator(), v);
+    _ = try @call(.auto, pack, .{ &out, fba.allocator() } ++ args);
     return gpa.dupe(u8, out.items);
+}
+
+/// The sortable encoding of `v` as an owned slice.
+pub fn valBytes(gpa: Allocator, v: Val) EncodeError![]u8 {
+    return ownedBytes(gpa, encodeVal, .{v});
 }
 
 /// An out-of-line equality key: the escaped 64-byte prefix and the
@@ -645,10 +626,12 @@ pub const DecodeError = error{ Corrupted, OutOfMemory };
 /// Decode one value encoding. `bytes` must hold exactly one encoding
 /// (the caller slices `v` out of the key by the fixed suffix). Strings
 /// and byte arrays are copied, unescaped, into `gpa`; digests borrow
-/// their prefix from `bytes`.
+/// their prefix from `bytes`. An inline value past `inline_max` bytes,
+/// or an out-of-line prefix of any length but `prefix_len`, is
+/// `error.Corrupted`, so a decoded encoding is at most `max_val_len`.
 pub fn decodeVal(gpa: Allocator, bytes: []const u8) DecodeError!KeyVal {
     if (bytes.len == 0) return error.Corrupted;
-    const tag = tagFromByte(bytes[0]) orelse return error.Corrupted;
+    const tag = std.enums.fromInt(Tag, bytes[0]) orelse return error.Corrupted;
     const body = bytes[1..];
     switch (tag) {
         .bool_false => return if (body.len == 0) .{ .val = .{ .boolean = false } } else error.Corrupted,
@@ -678,13 +661,16 @@ pub fn decodeVal(gpa: Allocator, bytes: []const u8) DecodeError!KeyVal {
         .string, .bytes => {
             const r = try unescapeFrom(gpa, body);
             if (r.consumed == body.len) {
+                if (r.bytes.len > inline_max) return error.Corrupted;
                 return if (tag == .string) .{ .val = .{ .string = r.bytes } } else .{ .val = .{ .bytes = r.bytes } };
             }
-            // Out of line: the bare 0x00 ends the escaped prefix, then the
-            // marker and the hash fill the rest exactly.
+            // Out of line: the bare 0x00 ends the escaped prefix of
+            // exactly `prefix_len` bytes, then the marker and the hash
+            // fill the rest exactly.
+            const prefix = r.bytes.len;
             gpa.free(r.bytes);
             const sep = r.consumed - 1;
-            if (body.len != sep + 2 + hash_len or body[sep + 1] != out_of_line_mark) return error.Corrupted;
+            if (prefix != prefix_len or body.len != sep + 2 + hash_len or body[sep + 1] != out_of_line_mark) return error.Corrupted;
             const d: Digest = .{
                 .prefix = body[0..sep],
                 .hash = std.mem.readInt(u128, body[sep + 2 ..][0..hash_len], .big),
@@ -705,7 +691,7 @@ pub fn decodeVal(gpa: Allocator, bytes: []const u8) DecodeError!KeyVal {
 /// parses its value this way where a field follows it.
 pub fn valLen(in: []const u8) DecodeError!usize {
     if (in.len == 0) return error.Corrupted;
-    const tag = tagFromByte(in[0]) orelse return error.Corrupted;
+    const tag = std.enums.fromInt(Tag, in[0]) orelse return error.Corrupted;
     const n: usize = switch (tag) {
         .bool_false, .bool_true => 1,
         .long, .double, .instant => 9,
@@ -726,13 +712,6 @@ pub fn valLen(in: []const u8) DecodeError!usize {
         },
     };
     return if (n > in.len) error.Corrupted else n;
-}
-
-fn tagFromByte(b: u8) ?Tag {
-    inline for (@typeInfo(Tag).@"enum".field_values) |value| {
-        if (value == b) return @fromBackingInt(@intCast(b));
-    }
-    return null;
 }
 
 // =============================================================================
@@ -759,12 +738,7 @@ pub const Index = enum(u8) {
     }
 
     pub fn name(self: Index) []const u8 {
-        return switch (self) {
-            .eavt => "eavt",
-            .aevt => "aevt",
-            .avet => "avet",
-            .vaet => "vaet",
-        };
+        return @tagName(self);
     }
 };
 
@@ -822,14 +796,13 @@ pub fn packKey(out: *std.ArrayList(u8), gpa: Allocator, index: Index, e: u64, a:
 }
 
 pub fn keyBytes(gpa: Allocator, index: Index, e: u64, a: u32, vbytes: []const u8, top: ?Top) ![]u8 {
-    var scratch: [scratch_len]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&scratch);
-    var out: std.ArrayList(u8) = .empty;
-    try packKey(&out, fba.allocator(), index, e, a, vbytes, top);
-    return gpa.dupe(u8, out.items);
+    return ownedBytes(gpa, packKey, .{ index, e, a, vbytes, top });
 }
 
-/// Decode a key of `index`. `history` selects the trailing `top`.
+/// Decode a key of `index`. `history` selects the trailing `top`. A
+/// value section longer than any encoding (`max_val_len`) is
+/// `error.Corrupted`, so a key rebuilt from the parts fits
+/// `max_key_len`.
 pub fn unpackKey(index: Index, history: bool, key: []const u8) DecodeError!Parts {
     const suffix_top: usize = if (history) top_len else 0;
     if (key.len < suffix_top) return error.Corrupted;
@@ -867,6 +840,7 @@ pub fn unpackKey(index: Index, history: bool, key: []const u8) DecodeError!Parts
             if (at != body.len) return error.Corrupted;
         },
     }
+    if (parts.v.len > max_val_len) return error.Corrupted;
     return parts;
 }
 
@@ -933,11 +907,7 @@ pub fn packPrefix(out: *std.ArrayList(u8), gpa: Allocator, index: Index, comps: 
 }
 
 pub fn prefixBytes(gpa: Allocator, index: Index, comps: Components) ![]u8 {
-    var scratch: [scratch_len]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&scratch);
-    var out: std.ArrayList(u8) = .empty;
-    _ = try packPrefix(&out, fba.allocator(), index, comps);
-    return gpa.dupe(u8, out.items);
+    return ownedBytes(gpa, packPrefix, .{ index, comps });
 }
 
 /// The least key greater than every key that starts with `prefix`,
@@ -1122,7 +1092,7 @@ test "a current value's t is a LEB128 in its shortest form, below the transactio
         try testing.expectError(error.Corrupted, readCurrent(bad));
     }
     var kb: [ordered_max]u8 = undefined;
-    try testing.expectEqual(@as(u64, 300), try readTxlogKey(writeTxlogKey(&kb, 300)));
+    try testing.expectEqual(@as(u64, 300), try readTxlogKey(writeOrdered(&kb, 300)));
     try testing.expectError(error.Corrupted, readTxlogKey(writeOrdered(&kb, tx_partition_bit)));
 }
 
@@ -1147,4 +1117,28 @@ test "ids and tops read from bytes are range-checked" {
     k[id_len] = 1;
     k[id_len + 1] = @backingInt(Tag.bool_true);
     try testing.expectError(error.Corrupted, unpackKey(.eavt, false, &k));
+}
+
+test "a value encoding or a key value section longer than its shape allows is Corrupted" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const tag = @backingInt(Tag.string);
+    // An inline string one byte past `inline_max`.
+    const long = [_]u8{tag} ++ @as([inline_max + 1]u8, @splat('a')) ++ [_]u8{0};
+    try testing.expectError(error.Corrupted, decodeVal(arena, &long));
+    // Out-of-line prefixes one byte short of `prefix_len`, and far past it.
+    const hash = [_]u8{ 0, out_of_line_mark } ++ @as([hash_len]u8, @splat(7));
+    const short = [_]u8{tag} ++ @as([prefix_len - 1]u8, @splat('a')) ++ hash;
+    try testing.expectError(error.Corrupted, decodeVal(arena, &short));
+    const huge = [_]u8{tag} ++ @as([1100]u8, @splat('a')) ++ hash;
+    try testing.expectError(error.Corrupted, decodeVal(arena, &huge));
+    // An EAVT key whose value section passes `max_val_len`.
+    var k: std.ArrayList(u8) = .empty;
+    try appendEntity(&k, arena, 1 << 33);
+    try appendOrdered(&k, arena, 100);
+    try k.append(arena, tag);
+    try k.appendNTimes(arena, 'a', max_val_len);
+    try k.append(arena, 0);
+    try testing.expectError(error.Corrupted, unpackKey(.eavt, false, k.items));
 }

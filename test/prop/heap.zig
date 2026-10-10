@@ -74,13 +74,11 @@ const Oracle = struct {
 // Helpers
 // -----------------------------------------------------------------------------
 
-/// Pick a random heap kind (kinds 16..29 per `docs/VALUE.md` §2.2).
+/// Pick a random heap kind (`docs/VALUE.md` §2.2).
 fn randHeapKind(rand: std.Random) value.Kind {
     const options = [_]value.Kind{
-        .string,            .bignum,      .persistent_map, .persistent_set,
-        .persistent_vector, .list,        .byte_vector,    .typed_vector,
-        .function,          .var_,        .durable_ref,    .transient,
-        .error_,            .meta_symbol,
+        .string,       .bignum,   .persistent_map, .persistent_set, .persistent_vector, .list,
+        .typed_vector, .function, .durable_ref,    .transient,      .atom,              .record,
     };
     const idx = rand.uintLessThan(usize, options.len);
     return options[idx];
@@ -358,7 +356,7 @@ test "H7: mixed tiny + large (64 KiB) bodies through sweep cycles" {
         // Allocate 8 big + 32 tiny per cycle; mark half of each.
         var i: usize = 0;
         while (i < 8) : (i += 1) {
-            const h = try heap.alloc(.byte_vector, big_body);
+            const h = try heap.alloc(.string, big_body);
             if (i % 2 == 0) h.setMarked();
         }
         i = 0;

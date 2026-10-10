@@ -8,8 +8,10 @@ programs (`nexis.sys`, `nexis.shell`, §11), instants (`nexis.time`,
 §12) and JSON (`nexis.json`, §13). The natives are in
 `src/stdlib.zig`, one table per namespace; the rest of the library is
 nexis in `src/stdlib/*.nx`.
-An error a native raises is caught as its error map, `{:error :tag
-:message m ...}` with the place it was raised (`docs/VM.md` §13); a
+An error a native or a library function raises is caught as its error
+map, `{:error :tag :message m ...}` with the place of the program's
+call it was raised under (`docs/VM.md` §13): the `.nx` sources raise
+theirs through `nexis.internal/#%raise`; a
 wrong argument count is `:arity-mismatch` for every native (the VM
 checks the declared arity).
 
@@ -40,7 +42,7 @@ Any other failure there is a bug in an embedded file or the image and
 panics with the loader's diagnostic or the image's error.
 
 **The image.** Evaluating the sources at every start would read,
-expand, compile and run 66 KB of nexis; instead the build does it once
+expand, compile and run 100 KB of nexis; instead the build does it once
 and every binary loads the result (`src/image.zig`). `zig build` runs
 `src/imagegen.zig`, built for the host over a runtime without an
 image: it boots the sources (`stdlib.writeImage`), writes the image of
@@ -102,7 +104,7 @@ Var inside a `binding`.
 
 | Namespace | Natives (`src/stdlib.zig`) | nexis source | Contract |
 |---|---|---|---|
-| `nexis.core` | `core_natives` | `core.nx` | text §2, printing §5, I/O §6, the rest of Clojure's core §8; `=` and `hash` SEMANTICS.md; `compare`, sorted collections, `subseq` and `rseq` SORTED.md; atoms ATOM.md; transients TRANSIENT.md; typed vectors TYPED_VECTOR.md §7.1; records and protocols PROTOCOLS.md; hierarchies and multimethods §9; the macros MACROEXPAND.md §2b |
+| `nexis.core` | `core_natives` | `core.nx` | text §2, printing §5, I/O §6, the rest of Clojure's core §8; `=` and `hash` SEMANTICS.md; `compare`, sorted collections, `subseq` and `rseq` SORTED.md; atoms ATOM.md; transients TRANSIENT.md; typed vectors TYPED_VECTOR.md §7.1; records and protocols PROTOCOLS.md; hierarchies and multimethods §9; the host macros MACROEXPAND.md §10 |
 | `db` | `db_natives` | (`with-tx`, `with-read-tx`, `with-snapshot` in `core.nx`) | DB.md §12 |
 | `nextomic` | `src/nextomic/natives.zig` | `nextomic.nx` (`with-conn`) | NEXTOMIC.md |
 | `nexis.string` | `string_natives` | `string.nx` | §3 |
@@ -117,7 +119,7 @@ Var inside a `binding`.
 | `nexis.test` | — | `test.nx` | TOOLING.md §3 |
 | `nexis.pprint` | — | `pprint.nx` | TOOLING.md §4 |
 | `nexis.simd` | `simd_natives` | — | TYPED_VECTOR.md §7.2 |
-| `nexis.internal` | `internal_natives` | — | the `#%` helpers macros emit: records and protocols (PROTOCOLS.md §7), `#%catch-matches?` (`try`), `#%raise` (the library's own error, `(#%raise :tag "sentence, got" x)`: the error map of `docs/VM.md` §13, its message naming the kind of `x`), `#%kwargs` (`& {:keys ...}`), `#%current-ns` (TOOLING.md §3), `#%delay` (`delay`, §8), `#%sorted-map` / `#%sorted-set` (a sorted collection a macro returns, MACROEXPAND.md §5), `#%push-out` / `#%pop-out` (`with-out-str`, §6), `#%mm-lookup` (a multimethod's call, §9.3), and the natives the namespaces of §11–§13 call |
+| `nexis.internal` | `internal_natives` | — | the `#%` helpers macros emit: records and protocols (PROTOCOLS.md §7), `#%catch-matches?` (`try`), `#%raise` (the library's own error, `(#%raise :tag "sentence, got" x)`: the error map of `docs/VM.md` §13, its message naming the kind of `x`; `(#%raise :tag "sentence, got" x data)` adds the entries of the map `data`; `(#%raise m)` throws the error map `m`; either carries the place of the program's call, as a runtime error does), `#%kwargs` (`& {:keys ...}`), `#%current-ns` (TOOLING.md §3), `#%delay` (`delay`, §8), `#%sorted-map` / `#%sorted-set` (a sorted collection a macro returns, MACROEXPAND.md §5), `#%push-out` / `#%pop-out` (`with-out-str`, §6), `#%mm-lookup` (a multimethod's call, §9.3), and the natives the namespaces of §11–§13 call |
 
 **Resolution.** Every other namespace has `nexis.core` as its parent,
 so an unqualified symbol a namespace does not define resolves in
@@ -158,7 +160,8 @@ still reaches `nexis.core`'s.
 - A helper no caller outside the file names is `defn-`, so `(require
   '[ns :refer :all])` skips it; a function a macro's expansion calls
   stays public, since the expansion names it from the caller's
-  namespace.
+  namespace, unless the expansion calls it through its Var, as `doc`
+  calls `(#'nexis.core/doc-of ...)`.
 
 ---
 
@@ -238,8 +241,8 @@ the result and write it once; a `replace` that finds nothing returns
 
 | Name | Arity | Semantics |
 |---|---|---|
-| `lower-case`, `upper-case` | 1 | ASCII letters mapped; every other byte, every byte of a multibyte scalar included, unchanged: `(upper-case "héllo")` is `"HéLLO"` |
-| `capitalize` | 1 | The first character upper-case and the rest lower-case, by the same ASCII rule |
+| `lower-case`, `upper-case` | 1 | Every character mapped as Java's `Character/toLowerCase` and `Character/toUpperCase` map it (`src/regex_tables.zig`, generated from Java's `Character`): `(upper-case "héllo")` is `"HÉLLO"`. The maps are one character to one, where Clojure's `String.toUpperCase` also expands (`"ß"` to `"SS"`) and lower-cases a final `Σ` to `ς`; a byte that is not UTF-8 is kept |
+| `capitalize` | 1 | The first character upper-case and the rest lower-case, by the same maps |
 | `reverse` | 1 | The code points in reverse order (not grapheme clusters) |
 | `trim`, `triml`, `trimr` | 1 | Without whitespace at both ends, the start, the end. Whitespace is Java's `Character/isWhitespace`, as Clojure's: tab through CR, FS through US, space, and the Unicode space, line and paragraph separators except the no-break ones (U+2003 and U+3000 are trimmed, U+00A0 stays). A byte that is not part of a well-formed UTF-8 sequence is not whitespace: it stops the trim and stays |
 | `trim-newline` | 1 | Without every `\n` and `\r` at the end |
@@ -260,8 +263,9 @@ string argument as UTF-8 before scanning and throw `:utf8-error` on a
 malformed one, so a separator can never cut a scalar in two; the
 code-point functions throw `:utf8-error` as §2 says.
 
-Full Unicode case mapping, normalization and grapheme segmentation
-are absent (STRING.md §6).
+The case maps are Java's simple ones; the full ones that change a
+string's length or read context, normalization and grapheme
+segmentation are absent.
 
 ---
 
@@ -274,7 +278,7 @@ are absent (STRING.md §6).
 |---|---|---|
 | `union` | 0+ | Every element of any argument, poured `into` the largest, which keeps its kind and metadata: `(union (sorted-set 3 1) #{2})` is a sorted set; `(union)` is `#{}`, one argument is itself (`(union nil)` is nil) |
 | `intersection` | 1+ | The elements of the first set present in every other one, `disj`ed from the smallest, which keeps its kind; with one argument, that argument unchanged |
-| `difference` | 1+ | The first set without the elements of the others; the first must be a set (`disj`), else `:kind-mismatch` |
+| `difference` | 1+ | The first set without the elements of the others, as Clojure's: of each pair the smaller set is walked, the first's elements tested against the second's when it has fewer; the first must be a set (`disj`), else `:kind-mismatch` |
 | `subset?`, `superset?` | 2 | Whether every element of the first is in the second (`subset?`), or the reverse |
 | `select` | 2 | `(select pred s)`: `s` without the elements for which `pred` is falsy (`disj`), so of `s`'s kind |
 | `map-invert` | 1 | The map with keys and values swapped; of duplicate values, the key iterated last wins |
@@ -345,9 +349,8 @@ their elements in the same mode. Who uses which:
 |---|---|
 | nil, booleans | `nil`, `true`, `false` |
 | fixnum, bignum | Decimal, no suffix |
-| float | SEMANTICS.md §6.3: `1.0`, `-0.0`, `1.0E10`, `1.0E-4`; `##NaN`, `##Inf`, `##-Inf` in both modes (`str` and `%s` of a bare float write Java's `NaN`, `Infinity`, `-Infinity`) |
-| char | display: its UTF-8. readable: `\space`, `\newline`, `\tab`, `\return`, `\formfeed`, `\backspace`, `\\`, the other ASCII controls and DEL as `\u{HEX}` (`\u{0}`), anything else as `\` and the char itself, as Clojure prints it (`\a`, `\é`) |
-| string | display: its bytes. readable: double-quoted, `\" \\ \n \t \r` escaped, other ASCII controls and DEL as `\u{HEX}`, every other byte as itself (`"é"`) |
+| float | SEMANTICS.md §6.3, in both modes (`str` and `%s` of a bare float write Java's `NaN`, `Infinity`, `-Infinity`) |
+| char, string | display: a char's UTF-8, a string's bytes. readable: SEMANTICS.md §6.4, §6.5 |
 | keyword, symbol | `:ns/name`, `ns/name`; names are not escaped |
 | list, vector, set | `(a b)`, `[a b]`, `#{a b}`, elements separated by one space; a sorted set in its order |
 | lazy seq | as a list, `(a b)`, `()` when empty. The printer runs no code: every caller but an error report realizes the value first, and a block whose body has not run prints as `...`, as does a cell of a realized cycle met again (`docs/LAZY.md` §8) |
@@ -359,7 +362,7 @@ their elements in the same mode. Who uses which:
 | atom, transient | `#<atom>`, `#<transient>` |
 | regex | `#"source"`, with Clojure's escaping of `"` (`docs/REGEX.md` §8); `str` and `%s` of a bare pattern write its source, as `Pattern.toString` does |
 | matcher | `#<matcher #"source">` |
-| protocol, protocol fn | `#<protocol id=N>`, `#<protocol-fn proto=N method=M>` |
+| protocol, protocol fn | `#<protocol id=N>`, `#<protocol-fn NAME>` (`NAME` the method's: `(defprotocol P (area [x]))` makes `#<protocol-fn area>`) |
 | durable ref | `#<durable-ref :tree hex:KEY>`, the key bytes in upper-case hex |
 | db connection, transactions | `#<db-connection>`, `#<db-write-txn>`, `#<db-read-txn>` |
 | Nextomic handles | `#nextomic/conn "path"`, `#nextomic/db {:basis-t N :mode :current}` (`:as-of N` / `:since N` when set), `#nextomic/entity {:db/id N}` |
@@ -402,10 +405,10 @@ buffered, so nothing is lost at `exit`). A VM with no `io` throws
 | `newline` | 0 | `(print "\n")` (`core.nx`) | — |
 | `flush` | 0 | nil: every print writes through at once, so there is nothing to flush (`core.nx`) | — |
 | `with-out-str` | macro | The body's printed output as a string; nothing reaches stdout. Captures nest; a throw discards the buffer and propagates | — |
-| `slurp` | 1 | The whole file at a path (relative to the working directory) as a string; no size cap; the text must be UTF-8 | `:kind-mismatch` (non-string path), `:invalid-path` (empty, or holding a NUL byte), `:file-not-found`, `:utf8-error`, `:io-error` (a directory, a permission, any other failure) |
-| `spit` | 2+ | `(spit path x)` writes `(str x)` (nil: an empty file), replacing the file; `(spit path x :append true)` writes after its end. Parent directories are not created (`db/open` is the one call that creates them). nil | as `slurp`, and `:file-not-found` for a missing parent; `:arity-mismatch` (an odd option list), `:invalid-argument` (an option other than `:append`) |
+| `slurp` | 1+ | The whole file at a path (relative to the working directory) as a string; no size cap; the text must be UTF-8. The one option is `:encoding` with `"UTF-8"` (any case, the dash optional), which nexis text always is | `:kind-mismatch` (non-string path), `:invalid-path` (empty, or holding a NUL byte), `:file-not-found`, `:utf8-error`, `:io-error` (a directory, a permission, any other failure), `:invalid-argument` (an option other than `:encoding`, an encoding other than UTF-8) |
+| `spit` | 2+ | `(spit path x)` writes `(str x)` (nil: an empty file), replacing the file; `(spit path x :append true)` writes after its end, opened `O_APPEND`, so the text lands at the end whatever another process appends meanwhile. The text is written as a stream, so a pipe, a FIFO or a device (`"/dev/stdout"`) takes it. Parent directories are not created (`db/open` is the one call that creates them). nil | as `slurp`, and `:file-not-found` for a missing parent; `:arity-mismatch` (an odd option list), `:invalid-argument` (an option other than `:append` and `:encoding`, an encoding other than UTF-8) |
 | `read-line` | 0 | The next line of stdin, of any length, without its `\n` or a trailing `\r`; nil at end of input. It shares one buffer with the REPL, so neither loses what the other read | `:io-error` (a read failure) |
-| `nano-time` | 0 | A monotonic clock in nanoseconds, reduced modulo the fixnum maximum, for intervals; the `time` macro prints `"Elapsed time: X msecs"` with `prn` | — |
+| `nano-time` | 0 | A monotonic clock in nanoseconds, for intervals: a 64-bit count, as Java's `System/nanoTime`, a bignum past the fixnum range (about 39 hours of the host's awake time); the `time` macro prints `"Elapsed time: X msecs"` with `prn` | — |
 | `exit` | 0–1 | Closes every store `db/open` opened and every Nextomic connection `connect` made, syncs every store file a commit left unsynced (`docs/DB.md` §3.3), then ends the process with the status (0 by default; the integer's low eight bits, so `(exit 257)` exits 1 and `(exit -1)` 255). Nothing after it runs, `finally` blocks included, as with Java's `System/exit` (`test/golden/cli/exit-status.nx`) | `:kind-mismatch` (non-integer) |
 | `*command-line-args*` | Var | The arguments after the program as a vector of strings, nil when there are none; `nexis run` binds it (TOOLING.md §1) | — |
 
@@ -427,14 +430,9 @@ the VM, so none needs a root scope (GC.md §11.5).
 
 ### 7. Tests
 
-`test/integration/eval_pipeline.zig` pins the text natives
-(`parse-long` and `parse-double` included), `format`,
-`nexis.string`, printing in both modes, `with-out-str`, `slurp` and
-`spit` end to end; `src/format.zig` carries the per-kind printer
-tests; `test/golden/cli/` pins `read-line` (`stdin`),
-`*command-line-args*` (`args`) and `exit` (`exit-status`) through
-`bin/nexis`; `test/integration/numbers.zig` pins the float
-spellings.
+`test/integration/eval_pipeline.zig` pins this document end to end,
+`src/format.zig` the printer kind by kind, `test/golden/cli/` what
+needs `bin/nexis` (`read-line`, `*command-line-args*`, `exit`).
 
 ---
 
@@ -449,14 +447,14 @@ returns a realized list where Clojure returns a lazy seq.
 |---|---|---|
 | `nfirst` | 1 | `(next (first x))` |
 | `tree-seq` | 3 | `(tree-seq branch? children root)`: the lazy seq of every node, depth first, each before its children; `children` of a node for which `branch?` is truthy gives its children. Realizing a node calls `branch?` and `children` on it, as Clojure's does; the children still to visit wait on an explicit stack, so a tree of any depth walks |
-| `replace` | 2 | `(replace smap coll)`: each element that `smap` (a map, or a vector by index) has as a key replaced by its value; a vector of a vector, keeping its metadata, else a lazy seq |
-| `partitionv`, `partitionv-all` | 2–4, 2–3 | `partition` and `partition-all` with each part a vector |
+| `replace` | 1–2 | `(replace smap coll)`: each element that `smap` (a map, or a vector by index) has as a key replaced by its value; a vector of a vector, keeping its metadata, else a lazy seq |
+| `partitionv`, `partitionv-all` | 2–4, 1–3 | `partition` and `partition-all` with each part a vector |
 | `splitv-at` | 2 | `[(vec (take n coll)) (drop n coll)]` |
 | `bounded-count` | 2 | `(count coll)` of a counted collection, else the count of at most the first `n` elements (`(bounded-count 2 "abcd")` is 2) |
-| `random-sample` | 2 | `(random-sample prob coll)`: each element kept with probability `prob` (`rand`) |
+| `random-sample` | 1–2 | `(random-sample prob coll)`: each element kept with probability `prob` (`rand`) |
 | `lazy-seq` | macro | `(lazy-seq body...)`: a lazy seq whose body runs once, when the seq is first walked, its result cached; a body that throws ends the seq there on the next walk (`docs/LAZY.md` §4) |
 | `chunked-seq?`, `chunk-first`, `chunk-rest`, `chunk-next`, `chunk-buffer`, `chunk-append`, `chunk`, `chunk-cons` | 1, 1, 1, 1, 1, 2, 1, 2 | Clojure's chunk functions, for library code (`docs/LAZY.md` §7): `chunked-seq?` is true of a chunked cons and of a vector's view; a chunk is a vector, `chunk-buffer` a transient vector, `chunk-append` `conj!`, `chunk` `persistent!`; `chunk-cons` copies the vector into a chunked cons in front of the rest, or is the rest itself when the chunk is empty |
-| `transduce`, `completing`, `cat`, `halt-when`, `eduction` | 3–4, 1–2, 1, 1–2, 1+ | Clojure 1.12's transducers (`docs/LAZY.md` §10), as are `into`'s 3-arity, `sequence`'s 2-arity and the transducer arities of `map`, `filter`, `remove`, `keep`, `take`, `take-while`, `drop`, `drop-while`, `map-indexed`, `keep-indexed`, `partition-all`, `partition-by`, `mapcat`, `interpose`, `distinct` and `dedupe` |
+| `transduce`, `completing`, `cat`, `halt-when`, `eduction` | 3–4, 1–2, 1, 1–2, 1+ | Clojure 1.12's transducers (`docs/LAZY.md` §10), as are `into`'s 3-arity, `sequence`'s 2-arity and the transducer arities of `map`, `filter`, `remove`, `keep`, `take`, `take-while`, `drop`, `drop-while`, `map-indexed`, `keep-indexed`, `partition-all`, `partition-by`, `partitionv-all`, `mapcat`, `interpose`, `take-nth`, `replace`, `random-sample`, `distinct` and `dedupe` |
 | `lazy-cat` | macro | `(lazy-cat coll...)`: `(concat (lazy-seq coll) ...)`, each coll's expression evaluated when the walk reaches it |
 | `iterate`, `repeat`, `repeatedly`, `cycle` | 2, 1–2, 1–2, 1 | Lazy and, without a count, infinite (`docs/LAZY.md` §7): `(take 5 (iterate inc 0))`; `(iterate f x n)` is `:arity-mismatch`; `repeat`'s count is truncated, as Clojure's `(long n)`, and every other sequence function's rounds up (`docs/LAZY.md` §9) |
 | `doall`, `dorun` | 1–2 | Walk the seq, realizing it (the first `n` steps with a count, as Clojure's `next` loop); `doall` returns its argument, `dorun` nil |
@@ -489,7 +487,7 @@ returns a realized list where Clojure returns a lazy seq.
 | `qualified-ident?`, `simple-ident?` | 1 | Whether `x` is a keyword or symbol with a namespace, without one |
 | `bit-and-not`, `bit-flip` | 2+, 2 | `(bit-and x (bit-not y))` over each further argument; `bit-flip` is `bit-set` or `bit-clear` of the bit, as `bit-test` finds it |
 | `alter-var-root` | 2+ | `(alter-var-root v f & args)`: sets the root of the Var `v` to `(apply f root args)` and returns it; a `binding` in force is left as it is. An unbound Var's root is nil to `f` and bound after (Clojure passes its `Unbound` object). A non-Var is `:kind-mismatch` |
-| `with-redefs-fn`, `with-redefs` | 2, macro | `(with-redefs-fn {#'v val ...} f)` calls `f` with each Var's root set to its value; `(with-redefs [name val ...] body...)` does it for the body, the names resolved as `var` resolves them. Root writes, not bindings, so every caller sees them and a Var need not be dynamic; each root is restored on every exit, a throw included, and a Var that was unbound is unbound again (`nexis.internal/#%unbind-root`), as Clojure restores its `Unbound` root. A call the compiler inlines (the arithmetic and comparison functions, COMPILER.md) does not go through the Var |
+| `with-redefs-fn`, `with-redefs` | 2, macro | `(with-redefs-fn {#'v val ...} f)` calls `f` with each Var's root set to its value; `(with-redefs [name val ...] body...)` does it for the body, the names resolved as `var` resolves them. Root writes, not bindings, so every caller sees them and a Var need not be dynamic; each root is restored on every exit, a throw included, and a Var that was unbound is unbound again (`nexis.internal/#%unbind-root`), as Clojure restores its `Unbound` root. A call the compiler inlines (the arithmetic and comparison functions and `not`, COMPILER.md) does not go through the Var |
 | `*ns*` | Var | The namespace a form is compiled in, as its name symbol: the compiler sets the root before it expands each top-level form, and `in-ns` when it switches, so `(ns-name *ns*)` in a file or a macro names the file's namespace. Dynamic, but a `binding` of it does not change where forms compile |
 | `ex-info`, `ex-data`, `ex-message`, `ex-cause` | 2–3, 1, 1, 1 | `(ex-info msg data cause?)` is the map `{:message msg :data data}` (`:cause` with a third argument), `msg` a string or nil and `data` a map, nil meaning `{}`, else `:kind-mismatch`. `ex-message` is a map's `:message`; `ex-data` an `ex-info` map's `:data`, and an error map (one with an `:error` and no `:data`: a caught runtime error, a Nextomic error) is its own data, so `(:error (ex-data e))` is the tag of either; `ex-cause` a map's `:cause`; each nil for anything else (`docs/VM.md` §13) |
 | `special-symbol?` | 1 | Whether `s` is a name the compiler takes as a special form: `def if do let* fn* loop* letfn* quote var recur try catch finally throw set! &` |
@@ -615,13 +613,16 @@ Vars, as `MultiFn` calls `clojure.core/isa?`.
 
 #### 9.4 Errors, the registry and the image
 
-| Situation | Thrown value | `catch` class |
+| Situation | Error map | `catch` class |
 |---|---|---|
 | No method | `{:error :no-method :message "No method in multimethod 'f' for dispatch value: X" :value dv}` | `IllegalArgumentException` |
 | An ambiguity | `{:error :ambiguous-method :message "Multiple methods in multimethod 'f' match dispatch value: X -> K and B, and neither is preferred" :value dv}` | `IllegalArgumentException` |
 | A preference conflict | `{:error :preference-conflict :message ...}` | `IllegalStateException` |
 | A cycle, or an edge to an ancestor (§9.1) | `{:error :invalid-derivation :message ...}` | any |
 | A `derive` assertion (§9.1) | `{:error :assertion-failed :message "Assert failed: ..."}` | `AssertionError` |
+
+Each is raised through `#%raise`, so a caught one carries the place
+keys of the program's call, as a runtime error does (`docs/VM.md` §13).
 
 Each value is printed into its message by `format`'s `%s`: a string
 bare, a keyword or vector as `pr-str` prints it, nil as `nil` where
@@ -714,7 +715,7 @@ as U+FFFD, as Java decodes it.
 |---|---|---|---|
 | `getenv` | 0–1 | `(getenv name)`: the value of the environment variable as a string, nil when it is not set (an empty name, or one holding a NUL byte, is never set); `(getenv)`: every variable as a map of name to value, Clojure's `(System/getenv)`. libc's environment, which nexis never changes | `:kind-mismatch` (a name that is not a string) |
 | `cwd` | 0 | The absolute path of the working directory, Java's `(System/getProperty "user.dir")` | `:io-error` |
-| `sh` | 1+ | `(sh "ls" "-l" :dir "/tmp")`: runs a program and waits for it, returning `{:exit status :out text :err text}`. The leading strings are the program, found on the PATH (`/usr/local/bin:/bin:/usr/bin` when the process has none), and its arguments; keyword options follow. `:in` is text written to the program's stdin, which otherwise reads end of input at once; `:dir` its working directory, else `*sh-dir*`; `:env` a map that is the whole of its environment, each name by `name` and value by `str`, else `*sh-env*`; nil for any of them is the process's own. A signal's status is 128 plus its number, as Java reports it; output that is not UTF-8 reads as U+FFFD | `:invalid-argument` (no program; an option other than these, among them Clojure's `:in-enc` and `:out-enc`; a NUL byte in an argument; a name no variable can have), `:kind-mismatch` (a non-string `:in`, a non-map `:env`), `:arity-mismatch` (an option without its value), `:file-not-found` (no such program, or no such `:dir`), `:io-error` (any other failure to run it; a VM with no `io`) |
+| `sh` | 1+ | `(sh "ls" "-l" :dir "/tmp")`: runs a program and waits for it, returning `{:exit status :out text :err text}`. The leading strings are the program, found on the PATH (`/usr/local/bin:/bin:/usr/bin` when the process has none), and its arguments; keyword options follow. `:in` is text written to the program's stdin, which otherwise reads end of input at once; `:dir` its working directory, else `*sh-dir*`; `:env` a map that is the whole of its environment, each name by `name` and value by `str`, else `*sh-env*`; nil for any of them is the process's own. A signal's status is 128 plus its number, as Java reports it; output that is not UTF-8 reads as U+FFFD | `:invalid-argument` (no program; an option other than these, among them Clojure's `:in-enc` and `:out-enc`; a NUL byte in an argument; a name no variable can have), `:kind-mismatch` (a non-string `:in`, a non-map `:env`, an `:env` name that is not a string, keyword or symbol), `:arity-mismatch` (an option without its value), `:file-not-found` (no such program, or no such `:dir`; with a `:dir` the message names both, `sh: cannot run ls in /x`), `:io-error` (any other failure to run it; a VM with no `io`) |
 | `*sh-dir*`, `*sh-env*` | Var | Dynamic, nil at the root: the `:dir` and `:env` of a `sh` that gives none | — |
 | `with-sh-dir`, `with-sh-env` | macro | `(with-sh-dir dir body...)`: the body with `*sh-dir*` bound to `dir`; `with-sh-env` the same for `*sh-env*` | — |
 
@@ -819,42 +820,39 @@ Nextomic attribute keeps its namespace; `:key-fn name` gives
 key is a string as it is, a keyword or symbol by its whole name, an
 integer by its digits. A string is written as UTF-8 with `"`, `\` and
 the control characters escaped (`\b`, `\f`, `\n`, `\r`, `\t`, else
-`\u00XX`); `clojure.data.json` escapes every non-ASCII character and
-`/` by default, this writer only when asked. The walk recurses on the
+`\u00XX`), and U+2028 and U+2029 as `\u2028` and `\u2029`, which
+JavaScript before ES2019 reads as line terminators, so the text stays
+one token inside a `<script>`, as `clojure.data.json`'s
+`:escape-js-separators` does by default; `clojure.data.json` also
+escapes every other non-ASCII character and `/` by default, this
+writer only when asked. The walk recurses on the
 data's depth under the stack guard, so data nested past the native
 stack is a catchable `:stack-overflow`.
 
 | Name | Arity | Semantics |
 |---|---|---|
 | `read-str` | 1+ | `(read-str s & opts)`: the value of the JSON text `s`. `:key-fn`: a function of each key's string, its result the map key (`keyword` gives keyword keys, interned without a call: an empty key, which names no keyword, is `:invalid-argument`). `:value-fn`: a function of each object member's key (after `:key-fn`) and value, inner objects first, whose result replaces the value, or drops the member when it is `:value-fn` itself |
-| `write-str` | 1+ | `(write-str x & opts)`: the JSON text of `x`, as above. `:key-fn`: a function of each map key to the string written; `:value-fn`: a function of each map entry's key and value whose result is written, the entry left out when it is `:value-fn` itself; `:indent true`: a newline before each member and element, two spaces a level, `": "` after a key, an empty collection kept as `{}` or `[]` (`clojure.data.json` 2.5's `:indent`); `:escape-unicode true`: every character past ASCII as `\uXXXX`, a pair past the BMP; `:escape-slash true`: `/` as `\/` |
+| `write-str` | 1+ | `(write-str x & opts)`: the JSON text of `x`, as above. `:key-fn`: a function of each map key to the string written; `:value-fn`: a function of each map entry's key and value whose result is written, the entry left out when it is `:value-fn` itself; `:indent true`: a newline before each member and element, two spaces a level, `": "` after a key, an empty collection kept as `{}` or `[]` (`clojure.data.json` 2.5's `:indent`); `:escape-unicode true`: every character past ASCII as `\uXXXX`, a pair past the BMP; `:escape-slash true`: `/` as `\/`; `:escape-js-separators` false or nil: U+2028 and U+2029 written as they are |
 | `read` | 1+ | `(read path & opts)`: `read-str` of the file's text (`slurp`); stdin is `(read "/dev/stdin")` |
 | `write` | 2+ | `(write x path & opts)`: `write-str` of `x` into the file, replacing it (`spit`); nil |
 
 **Errors.** Malformed text throws the map `{:error :json-error
-:message "JSON: <what> at line L, column C" :line L :column C}` (as
-the multimethod errors are maps, §9.4), the column counted in
-characters, so `(catch :json-error e (ex-message e))` takes it; the
+:message "JSON: <what> at line L, column C" :json-line L :json-column
+C}`, the column counted in characters, with the place of the
+program's call (`:fn`, `:file`, `:line`, `:column`) as every error a
+native raises; `(catch :json-error e (ex-message e))` takes it. The
 `<what>`s are `the text ends before its value`, `the text ends inside
 a string` (an `object`, an `array`), `text follows the value`,
 `unexpected 'c'`, `expected a string key`, `expected ':' after a
 key`, `expected ',' or '}'` (`']'`), `a malformed number`, `a control
 character in a string`, `an unknown escape`, `a lone surrogate`.
 Writing what JSON cannot hold throws `{:error :json-error :message
-...}` without a position: `NaN` or an infinity, a nil key, a key of
+...}`, placed, with no position in a text: `NaN` or an infinity, a nil key, a key of
 another class, a `:key-fn` result that is not a string, a value of any
 other class (a function, an atom). A text that is not a string, or an
 options map that is not a map, is `:kind-mismatch`; a string that is
 not UTF-8 `:utf8-error`; a throw from an option's function passes
 through.
-
-**Speed.** An optimized build (`-Doptimize=fast`, the Apple M5, one
-core under the machine's queue) reads a 10.5 MB document of 42,000
-records (nested objects, arrays, strings with escapes and non-ASCII
-text, doubles, integers to 10^12) in 41–56 ms, 30–43 ms with keyword
-keys, and writes it back in 42–47 ms (5 runs in one process); the
-process peaks at 203 MB. Babashka's cheshire takes 121–175 ms and
-60–161 ms on the same document.
 
 `test/integration/eval_pipeline.zig` pins every value kind both ways,
 the options, each error and its position, a round trip of every kind

@@ -113,7 +113,7 @@ of an in-flight atom is allowed: it reads and never marks.
 
 ```clojure
 (let [a (atom 0)]
-  [(try (swap! a (fn [_] (reset! a 9))) (catch :atom-re-entry e e)) @a])
+  [(try (swap! a (fn [_] (reset! a 9))) (catch :atom-re-entry e (:error e))) @a])
 ;; => [:atom-re-entry 0]
 ```
 
@@ -186,7 +186,7 @@ callback's result.
   (swap! a inc) (reset! a 5)
   @log)
 ;; => [[:log 1 2] [:log 2 5]]
-(let [a (atom 1 :validator pos?)] [(try (swap! a dec) (catch any e e)) @a])
+(let [a (atom 1 :validator pos?)] [(try (swap! a dec) (catch any e (:error e))) @a])
 ;; => [:invalid-reference-state 1]
 ```
 
@@ -257,7 +257,8 @@ first.
 | `:kind-mismatch` | `with-meta` on an atom (SEMANTICS.md §7) |
 
 Every one is catchable by keyword, `(catch :atom-re-entry e …)`, or
-with `(catch any e …)` (`docs/VM.md` §12).
+with `(catch any e …)`; either binds `e` to the error map, the keyword
+under `:error` (`docs/VM.md` §12).
 
 ---
 

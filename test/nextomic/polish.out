@@ -24,10 +24,10 @@ Ann
 {:error :nextomic/unknown-attribute, :message :user/nope names no attribute, :attr :user/nope}
 {:error :nextomic/query-syntax, :message ?a is never bound; a predicate, function or rule argument needs a pattern, an input or an earlier clause to bind it, :clause 1}
 {:error :nextomic/query-syntax, :message missing? is (missing? $ ?e :attr), :clause 1}
-{:error :nextomic/query-syntax, :message unknown rule, :clause 0}
+{:error :nextomic/query-syntax, :message (nope ...) calls a rule the rule set does not define, :clause 0}
 {:error :nextomic/unique, :message :user/email "ann@x" belongs to another entity, :attr :user/email, :value ann@x}
 {:error :nextomic/unknown-attribute, :message :user/nope names no attribute, :attr :user/nope}
-{:error :nextomic/tx-data, :message a nested map under a non-component ref needs :db/id or a unique attribute}
+{:error :nextomic/tx-data, :message a nested map under a non-component ref needs :db/id or a unique attribute, :attr :user/boss}
 {:error :nextomic/unknown-attribute, :message :user/nope names no attribute, :attr :user/nope}
 {:error :kind-mismatch, :message kind mismatch}
 {:error :nextomic/tx-data, :message a lookup ref is [attr value]}
@@ -35,8 +35,8 @@ Ann
 {:error :nextomic/value-type, :message :user/email takes a :db.type/string, not 5, :attr :user/email, :value 5}
 {:error :nextomic/no-entity, :message [:user/email "zed@x"] names no entity, :value [:user/email zed@x]}
 {:error :nextomic/no-entity, :message 0 names no entity, :value 0}
-{:error :nextomic/tx-data, :message a unique attribute is cardinality one}
-{:error :nextomic/tx-data, :message a unique attribute is cardinality one}
+{:error :nextomic/tx-data, :message a unique attribute is cardinality one, :attr :user/tags}
+{:error :nextomic/tx-data, :message a unique attribute is cardinality one, :attr :user/items}
 ok failed transactions leave the basis alone
 ([Ann] [Bob])
 Dee

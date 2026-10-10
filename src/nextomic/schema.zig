@@ -11,8 +11,6 @@
 //!     `attr(a)` is the timeline replayed to the schema's basis;
 //!     `attrAt(a, b)` replays it to `b`, so every flag and the
 //!     cardinality read as basis `b` saw them.
-//!   - `:db/fulltext` is the one bootstrap attribute whose id differs
-//!     between stores (`Store.fulltext_aid`); the store supplies it.
 //!   - `count` is the number of current AEVT entries of the attribute at
 //!     the transaction the schema was built in; it is a planner estimate.
 
@@ -92,18 +90,18 @@ pub const Attr = struct {
                 .unique => if (ev.added or @backingInt(out.unique) == ev.value) {
                     out.unique = @fromBackingInt(@intCast(v));
                 },
-                .index => if (ev.added or @intFromBool(out.indexed) == ev.value) {
-                    out.indexed = v == 1;
-                },
-                .component => if (ev.added or @intFromBool(out.component) == ev.value) {
-                    out.component = v == 1;
-                },
-                .fulltext => if (ev.added or @intFromBool(out.fulltext) == ev.value) {
-                    out.fulltext = v == 1;
-                },
+                .index => flag(&out.indexed, ev),
+                .component => flag(&out.component, ev),
+                .fulltext => flag(&out.fulltext, ev),
             }
         }
         return if (typed) out else null;
+    }
+
+    /// A flag's event: an assertion sets the flag, a retraction clears
+    /// the value in force.
+    fn flag(f: *bool, ev: Event) void {
+        if (ev.added or @intFromBool(f.*) == ev.value) f.* = ev.added and ev.value == 1;
     }
 };
 
@@ -141,7 +139,7 @@ pub const Schema = struct {
                 events = .empty;
                 e = parts.e;
             }
-            const ev = (try eventOf(parts.a, parts.v, store.fulltext_aid)) orelse continue;
+            const ev = (try eventOf(parts.a, parts.v)) orelse continue;
             try events.append(arena, .{ .t = row.t, .field = ev.field, .value = ev.value, .added = row.added });
         }
         try self.add(arena, e, events.items);
@@ -153,8 +151,9 @@ pub const Schema = struct {
 
     /// The event a history row of `(a v)` is, or null when `a` is not
     /// a schema attribute.
-    fn eventOf(a: u32, vbytes: []const u8, fulltext_aid: u32) !?struct { field: Event.Field, value: u8 } {
-        const field: Event.Field = if (a == fulltext_aid) .fulltext else switch (a) {
+    fn eventOf(a: u32, vbytes: []const u8) !?struct { field: Event.Field, value: u8 } {
+        const field: Event.Field = switch (a) {
+            boot.fulltext => .fulltext,
             boot.value_type => .value_type,
             boot.cardinality => .cardinality,
             boot.unique => .unique,
@@ -200,7 +199,6 @@ pub const Schema = struct {
 
     pub fn deinit(self: *Schema) void {
         const gpa = self.arena.child_allocator;
-        self.attrs.deinit(self.arena.allocator());
         self.arena.deinit();
         gpa.destroy(self);
     }
@@ -334,7 +332,7 @@ test "attrAt masks flags that arrived after the asked basis" {
             .{ .e = a, .a = boot.index, .vbytes = yes, .added = true, .avet = false, .vaet = false },
         }, arena);
         try store.writeBatch(txn, 4, &.{
-            .{ .e = a, .a = store.fulltext_aid, .vbytes = yes, .added = true, .avet = false, .vaet = false },
+            .{ .e = a, .a = boot.fulltext, .vbytes = yes, .added = true, .avet = false, .vaet = false },
         }, arena);
         const identity = try key.valBytes(arena, .{ .keyword = boot.unique_identity });
         try store.writeBatch(txn, 5, &.{

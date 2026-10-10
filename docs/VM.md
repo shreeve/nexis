@@ -391,14 +391,14 @@ the same way (the loader and `eval`).
 with the same argument count (`map` over one collection, `filter`,
 `remove`, `keep`, `reduce`, `group-by`) calls it through a
 `vm.Callback`, which
-makes at its first call the decisions `callValue` makes at every one
-and cannot change between calls from the same place: the callee's
+makes before its first call the decisions `callValue` makes at every
+one and cannot change between calls from the same place: the callee's
 kind, its arity against the count (for a closure, the routine with a
 fixed arity, its own or a member of its table, the count enters), and
 for a closure the stack guard
 (§13.1), the frame cap and the room the frame chain and the stack
 need, since every call starts from the frame depth and stack length
-the first one found. Each later call of a closure writes the
+the first one finds. Each call of a closure writes the
 arguments and nil locals into the window at that stack length (one or
 two arguments, `call1` and `call2`, are stored straight from the
 native's registers; the locals are nil'd four at once, past the window
@@ -407,15 +407,17 @@ the frame built at the first call and runs it as the loop would: the
 loop's depth and nesting are set, the safe point of the loop's entry
 taken, and the chain entered at the callee's first instruction, the
 frame the loop's first pass would run, so the pass needs no test. A
-pass that ends without an error has returned; one that ends with an
-error goes on to the loop, which takes the error as its own pass
-would (§8, §12). The frame built at the first call returns into a
+pass that ends without an error has returned, or a throw went past the
+frame, which leaves the result cell unfilled (`ControlTransferred` to
+the native, §12); one that ends with an error goes on to the loop,
+which takes the error as its own pass would (§8, §12). The frame built at the first call returns into a
 result cell of the `Callback`'s own, so a call sets one flag in it
 rather than making a cell, and the native reads the value back a word
 at a time, the width the return stored it (§8); a callee that
 re-enters the native makes a `Callback`, and a cell, of its own. A
 call that finds the depth or the length changed
-goes through `callValue`. A leaf native is called as `callValue` calls it, and a
+goes through `callValue`. A leaf native is called as `callValue` calls it,
+past the leaf call once its leaf body refuses the receiver, and a
 keyword or symbol given one argument that is a map, a record or nil
 looks itself up in place (§8); any other callee, a closure the count
 enters at a rest clause, and any callee whose arity the count does not
@@ -427,8 +429,8 @@ the results, errors, error details, traces and rooting are
 a run it holds calls it through `Callback.each` (`out[i] = (f
 items[i])`), `fold` (`acc = (f acc items[i])`) or `foldRange` (the same
 over an unrealized range or `repeat`, whose elements are computed),
-which make the run's calls in one pass of the chain. The first
-element's is a prepared call as above. The return of each element's
+which make the run's calls in one pass of the chain, starting with the
+first element's prepared call as above. The return of each element's
 frame into the callback's cell goes on in that frame: its result goes
 to its place (`each`'s into a block a root reaches, a buffer only
 tested for truth, or a root-stack region by index; `fold`'s
@@ -438,8 +440,7 @@ window, the frame stays as the first call pushed it (nothing a call
 runs changes a frame but its `pc`), the safe point a call's entry is
 taken, and the chain goes on at the callee's first instruction, which
 the first call looked up, so the native is re-entered once per run
-rather than once per element. A leaf native or a lookup is called in
-a loop of its own, its mode decided once. `fold` and `foldRange` end the pass after a
+rather than once per element. `fold` and `foldRange` end the pass after a
 result that is a record, which the native tests for `reduced`. Every
 element is still a call of its own, with a frame of its own: the pop
 of one element's and the push of the next one's are fused, at the same
@@ -542,7 +543,7 @@ keyed by frame index (§12).
 **Storage discipline.** Frames window one backing stack and a
 callee's window overlaps the top of its caller's, so no slice into
 `vm.stack.items` may be held across an operation that can grow it,
-and no `*Frame` across `vm.frames.append()`; `slotPtr` and
+and no `*Frame` across `vm.frames.append()`; `slotPtrIn` and
 `currentFrame` are one-shot. Frame indices stay valid because frames
 pop only from the top.
 
@@ -596,7 +597,9 @@ call stores it (`call:call`, the buffered and the general call,
 `call:lookup`, `coll:*`; `VM.storeResult`); the arguments a buffered
 or general call and a collection's construction copy off the stack are
 copied a value at a time, a map's key and value as one 32-byte entry,
-the width its constructor reads (`VM.copyRun`, `VM.copyEntries`).
+the width its constructor reads, which a target without AVX (the
+release's `x86_64_v2`) stores as two 16-byte halves (`VM.copyRun`,
+`VM.copyEntries`).
 A native returns its result through memory by a `return` of a value
 it holds, or of an error, which stores it in place: a result merged
 from an `if`, a `switch`, an `orelse` or a labeled block, or returned
@@ -613,14 +616,16 @@ runs whole. On both, `max` and `min` read their winner a word at a
 time (`docs/PERF.md` "A width-consistent native boundary").
 
 - `op_table` holds every opcode's **general handler**, which takes
-  every case and raises every trap. Every variant of `mov`, `jump` and
-  `cmp`, and `closure:get-cell`, `var:load-var`, `call:call`,
-  `call:self`, `call:return` and `call:return-nil`, has a general
-  handler of its own, and `call:lookup` and `call:lookup-or` share
-  one; a quickened variant's (§10.10) runs the instruction as its base
-  opcode, through the base's; every other entry is its group's, which switches on the
-  variant or, where no variant is left, traps as §10 says for one
-  outside the enum. A group outside the enum is `BytecodeCorruption`;
+  every case and raises every trap. `mov:move`, the conditional jumps,
+  every variant of `cmp`, and `closure:get-cell`, `var:load-var`,
+  `call:call`, `call:self`, `call:return` and `call:return-nil` each
+  have a general handler of their own, and `call:lookup` and `call:lookup-or`
+  share one; `mov:move-clear`, the `mov` loads and `jump:jmp` have
+  their fast handler there too, since verification leaves them no
+  other case; a quickened variant's (§10.10) runs the instruction as
+  its base opcode, through the base's; every other entry is its
+  group's, which switches on the variant or, where no variant is left,
+  traps as §10 says for one outside the enum. A group outside the enum is `BytecodeCorruption`;
   `transient`, `hash`, `tx`, `io` and `simd` trap
   `UnimplementedOpcode` for every variant.
 - `fast_table`, the table the fetch reads, is `op_table` with a
@@ -1082,7 +1087,8 @@ is thrown. When a throw that carries an origin leaves the run,
 detail and `error_trace` its chain, so the report is the one the error
 would have without the `try` around it. An origin no live record names
 is dropped before the next one is pushed; `resetAfterError` clears
-them all.
+them all. An origin is for the report only: a throw with no memory to
+record one goes on without it, reported where it leaves the run.
 
 **`ctrl:finally-exit`** pops the top `FinallyContinuation`
 (`InvalidHandlerState` if there is none or it belongs to another
@@ -1183,7 +1189,9 @@ native's keyword as the bare keyword, which the host reports with its
 trace; the REPL's `*e` holds the map a catch would have taken. Building
 the map can fail only for memory; then the value is the bare keyword,
 which every `catch` that takes the map also takes, so a handler still
-runs when the heap is exhausted. The line of a place costs a scan of
+runs when the heap is exhausted: nothing else a throw does allocates,
+since `ctrl:try-enter` reserves the room for a finally's continuation
+and the throw's origin is dropped when it cannot be recorded (§12). The line of a place costs a scan of
 the source before it; the VM keeps the last place it computed, so a
 handler taking an error in a loop scans once.
 
@@ -1332,12 +1340,15 @@ callback that catches it returns normally through `mapv`, `reduce`,
 ### 15. Tests
 
 `src/vm.zig` holds the opcode tests: hand-assembled routines
-covering every dispatched opcode and every trap it can raise, mostly
-as `RunCase{code, consts, slots, want}` tables run by `expectRuns`,
-which also asserts that a run that returns leaves no handler,
-pending finally or frame behind; the closure, cell, var and ctrl
-tests that inspect VM state are individual. `src/compile.zig` pins
-the 10k-iteration `recur` loop (§11).
+covering every dispatched opcode and every trap it can raise, as
+`RunCase` rows run by `expectRuns` (code, constants, tries, capture
+descriptors, a Var table, and the value, kind, Var, error or uncaught
+throw wanted), which also asserts that a run that returns leaves no
+handler, pending finally or frame behind; what verification refuses is
+the rows of `Routine.verify`'s own table, each run through `run` too.
+The tests that inspect VM state, batches and the numeric tower are
+individual. `src/compile.zig` pins the 10k-iteration `recur` loop
+(§11).
 `test/integration/eval_pipeline.zig`, `runtime_polish.zig` and
 `numbers.zig` run source through the compiler and VM (captured loop
 bindings, `letfn*`, variadic calls, every catchable error and its

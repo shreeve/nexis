@@ -87,7 +87,7 @@ ok a lookup ref names an identity asserted after it
 {:db/id 4294967304, :person/full-name El, :person/email l@example.com, :person/age 1, :person/tags #{:listed}}
 {:db/id 4294967304, :person/email l@example.com, :person/age 2}
 ok a list retractEntity
-{:error :nextomic/tx-data, :message :db/add is [:db/add e a v]}
-{:error :nextomic/tx-data, :message a list form is [op e ...]}
-{:error :nextomic/tx-data, :message a form is a vector, a list or a map}
+{:error :nextomic/tx-data, :message :db/add is [:db/add e a v], :value (:db/add l :person/age)}
+{:error :nextomic/tx-data, :message a list form is [op e ...], :value ()}
+{:error :nextomic/tx-data, :message a form is a vector, a list or a map, :value #{:db/add}}
 :basics-done

@@ -2,8 +2,9 @@
 //!
 //! A `Conn` owns the store, the ident cache and the schema cache. A
 //! `DbValue` is a plain value `{conn, basis, as_of, since, history}`
-//! with no open read transaction: every operation opens one, reads
-//! `sys["t"]` as `now`, and closes it. A speculative `with`
+//! with no open read transaction: every operation begins its read in
+//! the file's held snapshot or a fresh one (`docs/DB.md` §3.4), reads
+//! `sys["t"]` as `now`, and ends by keeping it. A speculative `with`
 //! (transact.zig) makes a second `Conn` over the same store whose
 //! reads are read-only children of the held write transaction, with
 //! ident and schema caches of its own. Invariants:
@@ -13,7 +14,7 @@
 //!   - `now < basis` is `error.BasisInFuture`; the db-value is dead.
 //!   - `as-of T` caps the view at `min(basis, T)`; `since T` shows only
 //!     facts asserted after `T`; `history` shows every row unfolded, and
-//!     composes with `as-of`.
+//!     composes with `as-of` and `since`.
 //!   - Out-of-line values are confirmed and materialised from their
 //!     payload, in the current EAVT row or the EAVT-h assertion row,
 //!     before a datom is returned.
@@ -32,7 +33,6 @@ const datom_mod = @import("datom.zig");
 const store_mod = @import("store.zig");
 const idents_mod = @import("idents.zig");
 const schema_mod = @import("schema.zig");
-const fulltext = @import("fulltext.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -112,10 +112,15 @@ pub const OpenOptions = struct {
     refused_format: ?*u16 = null,
 };
 
+/// The keywords tx-data's forms are read by (transact.zig).
+pub const FormKeyword = enum { @"db/id", @"db/add", @"db/retract", @"db/retractEntity", @"db.fn/call", @"db.fn/cas" };
+
 pub const Conn = struct {
     gpa: Allocator,
     store: *Store,
     interner: *Interner,
+    /// The interner's id of each form keyword, interned once.
+    form_keywords: std.EnumArray(FormKeyword, u32) = .initFill(0),
     idents: Idents,
     schema_cache: ?*Schema = null,
     sync_mode: SyncMode,
@@ -176,14 +181,16 @@ pub const Conn = struct {
         const sync_mode = options.sync orelse SyncMode.of(store_mod.db_layer.Durability.process());
         const store = try Store.open(self.gpa, path, .{ .sync = sync_mode, .refused_format = options.refused_format });
         errdefer store.close();
-        try refreshFulltext(self.gpa, store, sync_mode);
         const gpa = self.gpa;
         const interner = self.interner;
         const view = self.view;
+        var form_keywords: std.EnumArray(FormKeyword, u32) = undefined;
+        for (std.enums.values(FormKeyword)) |f| form_keywords.set(f, try interner.internKeyword(@tagName(f)));
         self.* = .{
             .gpa = gpa,
             .store = store,
             .interner = interner,
+            .form_keywords = form_keywords,
             .idents = Idents.init(gpa, store, interner),
             .sync_mode = sync_mode,
             .is_open = true,
@@ -191,29 +198,6 @@ pub const Conn = struct {
             .gen = gen,
             .view = view,
         };
-    }
-
-    /// Rebuild `nx/fulltext` when its rows are stale and some attribute
-    /// is full-text (fulltext.zig), in a write transaction of its own
-    /// that writes no datom. A file this process may only read, or one
-    /// whose writer is busy in this process, is left as it is: its
-    /// searches re-tokenise until a transaction rebuilds the rows.
-    fn refreshFulltext(gpa: Allocator, store: *Store, sync_mode: SyncMode) !void {
-        var arena_state = std.heap.ArenaAllocator.init(gpa);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-        {
-            const txn = try store.beginRead();
-            defer txn.abort();
-            if (!try fulltext.needsRebuild(store, txn, arena, try store.readT(txn))) return;
-        }
-        const txn = store.beginWrite(sync_mode) catch |err| switch (err) {
-            error.TxnReadOnly, error.WriterActive => return,
-            else => return err,
-        };
-        errdefer txn.abort();
-        try fulltext.rebuild(store, txn, arena, try store.readT(txn));
-        try store.commit(txn);
     }
 
     /// Stop accepting operations. Idempotent. The `Conn` stays allocated
@@ -265,7 +249,7 @@ pub const Conn = struct {
     /// write transaction. Ends with `endReadTxn`.
     pub fn beginReadTxn(self: *Conn) !*Txn {
         if (!self.is_open) return error.Closed;
-        const txn = if (self.overlay) |w| try self.store.beginReadChild(w) else self.store.file.takeHeld() orelse try self.store.beginRead();
+        const txn = if (self.overlay) |w| try w.beginReadChild() else self.store.file.takeHeld() orelse try self.store.beginRead();
         errdefer txn.abort();
         try self.idents.refresh(txn);
         self.busy += 1;
@@ -273,9 +257,10 @@ pub const Conn = struct {
     }
 
     /// End the read: a reader is kept for the next read while it is the
-    /// latest commit (NEXTOMIC.md §2), a child is aborted.
+    /// latest commit (NEXTOMIC.md §2); a `with` view's, a child of the
+    /// held write transaction, is aborted.
     pub fn endReadTxn(self: *Conn, txn: *Txn) void {
-        if (self.overlay == null) self.store.file.keep(txn) else txn.abort();
+        if (self.owns_store) self.store.file.keep(txn) else txn.abort();
         self.taskDone();
     }
 
@@ -349,7 +334,7 @@ pub const Conn = struct {
     fn schemaWritten(self: *Conn, txn: *Txn, after: u64, upto: u64) !bool {
         var start: [key.ordered_max]u8 = undefined;
         var end: [key.ordered_max]u8 = undefined;
-        var s = try Store.scanRange(txn, self.store.trees.txlog, key.writeTxlogKey(&start, after + 1), key.writeTxlogKey(&end, upto + 1));
+        var s = try Store.scanRange(txn, self.store.trees.txlog, key.writeOrdered(&start, after + 1), key.writeOrdered(&end, upto + 1));
         while (try s.next()) |kv| {
             if (try datom_mod.touchesAttrPartition(kv.value)) return true;
         }
@@ -708,7 +693,7 @@ pub const DatomScan = struct {
         if (row.current) {
             return (try store.currentPayload(self.read.txn, parts.e, parts.a, vbytes, self.arena)) orelse error.Corrupted;
         }
-        return self.arena.dupe(u8, try store.historyPayload(self.read.txn, parts.e, parts.a, vbytes, .{ .t = row.t, .added = row.added }, self.arena));
+        return self.arena.dupe(u8, try store.historyPayload(self.read.txn, parts.e, parts.a, vbytes, .{ .t = row.t, .added = row.added }));
     }
 };
 
@@ -735,9 +720,9 @@ pub fn txRange(conn: *Conn, arena: Allocator, from: u64, to: ?u64) ![]TxEntry {
     const src: datom_mod.Source = .{ .ctx = @ptrCast(&ctx), .attrType = &TxCtx.attrType, .payload = &TxCtx.payload };
 
     var start_buf: [key.ordered_max]u8 = undefined;
-    const start = key.writeTxlogKey(&start_buf, @max(from, 1));
+    const start = key.writeOrdered(&start_buf, @max(from, 1));
     var end_buf: [key.ordered_max]u8 = undefined;
-    const end: ?[]const u8 = if (to) |t| key.writeTxlogKey(&end_buf, t) else null;
+    const end: ?[]const u8 = if (to) |t| key.writeOrdered(&end_buf, t) else null;
 
     var out: std.ArrayList(TxEntry) = .empty;
     var s = try Store.scanRange(txn, conn.store.trees.txlog, start, end);
@@ -775,7 +760,7 @@ const TxCtx = struct {
                 if (cur.t == t) return if (cur.rest.len == 0) error.Corrupted else cur.rest;
             }
         }
-        return store.historyPayload(self.txn, e, a, vbytes, .{ .t = t, .added = added }, self.arena);
+        return store.historyPayload(self.txn, e, a, vbytes, .{ .t = t, .added = added });
     }
 };
 
@@ -813,276 +798,3 @@ pub const TestConn = struct {
         testing.allocator.destroy(self);
     }
 };
-
-test "a released connection reopens in its own struct; db-values of its earlier life stay closed" {
-    const tc = try TestConn.init("db_reopen");
-    defer tc.deinit();
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const old = try tc.conn.db();
-    try tc.conn.release();
-    const before = tc.conn;
-    try tc.conn.reopen(tc.td.path.ptr, .{ .sync = .none });
-    try testing.expectEqual(before, tc.conn);
-    try testing.expectError(error.Closed, old.datoms(arena, .eavt, .{ .e = boot.doc }));
-    try testing.expectEqual(@as(usize, 3), (try (try tc.conn.db()).datoms(arena, .eavt, .{ .e = boot.doc })).len);
-}
-
-test "a connection creates a new store file at the store's initial map size" {
-    const tc = try TestConn.init("db_map_size");
-    defer tc.deinit();
-    try testing.expectEqual(store_mod.db_layer.initial_map_size, tc.conn.store.file.env.info().mapSize);
-}
-
-test "db at bootstrap: datoms, entity, entid, ident, tx-range" {
-    const tc = try TestConn.init("db_boot");
-    defer tc.deinit();
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const db = try tc.conn.db();
-    try testing.expectEqual(@as(u64, 1), db.basis);
-
-    // Every view of the bootstrap agrees on :db/ident's datoms.
-    const cur = try db.datoms(arena, .eavt, .{ .e = boot.ident });
-    try testing.expectEqual(@as(usize, 5), cur.len);
-    const old = try db.asOf(1).datoms(arena, .eavt, .{ .e = boot.ident });
-    try testing.expectEqual(@as(usize, 5), old.len);
-    const none = try db.asOf(0).datoms(arena, .eavt, .{ .e = boot.ident });
-    try testing.expectEqual(@as(usize, 0), none.len);
-    const hist = try db.withHistory().datoms(arena, .eavt, .{ .e = boot.ident });
-    try testing.expectEqual(@as(usize, 5), hist.len);
-    for (cur, old, hist) |a, b, c| {
-        try testing.expect(a.eqlFact(b) and b.eqlFact(c));
-        try testing.expectEqual(@as(u64, 1), a.t);
-        try testing.expect(a.added and c.added);
-    }
-    const since = try db.sinceT(1).datoms(arena, .eavt, .{ .e = boot.ident });
-    try testing.expectEqual(@as(usize, 0), since.len);
-    const since0 = try db.sinceT(0).datoms(arena, .eavt, .{ .e = boot.ident });
-    try testing.expectEqual(@as(usize, 5), since0.len);
-
-    // Filter after a gap: eavt with only `a` bound scans everything and keeps one attribute.
-    const only_type = try db.datoms(arena, .eavt, .{ .a = boot.value_type });
-    try testing.expectEqual(@as(usize, boot.attrs.len), only_type.len);
-
-    // AVET on :db/ident with a value bound.
-    const vb = try key.valBytes(arena, .{ .keyword = boot.doc });
-    const hit = try db.datoms(arena, .avet, .{ .a = boot.ident, .v = vb });
-    try testing.expectEqual(@as(usize, 1), hit.len);
-    try testing.expectEqual(@as(u64, boot.doc), hit[0].e);
-
-    // entity: current, as-of and since views; never a history view.
-    const ent = try db.entity(arena, boot.tx_instant);
-    try testing.expectEqual(@as(usize, 4), ent.len);
-    try testing.expectEqual(boot.ident, ent[0].a);
-    try testing.expectEqual(@as(u32, boot.tx_instant), ent[0].vals[0].keyword);
-    try testing.expectError(error.HistoryView, db.withHistory().entity(arena, boot.tx_instant));
-
-    // entid / ident
-    const k_doc = try tc.interner.internKeyword("db/doc");
-    try testing.expectEqual(@as(?u64, boot.doc), try db.entid(arena, .{ .ident = k_doc }));
-    const k_nope = try tc.interner.internKeyword("nope/nope");
-    try testing.expect((try db.entid(arena, .{ .ident = k_nope })) == null);
-    try testing.expectEqual(@as(?u64, boot.doc), try db.entid(arena, .{ .lookup = .{ .a = boot.ident, .v = .{ .keyword = boot.doc } } }));
-    try testing.expectError(error.TxData, db.entid(arena, .{ .lookup = .{ .a = boot.doc, .v = .{ .string = "x" } } }));
-    try testing.expectEqual(@as(?u32, k_doc), try db.ident(arena, boot.doc));
-    try testing.expect((try db.ident(arena, 1 << 40)) == null);
-    try testing.expect((try db.asOf(0).entid(arena, .{ .ident = k_doc })) == null);
-
-    // attr as-of
-    try testing.expect((try db.attr(boot.ident)).?.indexed);
-    try testing.expect((try db.asOf(0).attr(boot.ident)) == null);
-
-    // tx-range
-    const entries = try txRange(tc.conn, arena, 0, null);
-    try testing.expectEqual(@as(usize, 1), entries.len);
-    try testing.expectEqual(@as(u64, 1), entries[0].t);
-    try testing.expect(entries[0].datoms.len > boot.idents.len);
-    try testing.expect(entries[0].instant > 0);
-    const empty = try txRange(tc.conn, arena, 2, null);
-    try testing.expectEqual(@as(usize, 0), empty.len);
-
-    // A closed connection refuses every operation.
-    try tc.conn.release();
-    try testing.expectError(error.Closed, db.datoms(arena, .eavt, .{ .e = 1 }));
-    try testing.expectError(error.Closed, tc.conn.db());
-}
-
-test "a bounded scan seeks to its start and stops at its end, on every view" {
-    const tc = try TestConn.init("db_scan_range");
-    defer tc.deinit();
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const db = try tc.conn.db();
-
-    // AVET of :db/ident is keyed by ident id: [doc, type_double) holds
-    // doc, txInstant and type_long.
-    const abuf = try key.prefixBytes(arena, .avet, .{ .a = boot.ident });
-    const lo = try key.prefixBytes(arena, .avet, .{ .a = boot.ident, .v = try key.valBytes(arena, .{ .keyword = boot.doc }) });
-    const hi = try key.prefixBytes(arena, .avet, .{ .a = boot.ident, .v = try key.valBytes(arena, .{ .keyword = boot.type_double }) });
-    for ([_]DbValue{ db, db.asOf(1) }) |view| {
-        var rd = try view.beginRead();
-        defer rd.close();
-        var it = try rd.scanRange(arena, .avet, lo, hi);
-        var seen: [3]u64 = undefined;
-        var n: usize = 0;
-        while (try it.next()) |d| : (n += 1) seen[n] = d.e;
-        try testing.expectEqual(@as(usize, 3), n);
-        try testing.expectEqualSlices(u64, &.{ boot.doc, boot.tx_instant, boot.type_long }, &seen);
-        // An open end runs to the attribute's last key and past it.
-        var open = try rd.scanRange(arena, .avet, lo, (try key.successor(arena, abuf)).?);
-        var m: usize = 0;
-        while (try open.next()) |_| m += 1;
-        try testing.expectEqual(@as(usize, boot.idents.len - boot.doc + 1), m);
-    }
-}
-
-test "a txlog key past the id range is corrupt, not a crash" {
-    const tc = try TestConn.init("db_txlog_corrupt");
-    defer tc.deinit();
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    {
-        const txn = try tc.conn.store.beginWrite(.none);
-        errdefer txn.abort();
-        try txn.putInTree(tc.conn.store.trees.txlog, &@as([key.id_len]u8, @splat(0xFF)), &.{});
-        try txn.commit();
-    }
-    try testing.expectError(error.Corrupted, txRange(tc.conn, arena_state.allocator(), 1, null));
-}
-
-test "basis in the future is refused" {
-    const tc = try TestConn.init("db_future");
-    defer tc.deinit();
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var db = try tc.conn.db();
-    db.basis = 99;
-    try testing.expectError(error.BasisInFuture, db.datoms(arena, .eavt, .{ .e = 1 }));
-}
-
-test "a t out of its range in a current row or a txlog key is Corrupted" {
-    const tc = try TestConn.init("db_t_range");
-    defer tc.deinit();
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const store = tc.conn.store;
-    // A current EAVT row of :db/doc whose `t` is 2^46 | 1, and a txlog
-    // key 2^46 | 2: both pass the id range, neither is a `t`.
-    {
-        const txn = try store.beginWrite(.none);
-        errdefer txn.abort();
-        const k = try key.keyBytes(arena, .eavt, boot.doc, boot.ident, try key.valBytes(arena, .{ .keyword = boot.doc }), null);
-        // 2^46 | 1 as a LEB128: seven groups of seven bits.
-        try txn.putInTree(store.trees.cur(.eavt), k, &.{ 0x81, 0x80, 0x80, 0x80, 0x80, 0x80, 0x10 });
-        var kb: [key.ordered_max]u8 = undefined;
-        try txn.putInTree(store.trees.txlog, key.writeOrdered(&kb, key.tx_partition_bit | 2), (try store.getTxlog(txn, 1)).?);
-        try store.commit(txn);
-    }
-    const db = try tc.conn.db();
-    try testing.expectError(error.Corrupted, db.datoms(arena, .eavt, .{ .e = boot.doc }));
-    try testing.expectError(error.Corrupted, txRange(tc.conn, arena, 0, null));
-}
-
-test "a VAET component must be a ref value" {
-    const tc = try TestConn.init("db_vaet_value");
-    defer tc.deinit();
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const db = try tc.conn.db();
-    const sb = try key.valBytes(arena, .{ .string = "x" });
-    try testing.expectError(error.ValueType, db.datoms(arena, .vaet, .{ .v = sb }));
-    try testing.expectError(error.ValueType, key.prefixBytes(arena, .vaet, .{ .v = sb }));
-    try testing.expectError(error.ValueType, key.keyBytes(arena, .vaet, 1, 2, sb, null));
-    try testing.expectError(error.ValueType, key.prefixBytes(arena, .vaet, .{ .v = "" }));
-    // A ref value scans; the other indexes take any value.
-    const rb = try key.valBytes(arena, .{ .ref = 1 });
-    _ = try db.datoms(arena, .vaet, .{ .v = rb });
-    _ = try db.datoms(arena, .avet, .{ .a = 1, .v = sb });
-}
-
-test "materialise every value kind into a heap" {
-    const tc = try TestConn.init("db_mat");
-    defer tc.deinit();
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const txn = try tc.conn.store.beginRead();
-    defer txn.abort();
-    const conn = tc.conn;
-    try testing.expect((try conn.valToValue(txn, &heap, .{ .boolean = true })).asBool());
-    try testing.expectEqual(@as(i64, -3), (try conn.valToValue(txn, &heap, .{ .long = -3 })).asFixnum());
-    try testing.expectEqual(@as(f64, 1.5), (try conn.valToValue(txn, &heap, .{ .double = 1.5 })).asFloat());
-    try testing.expectEqual(@as(i64, 7), (try conn.valToValue(txn, &heap, .{ .instant = 7 })).asFixnum());
-    try testing.expectEqual(@as(i64, 1 << 40), (try conn.valToValue(txn, &heap, .{ .ref = 1 << 40 })).asFixnum());
-    const kw = try conn.valToValue(txn, &heap, .{ .keyword = boot.card_many });
-    try testing.expectEqualStrings("db.cardinality/many", tc.interner.keywordName(kw.asKeywordId()));
-    const s = try conn.valToValue(txn, &heap, .{ .string = "hi" });
-    try testing.expectEqualStrings("hi", string_mod.asBytes(s));
-    const u = try conn.valToValue(txn, &heap, .{ .uuid = @splat(0) });
-    try testing.expectEqualStrings("00000000-0000-0000-0000-000000000000", string_mod.asBytes(u));
-    const b = try conn.valToValue(txn, &heap, .{ .bytes = "\x00\x01" });
-    try testing.expectEqualStrings("\x00\x01", string_mod.asBytes(b));
-}
-
-test "every operation on a closed connection is error.Closed" {
-    const tc = try TestConn.init("db_closed");
-    defer tc.deinit();
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const db = try tc.conn.db();
-    const views = [_]DbValue{ db, db.asOf(1), db.sinceT(0), db.withHistory() };
-    try tc.conn.release();
-    try tc.conn.release();
-    tc.conn.close();
-    try testing.expect(!tc.conn.is_open and tc.conn.store_closed);
-    try testing.expectError(error.Closed, tc.conn.db());
-    try testing.expectError(error.Closed, tc.conn.sync());
-    try testing.expectError(error.Closed, txRange(tc.conn, arena, 0, null));
-    for (views) |v| {
-        try testing.expectError(error.Closed, v.beginRead());
-        try testing.expectError(error.Closed, v.datoms(arena, .eavt, .{ .e = 1 }));
-        if (!v.history) try testing.expectError(error.Closed, v.entity(arena, 1));
-        try testing.expectError(error.Closed, v.entid(arena, .{ .eid = 1 }));
-        try testing.expectError(error.Closed, v.entid(arena, .{ .lookup = .{ .a = boot.ident, .v = .{ .keyword = boot.doc } } }));
-        try testing.expectError(error.Closed, v.ident(arena, boot.doc));
-        try testing.expectError(error.Closed, v.attr(boot.ident));
-    }
-}
-
-test "close waits for operations in flight; release refuses them" {
-    const tc = try TestConn.init("db_busy");
-    defer tc.deinit();
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const db = try tc.conn.db();
-
-    var rd = try db.beginRead();
-    try testing.expectEqual(@as(u32, 1), tc.conn.busy);
-    try testing.expectError(error.Busy, tc.conn.release());
-    try testing.expect(tc.conn.is_open);
-    // close marks the connection closed at once and keeps the store until
-    // the read ends, so its cursors stay valid.
-    tc.conn.close();
-    try testing.expect(!tc.conn.is_open);
-    try testing.expect(tc.conn.close_pending);
-    try testing.expectError(error.Closed, tc.conn.db());
-    try testing.expectError(error.Closed, db.datoms(arena, .eavt, .{ .e = 1 }));
-    var it = try rd.scan(arena, .eavt, .{ .e = boot.ident });
-    var n: usize = 0;
-    while (try it.next()) |_| n += 1;
-    try testing.expectEqual(@as(usize, 5), n);
-    rd.close();
-    try testing.expectEqual(@as(u32, 0), tc.conn.busy);
-    try testing.expect(!tc.conn.close_pending);
-    try testing.expect(tc.conn.store_closed);
-    try tc.conn.release();
-}

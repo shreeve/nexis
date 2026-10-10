@@ -2,7 +2,7 @@
 //! (NEXTOMIC.md §2, §5).
 //!
 //! Invariants:
-//!   - A row `[a:4][token][0x00][e:6][hash:16]` with an empty value is in
+//!   - A row `[A(a)][token][0x00][E(e)][hash:16]` with an empty value is in
 //!     the tree iff attribute `a` carries `:db/fulltext true` and `e`
 //!     currently holds under `a` a string value whose 128-bit content
 //!     hash (`key.hash128`) is `hash` and whose tokens include `token`.
@@ -20,12 +20,9 @@
 //!     key exceeds the page's key bound. A token never holds 0x00,
 //!     which makes the separator unambiguous. Indexing and search both
 //!     tokenise through `tokens`, so they fold alike.
-//!   - The rows are written under `store.fulltext_fold`, stamped in
-//!     `sys` with the `t` they are current at (`Store.fulltextFresh`).
-//!     A stamp of another folding, or a `t` committed without a stamp,
-//!     is stale: `rebuild` writes the rows again, at connect when the
-//!     file is writable and at the start of the next transaction, and
-//!     until then a search re-tokenises the values instead.
+//!   - The rows are written under `store.fulltext_fold`, which the
+//!     store format fixes: a change of folding is a change of format
+//!     (NEXTOMIC.md §2.3).
 //!   - `search` answers the `(e, hash)` pairs whose rows carry every
 //!     token of the needle; a needle without tokens matches nothing.
 
@@ -353,7 +350,7 @@ pub fn tokenPrefix(arena: Allocator, a: u32, token: []const u8) ![]const u8 {
 
 /// `[A(a)][token][0x00]`: a token holds no `0x00`, so the byte ends it.
 fn appendTokenPrefix(out: *std.ArrayList(u8), arena: Allocator, a: u32, token: []const u8) !void {
-    try key.appendAttrKey(out, arena, a);
+    try key.appendOrdered(out, arena, a);
     try out.appendSlice(arena, token);
     try out.append(arena, 0);
 }
@@ -383,43 +380,6 @@ pub fn indexRow(store: *Store, txn: *Txn, arena: Allocator, a: u32, e: u64, vbyt
         .bytes_long => return,
     };
     try index(store, txn, arena, a, e, text, added);
-}
-
-/// The attributes whose current `:db/fulltext` is true.
-fn fulltextAttrs(store: *Store, txn: *Txn, arena: Allocator) ![]const u32 {
-    var out: std.ArrayList(u32) = .empty;
-    var s = try Store.scan(txn, store.trees.cur(.aevt), try key.prefixBytes(arena, .aevt, .{ .a = store.fulltext_aid }));
-    while (try s.next()) |kv| {
-        const parts = try key.unpackKey(.aevt, false, kv.key);
-        const v = try key.decodeVal(arena, parts.v);
-        if (v == .val and v.val == .boolean and v.val.boolean) try out.append(arena, @intCast(parts.e));
-    }
-    return out.items;
-}
-
-/// Whether `rebuild` has work at `t`: the rows are stale and some
-/// attribute is full-text.
-pub fn needsRebuild(store: *Store, txn: *Txn, arena: Allocator, t: u64) !bool {
-    if (try store.fulltextFresh(txn, t)) return false;
-    return (try fulltextAttrs(store, txn, arena)).len > 0;
-}
-
-/// Write every row again, under this build's folding, from the current
-/// string values of every full-text attribute, and stamp the rows
-/// current at `t`.
-pub fn rebuild(store: *Store, txn: *Txn, arena: Allocator, t: u64) !void {
-    try txn.dropTree(store.trees.fulltext, false);
-    for (try fulltextAttrs(store, txn, arena)) |a| {
-        var rows: std.ArrayList(key.Parts) = .empty;
-        var r = try Store.scan(txn, store.trees.cur(.aevt), try key.prefixBytes(arena, .aevt, .{ .a = a }));
-        while (try r.next()) |kv| {
-            var parts = try key.unpackKey(.aevt, false, kv.key);
-            parts.v = try arena.dupe(u8, parts.v);
-            try rows.append(arena, parts);
-        }
-        for (rows.items) |p| try indexRow(store, txn, arena, a, p.e, p.v, true);
-    }
-    try store.writeFulltextStamp(txn, t);
 }
 
 /// One value found by `search`: the entity and its value's hash.

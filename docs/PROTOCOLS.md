@@ -114,7 +114,7 @@ without cloning the Value. Identity equality; GC leaf; prints
 The body holds `protocol_id` and `method_name_id` (the method's
 keyword id). `defprotocol` makes one per method and binds it as the
 method Var's root. Identity equality; GC leaf; prints
-`#<protocol-fn proto=P method=M>` with the numeric ids.
+`#<protocol-fn NAME>`, the method's name (STDLIB.md §5).
 
 A protocol fn is callable anywhere a fn is: in call position and
 through `VM.callValue`, so it works as an argument to `map`, `apply`,
@@ -150,6 +150,9 @@ the first `delay` registers `nexis.core/Delay` with field `:state`.
   Clojure's `defrecord` makes a new class: the constructors and
   predicate name the new type, and values built before keep the old
   one, so they are not `=` to new ones and fail the new predicate.
+  `class`, `type` and `instance?` name a record type by `ns.Name`
+  alone, so an old value and a new one report one class and `(instance?
+  P old)` is true, where Clojure, whose classes differ, says false.
 - `defprotocol` of an existing `(ns, name)` registers a new protocol
   with no impls, as Clojure's does; the method Vars are rebound to the
   new protocol's fns, so old impls no longer apply.

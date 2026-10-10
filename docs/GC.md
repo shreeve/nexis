@@ -114,9 +114,9 @@ reachable from wherever the program keeps it.
 | `deinit()` | Frees the gray worklist, whose capacity `collect` keeps |
 | `host: ?Host` | `Host.roots(ctx, collector)` marks every root the runtime holds, once per cycle after the explicit roots; `Host.trace(ctx, h, collector)` walks an already-marked `function` or `cell_internal` block |
 | `markValue(v)` | Ignores immediates and the pointer kinds with no block (`native_fn`, `var_`, the db connection), flags a db transaction handle reached (§5), and marks any other Value's header |
-| `mark(h)` | Sets the mark bit once and, unless `h` is a leaf (string, bignum, typed vector, durable ref, protocol, protocol fn, Nextomic connection or db) with no metadata, which has nothing to trace, traces `h` in place when the trace that reached it may (below), else pushes it on the gray worklist; outside a drain it drains before returning, so a direct call marks the transitive closure |
+| `mark(h)` | Sets the mark bit once and, unless `h` is a leaf (string, bignum, typed vector, durable ref, protocol, protocol fn, Nextomic connection or db, regex) with no metadata, which has nothing to trace, traces `h` in place when the trace that reached it may (below), else pushes it on the gray worklist; outside a drain it drains before returning, so a direct call marks the transitive closure |
 | `markInternal(h) bool` | Sets the mark bit of a collection-internal node and returns whether this call set it; walks neither the node's `meta` nor its kind: the caller walks the payload |
-| `collect(roots) usize` | Marks the roots and the host's roots, each root's transitive closure before the next root, sweeps the db transaction handles of the heap (`db.sweepHandles`, §5) and then the blocks (`Heap.sweepUnmarked`), resets the heap's allocation counter, and returns the number of blocks freed |
+| `collect(roots) usize` | Marks the roots and the host's roots, each root's transitive closure before the next root, sweeps the db transaction handles and closed connections of the heap (`db.sweepHandles`, §5) and then the blocks (`Heap.sweepUnmarked`), resets the heap's allocation counter, and returns the number of blocks freed |
 
 `mark` and `markInternal` share one primitive (`markHeaderOnce`), so
 the mark bit has one owner. Nothing in the API can fail: sweeping only
@@ -182,17 +182,21 @@ The dispatch in `Collector.trace`:
 | `cell_internal` | `Host.trace` (`VM.gcTrace`) | the cell's value |
 | anything else (`var_`, whose payload is an arena `*Var`; `byte_vector`, `error_`, `meta_symbol`, reserved and never allocated; an immediate) | panic | |
 
-**Transaction handles.** A `db_write_txn` or `db_read_txn` Value
-points at a `db.Handle`, which is not a block but holds an emdb
-transaction: the file's writer, or one of its reader slots. `markValue`
-sets the handle's reached flag. After the drain, `db.sweepHandles`
-walks the process's handles whose connection is on this heap: a
-flagged or held one (a native is running a callback over it) has its
-flag cleared and survives; any other has its transaction ended (a
-write aborted, a read ended) and is freed. Ending one frees emdb's
-transaction and releases its lock or slot, touching nothing on the
-heap. A cycle whose worklist could not grow ends nothing and only
-clears the flags. `docs/DB.md` §3.2 is the db side.
+**Transaction handles and connections.** A `db_write_txn` or
+`db_read_txn` Value points at a `db.Handle`, which is not a block but
+holds an emdb transaction: the file's writer, or one of its reader
+slots; a `db_connection` Value points at a `db.Connection`. `markValue`
+sets the handle's or connection's reached flag (`db.mark`). After the
+drain, `db.sweepHandles` walks the process's handles whose connection
+is on this heap: a flagged or held one (a native is running a callback
+over it) has its flag cleared and survives, and keeps its connection;
+any other has its transaction ended (a write aborted, a read ended)
+and is freed. Ending one frees emdb's transaction and releases its
+lock or slot, touching nothing on the heap. Then every closed
+connection on the heap that nothing flagged and no marked durable ref
+names is freed. A cycle whose worklist could not grow ends and frees
+nothing and only clears the flags. `docs/DB.md` §3 and §3.2 are the db
+side.
 
 A `function` or `cell_internal` block reaching a collector with no
 host panics, as does any immediate or sentinel kind byte on a header.
@@ -226,7 +230,7 @@ collect(roots):
                                         // block trace marks is traced
                                         // in place, four levels deep
     empty gray, keeping its capacity
-    db.sweepHandles(heap, !overflowed)  // ends unreached transactions
+    db.sweepHandles(heap, !overflowed)  // ends unreached transactions, frees closed connections
     freed = heap.sweepUnmarked()        // frees unmarked blocks;
                                         // clears the mark on survivors
                                         // (or, if gray could not grow:
@@ -389,8 +393,9 @@ make sure a root reaches it. What is rooted already:
   ring; `reverse`, `butlast` and `apply` put each in a `Results` too,
   `mapv` and `filterv` each result or kept element, `select-keys`
   conj's what it finds onto a result kept in a slot, and
-  `nexis.string/join` writes each element's text before the next
-  step); an `iterate`'s function or a `cycle`'s source,
+  `nexis.string/join` keeps the element whose text it makes in a slot,
+  since a map's entry is built by the walk and making its text
+  realizes its lazy values); an `iterate`'s function or a `cycle`'s source,
   reached from the argument, stays rooted through it. `into` with a
   transducer passes its argument to a closure, whose parameter holds
   it until its last move (`docs/COMPILER.md` §4.9). Reached by
@@ -448,7 +453,7 @@ The rule each native follows, by what it holds across a further
    root slot (`reducePure`);
    `whileSplit` (`take-while`, `drop-while`) and
    `reductions` keep what the iterator yields and walk with
-   `rootedSeqIter`, which pushes each built value on the native's
+   `SeqIter.rooted`, which pushes each built value on the native's
    root scope; `sortImpl` (`sort`, `sort-by`) collects the elements and
    pushes them all (`pushAll`) before any key fn or comparator runs;
    `group-by` builds its map on a transient it pushes, which reaches
@@ -464,11 +469,14 @@ The rule each native follows, by what it holds across a further
    in the block that heads it, so the elements already walked reach
    from the argument the walk started at, but a callback result
    (`reduce`'s accumulator, which goes into a root slot before each
-   step that may run code, `SeqIter.nextChunk`),
+   step that may run code, `SeqIter.nextChunk`, and after each call
+   over a `cycle`, whose first pass realizes its source),
    a value the native built (`frequencies`' transient, `select-keys`'
-   result) and a value another iterator built (the entries of a map
+   result, the transient `conj` and `into` edit in place while a lazy
+   key realizes before its edit, and the entries `into` gathers from a
+   map) and a value another iterator built (the entries of a map
    walked beside a lazy seq by `concat`, `interleave`, `zipmap`,
-   `partition`'s pad, which walk with `rootedSeqIter`) are not.
+   `partition`'s pad, which walk with `SeqIter.rooted`) are not.
 
 A batch (`Callback.each`, `fold`, `foldRange`; `docs/VM.md` §6)
 collects before each element, so it reads its elements from a run a

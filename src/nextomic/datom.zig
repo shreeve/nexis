@@ -108,9 +108,7 @@ pub fn encodeTxlog(arena: Allocator, t: u64, instant: i64, datoms: []const Datom
     try writeLeb(&out, arena, rows.len);
     var prev: u64 = 0;
     for (rows) |d| {
-        try writeLeb(&out, arena, zigzag(@as(i64, @bitCast(d.e -% prev))));
-        prev = d.e;
-        try writeLeb(&out, arena, (@as(u64, d.a) << 1) | @intFromBool(d.added));
+        try writeRowHead(&out, arena, &prev, d.e, d.a, d.added);
         try writeVal(&out, arena, d.v);
     }
     if (excised.len > 0) {
@@ -118,6 +116,14 @@ pub fn encodeTxlog(arena: Allocator, t: u64, instant: i64, datoms: []const Datom
         for (excised) |e| try writeLeb(&out, arena, e);
     }
     return out.toOwnedSlice(arena);
+}
+
+/// A row's `Δe` against `prev.*`, which it advances, and `a << 1 |
+/// added`.
+fn writeRowHead(out: *std.ArrayList(u8), arena: Allocator, prev: *u64, e: u64, a: u32, added: bool) !void {
+    try writeLeb(out, arena, zigzag(@as(i64, @bitCast(e -% prev.*))));
+    prev.* = e;
+    try writeLeb(out, arena, (@as(u64, a) << 1) | @intFromBool(added));
 }
 
 /// `:db/txInstant`, a bootstrap attribute (store.zig `boot.tx_instant`).
@@ -204,8 +210,9 @@ const Reader = struct {
     }
 };
 
-/// One row as stored: the value's bytes undecoded.
-const RawRow = struct { e: u64, a: u32, added: bool, v: []const u8 };
+/// One row as stored: the value's bytes undecoded, and the type they
+/// are of.
+const RawRow = struct { e: u64, a: u32, added: bool, vt: ValueType, v: []const u8 };
 
 /// The header and the raw rows of an entry.
 const Raw = struct {
@@ -235,7 +242,7 @@ fn parse(arena: Allocator, bytes: []const u8, types: Source) !Raw {
         const vt = (try types.attrType(types.ctx, a)) orelse return error.Corrupted;
         const start = r.at;
         try skipVal(&r, vt);
-        row.* = .{ .e = e, .a = a, .added = aa & 1 == 1, .v = bytes[start..r.at] };
+        row.* = .{ .e = e, .a = a, .added = aa & 1 == 1, .vt = vt, .v = bytes[start..r.at] };
     }
     var excised: []u64 = &.{};
     if (flags & flag_excised != 0) {
@@ -276,14 +283,14 @@ pub fn decodeTxlog(arena: Allocator, bytes: []const u8, t: u64, src: Source) !Tx
     const instant_row = raw.flags & flag_instant_row != 0;
     const datoms = try arena.alloc(Datom, raw.rows.len + @intFromBool(instant_row));
     for (raw.rows, datoms[0..raw.rows.len]) |row, *d| {
-        const vt = (try src.attrType(src.ctx, row.a)) orelse return error.Corrupted;
-        d.* = .{ .e = row.e, .a = row.a, .v = try decodeVal(arena, row, vt, t, src), .t = t, .added = row.added };
+        d.* = .{ .e = row.e, .a = row.a, .v = try decodeVal(arena, row, t, src), .t = t, .added = row.added };
     }
     if (instant_row) datoms[raw.rows.len] = .{ .e = key.txEntity(t), .a = tx_instant_attr, .v = .{ .instant = raw.instant }, .t = t, .added = true };
     return .{ .instant = raw.instant, .datoms = datoms, .excised = raw.excised };
 }
 
-fn decodeVal(arena: Allocator, row: RawRow, vt: ValueType, t: u64, src: Source) !Val {
+fn decodeVal(arena: Allocator, row: RawRow, t: u64, src: Source) !Val {
+    const vt = row.vt;
     var r: Reader = .{ .bytes = row.v };
     return switch (vt) {
         .boolean => .{ .boolean = try r.byte() == 1 },
@@ -343,9 +350,7 @@ pub fn exciseTxlog(arena: Allocator, bytes: []const u8, e: u64, a: ?u32, types: 
     var prev: u64 = 0;
     for (raw.rows) |row| {
         if (row.e == e and (a == null or row.a == a.?)) continue;
-        try writeLeb(&out, arena, zigzag(@as(i64, @bitCast(row.e -% prev))));
-        prev = row.e;
-        try writeLeb(&out, arena, (@as(u64, row.a) << 1) | @intFromBool(row.added));
+        try writeRowHead(&out, arena, &prev, row.e, row.a, row.added);
         try out.appendSlice(arena, row.v);
     }
     const marked = std.mem.findScalar(u64, raw.excised, e) != null;
@@ -477,7 +482,7 @@ test "txlog entry round trips every value type" {
     // The instant's datom is the header's; no row repeats the long
     // string's payload.
     try testing.expect(bytes[0] & flag_instant_row != 0 and bytes[0] & flag_attr_partition == 0);
-    try testing.expect(std.mem.indexOf(u8, bytes, long[64..]) == null);
+    try testing.expect(std.mem.find(u8, bytes, long[64..]) == null);
     try testing.expect(!try touchesAttrPartition(bytes));
     const out = try decodeTxlog(arena, bytes, t, ts.source());
     try testing.expectEqual(@as(i64, 1234), out.instant);

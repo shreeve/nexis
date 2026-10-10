@@ -1008,3 +1008,12 @@ entry stating the decision and its rationale.
   itself is never changed. Reason: a handler, an agent's above all,
   could not log what went wrong; the uncaught report knew and the
   caught keyword did not. `docs/VM.md` §13 is the authority.
+- **2026-10-09 — A fn carries metadata (the attachability matrix,
+  `docs/SEMANTICS.md` §7).** `with-meta` of a `fn` returns a new
+  closure over the same routine and captured cells carrying the map,
+  and `meta` reads it, as Clojure's `AFunction`; a native function,
+  a static descriptor with no block, stays `:kind-mismatch`. The
+  metadata lives in the closure's block header, which the collector
+  traces and the stdlib image writes for every block. Reason: a
+  multimethod keeps its state on its own fn, so no process-wide
+  registry outlives it. `docs/SEMANTICS.md` §7 is the authority.
