@@ -570,7 +570,7 @@ fn exists(b: *std.Build, path: []const u8) bool {
 const Suite = struct { path: []const u8, quick: bool, nextomic: bool };
 
 /// The suites `zig build quick` runs besides `unit`.
-const quick_suites = [_][]const u8{ "compile", "nextomic_key", "nextomic_tx", "eval_pipeline", "runtime_polish", "numbers" };
+const quick_suites = [_][]const u8{ "compile", "nextomic_key", "nextomic_tx", "nextomic_store", "db_layer", "eval_pipeline", "runtime_polish", "numbers" };
 
 /// Every `.zig` file in test/prop, test/integration and test/regex but the
 /// fixtures the suites import (`_fx.zig`), so a new suite runs without
