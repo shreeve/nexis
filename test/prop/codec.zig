@@ -116,8 +116,8 @@ test "C1: 100000 random Values round-trip with equal hashes" {
 
 test "C2: re-encode(decode(encode(v))) byte-equal for canonical-order kinds" {
     // Canonical-order kinds per CODEC.md §2.5:
-    //   scalars (nil/bool/char/fixnum/float/keyword/symbol),
-    //   strings, bignums, vectors, lists.
+    //   scalars (nil/bool/char/fixnum/float/instant/keyword/symbol),
+    //   strings, bignums, UUIDs, vectors, lists.
     // Map/set excluded because iteration order depends on internal
     // structure which may differ between equal values built via
     // different histories.
@@ -175,7 +175,7 @@ fn canonicalKindGen(ctx: *TestCtx, r: std.Random, depth: u8) !Value {
 }
 
 fn canonicalScalar(ctx: *TestCtx, r: std.Random) !Value {
-    const pick = r.uintLessThan(u8, 10);
+    const pick = r.uintLessThan(u8, 12);
     return switch (pick) {
         0 => value.nilValue(),
         1 => value.fromBool(true),
@@ -209,6 +209,12 @@ fn canonicalScalar(ctx: *TestCtx, r: std.Random) !Value {
             const high: u64 = r.int(u64) | (@as(u64, 1) << 63);
             const neg = r.boolean();
             break :blk try bignum.fromLimbs(&ctx.heap, neg, &[_]u64{ r.int(u64), high });
+        },
+        10 => value.fromInst(r.int(i64)),
+        11 => blk: {
+            var u: [16]u8 = undefined;
+            r.bytes(&u);
+            break :blk try nx.uuid.make(&ctx.heap, u);
         },
         else => unreachable,
     };

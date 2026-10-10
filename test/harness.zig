@@ -234,10 +234,11 @@ pub const Gen = struct {
     pub const Error = std.mem.Allocator.Error || error{ InternTableFull, EmptyName, InvalidListTail, Overflow };
 
     /// nil, a boolean, a fixnum, a char, a float, a keyword, a
-    /// symbol, a string or a bignum outside the fixnum range.
+    /// symbol, a string, a bignum outside the fixnum range, an instant
+    /// or a UUID.
     pub fn scalar(self: *Gen) Error!Value {
         const r = self.r;
-        return switch (r.uintLessThan(u8, 10)) {
+        return switch (r.uintLessThan(u8, 12)) {
             0 => value_mod.nilValue(),
             1 => value_mod.fromBool(true),
             2 => value_mod.fromBool(false),
@@ -270,6 +271,12 @@ pub const Gen = struct {
                 const high: u64 = r.int(u64) | (@as(u64, 1) << 63);
                 const neg = r.boolean();
                 break :blk try nx.bignum.fromLimbs(self.heap, neg, &[_]u64{ r.int(u64), high });
+            },
+            10 => value_mod.fromInst(r.int(i64)),
+            11 => blk: {
+                var u: [16]u8 = undefined;
+                r.bytes(&u);
+                break :blk try nx.uuid.make(self.heap, u);
             },
             else => unreachable,
         };

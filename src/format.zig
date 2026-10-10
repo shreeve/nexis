@@ -30,6 +30,8 @@ const vector_mod = @import("coll/vector.zig");
 const champ_mod = @import("coll/champ.zig");
 const sorted_mod = @import("coll/sorted.zig");
 const string_mod = @import("string.zig");
+const inst_mod = @import("inst.zig");
+const uuid_mod = @import("uuid.zig");
 const heap_mod = @import("heap.zig");
 const vm_mod = @import("vm.zig");
 const atom_mod = @import("atom.zig");
@@ -82,6 +84,19 @@ pub fn format(
         .true_ => try writer.writeAll("true"),
         .false_ => try writer.writeAll("false"),
         .fixnum => try writer.print("{d}", .{v.asFixnum()}),
+        // Clojure's text of a `Date` and a `UUID`, in both modes, as
+        // its `print-method`s ignore `*print-readably*`; each reads
+        // back `=` (SEMANTICS §6.1).
+        .inst => {
+            try writer.writeAll("#inst \"");
+            try inst_mod.write(writer, v.asInstMs(), .literal);
+            try writer.writeByte('"');
+        },
+        .uuid => {
+            var text: [uuid_mod.text_len]u8 = undefined;
+            uuid_mod.writeText(&text, uuid_mod.bytesOf(v).*);
+            try writer.print("#uuid \"{s}\"", .{&text});
+        },
         .keyword => {
             // Null interner is a programmer error here, not a
             // user-visible runtime path. Caller guarantees the
@@ -498,6 +513,9 @@ test "scalars and bignums print the same in both modes" {
         .{ .v = fx(42), .expect = "42" },
         .{ .v = fx(-7), .expect = "-7" },
         .{ .v = (try bignum_mod.parseDecimal(&heap, "-340282366920938463463374607431768211456")).?, .expect = "-340282366920938463463374607431768211456" },
+        .{ .v = value_mod.fromInst(0), .expect = "#inst \"1970-01-01T00:00:00.000-00:00\"" },
+        .{ .v = value_mod.fromInst(-1), .expect = "#inst \"1969-12-31T23:59:59.999-00:00\"" },
+        .{ .v = try uuid_mod.make(&heap, .{ 0x01, 0x23, 0xab, 0xcd, 0x45, 0x67, 0x89, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef }), .expect = "#uuid \"0123abcd-4567-89ef-0123-456789abcdef\"" },
     };
     for (cases) |c| for ([_]FormatMode{ .display, .readable }) |mode| try expectFormat(c.v, mode, null, c.expect);
 }

@@ -33,6 +33,7 @@ const list_mod = @import("../coll/list.zig");
 const vector_mod = @import("../coll/vector.zig");
 const champ = @import("../coll/champ.zig");
 const string_mod = @import("../string.zig");
+const uuid_mod = @import("../uuid.zig");
 const key = @import("key.zig");
 const datom_mod = @import("datom.zig");
 const db_mod = @import("db.zig");
@@ -192,7 +193,7 @@ pub fn scalarVal(vt: key.ValueType, v: Value) error{ValueType}!Val {
             return switch (vt) {
                 .string => .{ .string = b },
                 .bytes => .{ .bytes = b },
-                else => .{ .uuid = datom_mod.uuidFromCanonical(b) orelse return error.ValueType },
+                else => .{ .uuid = canonicalUuid(b) orelse return error.ValueType },
             };
         },
         .keyword, .ref => unreachable,
@@ -220,7 +221,7 @@ pub fn encodeCell(read: *Read, cell: Cell, vt: key.ValueType) Error!?Val {
         .string => if (cell == .str) .{ .string = cell.str } else null,
         .uuid => blk: {
             if (cell != .str) break :blk null;
-            const u = datom_mod.uuidFromCanonical(cell.str) orelse break :blk null;
+            const u = canonicalUuid(cell.str) orelse break :blk null;
             break :blk .{ .uuid = u };
         },
         .bytes => if (cell == .str) .{ .bytes = cell.str } else null,
@@ -238,11 +239,21 @@ pub fn cellOf(read: *Read, arena: Allocator, v: Val) !Cell {
         .ref => |e| .{ .int = @intCast(e) },
         .string, .bytes => |s| .{ .str = s },
         .uuid => |u| blk: {
-            const text = try arena.alloc(u8, 36);
-            datom_mod.uuidToText(text[0..36], u);
+            const text = try arena.alloc(u8, uuid_mod.text_len);
+            uuid_mod.writeText(text[0..uuid_mod.text_len], u);
             break :blk .{ .str = text };
         },
     };
+}
+
+/// The uuid whose canonical text `s` is (lower-case hex, 8-4-4-4-12),
+/// or null for any other string: Nextomic takes one text per uuid, so
+/// a string compares alike wherever a uuid is matched (NEXTOMIC.md
+/// §2.2).
+fn canonicalUuid(s: []const u8) ?[16]u8 {
+    if (s.len != uuid_mod.text_len) return null;
+    for (s) |c| if (c >= 'A' and c <= 'F') return null;
+    return uuid_mod.parse(s);
 }
 
 // =============================================================================

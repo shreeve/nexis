@@ -166,7 +166,8 @@ runtime throw) instead of faulting (`docs/VM.md` §13.1).
 
 `src/value.zig`: a 16-byte `{tag, payload}` cell. Immediates are nil,
 booleans, chars, fixnums (i48), floats (f64), keywords and symbols
-(intern ids); heap kinds are numbered 16-45, with 22 (`byte_vector`),
+(intern ids) and instants (i64 epoch milliseconds); heap kinds are
+numbered 16-46, with 22 (`byte_vector`),
 28 and 29 reserved because kind bytes are the codec's wire tags
 (`docs/VALUE.md`). An integer result outside i48 is a bignum and one
 that fits is a fixnum again (`docs/BIGNUM.md`). Equality, hash and

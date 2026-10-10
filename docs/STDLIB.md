@@ -341,7 +341,7 @@ their elements in the same mode. Who uses which:
 |---|---|
 | `print`, `println`, `print-str`, `println-str` | display |
 | `pr`, `prn`, `pr-str`, `prn-str`; the REPL and `nexis -e` results; error-report payloads | readable |
-| `str`, `%s`, `join`, `spit` | nil is empty (`%s` writes `nil`); a string or char display, a float in Java's spelling (`(str ##Inf)` is `"Infinity"`); any other value readable, so `(str ["a"])` is `"[\"a\"]"` and `(str [##Inf])` `"[##Inf]"` |
+| `str`, `%s`, `join`, `spit` | nil is empty (`%s` writes `nil`); a string or char display, a float in Java's spelling (`(str ##Inf)` is `"Infinity"`), an instant `Instant.toString`'s text (`2020-01-01T00:00:00Z`), a UUID its canonical text; any other value readable, so `(str ["a"])` is `"[\"a\"]"` and `(str [##Inf])` `"[##Inf]"` |
 
 **By kind** (both modes unless the row says otherwise):
 
@@ -352,6 +352,8 @@ their elements in the same mode. Who uses which:
 | float | SEMANTICS.md §6.3, in both modes (`str` and `%s` of a bare float write Java's `NaN`, `Infinity`, `-Infinity`) |
 | char, string | display: a char's UTF-8, a string's bytes. readable: SEMANTICS.md §6.4, §6.5 |
 | keyword, symbol | `:ns/name`, `ns/name`; names are not escaped |
+| instant | `#inst "2026-10-09T10:30:15.123-00:00"`, Clojure's text of a `Date`: always the milliseconds and `-00:00`; a year before 0 or past 9999 with its sign and at least four digits (`#inst "+10000-01-01T00:00:00.000-00:00"`), so the text always reads back (`src/inst.zig`) |
+| UUID | `#uuid "0123abcd-4567-89ef-0123-456789abcdef"`, the canonical lower-case text |
 | list, vector, set | `(a b)`, `[a b]`, `#{a b}`, elements separated by one space; a sorted set in its order |
 | lazy seq | as a list, `(a b)`, `()` when empty. The printer runs no code: every caller but an error report realizes the value first, and a block whose body has not run prints as `...`, as does a cell of a realized cycle met again (`docs/LAZY.md` §8) |
 | map | `{k v, k v}`, entries separated by `, `; a sorted map in its order |

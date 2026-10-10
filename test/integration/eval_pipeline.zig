@@ -5058,11 +5058,15 @@ test "time: parse reads ISO-8601 instants, a missing offset UTC" {
     try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"2026-10-09t12:30:15.123456789z\"))", "1791549015123");
     try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"2026-10-09T12:30:00-0530\"))", "1791568800000");
     try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"2026-10-09T12:30\"))", "1791549000000");
+    // Clojure's #inst grammar: an hour alone, and a leap second in
+    // minute 59, which rolls into the next minute.
+    try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"2026-10-09T12Z\"))", "1791547200000");
+    try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"2026-10-09T12:59:60Z\"))", "1791550800000");
     try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"2026\"))", "1767225600000");
     try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"2026-10\"))", "1790812800000");
     try expectOutput("(nexis.time/inst-ms (nexis.time/parse \"-0001-01-01T00:00:00Z\"))", "-62198755200000");
     try expectOutput("(= (nexis.time/instant \"2026-10-09\") (nexis.time/parse \"2026-10-09T00:00:00.000Z\"))", "true");
-    for ([_][]const u8{ "", "x", "2026-13-01", "2026-02-29", "2026-10-09T24:00Z", "2026-10-09T12:60Z", "2026-10-09T12:30:61Z", "2026-10-09T12Z", "2026-10-09T12:30:15.Z", "2026-10-09T12:30+25:00", "2026-10-09T12:30Zx", "26-10-09", "2026-1-09", "99999-01-01" }) |text| {
+    for ([_][]const u8{ "", "x", "2026-13-01", "2026-02-29", "2026-10-09T24:00Z", "2026-10-09T12:60Z", "2026-10-09T12:30:61Z", "2026-10-09T12:58:60Z", "2026-10-09T12:30:15.Z", "2026-10-09T12:30+25:00", "2026-10-09T12:30Zx", "26-10-09", "2026-1-09", "99999-01-01" }) |text| {
         const src = try std.fmt.allocPrint(testing.allocator, "(try (nexis.time/parse \"{s}\") (catch any e (:error e)))", .{text});
         defer testing.allocator.free(src);
         try expectOutput(src, ":invalid-argument");

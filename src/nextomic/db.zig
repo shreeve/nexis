@@ -26,6 +26,7 @@ const value = @import("../value.zig");
 const heap_mod = @import("../heap.zig");
 const intern_mod = @import("../intern.zig");
 const string_mod = @import("../string.zig");
+const uuid_mod = @import("../uuid.zig");
 const bignum = @import("../bignum.zig");
 const emdb = @import("emdb");
 const key = @import("key.zig");
@@ -357,8 +358,8 @@ pub const Conn = struct {
             .ref => |eid| value.fromFixnum(@intCast(eid)) orelse error.ValueType,
             .string => |s| try string_mod.fromBytes(heap, s),
             .uuid => |u| blk: {
-                var text: [36]u8 = undefined;
-                datom_mod.uuidToText(&text, u);
+                var text: [uuid_mod.text_len]u8 = undefined;
+                uuid_mod.writeText(&text, u);
                 break :blk try string_mod.fromBytes(heap, &text);
             },
             .bytes => |b| try string_mod.fromBytes(heap, b),

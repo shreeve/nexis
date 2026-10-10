@@ -49,6 +49,7 @@ const value_mod = @import("value.zig");
 const heap_mod = @import("heap.zig");
 const intern_mod = @import("intern.zig");
 const string_mod = @import("string.zig");
+const uuid_mod = @import("uuid.zig");
 const regex_mod = @import("regex.zig");
 const atom_mod = @import("atom.zig");
 const vector_mod = @import("coll/vector.zig");
@@ -152,7 +153,7 @@ pub fn matches(bytes: []const u8, sources: []const Source) bool {
 }
 
 const RefTag = enum(u8) { nil, immediate, keyword, symbol, object, native, var_ };
-const ObjTag = enum(u8) { cell, atom, string, bignum, regex, vector, empty_list, cons, map, set, function, protocol, protocol_fn, record };
+const ObjTag = enum(u8) { cell, atom, string, bignum, regex, vector, empty_list, cons, map, set, function, protocol, protocol_fn, record, uuid };
 const EntryTag = enum(u8) {
     /// A Var keyed by its own name storage: the namespace's own.
     named,
@@ -596,7 +597,7 @@ const Writer = struct {
     fn ref(w: *Writer, out: *Out, v: Value) WriteError!void {
         switch (v.kind()) {
             .nil => try out.byte(@backingInt(RefTag.nil)),
-            .false_, .true_, .char, .fixnum, .float => {
+            .false_, .true_, .char, .fixnum, .float, .inst => {
                 try out.byte(@backingInt(RefTag.immediate));
                 try out.int(u64, v.tag);
                 try out.int(u64, v.payload);
@@ -656,6 +657,10 @@ const Writer = struct {
             .regex => blk: {
                 try body.str(regex_mod.sourceOf(v));
                 break :blk .regex;
+            },
+            .uuid => blk: {
+                for (uuid_mod.bytesOf(v)) |b| try body.byte(b);
+                break :blk .uuid;
             },
             .persistent_vector => blk: {
                 const n = vector_mod.count(v);
@@ -1066,6 +1071,11 @@ const Loader = struct {
                         .ok => |v| v,
                         .err => return error.Corrupt,
                     },
+                    .uuid => blk: {
+                        var bytes: [16]u8 = undefined;
+                        for (&bytes) |*b| b.* = try l.in.byte();
+                        break :blk try mem(uuid_mod.make(l.heap, bytes));
+                    },
                     .vector => blk: {
                         try l.refs(&elems, try l.in.int(u32));
                         break :blk try mem(if (elems.items.len == 0) vector_mod.empty(l.heap) else vector_mod.fromSlice(l.heap, elems.items));
@@ -1294,7 +1304,7 @@ const Loader = struct {
 };
 
 /// `v` when it is an immediate the runtime's constructors make: a
-/// boolean, a char, a fixnum or a float, nothing past its kind byte,
+/// boolean, a char, a fixnum, a float or an instant, nothing past its kind byte,
 /// its payload in range. A reserved kind, a surrogate or a char past
 /// U+10FFFF, a fixnum outside i48 or a NaN other than the canonical
 /// one is `Corrupt` (VALUE.md §3).
@@ -1304,6 +1314,7 @@ fn immediate(v: Value) LoadError!Value {
         .char => if (v.payload > std.math.maxInt(u21)) null else value_mod.fromChar(@intCast(v.payload)),
         .fixnum => value_mod.fromFixnum(@bitCast(v.payload)),
         .float => value_mod.fromFloat(@bitCast(v.payload)),
+        .inst => value_mod.fromInst(@bitCast(v.payload)),
         else => null,
     };
     const m = made orelse return error.Corrupt;
@@ -1469,7 +1480,7 @@ const Verifier = struct {
         if (try v.seen(@intFromPtr(hx), @intFromPtr(hy))) return;
         try v.value(dispatch_mod.metaOf(hx), dispatch_mod.metaOf(hy));
         switch (x.kind()) {
-            .string, .bignum, .regex => if (!std.mem.eql(u8, Heap.bodyBytes(hx), Heap.bodyBytes(hy)) and !(x.kind() == .regex and std.mem.eql(u8, regex_mod.sourceOf(x), regex_mod.sourceOf(y)))) return v.fail("{t} differs", .{x.kind()}),
+            .string, .bignum, .regex, .uuid => if (!std.mem.eql(u8, Heap.bodyBytes(hx), Heap.bodyBytes(hy)) and !(x.kind() == .regex and std.mem.eql(u8, regex_mod.sourceOf(x), regex_mod.sourceOf(y)))) return v.fail("{t} differs", .{x.kind()}),
             .persistent_vector => {
                 const n = vector_mod.count(x);
                 if (n != vector_mod.count(y)) return v.fail("vector length", .{});
@@ -1682,11 +1693,13 @@ test "load: an immediate of every kind the runtime makes is read" {
         value_mod.fromFixnum(value_mod.fixnum_max).?,
         value_mod.fromFloat(std.math.nan(f64)),
         value_mod.fromFloat(-0.0),
+        value_mod.fromInst(std.math.minInt(i64)),
+        value_mod.fromInst(std.math.maxInt(i64)),
     }) |v| try loadImmediate(v.tag, v.payload);
 }
 
 test "load: an immediate of a reserved or non-immediate kind is Corrupt" {
-    for ([_]u64{ @backingInt(Kind.nil), 8, 15, @backingInt(Kind.string), @backingInt(Kind.cell_internal), 0xff }) |tag|
+    for ([_]u64{ @backingInt(Kind.nil), 9, 15, @backingInt(Kind.string), @backingInt(Kind.uuid), @backingInt(Kind.cell_internal), 0xff }) |tag|
         try std.testing.expectError(error.Corrupt, loadImmediate(tag, 0));
     // A known kind with stray bits above its kind byte.
     try std.testing.expectError(error.Corrupt, loadImmediate(@as(u64, 1) << 16 | @backingInt(Kind.fixnum), 0));
@@ -1780,6 +1793,30 @@ test "load: an arity table comes back whole, every member written and run" {
     try std.testing.expectEqual(@as(usize, 1), list_mod.count(rest));
     try std.testing.expectError(error.ArityMismatch, b.callValue(f, &.{ seven, seven }));
     try std.testing.expectEqualStrings("f takes 0, 1 or at least 3 arguments, got 2", b.error_detail);
+}
+
+test "load: an instant and a uuid a Var holds come back equal" {
+    const gpa = std.testing.allocator;
+    var a = try VM.init(gpa, &VM.idle_routine);
+    defer a.deinit();
+    const bytes16 = [16]u8{ 0x01, 0x23, 0xab, 0xcd, 0x45, 0x67, 0x89, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef };
+    const x = try (try a.ensureRegistry()).core.intern("image-test-x");
+    x.root = try vector_mod.fromSlice(a.ensureHeap(), &.{ value_mod.fromInst(-1), try uuid_mod.make(a.ensureHeap(), bytes16) });
+    x.bound = true;
+    const bytes = try testWrite(gpa, &a);
+    defer gpa.free(bytes);
+    var b = try VM.init(gpa, &VM.idle_routine);
+    defer b.deinit();
+    _ = try load(&b, bytes, &.{});
+    var why: []const u8 = "";
+    verify(gpa, &a, &b, &why) catch |err| {
+        std.debug.print("image differs: {s}\n", .{why});
+        gpa.free(why);
+        return err;
+    };
+    const got = (try b.ensureRegistry()).core.lookupLocal("image-test-x").?.root;
+    try std.testing.expect(vector_mod.nth(got, 0).identicalTo(value_mod.fromInst(-1)));
+    try std.testing.expectEqualSlices(u8, &bytes16, uuid_mod.bytesOf(vector_mod.nth(got, 1)));
 }
 
 test "load: an arity table a call cannot pick from is refused, not loaded" {

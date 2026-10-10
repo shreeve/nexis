@@ -205,6 +205,32 @@ was computed past a spoil keeps no cached hash, so the wrong answer
 never outlives the throw. The codec walks nesting with a heap stack
 and has no depth bound (`docs/CODEC.md` §2.7).
 
+#### 2.8 Instants and UUIDs
+
+An **instant** is the immediate kind `inst` (`docs/VALUE.md` §2.1):
+the milliseconds since 1970-01-01T00:00:00Z on the proleptic
+Gregorian calendar, in UTC, without leap seconds, as an i64, the
+precision and range of Clojure's `java.util.Date`. A **UUID** is the
+heap kind `uuid`, a leaf block of its 16 bytes (`docs/VALUE.md`
+§2.2). Neither is a number nor a string.
+
+| Operation | Instant | UUID |
+|---|---|---|
+| `=` | same milliseconds, as `Date.equals`; never `=` to another kind: `(= (nexis.time/instant 0) 0)` is false | same 16 bytes; never `=` to its text, as in Clojure |
+| `hash` | the fixnum's base over the i64, in domain 8 (§3.2) | `xxh3` of the bytes, in domain 46, not cached |
+| `identical?` | bit equality: two instants of the same milliseconds are identical, as two equal fixnums are | the same block |
+| `compare`, `sort` | by milliseconds; against another kind `:kind-mismatch`; nil sorts first | by **unsigned** bytes, the canonical text's order, RFC 9562's (a version-7 UUID sorts by time) and Nextomic's index order. Java's `UUID.compareTo` compares two signed longs, so Clojure orders `8000…` before `0000…`; nexis does not |
+| `<`, `+`, `inc` | `:kind-mismatch`: an instant is not a number, as in Clojure | `:kind-mismatch` |
+| `class` | `:inst` | `:uuid` |
+| metadata | none (§7) | none (§7) |
+| `str` | `Instant.toString`'s text, `2026-10-09T10:30:15.123Z` (`docs/STDLIB.md` §5) | the canonical text: lower-case hex in groups of 8, 4, 4, 4 and 12 digits joined by `-` |
+| `pr`, `print` | `#inst "2026-10-09T10:30:15.123-00:00"`, Clojure's text, in both modes | `#uuid "0123abcd-4567-89ef-0123-456789abcdef"`, in both modes |
+| codec | kind byte 8 and the zigzag LEB128 of the i64 (`docs/CODEC.md` §2) | kind byte 46 and the 16 bytes |
+
+Clojure's `(str date)` is `Date.toString` in the local zone
+(`"Tue Dec 31 17:00:00 MST 2019"`); nexis writes the ISO text, which
+JSON and `nexis.time/format` write too (`CLOJURE-REVIEW.md`).
+
 ---
 
 ### 3. Hashing
@@ -255,6 +281,10 @@ xxHash3-64 seeded with the ASCII bytes `"nexis1/1"` (`hash.seed`):
   of the text alone, never of the intern id, so the order of a map or
   set a keyword keys does not depend on which names the process
   interned first. The kinds differ by domain.
+- **inst**: `xxh3` of the i64 milliseconds as 8 little-endian bytes,
+  the fixnum's base; the domain keeps `inst(65)` apart from
+  `fixnum(65)`.
+- **uuid**: `xxh3` of the 16 bytes, computed each time.
 - **string**: `xxh3` of the bytes. **bignum**: the ordered combine
   below of the sign (1 negative, 0 not) and `xxh3` of the limbs.
 - **Ordered combine** (list, vector): `h = 1; for each x: h = 31*h +
@@ -298,6 +328,7 @@ domain its hash lands in. `dispatch.zig` is its code
 | 5 | `float` | own kind | 5 | IEEE, `-0.0 = 0.0`, NaN = NaN | bits, zero folded |
 | 6 | `keyword` | own kind | 6 | intern id | name hash |
 | 7 | `symbol` | own kind | 7 | intern id | name hash |
+| 8 | `inst` | own kind | 8 | milliseconds | i64 bytes |
 | 16 | `string` | own kind | 16 | bytes | bytes, cached |
 | 17 | `bignum` | own kind | 17 | sign and limbs | sign and limbs, cached |
 | 18 | `persistent_map` | map | 18 | entry-wise, both layouts and with a sorted map | unordered, cached |
@@ -323,6 +354,7 @@ domain its hash lands in. `dispatch.zig` is its code
 | 43 | `lazy_seq` | sequential | `0xF0` | element-wise with any list, vector or lazy seq | ordered; cached except a chunked cons |
 | 44 | `regex` | identity | 44 | same value | pointer |
 | 45 | `matcher` | identity | 45 | same value | pointer |
+| 46 | `uuid` | own kind | 46 | bytes | bytes |
 
 The reserved kinds (22 `byte_vector`, 28 `error_`, 29 `meta_symbol`)
 are never constructed; `dispatch` panics on one. A kind module
@@ -491,7 +523,7 @@ map or `nil`; it never throws.
 | `function` (a `fn`) | a new closure over the same routine and the same captured cells, carrying the map, as Clojure's `AFunction.withMeta`; it calls as the original and is not `=` to it | the map or `nil` |
 | `lazy-seq` | a new realized lazy block carrying the map whose seq is the argument's, realizing one step (`LazySeq.withMeta`), so no `rest` carries it (`docs/LAZY.md` §4) | the map or `nil` |
 | `var` | `:kind-mismatch`. A Var's metadata changes in place with `reset-meta!` / `alter-meta!`; `def`, `defn` and `defmacro` set it from `^meta` on the name, a docstring (`:doc`) and an attribute map, `defn` and `defmacro` adding `:arglists`; `:dynamic true` makes the Var dynamic | the map or `nil` |
-| the scalars: `nil`, booleans, `char`, numbers, `string`, `keyword`, `symbol` | `:no-metadata-on-immediate` | `nil` |
+| the scalars: `nil`, booleans, `char`, numbers, `string`, `keyword`, `symbol`, `inst`, `uuid` | `:no-metadata-on-immediate` | `nil` |
 | `atom` | `:kind-mismatch`, as in Clojure: an atom is a reference, not a value carrying metadata. Its metadata is set by `atom`'s `:meta` option and changed in place with `reset-meta!` / `alter-meta!` (`docs/ATOM.md` §4.9) | the map or `nil` |
 | every other kind: `native-fn` (a static descriptor, no block to carry it), `transient`, `durable-ref`, `regex`, `matcher`, protocols, the db and Nextomic handles | `:kind-mismatch` | `nil` |
 

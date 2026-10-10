@@ -166,6 +166,8 @@ list of entries (`[k v]` for a map), or nil when nothing satisfies it.
 | two strings | by UTF-8 bytes, which is code-point order |
 | two keywords, two symbols | an unqualified name before a qualified one, then by namespace, then by name, bytewise |
 | two chars | by scalar |
+| two instants | by milliseconds |
+| two UUIDs | by unsigned bytes, the canonical text's order (`docs/SEMANTICS.md` §2.8) |
 | two vectors | the shorter first, then element by element |
 | anything else | `:kind-mismatch`: two kinds apart, or a kind with no order (lists, maps, sets, functions, ...) |
 

@@ -9,7 +9,7 @@
 //!       after collect every root's transitive closure survives and
 //!       every other block is freed.
 //!   G2. Nested reachability graph: 60 random heap objects
-//!       (strings, lists, maps, sets, vectors) nested into each
+//!       (strings, UUIDs, lists, maps, sets, vectors) nested into each
 //!       other; a random subset declared as roots; after a cycle
 //!       exactly the objects transitively reachable from the roots
 //!       survive.
@@ -117,7 +117,12 @@ test "G2: nested graph — exactly the pool members reachable from the roots sur
         // Decide what kind of object to build. Simpler kinds first;
         // nested kinds can reference earlier pool members.
         const choice = r.uintLessThan(u8, 5);
-        if (choice == 0 or i == 0) {
+        if ((choice == 0 or i == 0) and r.boolean()) {
+            // UUID (leaf)
+            var u: [16]u8 = undefined;
+            r.bytes(&u);
+            pool[i] = try nx.uuid.make(&heap, u);
+        } else if (choice == 0 or i == 0) {
             // String (leaf)
             var buf: [16]u8 = undefined;
             const txt = try std.mem.print(&buf, "s{d}", .{i});

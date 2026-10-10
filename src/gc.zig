@@ -141,7 +141,7 @@ pub const Collector = struct {
     /// `trace` has one empty arm for them.
     fn isLeafKind(kind: u16) bool {
         return switch (@as(Kind, @fromBackingInt(@intCast(kind)))) {
-            .string, .bignum, .typed_vector, .durable_ref, .protocol, .protocol_fn, .nextomic_conn, .nextomic_db, .regex => true,
+            .string, .bignum, .typed_vector, .durable_ref, .protocol, .protocol_fn, .nextomic_conn, .nextomic_db, .regex, .uuid => true,
             else => false,
         };
     }
@@ -166,7 +166,7 @@ pub const Collector = struct {
         switch (k) {
             // The leaves (`isLeafKind`): numbers, bytes or pointers
             // the VM owns, no heap value but the metadata just marked.
-            .string, .bignum, .typed_vector, .durable_ref, .protocol, .protocol_fn, .nextomic_conn, .nextomic_db, .regex => {},
+            .string, .bignum, .typed_vector, .durable_ref, .protocol, .protocol_fn, .nextomic_conn, .nextomic_db, .regex, .uuid => {},
             .list => list.trace(h, self),
             .lazy_seq => lazy.trace(h, self),
             .persistent_vector => vector.trace(h, self),

@@ -16,7 +16,7 @@ of their own (`docs/NEXTOMIC.md` §2).
 ### 1. Scope
 
 **In.** The data kinds `nil`, `false_`, `true_`, `char`, `fixnum`,
-`float`, `keyword`, `symbol`, `string`, `bignum`, `list`,
+`float`, `keyword`, `symbol`, `inst`, `string`, `bignum`, `uuid`, `list`,
 `persistent_vector`, `persistent_map`, `persistent_set` and
 `typed_vector`, and `sorted_map` and `sorted_set` in the natural order
 (§2.8), nested to any depth (§2.7).
@@ -66,6 +66,7 @@ VALUE.md §2):
 | `float` (5) | `[5] [u64 LE = IEEE 754 bits, canonical NaN]` |
 | `keyword` (6) | `[6] [unsigned LEB128 len] [name bytes]` |
 | `symbol` (7) | `[7] [unsigned LEB128 len] [name bytes]` |
+| `inst` (8) | `[8] [zigzag LEB128 = the i64 milliseconds]` |
 | `string` (16) | `[16] [unsigned LEB128 len] [bytes]` |
 | `bignum` (17) | `[17] [negative: u8 ∈ {0,1}] [unsigned LEB128 limb_count] [u64 LE × limb_count]` |
 | `persistent_map` (18) | `[18] [unsigned LEB128 count] [(key, value) × count]` |
@@ -75,12 +76,16 @@ VALUE.md §2):
 | `typed_vector` (23) | `[23] [elem: u8 ∈ {1 = i64, 3 = f64}] [unsigned LEB128 count] [u64 LE × count]`: i64 as two's-complement bits, f64 as canonical IEEE bits (`docs/TYPED_VECTOR.md` §4) |
 | `sorted_map` (41) | `[41] [unsigned LEB128 count] [(key, value) × count]`, keys ascending (§2.8) |
 | `sorted_set` (42) | `[42] [unsigned LEB128 count] [element × count]`, ascending (§2.8) |
+| `uuid` (46) | `[46] [16 bytes, the UUID in network order]` |
 
 #### 2.1 Varints and bounds
 
 - **Unsigned LEB128** for every length and count.
 - **ZigZag LEB128** for fixnums: small integers take 1–2 bytes, the
   widest i48 eight. A decoded value outside i48 is `MalformedPayload`.
+  An instant's milliseconds take the same encoding over the whole
+  i64, 1 to 10 bytes; every i64 is an instant.
+- **Sixteen raw bytes** for a UUID; fewer left is `TruncatedInput`.
 - **Fixed little-endian** for floats and chars (fixed-size inputs),
   bignum limbs (canonical bignums are beyond i48, BIGNUM.md §1) and
   typed-vector elements (eight bytes each in memory too). A
@@ -179,8 +184,8 @@ is `UnserializableKind`: the comparator is code.
 
 | Kind (number) | Serializes | Why not |
 |---|---|---|
-| `nil` `false_` `true_` `char` `fixnum` `float` `keyword` `symbol` (0–7) | yes | |
-| `string` (16), `bignum` (17), `persistent_map` (18), `persistent_set` (19), `persistent_vector` (20), `list` (21), `typed_vector` (23) | yes | |
+| `nil` `false_` `true_` `char` `fixnum` `float` `keyword` `symbol` `inst` (0–8) | yes | |
+| `string` (16), `bignum` (17), `persistent_map` (18), `persistent_set` (19), `persistent_vector` (20), `list` (21), `typed_vector` (23), `uuid` (46) | yes | |
 | `sorted_map` (41), `sorted_set` (42) | in the natural order | A comparator of its own is code (§2.8). |
 | `lazy_seq` (43) | as the list it realized to, kind byte 21 | The codec never runs code: a lazy seq any block of which has not run is `error.Unrealized`, and the storage native that encodes realizes the value and encodes again (`docs/LAZY.md` §8). It decodes as a list, `=` to the seq and hashed alike; byte 43 is never written. |
 | `function` (24), `native_fn` (30) | no | Code, upvalues and VM state are process-local. |
@@ -250,7 +255,8 @@ the value layer and the collection modules it walks.
 
 The inline tests in `src/codec.zig` cover each kind's round trip (a
 sorted map and set among them, with the refusal of a comparator and of
-keys out of order), the
+keys out of order; an instant at both ends of the i64 range; a UUID
+and a truncated one), the
 envelope, truncation, trailing bytes, malformed LEB128, surrogate
 chars, every one of the 256 kind bytes outside the set
 (`MalformedPayload`, §3), a transient on

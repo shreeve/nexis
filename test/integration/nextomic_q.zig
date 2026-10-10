@@ -539,7 +539,7 @@ const Naive = struct {
                     .string, .bytes => |s| .{ .str = s },
                     .uuid => |u| blk: {
                         const text = try self.arena.alloc(u8, 36);
-                        nextomic.datom.uuidToText(text[0..36], u);
+                        nx.uuid.writeText(text[0..36], u);
                         break :blk .{ .str = text };
                     },
                 };

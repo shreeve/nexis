@@ -176,8 +176,8 @@ in source is a `with-meta` datum, not a field.
 
 **Layer 2 — runtime Value.** What bytecode manipulates: a 16-byte
 tagged cell (§23 #1). Immediates are nil, booleans, chars, fixnums
-(i48), floats (f64), keywords and symbols (intern ids); every other
-kind is a pointer to a heap object with a shared header
+(i48), floats (f64), instants (i64 epoch milliseconds), keywords and
+symbols (intern ids); every other kind is a pointer to a heap object with a shared header
 (`docs/VALUE.md`, `docs/HEAP.md`). Collections compare structurally;
 Vars, atoms and durable refs by identity.
 
@@ -270,10 +270,10 @@ Each item is a commitment; changing one takes an Amendment Log entry
     annotation field; source metadata is the `with-meta` datum. Macros
     see and produce Forms (§5).
 25. **Serialization has a fixed scope.** Serializable: nil, bool,
-    char, fixnum, bignum, f64, string, keyword and symbol (as text),
-    list, vector, map, set, typed vector, a lazy seq (written as the
-    list it realizes to), and sorted map and sorted set in the natural
-    order. Everything else (functions, Vars, atoms,
+    char, fixnum, bignum, f64, instant, UUID, string, keyword and
+    symbol (as text), list, vector, map, set, typed vector, a lazy seq
+    (written as the list it realizes to), and sorted map and sorted set
+    in the natural order. Everything else (functions, Vars, atoms,
     transients, durable refs, byte vectors, records, protocols, db and
     Nextomic handles, regexes and matchers, a sorted collection with a
     comparator of its own) is not; encoding one raises the keyword
@@ -1017,3 +1017,30 @@ entry stating the decision and its rationale.
   traces and the stdlib image writes for every block. Reason: a
   multimethod keeps its state on its own fn, so no process-wide
   registry outlives it. `docs/SEMANTICS.md` §7 is the authority.
+- **2026-10-10 — Instants and UUIDs are value kinds (§5, §23 #25).**
+  An instant is the immediate kind `inst` (8): the payload is the
+  milliseconds since 1970-01-01T00:00:00Z as an i64, the precision and
+  range of Clojure's `java.util.Date`. It is `=` and hashes by its
+  milliseconds, orders by them under `compare`, is not a number,
+  carries no metadata, satisfies `Inst`, and `class` names it `:inst`.
+  A UUID is the heap kind `uuid` (46), a leaf block of its 16 bytes:
+  128 bits do not fit the 120 a Value leaves beside its kind byte. It
+  is `=` and hashes by its bytes, carries no metadata, and `class`
+  names it `:uuid`. `compare` orders it by unsigned bytes, which is its
+  text's order, RFC 9562's and Nextomic's index order, where Java's
+  `UUID.compareTo` compares signed longs. Both serialize: kind byte 8
+  and a zigzag LEB128 i64, kind byte 46 and 16 bytes, additive to
+  codec format 1.0. `random-uuid` and `parse-uuid` return a uuid,
+  `random-uuid` from the process CSPRNG as Java's `SecureRandom`;
+  `uuid?` is true of the kind only, as in Clojure. The record
+  `nexis.time.Instant` is removed: `nexis.time` makes and takes the
+  kind. Nextomic's `:db.type/instant` and `:db.type/uuid` take and
+  return the kinds and nothing else, as Datomic's take a `Date` and a
+  `UUID`; the stored bytes do not change. Reason: Clojure programs and
+  EDN data carry instants and UUIDs as values, a record could be
+  neither stored nor compared, and a UUID string was not `uuid?` in
+  Clojure; one kind per Nextomic type keeps every query path comparing
+  one representation. `docs/VALUE.md` §2 and `docs/SEMANTICS.md` §2.8
+  are the authority; `docs/CODEC.md` §2 and §3, `docs/GC.md` §5,
+  `docs/SORTED.md` §6, `docs/STDLIB.md` §5, §8, §12, §13 and §14,
+  `docs/NEXTOMIC.md` §2.2 and §9 and `CLOJURE-REVIEW.md` carry it.

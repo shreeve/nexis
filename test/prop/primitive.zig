@@ -41,7 +41,7 @@ const Value = value.Value;
 const iterations_per_property: usize = 1_000;
 const prng_seed: u64 = 0x6E65_7869_7350_726F; // "nexisPro" as ASCII big-endian
 
-const Kind = enum { nil_, true_v, false_v, char_v, fixnum_v, float_v, kw_v, sym_v };
+const Kind = enum { nil_, true_v, false_v, char_v, fixnum_v, float_v, kw_v, sym_v, inst_v };
 const kind_count: usize = @typeInfo(Kind).@"enum".field_names.len;
 
 fn randKind(rand: std.Random) Kind {
@@ -78,6 +78,8 @@ fn randValue(rand: std.Random) Value {
         },
         .kw_v => value.testKeyword(rand.uintLessThan(u32, 32)),
         .sym_v => value.testSymbol(rand.uintLessThan(u32, 32)),
+        // Small instants as often as wide ones, so equal pairs occur.
+        .inst_v => value.fromInst(if (rand.boolean()) rand.int(i64) else rand.intRangeAtMost(i64, -16, 16)),
     };
 }
 
@@ -156,6 +158,7 @@ test "P5: hash is a pure function of the Value bits (modulo the -0.0/+0.0 collap
             .float => value.fromFloat(a.asFloat()),
             .keyword => value.fromKeyword(a.asKeywordId(), a.nameHash()),
             .symbol => value.fromSymbol(a.asSymbolId(), a.nameHash()),
+            .inst => value.fromInst(a.asInstMs()),
             else => unreachable,
         };
         try std.testing.expectEqual(a.hashImmediate(), b.hashImmediate());

@@ -12,6 +12,7 @@ canonical Form schema in [`PLAN.md`](../PLAN.md) §23 and §28.
 | `src/root.zig` | `build.zig` `checkLayering` | The one runtime module: every runtime file, declared bottom-up in layering order |
 | `src/stack.zig` | [`VM.md`](VM.md) §13.1 | Native stack guard: `check` on every recursion over input depth, `:stack-overflow` |
 | `src/value.zig` | [`VALUE.md`](VALUE.md) | 16-byte tagged Value, the Kind table |
+| `src/inst.zig`, `src/uuid.zig` | [`SEMANTICS.md`](SEMANTICS.md) §2.8 | The instant's calendar and text; the UUID heap kind and its text |
 | `src/heap.zig` | [`HEAP.md`](HEAP.md) | Heap header, header bits, the Heap allocator |
 | `src/dispatch.zig`, `src/hash.zig`, `src/xxhash3.zig` | [`SEMANTICS.md`](SEMANTICS.md) §2, §3, §3.3 | Cross-kind `=` and hash; the kind → equality category → hash domain table; XXH3-64 |
 | `src/intern.zig` | [`INTERN.md`](INTERN.md) | Symbol and keyword interning |
