@@ -97,8 +97,9 @@ VALUE.md §2):
   two, each limb or typed-vector element eight. A count past what
   remains is `TruncatedInput`, never an overflow or an allocation
   sized by the count. The tenth byte of a LEB128 may carry only bit
-  63; more is `MalformedPayload`. Overlong encodings (`80 00` for 0) name
-  the same number and are accepted; encode never writes them.
+  63; more is `MalformedPayload`. Only the shortest form is accepted: an
+  overlong encoding (`80 00` for 0) is `MalformedPayload`. Nextomic's
+  datom entries share this reader and writer.
 
 #### 2.2 Keyword, symbol and string bytes
 

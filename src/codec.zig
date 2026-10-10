@@ -75,7 +75,7 @@ pub const DecodeError = error{ TruncatedInput, MalformedPayload, Overflow } || s
 // Varint primitives (unsigned LEB128 + signed ZigZag LEB128)
 // =============================================================================
 
-inline fn writeUleb128(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: u64) !void {
+pub inline fn writeUleb128(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: u64) !void {
     var x = v;
     while (true) {
         const byte: u8 = @intCast(x & 0x7F);
@@ -90,16 +90,20 @@ inline fn writeUleb128(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v:
 
 /// Decode unsigned LEB128 starting at `cursor.*`, advancing the
 /// cursor past it. The tenth byte may carry only bit 63; anything
-/// more overflows u64. Overlong encodings (`80 00`) are accepted:
-/// encode never writes them, and they name the same number.
-fn readUleb128(bytes: []const u8, cursor: *usize) DecodeError!u64 {
+/// more overflows u64. Only the shortest form is accepted: an
+/// overlong encoding (`80 00`) is `MalformedPayload`, as encode never
+/// writes one.
+pub fn readUleb128(bytes: []const u8, cursor: *usize) DecodeError!u64 {
     var result: u64 = 0;
     var shift: u6 = 0;
     while (true) : (shift += 7) {
         const byte = try readByte(bytes, cursor);
         if (shift == 63 and byte > 1) return error.MalformedPayload;
         result |= @as(u64, byte & 0x7F) << shift;
-        if (byte & 0x80 == 0) return result;
+        if (byte & 0x80 == 0) {
+            if (byte == 0 and shift > 0) return error.MalformedPayload;
+            return result;
+        }
     }
 }
 
@@ -1311,4 +1315,10 @@ test "decode: each malformed or short input fails with its error" {
         .{ &.{ 1, 0, @backingInt(Kind.string), 5, 'a', 'b', 'c' }, error.TruncatedInput }, // mid-string
     };
     for (cases) |c| try testing.expectError(c[1], decode(&ctx.heap, &ctx.interner, c[0], &synthHash, &synthEq));
+}
+
+test "LEB128 unsigned: an overlong encoding is refused" {
+    const bytes = [_]u8{ 0x80, 0x00 };
+    var cursor: usize = 0;
+    try testing.expectError(error.MalformedPayload, readUleb128(&bytes, &cursor));
 }

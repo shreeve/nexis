@@ -30,6 +30,7 @@
 const std = @import("std");
 const value = @import("../value.zig");
 const bignum = @import("../bignum.zig");
+const codec = @import("../codec.zig");
 const key = @import("key.zig");
 
 const Allocator = std.mem.Allocator;
@@ -163,9 +164,7 @@ fn unzigzag(u: u64) i64 {
 }
 
 fn writeLeb(out: *std.ArrayList(u8), arena: Allocator, n: u64) !void {
-    var x = n;
-    while (x >= 0x80) : (x >>= 7) try out.append(arena, @as(u8, @truncate(x)) | 0x80);
-    try out.append(arena, @truncate(x));
+    try codec.writeUleb128(out, arena, n);
 }
 
 // =============================================================================
@@ -191,18 +190,7 @@ const Reader = struct {
 
     /// An unsigned LEB128 of at most 64 bits, in its shortest form.
     fn leb(self: *Reader) !u64 {
-        var n: u64 = 0;
-        var shift: u7 = 0;
-        while (true) : (shift += 7) {
-            const b = try self.byte();
-            if (shift == 63 and b > 1) return error.Corrupted;
-            n |= @as(u64, b & 0x7F) << @intCast(shift);
-            if (b & 0x80 == 0) {
-                if (b == 0 and shift > 0) return error.Corrupted;
-                return n;
-            }
-            if (shift == 63) return error.Corrupted;
-        }
+        return codec.readUleb128(self.bytes, &self.at) catch error.Corrupted;
     }
 
     fn done(self: *const Reader) bool {
