@@ -136,11 +136,12 @@ files; each is a few lines.
     `SyncMode.of` in `nextomic/store.zig` (`Durability.syncOverride`;
     two enums, so one must be renamed across both layers), and one
     random generator for the query layer and `rand`.
-28. **Small error-map and comment rows:** `:nextomic/conflict` names its
-    attribute `:a` where the rest use `:attr`; `db.failureName` keeps
-    arms for codec errors that no longer exist; a fulltext needle with
-    an over-long token; the reserved `Kind` names `.error_` still used
-    in vm.zig and stdlib.zig.
+28. **Small rows left:** a fulltext needle with an over-long token
+    (`nextomic/fulltext.zig` drops it from the needle, so the search
+    widens; a decision, not a deletion), and the reserved `Kind` name
+    `.error_` (kind 28 is one of three reserved wire tags, documented as
+    a set in VALUE.md, CODEC.md, GC.md and SEMANTICS.md §Kinds; the one
+    use is a `false` arm in `stdlib.zig`).
 29. **The test and doc pass the revamp deferred:** `eval_pipeline`'s
     superseded early cases and its fresh VM per case (31 s of the gate),
     the duplicated pins, `docs/PERF.md`'s superseded tables, test
