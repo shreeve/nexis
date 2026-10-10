@@ -3756,12 +3756,10 @@ fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
     return .{ .tag = @backingInt(Kind.db_connection), .payload = @intFromPtr(conn) };
 }
 
-/// The `:durability` of a `db/open` options map; null when the map is
-/// nil or has none.
+/// The `:durability` of a `db/open` options map, its one option; null
+/// when the map is nil or has none.
 fn durabilityOption(vm: *VM, opts: Value) VmError!?db_mod.Durability {
-    if (opts.isNil()) return null;
-    if (opts.kind() != .persistent_map) return VmError.KindMismatch;
-    const found = (try keywordGet(vm, opts, "durability")) orelse return null;
+    const found = (try keywordOptions(vm, opts, "db/open", &.{"durability"}))[0] orelse return null;
     if (found.kind() != .keyword) return VmError.InvalidArgument;
     return db_mod.Durability.parse(vm.ensureInterner().keywordName(found.asKeywordId())) orelse VmError.InvalidArgument;
 }
@@ -6318,7 +6316,8 @@ fn keywordOptions(vm: *VM, opts: Value, comptime who: []const u8, comptime names
             for (names, 0..) |n, i| text = text ++ (if (i > 0) ", :" else ":") ++ n;
             break :blk text;
         };
-        return vm.fail(VmError.InvalidArgument, who ++ ": an option other than " ++ accepted, .{});
+        if (e.key.kind() == .keyword) return vm.fail(VmError.InvalidArgument, who ++ ": no option :{s}; the options are " ++ accepted, .{interner.keywordName(e.key.asKeywordId())});
+        return vm.fail(VmError.InvalidArgument, who ++ ": no option of class {s}; the options are " ++ accepted, .{className(e.key.kind())});
     }
     return out;
 }

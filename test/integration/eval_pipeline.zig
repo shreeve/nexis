@@ -8763,7 +8763,7 @@ test "json: write-str escapes U+2028 and U+2029 unless :escape-js-separators is 
 test "shell: sh names a missing :dir, an :env name of another kind and an unknown option" {
     try expectOutputWithIo("(try (nexis.shell/sh \"ls\" :dir \"/nexis-no-such-dir\") (catch any e [(:error e) (:message e)]))", "[:file-not-found sh: cannot run ls in /nexis-no-such-dir]");
     try expectOutputWithIo("(try (nexis.shell/sh \"env\" :env {1 \"x\"}) (catch any e [(:error e) (:message e)]))", "[:kind-mismatch sh: an :env name is a string, keyword or symbol, got an integer]");
-    try expectOutputWithIo("(try (nexis.shell/sh \"true\" :out-enc \"UTF-8\") (catch any e [(:error e) (:message e)]))", "[:invalid-argument sh: an option other than :in, :dir, :env]");
+    try expectOutputWithIo("(try (nexis.shell/sh \"true\" :out-enc \"UTF-8\") (catch any e [(:error e) (:message e)]))", "[:invalid-argument sh: no option :out-enc; the options are :in, :dir, :env]");
 }
 
 // =============================================================================
@@ -8795,4 +8795,12 @@ test "io: slurp and spit take :encoding \"UTF-8\", the one encoding" {
         \\ (try (slurp "@STORE@" :append true) (catch any e (:error e)))
         \\ (try (slurp "@STORE@" :encoding) (catch any e (:error e)))]
     , "[h\u{e9}! h\u{e9}! :invalid-argument :invalid-argument :invalid-argument :arity-mismatch]");
+}
+
+test "db: db/open refuses an option it does not take, naming it" {
+    try expectOutputProgramWithStore("open-unknown-option",
+        \\[(try (db/open "@STORE@" {:durabilty :commit}) (catch any e [(:error e) (:message e)]))
+        \\ (try (db/open "@STORE@" {"durability" :commit}) (catch any e [(:error e) (:message e)]))
+        \\ (let [c (db/open "@STORE@" {:durability :commit})] (db/close c) :ok)]
+    , "[[:invalid-argument db/open: no option :durabilty; the options are :durability] [:invalid-argument db/open: no option of class string; the options are :durability] :ok]");
 }
