@@ -1,4 +1,4 @@
-//! datom.zig — the Datom struct, the txlog entry codec and uuid text.
+//! datom.zig — the Datom struct and the txlog entry codec.
 //!
 //! A txlog entry (NEXTOMIC.md §2, `nx/txlog`) is bytes:
 //!
@@ -370,55 +370,6 @@ pub fn longOf(v: Value) ?i64 {
 }
 
 // =============================================================================
-// UUID text (8-4-4-4-12, lower-case hex)
-// =============================================================================
-
-pub fn uuidToText(out: *[36]u8, u: [16]u8) void {
-    const hex = "0123456789abcdef";
-    var o: usize = 0;
-    for (u, 0..) |b, i| {
-        if (i == 4 or i == 6 or i == 8 or i == 10) {
-            out[o] = '-';
-            o += 1;
-        }
-        out[o] = hex[b >> 4];
-        out[o + 1] = hex[b & 0xF];
-        o += 2;
-    }
-}
-
-/// The uuid whose canonical text `s` is (lower-case hex, 8-4-4-4-12),
-/// or null for any other string: Nextomic takes one text per uuid, so
-/// a string compares alike wherever a uuid is matched (NEXTOMIC.md
-/// §2.2).
-pub fn uuidFromCanonical(s: []const u8) ?[16]u8 {
-    for (s) |c| if (c >= 'A' and c <= 'F') return null;
-    return uuidFromText(s);
-}
-
-/// The uuid `s` spells in 8-4-4-4-12 hex digits of either case, or
-/// null (`parse-uuid`).
-pub fn uuidFromText(s: []const u8) ?[16]u8 {
-    if (s.len != 36) return null;
-    var out: [16]u8 = undefined;
-    var o: usize = 0;
-    var i: usize = 0;
-    while (i < 36) {
-        if (i == 8 or i == 13 or i == 18 or i == 23) {
-            if (s[i] != '-') return null;
-            i += 1;
-            continue;
-        }
-        const hi = std.fmt.charToDigit(s[i], 16) catch return null;
-        const lo = std.fmt.charToDigit(s[i + 1], 16) catch return null;
-        out[o] = (hi << 4) | lo;
-        o += 1;
-        i += 2;
-    }
-    return out;
-}
-
-// =============================================================================
 // Tests
 // =============================================================================
 
@@ -575,16 +526,4 @@ test "a malformed entry is Corrupted" {
         &.{ 0, 0, 1, 0, 2 << 1, 98 }, // a string length past the out-of-line mark
     };
     for (cases) |bytes| try testing.expectError(error.Corrupted, decodeTxlog(arena, bytes, 2, ts.source()));
-}
-
-test "uuid text round trip" {
-    const u = [_]u8{ 0xff, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 };
-    var text: [36]u8 = undefined;
-    uuidToText(&text, u);
-    try testing.expectEqualStrings("ff000102-0304-0506-0708-090a0b0c0d0e", &text);
-    try testing.expectEqualSlices(u8, &u, &uuidFromText(&text).?);
-    try testing.expect(uuidFromText("nope") == null);
-    // One text per uuid: upper-case hex is not its text.
-    try testing.expect(uuidFromCanonical("0123ABCD-4567-89EF-0123-456789ABCDEF") == null);
-    try testing.expectEqualSlices(u8, &u, &uuidFromCanonical(&text).?);
 }

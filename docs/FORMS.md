@@ -40,6 +40,8 @@ true, false                          ;; bool
 ##Inf, ##-Inf, ##NaN                 ;; real    (the symbolic floats)
 "hello"                              ;; string  (escapes decoded, UTF-8)
 #"a\d+", #"\""                       ;; regex   (the text between the quotes, no escape processing)
+#inst "2026-10-09T12:30+02:00"       ;; inst    (the instant: milliseconds since the epoch, i64)
+#uuid "0123abcd-4567-89ef-0123-456789abcdef" ;; uuid (its 16 bytes)
 \a, \newline, \u{2603}, \u2603       ;; char    (Unicode scalar)
 :foo, :ns/foo                        ;; keyword
 foo, ns/foo, set!, ->>               ;; symbol
@@ -60,6 +62,14 @@ foo, ns/foo, set!, ->>               ;; symbol
   passes them to `Pattern.compile`. The reader compiles it once to
   check it (§3); the compiler lifts it into a pattern constant and
   `quote` and macros see a pattern value (`docs/REGEX.md` §10).
+- `inst` and `uuid` hold the value their tag's string names, parsed
+  once by the reader: `#inst` in Clojure's grammar (`src/inst.zig`,
+  `docs/STDLIB.md` §12), `#uuid` in Java's `UUID.fromString` grammar
+  (`src/uuid.zig`). The compiler lifts each into a constant, an
+  instant immediate and a UUID block, and `quote` and macros see the
+  value; a macro may return either value and it becomes the datum
+  again. They are the two tags EDN builds in; no other tag reads
+  (§3), and user tags are open (PLAN §24 #3).
 - `#'x` has no datum of its own: it reads as the list `(var x)` (§3).
 - `anon_fn` holds the body forms only; `%`, `%1`, `%&` inside stay
   ordinary symbols. The macroexpander rewrites it to `(fn* [%1 ...]
@@ -113,8 +123,14 @@ foo, ns/foo, set!, ->>               ;; symbol
 | `#"a\d"` | the `regex` datum of the text `a\d`: a backslash and the character after it are kept as written, so `#"\""` holds `\"` |
 | `#"("`, `#"a{2,1}"`, `#"(?=a)"` | `:invalid-regex`, detail the compiler's sentence and the code-point index in the pattern (`"Unclosed group at index 1"`), the span the literal |
 | `#"abc` with no closing quote | parse error at the `#"` |
+| `#inst "2026-10-09T12:30:15.123+02:00"`, `#inst "2020"` | the `inst` datum of the instant the string names: a year of four or more digits with an optional sign, then optionally `-MM`, `-DD`, `T` and `HH`, `:mm`, `:ss` and a fraction (its first three digits the milliseconds), each only after the one before; then `Z`, an offset `±HH:mm` or `±HHmm`, or nothing, which is UTC. `T` and `Z` may be lower case; a second may be 60 in minute 59, which rolls into the next minute |
+| `#uuid "0123ABCD-4567-89EF-0123-456789ABCDEF"`, `#uuid "1-2-3-4-5"` | the `uuid` datum: five groups of 1–8, 1–4, 1–4, 1–4 and 1–12 hex digits of either case, joined by `-`, at most 36 characters |
+| `#inst #_x "1970"` | a discard between the tag and its form is dropped |
+| `#inst "2020-13"`, `#inst 5`, `#inst ^:m "2020"` | `:invalid-inst`, detail `not an instant: "2020-13"` or `#inst takes a string`, the span the tag through its form |
+| `#uuid "x"`, `#uuid 5` | `:invalid-uuid`, detail `not a UUID: "x"` or `#uuid takes a string` |
+| `#foo/bar 1`, `#ns.Rec{:a 1}`, `#js {}` | `:unknown-tag`, detail `#foo/bar; nexis reads the tags #inst and #uuid`, before the tag's form is read |
 | `#! text`, `; text` | a comment to the end of the line, anywhere, as in Clojure, so a script may begin `#!/usr/bin/env nexis` |
-| `##Infinity`, `#?(...)`, `::k`, `#%x`, `:` | parse error naming the token (`` unexpected `##Infinity` ``): none is in the reader (`CLOJURE-REVIEW.md` §4) |
+| `##Infinity`, `#?(...)`, `::k`, `#%x`, `:` | parse error naming the token (`` unexpected `##Infinity` ``): none is in the reader (`CLOJURE-REVIEW.md` §4). `#` and a letter is a tag token, never a parse error |
 | a form nested past the native stack's budget | `:nesting-too-deep` (`src/stack.zig`) |
 | a source text past 4 GiB (`reader.max_source_len`, 2^32 - 1 bytes) | reader error naming the bound and the size, before a byte is read: positions are `u32` offsets |
 
@@ -142,7 +158,9 @@ set (§5), so `\a1` and `\u041` fail whole.
 **Duplicate detection.** Only literal keys and elements count:
 `{:a 1 (keyword "a") 2}` reads, since the second key is a runtime value.
 Literal equality compares integers by value, `bigint` by text, strings
-byte for byte, keywords and symbols by name. A `regex` is equal to
+byte for byte, keywords and symbols by name, instants by milliseconds
+and UUIDs by bytes, so `#{#inst "2020" #inst "2020-01-01T00:00Z"}` is
+a duplicate, as Clojure's reader reports one. A `regex` is equal to
 nothing, so `#{#"a" #"a"}` reads, as in Clojure, where each literal
 is a distinct `Pattern`. `1` and `1.0` differ
 (`(= 1 1.0)` is false, PLAN §23 #11), `:a` and `a` differ, and reals
@@ -162,8 +180,8 @@ The pipeline and its one-way stage boundaries (PLAN §5, §28.4;
 
 | Stage | Input → output | Responsibilities |
 |---|---|---|
-| Parser (`src/parser.zig`, generated from `nexis.grammar`; scanner `src/nexis.zig`) | source → `Sexp` with token spans | Tokenizing and the LALR(1) parse; drops `#_` and its form. No normalization. |
-| Reader (`src/reader.zig`) | `Sexp` → `Form` | §3: typed atoms, spans, metadata merge, `anon_fn`, the `syntax-quote` marker, the `regex` datum and its validation, every reader error. |
+| Parser (`src/parser.zig`, generated from `nexis.grammar`; scanner `src/nexis.zig`) | source → `Sexp` with token spans | Tokenizing and the LALR(1) parse; drops `#_` and its form; a tag and its form as one `tagged` node. No normalization. |
+| Reader (`src/reader.zig`) | `Sexp` → `Form` | §3: typed atoms, spans, metadata merge, `anon_fn`, the `syntax-quote` marker, the `regex` datum and its validation, the `inst` and `uuid` datums, every reader error. |
 | Macroexpander (`src/expand.zig`) | `Form` → expanded `Form` | Macros to a fixpoint, `syntax-quote`, `anon_fn` → `fn*`, destructuring. A macro receives the call (`&form`), the locals in scope (`&env`) and its arguments (PLAN §23 #34). `MACROEXPAND.md`. |
 | Compiler (`src/compile.zig`) | expanded `Form` → Tiny tree → bytecode | Resolves each symbol to a slot, capture, Var or special form in `lowerForm`; there is no separate resolver. `COMPILER.md`. |
 
@@ -183,7 +201,9 @@ deterministic:
   spaces past the parent. There is no width-aware wrapping.
 - Atoms carry their datum tag, so a symbol and a keyword are never
   confused: `nil`, `(bool true)`, `(int N)`, `(bigint N)`, `(real R)`,
-  `(string "S")`, `(regex "S")`, `(char C)`, `(keyword :K)`, `(symbol S)`.
+  `(string "S")`, `(regex "S")`, `(char C)`, `(keyword :K)`, `(symbol S)`,
+  `(inst "2026-10-09T10:30:15.123-00:00")` (Clojure's `#inst` text of
+  the milliseconds), `(uuid "0123abcd-…")` (the canonical text).
 - Integers print in decimal whatever the source radix. Reals use Zig's
   `{d}` format (`1e9` prints `1000000000`); NaN and the infinities print
   `+nan`, `+inf`, `-inf`.
@@ -235,7 +255,8 @@ pin them where they show: error carets and `nexis disasm` annotations.
 
 - `test/golden/basic.nx` and `reader-literals.nx` cover the reader
   surface (every radix, escape, named and hex char, qualified name,
-  collection literal, reader macro, `#_`, `#()` and metadata shape);
+  collection literal, reader macro, `#_`, `#()`, metadata shape, `#inst`
+  and `#uuid`);
   each `.sexp` sibling is the expected `writeProgram` output.
 - Each `test/golden/errors/<name>.nx` pairs with `<name>.err`: one line,
   the error keyword, then ` :detail "..."` when the reader gives one,

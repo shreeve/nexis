@@ -364,7 +364,6 @@ pub const Loader = struct {
             const where = info.lineCol(o.pos);
             return self.diagnose(at, "parse error: unexpected `{s}`; the `{s}` at {d}:{d} is open", .{ token, text[o.pos..][0..o.len], where.line, where.col });
         };
-        if (reader_mod.taggedLiteralHint(token)) |hint| return self.diagnose(at, "parse error: unexpected `{s}`; {s}", .{ token, hint });
         return self.diagnose(at, "parse error: unexpected `{s}`", .{token});
     }
 

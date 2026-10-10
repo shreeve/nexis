@@ -99,7 +99,7 @@
                  db '[[(reach ?x ?y) [?x :person/friends ?y]]
                       [(reach ?x ?y) [?x :person/friends ?z] (reach ?z ?y)]])))
 (show "by uuid" (d/q '[:find ?n . :in $ ?u :where [?e :person/id ?u] [?e :person/name ?n]]
-                     db "fedcba98-7654-3210-fedc-ba9876543210"))
+                     db #uuid "fedcba98-7654-3210-fedc-ba9876543210"))
 (show "by bytes" (d/q '[:find ?n . :where [?e :person/photo "png"] [?e :person/name ?n]] db))
 (show "by long bio" (d/q '[:find ?n . :in $ ?b :where [?e :person/bio ?b] [?e :person/name ?n]]
                          db (:person/bio (d/entity db [:person/name "Ann"]))))
@@ -146,7 +146,7 @@
 
 (println "-- tx-range")
 (doseq [{:keys [t instant data excised]} (d/tx-range n)]
-  (show t [(if (= t 1) :clock (- instant 4102444800000)) (digest data) excised]))
+  (show t [(if (= t 1) :clock (- (inst-ms instant) 4102444800000)) (digest data) excised]))
 (doseq [{:keys [t data]} (d/tx-range n 8 15)
         datom (take 12 data)]
   (println t (pr-str datom)))

@@ -193,12 +193,12 @@ are the map for someone who knows Clojure.
 | String escapes | `\b \f`, octal, `\uHHHH` | Clojure's, and `\u{HEX}` | `\u{HEX}` names any scalar in one escape (§23 #26) |
 | `#:ns{:a 1}`, `::k` | namespaced map, auto-resolved keyword | parse error | no current namespace at read time |
 | `#?(...)` | reader conditional | parse error | one target (PLAN §4) |
-| `#inst`, `#uuid` | tagged literals | parse error; `nexis.time/parse` reads an instant's text | PLAN §4, §24 #3 |
+| `#inst`, `#uuid` | tagged literals: a `java.util.Date` and a `java.util.UUID` | an instant and a UUID, value kinds (`docs/SEMANTICS.md` §2.8), read in Clojure's `#inst` grammar and Java's `UUID.fromString`'s, which nexis widens: a signed or longer year, a lower-case `T` or `Z`, an offset without its colon. Any other tag, and `*data-readers*`, is `:unknown-tag` | PLAN §24 #3, `docs/FORMS.md` §3 |
 | `#"re"` | a `Pattern` | a pattern, compiled when the source is read; a construct that needs backtracking is `:invalid-regex` | a linear-time engine (`docs/REGEX.md`) |
 | `#=(...)`, `#<...>`, `#^{...}` | read-eval, unreadable, old metadata | parse error | no read-time evaluation; one `^` spelling |
 
 The `#` dispatch set is `#{}`, `#(...)`, `#_`, `#'` (`#'foo` is
-`(var foo)`) and `#"..."`. Clojure's reader
+`(var foo)`), `#"..."` and the tags `#inst` and `#uuid`. Clojure's reader
 throws ad-hoc exceptions for malformed input; nexis reports a stable
 keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 `:nested-anon-fn`, `:unquote-outside-syntax-quote`, ...; PLAN §28.3).
@@ -231,7 +231,7 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | `(reduced x)` | an opaque box | a `nexis.core/Reduced` record with field `:val`; `reduce`, `reductions`, `reduce-kv` and `run!` honour it | `src/stdlib/core.nx` |
 | `(read-string s)`, `(read-string opts s)` | the full reader; `opts` takes `:eof`, `:read-cond` and `:features` | the first form as data, `^meta` on a collection kept (on a symbol dropped); syntax-quote and unquote are not data and raise `:reader-error`; `opts` takes `:eof`, the value of a string that holds no form | `docs/STDLIB.md` §2 |
 | `clojure.math` | doubles in and out; `floor` and `ceil` of a long give a double | `nexis.math`: the same functions over doubles, except that `floor` and `ceil` give an integer back unchanged (`(floor 3)` is `3`, Clojure's `3.0`), and `floor-div` of `Long/MIN_VALUE` by `-1` is `2^63`, a bignum, where Java's wraps to `Long/MIN_VALUE`, since every integer operator promotes (`docs/SEMANTICS.md` §2.2); the last bit of a transcendental result is the platform library's | `docs/TOOLING.md` §4 |
-| `clojure.edn/read-string` | the EDN reader: no reader sugar, tagged literals through `:readers` and `:default` | `nexis.edn/read-string`, the nexis reader with `{:eof nil}`: `'x`, `@x` and `#()` read as the forms they stand for, and a tagged literal is a `:reader-error` whatever `:readers` holds (there are none, PLAN §4); nothing is evaluated | `docs/STDLIB.md` §4 |
+| `clojure.edn/read-string` | the EDN reader: no reader sugar, tagged literals through `:readers` and `:default` | `nexis.edn/read-string`, the nexis reader with `{:eof nil}`: `'x`, `@x` and `#()` read as the forms they stand for; `#inst` and `#uuid` read, and any other tag is a `:reader-error` whatever `:readers` holds (PLAN §24 #3); nothing is evaluated | `docs/STDLIB.md` §4 |
 | `(eval form)` | binds `*ns*` | compiles in the current namespace as the REPL does; a compile error is the catchable map `{:error :compile-error :message sentence :form form :kind name}` | `docs/MACROEXPAND.md` |
 | `(macroexpand form)` | `&env` the compiler's locals when called while compiling, else nil | `&env` nil; `^meta` on the form dropped; subforms never expand | `docs/MACROEXPAND.md` §1.2 |
 | `&env`'s values | `LocalBinding` objects | each local's symbol, so `get`, `contains?`, `keys` and calling the map answer alike | `docs/MACROEXPAND.md` §1.3 |
@@ -255,11 +255,11 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | the no-method and preference messages | `"... dispatch value: null"` | `"... dispatch value: nil"`, as `format`'s `%s` prints nil | `docs/STDLIB.md` §9.4 |
 | the ambiguity message's pair | `PersistentHashMap` order | the method table's: insertion order to eight entries, CHAMP order past them, so the two keys named can be in the other order | `docs/STDLIB.md` §9.4 |
 | namespaces | `Namespace` objects | their name symbols: `(the-ns 'user)` and `*ns*` in `user` are `user`; `ns-publics` and `resolve` return Vars as Clojure's do, and a host macro resolves to nil; a `binding` of `*ns*` does not change where `eval` compiles | `docs/STDLIB.md` §8 |
-| `(random-uuid)`, `(parse-uuid s)` | a `java.util.UUID`, printed `#uuid "..."` | the canonical lowercase string; `uuid?` is true of a string in that form | `docs/STDLIB.md` §8 |
+| `(random-uuid)`, `(parse-uuid s)`, `uuid?` | a `java.util.UUID`, printed `#uuid "..."`; `parse-uuid` is `UUID.fromString`, which takes a sign on a group and drops the high digits of a long one; `compareTo` compares two signed longs | a UUID, a value kind, printed `#uuid "..."`; `uuid?` is true of the kind only; `parse-uuid` refuses a signed or over-long group; `compare` orders by unsigned bytes, the text's order, so `8000…` sorts after `0000…` | `docs/STDLIB.md` §8, §14 |
 | `(System/getenv)`, `(System/getenv name)` | static methods | `nexis.sys/getenv`; bytes that are not UTF-8 read as U+FFFD | `docs/STDLIB.md` §11 |
 | `clojure.java.shell/sh` | `:in` a string, bytes, a stream, a reader or a file; `:in-enc`, `:out-enc` (`:bytes`) | `nexis.shell/sh`, also required as `clojure.java.shell`: `:in` a string, no encodings (`:invalid-argument`); a signal's `:exit` is 128 plus its number, as Java's | `docs/STDLIB.md` §11 |
-| instants | `java.util.Date` and `java.time.Instant` extend `Inst`, printed `#inst "..."` | `nexis.time.Instant`, a record of epoch milliseconds that extends `Inst`, printed `#nexis.time.Instant{:ms n}`; `nexis.time` parses and formats ISO-8601 in UTC; an Instant is not `compare`-able | `docs/STDLIB.md` §8, §12 |
-| `clojure.data.json` | keys and keyword values written by `name`; non-ASCII and `/` escaped by default; unknown options ignored | `nexis.json`, also required as `clojure.data.json`: a keyword written whole (`"person/name"`); nothing escaped past JSON's need and U+2028/U+2029 unless `:escape-unicode` or `:escape-slash`; an unknown option is `:invalid-argument`; an Instant written as its ISO-8601 text; malformed text is `{:error :json-error :message :json-line :json-column}`, placed as any error | `docs/STDLIB.md` §13 |
+| instants | `java.util.Date` and `java.time.Instant` extend `Inst`, printed `#inst "..."`; `(str date)` is `Date.toString` in the local zone, `"Tue Dec 31 17:00:00 MST 2019"` | an instant, a value kind of i64 epoch milliseconds (a `Date`'s precision and range) that extends `Inst`, printed `#inst "..."` as a `Date` is, a year past 9999 with its sign so it reads back; `str` is the ISO-8601 text, `"2019-12-31T17:00:00Z"`; `nexis.time` parses and formats ISO-8601 in UTC | `docs/SEMANTICS.md` §2.8, `docs/STDLIB.md` §8, §12 |
+| `clojure.data.json` | keys and keyword values written by `name`; non-ASCII and `/` escaped by default; unknown options ignored | `nexis.json`, also required as `clojure.data.json`: a keyword written whole (`"person/name"`); nothing escaped past JSON's need and U+2028/U+2029 unless `:escape-unicode` or `:escape-slash`; an unknown option is `:invalid-argument`; an instant written as its ISO-8601 text and a UUID as its canonical text, as `clojure.data.json` writes them; malformed text is `{:error :json-error :message :json-line :json-column}`, placed as any error | `docs/STDLIB.md` §13 |
 | `(list? (seq [1 2]))`, and of `rest`, `(cons 1 ())`, `keys`, `sort` | false: each is a seq class of its own (`ChunkedSeq`, `Cons`, `KeySeq`, `ArraySeq`), and `list?` holds of a `PersistentList` only | true: a realized seq is a list, there being no seq kinds beside the list and the lazy seq (a vector's seq is a view of it); false of a lazy seq (`map`, `range`, a `cons` onto one) | `docs/LIST.md` §1 |
 | `(map-entry? [:a 1])` | false: a map entry is a `MapEntry` | true: a map's entries are two-element vectors | `docs/STDLIB.md` §8 |
 | `(float x)` | a 32-bit float | the f64 itself, after Java's range check | `docs/SEMANTICS.md` §2.2 |
@@ -272,6 +272,6 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 
 The deliberate ones are PLAN §4's non-goals: STM,
 agents, `core.async`, reader conditionals,
-tagged literals, rationals and decimals, full hygiene, other compile
+rationals and decimals, full hygiene, other compile
 targets, Java interop. Library functions that do not exist are known gaps, not decisions
 (`HANDOFF.md` §6).

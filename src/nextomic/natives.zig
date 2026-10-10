@@ -4,9 +4,9 @@
 //! transaction, an arena for the storage layer's scratch, and copies
 //! only results into the VM heap. Lisp values become `key.Val` by the
 //! attribute's `:db/valueType` in `marshal.zig` and `transact.zig`
-//! (integer in i64 → long or instant, double → double, keyword → ident
-//! id, eid/ident/lookup ref → ref, string → string, uuid or bytes text
-//! → their storage form, boolean → boolean); datom values come back
+//! (integer in i64 → long, instant → instant, uuid → uuid, double →
+//! double, keyword → ident id, eid/ident/lookup ref → ref, string →
+//! string or bytes, boolean → boolean); datom values come back
 //! through `Conn.valToValue`.
 //!
 //! Errors: every `nextomic.Error` and storage error becomes a keyword
@@ -39,7 +39,6 @@ const std = @import("std");
 const value = @import("../value.zig");
 const vm_mod = @import("../vm.zig");
 const heap_mod = @import("../heap.zig");
-const bignum = @import("../bignum.zig");
 const gc = @import("../gc.zig");
 const string_mod = @import("../string.zig");
 const vector_mod = @import("../coll/vector.zig");
@@ -106,7 +105,7 @@ const rows = .{
     .{ "as-of", 2, 2, &fnAsOf, "[db t]", "Returns the view of db as of the transaction t, a t or a transaction\n  entity id: what the transactions up to t asserted and did not\n  retract. Of repeated bounds the older holds. A negative t is\n  :invalid-argument." },
     .{ "since", 2, 2, &fnSince, "[db t]", "Returns the view of db holding only what the transactions after t, a\n  t or a transaction entity id, asserted and did not retract: an entity\n  untouched since t is invisible. Of repeated bounds the newer holds." },
     .{ "history", 1, 1, &fnHistory, "[db]", "Returns the history view of db: every assertion and retraction up to\n  its basis, each datom with its added flag. q and datoms read it;\n  entity and pull are :nextomic/history-view." },
-    .{ "tx-range", 1, 3, &fnTxRange, "[conn] [conn from] [conn from to]", "Returns a vector of the log's entries {:t t :instant ms :data [datoms]}\n  for from <= t < to, oldest first; a nil or missing bound is open. An\n  entry an excision touched carries :excised [e ...]." },
+    .{ "tx-range", 1, 3, &fnTxRange, "[conn] [conn from] [conn from to]", "Returns a vector of the log's entries {:t t :instant inst :data\n  [datoms]} for from <= t < to, oldest first, :instant the\n  transaction's instant; a nil or missing bound is open. An entry an\n  excision touched carries :excised [e ...]." },
     .{ "schema", 1, 1, &fnSchema, "[db]", "Returns a map of each attribute's ident to its definition as db's\n  basis saw it: :db/id, :db/ident, :db/valueType, :db/cardinality,\n  :db/index, :db/isComponent and :db/fulltext, with :db/unique and\n  :db/doc when the attribute has them." },
     .{ "sync", 1, 1, &fnSync, "[conn]", "Makes every commit to conn's file durable, with one full sync when a\n  commit left it unsynced; returns nil. :db/sync-failed once a sync of\n  the file has failed, until it is reopened." },
     .{ "pull", 3, 3, &fnPull, "[db pattern e]", "Returns the map pattern selects of the entity e in db, nil when e has\n  no datoms there: attributes, :ns/_name reverse refs, *, {attr\n  sub-pattern} and (attr :limit n :default v :as k), :db/id always.\n  A bad pattern is :nextomic/pull-syntax." },
@@ -1257,7 +1256,7 @@ fn txRangeNative(vm: *VM, args: []const Value) !Value {
     for (out, entries) |*slot, entry| {
         var m = try champ.mapEmpty(b.heap);
         m = try b.putKw(m, "t", try fixnum(entry.t));
-        m = try b.putKw(m, "instant", try bignum.fromI64(b.heap, entry.instant));
+        m = try b.putKw(m, "instant", value.fromInst(entry.instant));
         m = try b.putKw(m, "data", try b.datoms(arena, entry.datoms));
         if (entry.excised.len > 0) {
             const ids = try arena.alloc(Value, entry.excised.len);

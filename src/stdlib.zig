@@ -43,6 +43,8 @@ const heap_mod = @import("heap.zig");
 const dispatch_mod = @import("dispatch.zig");
 const atom_mod = @import("atom.zig");
 const string_mod = @import("string.zig");
+const inst_mod = @import("inst.zig");
+const uuid_mod = @import("uuid.zig");
 const regex_mod = @import("regex.zig");
 const regex_tables = @import("regex_tables.zig");
 const format_mod = @import("format.zig");
@@ -271,8 +273,7 @@ pub const embedded = [_]image_mod.Source{
     .{ .ns = "nexis.shell", .info = .{ .path = "shell.nx", .text = @embedFile("stdlib/shell.nx"), .library = true } },
     // Instants, ISO-8601 text and durations.
     .{ .ns = "nexis.time", .info = .{ .path = "time.nx", .text = @embedFile("stdlib/time.nx"), .library = true } },
-    // JSON, in clojure.data.json's shape; after time.nx, whose
-    // instants it writes.
+    // JSON, in clojure.data.json's shape.
     .{ .ns = "nexis.json", .info = .{ .path = "json.nx", .text = @embedFile("stdlib/json.nx"), .library = true } },
 };
 
@@ -474,8 +475,8 @@ const core_rows = .{
     .{ "ns-publics", 1, 1, bind(nsVars, true), "[ns]", "Returns ns-interns of the namespace the symbol ns names without the\n  Vars marked :private." },
     .{ "resolve", 1, 1, &fnResolve, "[sym]", "Returns the Var sym names in the current namespace, resolved as the\n  compiler resolves a global, else nil. A host macro such as when has\n  no Var, so it resolves to nil." },
     .{ "ns-resolve", 2, 2, &fnNsResolve, "[ns sym]", "Returns the Var sym names in the namespace the symbol ns names, as\n  resolve does, else nil; :no-such-namespace when ns names none." },
-    .{ "random-uuid", 0, 0, &fnRandomUuid, "[]", "Returns a random version-4 UUID as its canonical lowercase text: a\n  UUID is a string, and there is no #uuid literal." },
-    .{ "parse-uuid", 1, 1, &fnParseUuid, "[s]", "Returns the canonical lowercase text of the UUID the string s spells\n  in 8-4-4-4-12 hex digits of either case, else nil." },
+    .{ "random-uuid", 0, 0, &fnRandomUuid, "[]", "Returns a random version-4 UUID, from the process's cryptographically\n  secure generator." },
+    .{ "parse-uuid", 1, 1, &fnParseUuid, "[s]", "Returns the UUID the string s names, in the grammar of Java's\n  UUID.fromString (five groups of hex digits joined by -, of either\n  case, 0123abcd-4567-89ef-0123-456789abcdef or 1-2-3-4-5), else nil." },
     .{ "indexed?", 1, 1, kindPredicate(isIndexed), .leaf, "[coll]", "Returns true if coll is a vector or a typed vector, whose nth takes\n  constant time." },
     // Collection construction + access.
     .{ "vector", 0, null, &fnVector, "[& args]", "Returns a vector of the args." },
@@ -699,6 +700,8 @@ const internal_rows = .{
     .{ "#%sh", 2, 2, &fnSh },
     // The natives under nexis.time (time.nx, STDLIB.md §12).
     .{ "#%now-ms", 0, 0, &fnNowMs },
+    .{ "#%inst", 1, 1, &fnInst },
+    .{ "#%inst-ms", 1, 1, &fnInstMs },
     .{ "#%format-instant", 1, 1, &fnFormatInstant },
     .{ "#%parse-instant", 1, 1, &fnParseInstant },
     // The natives under nexis.json (json.nx, STDLIB.md §13).
@@ -1279,8 +1282,8 @@ fn fnBitClear(vm: *VM, args: []const Value) VmError!Value {
     return integerValue(vm, try intArg(args[0]) & ~try bitMask(args[1]));
 }
 
-/// The generator behind `rand`, `rand-int`, `shuffle` and
-/// `random-uuid`, seeded from the I/O's entropy at first use. One
+/// The generator behind `rand`, `rand-int` and `shuffle`, seeded from
+/// the I/O's entropy at first use. One
 /// isolate, one thread.
 var prng: ?std.Random.DefaultPrng = null;
 
@@ -3183,7 +3186,7 @@ fn fnWithMeta(vm: *VM, args: []const Value) VmError!Value {
     if (!m.isNil() and m.kind() != .persistent_map and m.kind() != .sorted_map) return VmError.KindMismatch;
     const x = args[0];
     if (!carriesHeaderMeta(x.kind())) return switch (x.kind()) {
-        .nil, .true_, .false_, .char, .fixnum, .float, .bignum, .string, .keyword, .symbol => vm.throwKeyword("no-metadata-on-immediate"),
+        .nil, .true_, .false_, .char, .fixnum, .float, .bignum, .string, .keyword, .symbol, .inst, .uuid => vm.throwKeyword("no-metadata-on-immediate"),
         else => VmError.KindMismatch,
     };
     const meta_h: ?*heap_mod.HeapHeader = if (m.isNil()) null else heap_mod.Heap.asHeapHeader(m);
@@ -3519,7 +3522,7 @@ const namespace_docs = std.StaticStringMap([]const u8).initComptime(.{
     .{ "nexis.pprint", "Clojure's clojure.pprint, which names it: pprint and pprint-str." },
     .{ "nexis.sys", "The process's environment and working directory: getenv and cwd.\n  exit and *command-line-args* are nexis.core's." },
     .{ "nexis.shell", "Clojure's clojure.java.shell: sh runs a program and returns\n  {:exit :out :err}; with-sh-dir and with-sh-env set its defaults." },
-    .{ "nexis.time", "Instants, the record Instant of epoch milliseconds: now, parse and\n  format (ISO-8601), durations in milliseconds, plus, minus, between.\n  Each takes Nextomic's epoch-millisecond longs as well." },
+    .{ "nexis.time", "Instants, the inst values #inst reads: now, parse and format\n  (ISO-8601), durations in milliseconds, plus, minus, between. Each\n  takes epoch milliseconds and ISO-8601 text as well." },
     .{ "nexis.json", "JSON in clojure.data.json's shape: read-str, write-str, read and\n  write, with :key-fn, :value-fn and :indent." },
     .{ "nexis.simd", "Kernels over typed vectors (i64-vector, f64-vector): sum, dot,\n  scale and map." },
     .{ "nexis.internal", "The helpers macro expansions call. Not for programs." },
@@ -3549,7 +3552,7 @@ const nextomic_docs = std.StaticStringMap(Doc).initComptime(.{
     .{ "nextomic/sync", nextomicDoc("[conn]", sync_doc) },
     .{ "nextomic/touch", nextomicDoc("[ent]", "Returns the map {:db/id e :attr v ...} of every attribute of the\n  entity ent, read in one pass: card-many values as sets, refs as eids.") },
     .{ "nextomic/transact!", nextomicDoc("[conn tx-data] [conn tx-data opts]", "Commits tx-data as one transaction and returns the report {:db-before\n  :db-after :tx :tempids :tx-data}. tx-data holds entity maps and\n  [:db/add e a v], [:db/retract e a v?], [:db/retractEntity e],\n  [:db.fn/call f & args] and [:db.fn/cas e a old new]. opts takes :sync.") },
-    .{ "nextomic/tx-range", nextomicDoc("[conn] [conn from] [conn from to]", "Returns a vector of the log's entries {:t t :instant ms :data [datoms]}\n  for from <= t < to, oldest first; a nil or missing bound is open. An\n  entry an excision touched carries :excised [e ...].") },
+    .{ "nextomic/tx-range", nextomicDoc("[conn] [conn from] [conn from to]", "Returns a vector of the log's entries {:t t :instant inst :data\n  [datoms]} for from <= t < to, oldest first, :instant the\n  transaction's instant; a nil or missing bound is open. An entry an\n  excision touched carries :excised [e ...].") },
     .{ "nextomic/with", nextomicDoc("[conn tx-data f]", "Applies tx-data without committing it: calls (f db-after report)\n  inside the held write transaction, then aborts it, and returns f's\n  value. db-after is :nextomic/closed once f returns. Unlike Datomic's,\n  it takes a connection and a function.") },
 });
 
@@ -4184,22 +4187,22 @@ fn fnNsResolve(vm: *VM, args: []const Value) VmError!Value {
     return resolveIn(vm, try theNs(vm, args[0]), args[1]);
 }
 
+/// Version 4, variant 10, from the I/O's cryptographically secure
+/// generator, as Java's `randomUUID` draws on `SecureRandom`: an
+/// identity minted for a store is not predictable from `rand`'s
+/// output.
 fn fnRandomUuid(vm: *VM, _: []const Value) VmError!Value {
     var u: [16]u8 = undefined;
-    random(vm).bytes(&u);
+    ioOf(vm).random(&u);
     u[6] = (u[6] & 0x0F) | 0x40;
     u[8] = (u[8] & 0x3F) | 0x80;
-    var text: [36]u8 = undefined;
-    nextomic_mod.datom.uuidToText(&text, u);
-    return string_mod.fromBytes(vm.ensureHeap(), &text) catch VmError.OutOfMemory;
+    return uuid_mod.make(vm.ensureHeap(), u) catch VmError.OutOfMemory;
 }
 
 fn fnParseUuid(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .string) return VmError.KindMismatch;
-    const u = nextomic_mod.datom.uuidFromText(string_mod.asBytes(args[0])) orelse return value_mod.nilValue();
-    var text: [36]u8 = undefined;
-    nextomic_mod.datom.uuidToText(&text, u);
-    return string_mod.fromBytes(vm.ensureHeap(), &text) catch VmError.OutOfMemory;
+    const u = uuid_mod.parse(string_mod.asBytes(args[0])) orelse return value_mod.nilValue();
+    return uuid_mod.make(vm.ensureHeap(), u) catch VmError.OutOfMemory;
 }
 
 // =============================================================================
@@ -4999,6 +5002,14 @@ fn appendStrValue(
     if (v.isFloat()) return format_mod.formatFloatJava(v.asFloat(), &w.writer) catch return VmError.OutOfMemory;
     // A pattern by itself is its source (`Pattern.toString`).
     if (v.kind() == .regex) return w.writer.writeAll(regex_mod.sourceOf(v)) catch return VmError.OutOfMemory;
+    // An instant by itself is `Instant.toString`'s text, a UUID its
+    // canonical text; inside a collection each prints its literal.
+    if (v.kind() == .inst) return inst_mod.write(&w.writer, v.asInstMs(), .iso) catch return VmError.OutOfMemory;
+    if (v.kind() == .uuid) {
+        var text: [uuid_mod.text_len]u8 = undefined;
+        uuid_mod.writeText(&text, uuid_mod.bytesOf(v).*);
+        return w.writer.writeAll(&text) catch return VmError.OutOfMemory;
+    }
     const mode: format_mod.FormatMode = switch (v.kind()) {
         .string, .char => .display,
         else => .readable,
@@ -6108,138 +6119,10 @@ fn shExchange(vm: *VM, io: std.Io, child: *std.process.Child, input: []const u8,
 // Instants (nexis.time, STDLIB.md §12)
 // =============================================================================
 //
-// An instant is a count of milliseconds since 1970-01-01T00:00:00Z on
-// the proleptic Gregorian calendar, as Nextomic's `:db.type/instant`
-// values are; these natives turn one into ISO-8601 text and back.
-
-const ms_per_day = 86_400_000;
-
-/// The days from 1970-01-01 to the date `year-month-day` (Hinnant's
-/// `days_from_civil`, exact for every year).
-fn daysFromCivil(year: i64, month: u32, day: u32) i64 {
-    const y = if (month <= 2) year - 1 else year;
-    const era = @divFloor(y, 400);
-    const yoe = y - era * 400;
-    const mp: i64 = if (month > 2) month - 3 else month + 9;
-    const doy = @divFloor(153 * mp + 2, 5) + day - 1;
-    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-    return era * 146_097 + doe - 719_468;
-}
-
-const Civil = struct { year: i64, month: u32, day: u32 };
-
-/// The date `days` after 1970-01-01 (`civil_from_days`).
-fn civilFromDays(days: i64) Civil {
-    const z = days + 719_468;
-    const era = @divFloor(z, 146_097);
-    const doe = z - era * 146_097;
-    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36_524) - @divFloor(doe, 146_096), 365);
-    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
-    const mp = @divFloor(5 * doy + 2, 153);
-    const month = if (mp < 10) mp + 3 else mp - 9;
-    return .{
-        .year = yoe + era * 400 + @intFromBool(month <= 2),
-        .month = @intCast(month),
-        .day = @intCast(doy - @divFloor(153 * mp + 2, 5) + 1),
-    };
-}
-
-fn daysInMonth(year: i64, month: u32) u32 {
-    return switch (month) {
-        2 => if (@mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0)) 29 else 28,
-        4, 6, 9, 11 => 30,
-        else => 31,
-    };
-}
-
-/// The instant `ms` as Java's `Instant.toString` writes it, to the
-/// millisecond: `2026-10-09T12:30:15.123Z`, the fraction left out when
-/// it is zero, a year before 1 with a `-` and one past 9999 with a `+`.
-fn writeInstant(w: *std.Io.Writer, ms: i64) std.Io.Writer.Error!void {
-    const in_day: u64 = @intCast(@mod(ms, ms_per_day));
-    const date = civilFromDays(@divFloor(ms, ms_per_day));
-    if (date.year < 0) try w.writeByte('-') else if (date.year > 9999) try w.writeByte('+');
-    try w.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}", .{ @abs(date.year), date.month, date.day, in_day / 3_600_000, in_day / 60_000 % 60, in_day / 1000 % 60 });
-    if (in_day % 1000 != 0) try w.print(".{d:0>3}", .{in_day % 1000});
-    try w.writeByte('Z');
-}
-
-/// The instant the ISO-8601 text `s` names, in epoch milliseconds, or
-/// null when `s` is not one. The grammar is Clojure's `#inst`, which
-/// RFC 3339 is a part of: `[+-]YYYY`, then optionally `-MM`, `-DD`,
-/// `THH:MM`, `:SS` and a fraction of 1 to 9 digits (truncated to the
-/// millisecond), each only after the one before; then `Z`, an offset
-/// `+HH:MM` (or `+HHMM`), or nothing, which is UTC. `T` and `Z` may be
-/// lower case.
-fn parseInstant(s: []const u8) ?i64 {
-    const Scan = struct {
-        s: []const u8,
-        i: usize = 0,
-
-        fn eat(p: *@This(), set: []const u8) bool {
-            if (p.i >= p.s.len or std.mem.findScalar(u8, set, p.s[p.i]) == null) return false;
-            p.i += 1;
-            return true;
-        }
-
-        fn digits(p: *@This(), n: usize) ?u32 {
-            if (p.s.len - p.i < n) return null;
-            var v: u32 = 0;
-            for (p.s[p.i..][0..n]) |c| {
-                if (!std.ascii.isDigit(c)) return null;
-                v = v * 10 + (c - '0');
-            }
-            p.i += n;
-            return v;
-        }
-    };
-    var p: Scan = .{ .s = s };
-    const negative = p.eat("-");
-    if (!negative) _ = p.eat("+");
-    const year: i64 = @as(i64, p.digits(4) orelse return null) * @as(i64, if (negative) -1 else 1);
-    var month: u32 = 1;
-    var day: u32 = 1;
-    var hour: u32 = 0;
-    var minute: u32 = 0;
-    var second: u32 = 0;
-    var milli: u32 = 0;
-    if (p.eat("-")) {
-        month = p.digits(2) orelse return null;
-        if (p.eat("-")) {
-            day = p.digits(2) orelse return null;
-            if (p.eat("Tt")) {
-                hour = p.digits(2) orelse return null;
-                if (!p.eat(":")) return null;
-                minute = p.digits(2) orelse return null;
-                if (p.eat(":")) {
-                    second = p.digits(2) orelse return null;
-                    if (p.eat(".")) {
-                        const start = p.i;
-                        while (p.i < s.len and std.ascii.isDigit(s[p.i])) p.i += 1;
-                        const n = p.i - start;
-                        if (n == 0 or n > 9) return null;
-                        for (0..3) |k| milli = milli * 10 + if (k < n) s[start + k] - '0' else 0;
-                    }
-                }
-            }
-        }
-    }
-    var offset: i64 = 0;
-    if (!p.eat("Zz") and p.i < s.len and (s[p.i] == '+' or s[p.i] == '-')) {
-        const sign: i64 = if (s[p.i] == '-') -1 else 1;
-        p.i += 1;
-        const oh = p.digits(2) orelse return null;
-        _ = p.eat(":");
-        const om = p.digits(2) orelse return null;
-        if (oh > 23 or om > 59) return null;
-        offset = sign * (oh * 60 + om);
-    }
-    if (p.i != s.len) return null;
-    if (month < 1 or month > 12 or day < 1 or day > daysInMonth(year, month)) return null;
-    if (hour > 23 or minute > 59 or second > 59) return null;
-    const seconds = (@as(i64, hour) * 60 + minute - offset) * 60 + second;
-    return daysFromCivil(year, month, day) * ms_per_day + seconds * 1000 + milli;
-}
+// An instant is the `inst` kind, its payload the milliseconds since
+// 1970-01-01T00:00:00Z on the proleptic Gregorian calendar; these
+// natives make one, take it apart, and turn it into ISO-8601 text and
+// back (`src/inst.zig`).
 
 /// `(#%now-ms)` → the wall clock in epoch milliseconds.
 fn fnNowMs(vm: *VM, _: []const Value) VmError!Value {
@@ -6247,22 +6130,40 @@ fn fnNowMs(vm: *VM, _: []const Value) VmError!Value {
     return value_mod.fromFixnum(@intCast(@divFloor(now.nanoseconds, std.time.ns_per_ms))) orelse VmError.ArithmeticOverflow;
 }
 
-/// `(#%format-instant ms)` → the ISO-8601 text of the instant `ms`.
+/// `(#%inst n)` → the instant `n` milliseconds after the epoch;
+/// `:invalid-argument` past the i64 range an instant holds.
+fn fnInst(vm: *VM, args: []const Value) VmError!Value {
+    return switch (args[0].kind()) {
+        .fixnum => value_mod.fromInst(args[0].asFixnum()),
+        .bignum => value_mod.fromInst(bignum_mod.toI64(args[0]) orelse
+            return vm.fail(VmError.InvalidArgument, "an instant is within 2^63 milliseconds of the epoch", .{})),
+        else => VmError.KindMismatch,
+    };
+}
+
+/// `(#%inst-ms i)` → the epoch milliseconds of the instant `i`, a
+/// fixnum or, past the fixnum range, a bignum.
+fn fnInstMs(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .inst) return VmError.KindMismatch;
+    return integerValue(vm, args[0].asInstMs());
+}
+
+/// `(#%format-instant i)` → the ISO-8601 text of the instant `i`.
 fn fnFormatInstant(vm: *VM, args: []const Value) VmError!Value {
-    var buf: [40]u8 = undefined;
+    if (args[0].kind() != .inst) return VmError.KindMismatch;
+    var buf: [inst_mod.max_text_len]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    writeInstant(&w, try requireFixnum(args[0])) catch unreachable;
+    inst_mod.write(&w, args[0].asInstMs(), .iso) catch unreachable;
     return string_mod.fromBytes(vm.ensureHeap(), w.buffered()) catch VmError.OutOfMemory;
 }
 
-/// `(#%parse-instant s)` → the instant the ISO-8601 text `s` names, in
-/// epoch milliseconds; `:invalid-argument` for any other text, or an
-/// instant past the fixnum range (-2490-03-17 to 6429-10-17).
+/// `(#%parse-instant s)` → the instant the ISO-8601 text `s` names;
+/// `:invalid-argument` for any other text.
 fn fnParseInstant(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .string) return VmError.KindMismatch;
     const s = string_mod.asBytes(args[0]);
-    const ms = parseInstant(s) orelse return vm.fail(VmError.InvalidArgument, "not an ISO-8601 instant: \"{s}\"", .{s});
-    return value_mod.fromFixnum(ms) orelse vm.fail(VmError.InvalidArgument, "an instant past the fixnum range: \"{s}\"", .{s});
+    const ms = inst_mod.parse(s) orelse return vm.fail(VmError.InvalidArgument, "not an ISO-8601 instant: \"{s}\"", .{s});
+    return value_mod.fromInst(ms);
 }
 
 // =============================================================================
@@ -6684,12 +6585,20 @@ const JsonWriter = struct {
             .keyword => try jw.string(interner.keywordName(v.asKeywordId())),
             .symbol => try jw.string(interner.symbolName(v.asSymbolId())),
             .persistent_map, .sorted_map => try jw.object(v),
-            .record => if (jw.instantMs(v)) |ms| {
-                var buf: [40]u8 = undefined;
+            .record => try jw.object(v),
+            // clojure.data.json's choices: an instant as
+            // `Instant.toString`'s text, a UUID as its own.
+            .inst => {
+                var buf: [inst_mod.max_text_len]u8 = undefined;
                 var fixed: std.Io.Writer = .fixed(&buf);
-                writeInstant(&fixed, ms) catch unreachable;
+                inst_mod.write(&fixed, v.asInstMs(), .iso) catch unreachable;
                 try jw.string(fixed.buffered());
-            } else try jw.object(v),
+            },
+            .uuid => {
+                var text: [uuid_mod.text_len]u8 = undefined;
+                uuid_mod.writeText(&text, uuid_mod.bytesOf(v).*);
+                try jw.string(&text);
+            },
             .nextomic_entity => {
                 const m = try (seq_mod.entity_map orelse return VmError.KindMismatch)(jw.vm, v);
                 try jw.scope.push(m);
@@ -6698,15 +6607,6 @@ const JsonWriter = struct {
             .persistent_vector, .list, .lazy_seq, .persistent_set, .sorted_set, .typed_vector => try jw.array(v),
             else => |k| return throwJson(jw.vm, null, "cannot write a value of class {s}", .{className(k)}),
         }
-    }
-
-    /// The epoch milliseconds of a `nexis.time.Instant`, null for any
-    /// other record (STDLIB.md §12).
-    fn instantMs(jw: *JsonWriter, v: Value) ?i64 {
-        const t = jw.vm.recordType(record_mod.typeId(v)) orelse return null;
-        if (!std.mem.eql(u8, t.ns_name, "nexis.time") or !std.mem.eql(u8, t.type_name, "Instant")) return null;
-        const ms = (keywordGet(jw.vm, record_mod.fieldsOf(v), "ms") catch return null) orelse return null;
-        return if (ms.kind() == .fixnum) ms.asFixnum() else null;
     }
 
     fn array(jw: *JsonWriter, v: Value) VmError!void {
@@ -8359,44 +8259,5 @@ test "stdlib: reduce over an infinite range past the fixnum range keeps its elem
         defer w.deinit();
         try format_mod.format(got, .readable, &w.writer, vm.ensureInterner());
         try testing.expectEqualStrings(case.want, w.written());
-    }
-}
-
-test "stdlib: the civil calendar agrees with std.time.epoch and walks day by day" {
-    var day: i64 = 0;
-    while (day < 60_000) : (day += 1) {
-        const yd = (std.time.epoch.EpochDay{ .day = @intCast(day) }).calculateYearDay();
-        const md = yd.calculateMonthDay();
-        const c = civilFromDays(day);
-        try testing.expectEqual(@as(i64, yd.year), c.year);
-        try testing.expectEqual(@as(u32, @backingInt(md.month)), c.month);
-        try testing.expectEqual(@as(u32, md.day_index) + 1, c.day);
-    }
-    // Every day of years -2500 to 6500 follows the one before it.
-    var prev = civilFromDays(-1_633_000);
-    day = -1_632_999;
-    while (day < 1_660_000) : (day += 1) {
-        const c = civilFromDays(day);
-        try testing.expectEqual(day, daysFromCivil(c.year, c.month, c.day));
-        if (c.day == 1) {
-            try testing.expectEqual(daysInMonth(prev.year, prev.month), prev.day);
-            try testing.expectEqual(if (c.month == 1) prev.year + 1 else prev.year, c.year);
-        } else try testing.expectEqual(prev.day + 1, c.day);
-        prev = c;
-    }
-}
-
-test "stdlib: an instant's text reads back as the same instant" {
-    var buf: [40]u8 = undefined;
-    var rng = std.Random.DefaultPrng.init(0x1505);
-    for (0..20_000) |i| {
-        const ms: i64 = switch (i) {
-            0 => value_mod.fixnum_min,
-            1 => value_mod.fixnum_max,
-            else => rng.random().intRangeAtMost(i64, value_mod.fixnum_min, value_mod.fixnum_max),
-        };
-        var w: std.Io.Writer = .fixed(&buf);
-        try writeInstant(&w, ms);
-        try testing.expectEqual(ms, parseInstant(w.buffered()).?);
     }
 }

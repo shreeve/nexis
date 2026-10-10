@@ -27,6 +27,7 @@ nil
 {:error :nextomic/tx-data, :message a tempid no assertion stands on names no entity, :value ghost}
 {:error :nextomic/tx-data, :message :db/txInstant is asserted on the transaction's own entity only, and never retracted}
 {:error :nextomic/tx-data, :message a transaction's :db/txInstant is never earlier than the one before}
+{:error :nextomic/value-type, :message :db/txInstant takes a :db.type/instant, not 5, :attr :db/txInstant, :value 5}
 ok a failed transaction leaves the basis alone
 ok the store still works after every failure
 {:error :nextomic/conflict, :message two claims of one transaction disagree about :db/ident of entity 27, :e 27, :a :db/ident}

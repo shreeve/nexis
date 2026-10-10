@@ -46,9 +46,9 @@
 (def intake
   (d/transact! conn
     [{:db/id "dr" :clinician/name "Dr. Okafor"}
-     {:patient/mrn "MRN-1001" :patient/name "Mara Quist" :patient/born 631152000000
+     {:patient/mrn "MRN-1001" :patient/name "Mara Quist" :patient/born #inst "1990-01-01"
       :patient/allergies [:penicillin] :patient/primary "dr"}
-     {:patient/mrn "MRN-1002" :patient/name "Teo Lund" :patient/born 946684800000
+     {:patient/mrn "MRN-1002" :patient/name "Teo Lund" :patient/born #inst "2000-01-01"
       :patient/primary "dr"}
      [:db/add "datomic.tx" :db/doc "intake"]]))
 

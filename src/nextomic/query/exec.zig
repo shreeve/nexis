@@ -46,6 +46,7 @@ const value = @import("../../value.zig");
 const heap_mod = @import("../../heap.zig");
 const intern_mod = @import("../../intern.zig");
 const string_mod = @import("../../string.zig");
+const uuid_mod = @import("../../uuid.zig");
 const list_mod = @import("../../coll/list.zig");
 const vector_mod = @import("../../coll/vector.zig");
 const champ = @import("../../coll/champ.zig");
@@ -177,11 +178,11 @@ pub const Exec = struct {
         };
     }
 
-    fn datomCells(self: *Exec, read: *Read, d: datom_mod.Datom) ![5]Cell {
+    fn datomCells(read: *Read, d: datom_mod.Datom) ![5]Cell {
         return .{
             .{ .int = @intCast(d.e) },
             .{ .int = d.a },
-            try marshal.cellOf(read, self.arena, d.v),
+            try marshal.cellOf(read, d.v),
             .{ .int = @intCast(key.txEntity(d.t)) },
             .{ .boolean = d.added },
         };
@@ -197,6 +198,8 @@ pub const Exec = struct {
             .boolean => |b| value.fromBool(b),
             .keyword => |k| self.interner.keywordValue(k),
             .str => |s| try string_mod.fromBytes(self.heap, s),
+            .inst => |ms| value.fromInst(ms),
+            .uuid => |u| try uuid_mod.make(self.heap, u),
             .vm => |v| v,
         };
     }
@@ -421,7 +424,7 @@ pub const Exec = struct {
         var it = try read.scan(self.arena, index, comps);
         const cells = try self.arena.alloc(Cell, out.cols.len);
         datoms: while (try it.next()) |d| {
-            const dc = try self.datomCells(read, d);
+            const dc = try datomCells(read, d);
             for (slots, wants, 0..) |slot, want, pos| {
                 if (want) |w| {
                     if (!dc[pos].eql(w)) continue :datoms;
@@ -599,7 +602,7 @@ pub const Exec = struct {
     }
 
     fn pair(self: *Exec, read: *Read, d: datom_mod.Datom) ![]const Cell {
-        return self.arena.dupe(Cell, &.{ .{ .int = @intCast(d.e) }, try marshal.cellOf(read, self.arena, d.v) });
+        return self.arena.dupe(Cell, &.{ .{ .int = @intCast(d.e) }, try marshal.cellOf(read, d.v) });
     }
 
     fn unknownAttribute(self: *Exec, kw: u32) anyerror {
@@ -623,7 +626,7 @@ pub const Exec = struct {
         const eid = e.asEid() orelse return null;
         var it = try read.scan(self.arena, .eavt, .{ .e = eid, .a = at.id });
         const d = (try it.next()) orelse return null;
-        return try marshal.cellOf(read, self.arena, d.v);
+        return try marshal.cellOf(read, d.v);
     }
 
     /// `get-else`: the attribute's value on the entity, else the
@@ -1311,6 +1314,8 @@ pub const Exec = struct {
             .boolean => "a boolean",
             .keyword => "a keyword",
             .str => "a string",
+            .inst => "an instant",
+            .uuid => "a UUID",
             .vm => |v| vm_mod.kindPhrase(v.kind()),
         };
     }

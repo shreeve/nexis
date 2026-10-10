@@ -16,14 +16,16 @@
 //!     `StackOverflow`.
 //!   - `valOf`: a VM value under an attribute's type; null when a
 //!     keyword or entity reference names nothing (no datom can match
-//!     it), `ValueType` on a kind mismatch. A long or an instant is
-//!     any integer in i64 (`datom.longOf`), a bignum past the fixnum range
-//!     included.
+//!     it), `ValueType` on a kind mismatch. A long is any integer in
+//!     i64 (`datom.longOf`), a bignum past the fixnum range included;
+//!     an instant is an `inst` and a uuid a `uuid`, nothing else, as
+//!     Datomic takes a `Date` and a `UUID`.
 //!   - `encodeCell`: a query cell under an attribute's type; null when
 //!     no value of that type equals it, never an error, because a
 //!     query constant of the wrong type matches nothing.
-//!   - `cellOf`: a datom value as the query engine compares it: ids,
-//!     longs and instants as `int`, keywords as VM keyword ids.
+//!   - `cellOf`: a datom value as the query engine compares it: ids
+//!     and longs as `int`, instants as `inst`, uuids as `uuid`,
+//!     keywords as VM keyword ids.
 //!   - `sequence` and `collection`: the elements of a vector or list,
 //!     or of a vector, list or set; null for any other kind.
 
@@ -33,6 +35,7 @@ const list_mod = @import("../coll/list.zig");
 const vector_mod = @import("../coll/vector.zig");
 const champ = @import("../coll/champ.zig");
 const string_mod = @import("../string.zig");
+const uuid_mod = @import("../uuid.zig");
 const key = @import("key.zig");
 const datom_mod = @import("datom.zig");
 const db_mod = @import("db.zig");
@@ -178,22 +181,19 @@ fn convertVal(rd: *Read, arena: Allocator, vt: key.ValueType, v: Value, fault: *
 
 /// The datom value of `v` under `vt`, any type but keyword and ref,
 /// whose values name idents and entities: `ValueType` on a kind
-/// mismatch, a NaN, an integer outside i64 or a uuid's text not
-/// canonical. A string or a byte array borrows `v`'s bytes.
+/// mismatch, a NaN or an integer outside i64. A string or a byte array
+/// borrows `v`'s bytes.
 pub fn scalarVal(vt: key.ValueType, v: Value) error{ValueType}!Val {
     switch (vt) {
         .boolean => return if (v.isBool()) .{ .boolean = v.asBool() } else error.ValueType,
         .long => return .{ .long = datom_mod.longOf(v) orelse return error.ValueType },
         .double => return if (v.kind() == .float and !std.math.isNan(v.asFloat())) .{ .double = v.asFloat() } else error.ValueType,
-        .instant => return .{ .instant = datom_mod.longOf(v) orelse return error.ValueType },
-        .string, .uuid, .bytes => {
+        .instant => return if (v.isInst()) .{ .instant = v.asInstMs() } else error.ValueType,
+        .uuid => return if (v.kind() == .uuid) .{ .uuid = uuid_mod.bytesOf(v).* } else error.ValueType,
+        .string, .bytes => {
             if (v.kind() != .string) return error.ValueType;
             const b = string_mod.asBytes(v);
-            return switch (vt) {
-                .string => .{ .string = b },
-                .bytes => .{ .bytes = b },
-                else => .{ .uuid = datom_mod.uuidFromCanonical(b) orelse return error.ValueType },
-            };
+            return if (vt == .string) .{ .string = b } else .{ .bytes = b };
         },
         .keyword, .ref => unreachable,
     }
@@ -207,7 +207,7 @@ pub fn encodeCell(read: *Read, cell: Cell, vt: key.ValueType) Error!?Val {
         .boolean => if (cell == .boolean) .{ .boolean = cell.boolean } else null,
         .long => if (cell == .int) .{ .long = cell.int } else null,
         .double => if (cell == .double) .{ .double = cell.double } else null,
-        .instant => if (cell == .int) .{ .instant = cell.int } else null,
+        .instant => if (cell == .inst) .{ .instant = cell.inst } else null,
         .keyword => blk: {
             if (cell != .keyword) break :blk null;
             const id = (try read.db.conn.idents.idOf(read.txn, cell.keyword)) orelse break :blk null;
@@ -218,30 +218,23 @@ pub fn encodeCell(read: *Read, cell: Cell, vt: key.ValueType) Error!?Val {
             break :blk .{ .ref = eid };
         },
         .string => if (cell == .str) .{ .string = cell.str } else null,
-        .uuid => blk: {
-            if (cell != .str) break :blk null;
-            const u = datom_mod.uuidFromCanonical(cell.str) orelse break :blk null;
-            break :blk .{ .uuid = u };
-        },
+        .uuid => if (cell == .uuid) .{ .uuid = cell.uuid } else null,
         .bytes => if (cell == .str) .{ .bytes = cell.str } else null,
     };
 }
 
 /// The cell a datom value compares as (see the module contract). A
 /// keyword the store knows but the interner does not is `Corrupted`.
-pub fn cellOf(read: *Read, arena: Allocator, v: Val) !Cell {
+pub fn cellOf(read: *Read, v: Val) !Cell {
     return switch (v) {
         .boolean => |b| .{ .boolean = b },
-        .long, .instant => |n| .{ .int = n },
+        .long => |n| .{ .int = n },
+        .instant => |n| .{ .inst = n },
+        .uuid => |u| .{ .uuid = u },
         .double => |d| .{ .double = d },
         .keyword => |id| .{ .keyword = (try read.db.conn.idents.internOf(read.txn, id)) orelse return error.Corrupted },
         .ref => |e| .{ .int = @intCast(e) },
         .string, .bytes => |s| .{ .str = s },
-        .uuid => |u| blk: {
-            const text = try arena.alloc(u8, 36);
-            datom_mod.uuidToText(text[0..36], u);
-            break :blk .{ .str = text };
-        },
     };
 }
 
@@ -273,7 +266,8 @@ test "marshalling both ways for every value type" {
     const kw_string = try tc.interner.internKeywordValue("db.type/string");
     const kw_ident = try tc.interner.internKeywordValue("db/ident");
     const kw_doc = try tc.interner.internKeywordValue("db/doc");
-    const uuid_text = try string_mod.fromBytes(&heap, "0123abcd-4567-89ef-0123-456789abcdef");
+    const uuid_bytes = [16]u8{ 0x01, 0x23, 0xab, 0xcd, 0x45, 0x67, 0x89, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef };
+    const a_uuid = try uuid_mod.make(&heap, uuid_bytes);
     const lookup = try vector_mod.fromSlice(&heap, &.{ kw_ident, kw_doc });
 
     const b = (try valOf(&rd, arena, .boolean, value.fromBool(true), &fault)).?;
@@ -288,9 +282,13 @@ test "marshalling both ways for every value type" {
     try testing.expectEqual(@as(f64, 2.5), f.double);
     try testing.expectEqual(@as(f64, 2.5), (try conn.valToValue(rd.txn, &heap, f)).asFloat());
 
-    const i = (try valOf(&rd, arena, .instant, value.fromFixnum(1_700_000_000_000).?, &fault)).?;
+    const i = (try valOf(&rd, arena, .instant, value.fromInst(1_700_000_000_000), &fault)).?;
     try testing.expectEqual(@as(i64, 1_700_000_000_000), i.instant);
-    try testing.expectEqual(@as(i64, 1_700_000_000_000), (try conn.valToValue(rd.txn, &heap, i)).asFixnum());
+    try testing.expect((try conn.valToValue(rd.txn, &heap, i)).identicalTo(value.fromInst(1_700_000_000_000)));
+    // The stored bytes are the instant's and the uuid's, whichever VM
+    // kind carried them in: tag 0x20 and the i64 with its sign bit
+    // flipped, big-endian; tag 0x60 and the 16 bytes.
+    try testing.expectEqualSlices(u8, &.{ 0x20, 0x80, 0x00, 0x01, 0x8b, 0xcf, 0xe5, 0x68, 0x00 }, try key.valBytes(arena, i));
 
     const k = (try valOf(&rd, arena, .keyword, kw_string, &fault)).?;
     try testing.expectEqual(@as(u32, boot.type_string), k.keyword);
@@ -306,34 +304,43 @@ test "marshalling both ways for every value type" {
     try testing.expectEqualStrings("héllo", s.string);
     try testing.expectEqualStrings("héllo", string_mod.asBytes(try conn.valToValue(rd.txn, &heap, s)));
 
-    const u = (try valOf(&rd, arena, .uuid, uuid_text, &fault)).?;
-    try testing.expectEqual(@as(u8, 0x01), u.uuid[0]);
-    try testing.expectEqualStrings("0123abcd-4567-89ef-0123-456789abcdef", string_mod.asBytes(try conn.valToValue(rd.txn, &heap, u)));
+    const u = (try valOf(&rd, arena, .uuid, a_uuid, &fault)).?;
+    try testing.expectEqualSlices(u8, &uuid_bytes, &u.uuid);
+    try testing.expectEqualSlices(u8, &uuid_bytes, uuid_mod.bytesOf(try conn.valToValue(rd.txn, &heap, u)));
+    try testing.expectEqualSlices(u8, &([_]u8{0x60} ++ uuid_bytes), try key.valBytes(arena, u));
+    try testing.expect((try cellOf(&rd, u)).eql(.{ .uuid = uuid_bytes }));
+    try testing.expect((try encodeCell(&rd, .{ .uuid = uuid_bytes }, .uuid)).?.eql(u));
 
     const by = (try valOf(&rd, arena, .bytes, try string_mod.fromBytes(&heap, "\x00\x01"), &fault)).?;
     try testing.expectEqualStrings("\x00\x01", by.bytes);
     try testing.expectEqualStrings("\x00\x01", string_mod.asBytes(try conn.valToValue(rd.txn, &heap, by)));
 
-    // A long or an instant is any integer in i64, a fixnum or a bignum,
-    // and reads back as the language's integer.
+    // A long is any integer in i64, a fixnum or a bignum, and reads
+    // back as the language's integer; an instant is an instant over
+    // the whole i64 range, and nothing else is.
     for ([_]i64{ std.math.minInt(i64), -(1 << 47) - 1, -(1 << 47), (1 << 47) - 1, 1 << 47, std.math.maxInt(i64) }) |x| {
         const in = try bignum.fromI64(&heap, x);
-        for ([_]key.ValueType{ .long, .instant }) |vt| {
-            const got = (try valOf(&rd, arena, vt, in, &fault)).?;
-            try testing.expectEqual(x, switch (got) {
-                .long, .instant => |m| m,
-                else => unreachable,
-            });
-            try testing.expectEqual(x, bignum.toI64(try conn.valToValue(rd.txn, &heap, got)).?);
-            try testing.expect((try cellOf(&rd, arena, got)).eql(.{ .int = x }));
-            try testing.expect((try encodeCell(&rd, .{ .int = x }, vt)).?.eql(got));
-        }
+        const got = (try valOf(&rd, arena, .long, in, &fault)).?;
+        try testing.expectEqual(x, got.long);
+        try testing.expectEqual(x, bignum.toI64(try conn.valToValue(rd.txn, &heap, got)).?);
+        try testing.expect((try cellOf(&rd, got)).eql(.{ .int = x }));
+        try testing.expect((try encodeCell(&rd, .{ .int = x }, .long)).?.eql(got));
+        const at = (try valOf(&rd, arena, .instant, value.fromInst(x), &fault)).?;
+        try testing.expectEqual(x, at.instant);
+        try testing.expect((try conn.valToValue(rd.txn, &heap, at)).identicalTo(value.fromInst(x)));
+        try testing.expect((try cellOf(&rd, at)).eql(.{ .inst = x }));
+        try testing.expect((try encodeCell(&rd, .{ .inst = x }, .instant)).?.eql(at));
+        try testing.expectError(error.ValueType, valOf(&rd, arena, .instant, in, &fault));
+        try testing.expect((try encodeCell(&rd, .{ .int = x }, .instant)) == null);
     }
     for ([_]i128{ @as(i128, std.math.maxInt(i64)) + 1, @as(i128, std.math.minInt(i64)) - 1 }) |x| {
         const past = try bignum.fromI128(&heap, x);
         try testing.expectError(error.ValueType, valOf(&rd, arena, .long, past, &fault));
-        try testing.expectError(error.ValueType, valOf(&rd, arena, .instant, past, &fault));
     }
+    // A uuid's text, in any spelling, is a string, not a uuid.
+    const uuid_text = try string_mod.fromBytes(&heap, "0123abcd-4567-89ef-0123-456789abcdef");
+    try testing.expectError(error.ValueType, valOf(&rd, arena, .uuid, uuid_text, &fault));
+    try testing.expect((try encodeCell(&rd, .{ .str = "0123abcd-4567-89ef-0123-456789abcdef" }, .uuid)) == null);
 
     // Names that resolve to nothing match nothing.
     const kw_none = try tc.interner.internKeywordValue("nope/nope");

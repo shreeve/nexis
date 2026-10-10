@@ -29,6 +29,7 @@ const heap_mod = @import("../heap.zig");
 const hash_mod = @import("../hash.zig");
 const intern_mod = @import("../intern.zig");
 const string_mod = @import("../string.zig");
+const uuid_mod = @import("../uuid.zig");
 const bignum_mod = @import("../bignum.zig");
 const vector_mod = @import("vector.zig");
 const champ = @import("champ.zig");
@@ -502,6 +503,10 @@ pub fn naturalOrder(interner: *const intern_mod.Interner, a: Value, b: Value) Or
         .keyword => intern_mod.Interner.compareNames(interner.keywordName(a.asKeywordId()), interner.keywordName(b.asKeywordId())),
         .symbol => intern_mod.Interner.compareNames(interner.symbolName(a.asSymbolId()), interner.symbolName(b.asSymbolId())),
         .char => std.math.order(a.asChar(), b.asChar()),
+        .inst => std.math.order(a.asInstMs(), b.asInstMs()),
+        // Unsigned bytes, the text's order, where Java's
+        // `UUID.compareTo` compares signed longs (SEMANTICS §2.8).
+        .uuid => uuid_mod.order(a, b),
         .persistent_vector => blk: {
             const na = vector_mod.count(a);
             const nb = vector_mod.count(b);
@@ -743,4 +748,11 @@ test "the natural order: nil first, numbers across the tower, vectors by count, 
     try testing.expectEqual(Order.lt, try o.order(try vector_mod.fromSlice(&heap, &.{fx(9)}), try vector_mod.fromSlice(&heap, &.{ fx(1), fx(2) })));
     try testing.expectEqual(Order.gt, try o.order(try vector_mod.fromSlice(&heap, &.{ fx(1), fx(3) }), try vector_mod.fromSlice(&heap, &.{ fx(1), fx(2) })));
     try testing.expectError(error.KindMismatch, o.order(fx(1), try interner.internKeywordValue("a")));
+    // Instants by milliseconds, past the fixnum range; UUIDs by
+    // unsigned bytes; neither against a number.
+    try testing.expectEqual(Order.lt, try o.order(value.fromInst(std.math.minInt(i64)), value.fromInst(-1)));
+    try testing.expectEqual(Order.gt, try o.order(value.fromInst(std.math.maxInt(i64)), value.fromInst(0)));
+    try testing.expectEqual(Order.gt, try o.order(try uuid_mod.make(&heap, @splat(0xff)), try uuid_mod.make(&heap, @splat(0))));
+    try testing.expectEqual(Order.lt, try o.order(value.nilValue(), try uuid_mod.make(&heap, @splat(0))));
+    try testing.expectError(error.KindMismatch, o.order(value.fromInst(1), fx(1)));
 }

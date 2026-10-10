@@ -26,6 +26,7 @@ const value = @import("../value.zig");
 const heap_mod = @import("../heap.zig");
 const intern_mod = @import("../intern.zig");
 const string_mod = @import("../string.zig");
+const uuid_mod = @import("../uuid.zig");
 const bignum = @import("../bignum.zig");
 const emdb = @import("emdb");
 const key = @import("key.zig");
@@ -342,13 +343,14 @@ pub const Conn = struct {
     }
 
     /// Materialise a datom value into the VM heap. Refs become
-    /// fixnums, longs and instants the language's integer (a bignum
-    /// past the fixnum range); keywords are interned into the VM;
-    /// uuids become their canonical text; byte arrays become strings.
+    /// fixnums, longs the language's integer (a bignum past the fixnum
+    /// range), instants and uuids their kinds; keywords are interned
+    /// into the VM; byte arrays become strings.
     pub fn valToValue(self: *Conn, txn: *Txn, heap: *Heap, v: Val) !Value {
         return switch (v) {
             .boolean => |b| value.fromBool(b),
-            .long, .instant => |n| try bignum.fromI64(heap, n),
+            .long => |n| try bignum.fromI64(heap, n),
+            .instant => |ms| value.fromInst(ms),
             .double => |d| value.fromFloat(d),
             .keyword => |id| blk: {
                 const k = (try self.idents.internOf(txn, id)) orelse return error.Corrupted;
@@ -356,11 +358,7 @@ pub const Conn = struct {
             },
             .ref => |eid| value.fromFixnum(@intCast(eid)) orelse error.ValueType,
             .string => |s| try string_mod.fromBytes(heap, s),
-            .uuid => |u| blk: {
-                var text: [36]u8 = undefined;
-                datom_mod.uuidToText(&text, u);
-                break :blk try string_mod.fromBytes(heap, &text);
-            },
+            .uuid => |u| try uuid_mod.make(heap, u),
             .bytes => |b| try string_mod.fromBytes(heap, b),
         };
     }

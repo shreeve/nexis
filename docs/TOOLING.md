@@ -171,11 +171,11 @@ class member (`Exception.`: ``throw (ex-info "message" {:key
 value})``; `.toUpperCase`: `nexis.string/upper-case`; `Math/sqrt`:
 `nexis.math/sqrt`; `System/getenv`: `nexis.sys/getenv`), a name of
 Clojure's threads, agents or STM (`future`, `pmap`, `agent`,
-`thread`, `dosync`), a ratio or BigDecimal literal (`1/3`, `1.5M`), a
-tagged literal (`#inst`, `#uuid`) and a library with no counterpart
-(`clojure.java.io`). The tables are `expand.idiomHint` and
-`namespaceHint` and `reader.numberLiteralHint` and
-`taggedLiteralHint`; a name the program defines itself is its own, so
+`thread`, `dosync`), a ratio or BigDecimal literal (`1/3`, `1.5M`)
+and a library with no counterpart (`clojure.java.io`); an unknown tag
+names the two the reader reads (`docs/FORMS.md` §3). The tables are
+`expand.idiomHint` and `namespaceHint` and
+`reader.numberLiteralHint`; a name the program defines itself is its own, so
 `(defn thread ...)` resolves as any other.
 
 ```

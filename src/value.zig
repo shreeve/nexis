@@ -25,7 +25,8 @@ pub const Kind = enum(u8) {
     float = 5,
     keyword = 6,
     symbol = 7,
-    // 8..15 reserved for immediates.
+    inst = 8,
+    // 9..15 reserved for immediates.
     string = 16,
     bignum = 17,
     persistent_map = 18,
@@ -58,7 +59,8 @@ pub const Kind = enum(u8) {
     lazy_seq = 43,
     regex = 44,
     matcher = 45,
-    // 46..63 reserved for heap kinds.
+    uuid = 46,
+    // 47..63 reserved for heap kinds.
     /// An upvalue cell block: runtime-private, never a user value
     /// (VALUE.md §2.3).
     cell_internal = 66,
@@ -139,6 +141,10 @@ pub const Value = extern struct {
         return self.kind() == .symbol;
     }
 
+    pub inline fn isInst(self: Value) bool {
+        return self.kind() == .inst;
+    }
+
     pub inline fn isTruthy(self: Value) bool {
         // Only `nil` and `false` are falsy (PLAN §23 #13); they sit at
         // kinds 0 and 1.
@@ -176,6 +182,12 @@ pub const Value = extern struct {
 
     pub inline fn asFloat(self: Value) f64 {
         std.debug.assert(self.isFloat());
+        return @bitCast(self.payload);
+    }
+
+    /// An instant's milliseconds since 1970-01-01T00:00:00Z.
+    pub inline fn asInstMs(self: Value) i64 {
+        std.debug.assert(self.isInst());
         return @bitCast(self.payload);
     }
 
@@ -241,6 +253,7 @@ pub const Value = extern struct {
             .true_ => 0x1111_1111_1111_1111,
             .char => hash.hashChar(self.asChar()),
             .fixnum => hash.hashI64(self.asFixnum()),
+            .inst => hash.hashI64(self.asInstMs()),
             .float => hash.hashFloat(self.asFloat()),
             // The text, never the intern id: a map's order must not
             // depend on which names a process happened to intern first.
@@ -301,6 +314,15 @@ pub fn fromFloat(f: f64) Value {
     return Value{
         .tag = @backingInt(Kind.float),
         .payload = @bitCast(canonical),
+    };
+}
+
+/// Infallible: every i64 is an instant, the milliseconds since
+/// 1970-01-01T00:00:00Z (SEMANTICS §2.8).
+pub fn fromInst(ms: i64) Value {
+    return Value{
+        .tag = @backingInt(Kind.inst),
+        .payload = @bitCast(ms),
     };
 }
 
@@ -434,6 +456,7 @@ test "fromFloat: NaN canonicalization" {
 
 test "isHeap: the heap kinds, not the immediates or the sentinels" {
     try std.testing.expect(!Kind.nil.isHeap() and Kind.string.isHeap() and Kind.matcher.isHeap() and !Kind.cell_internal.isHeap());
+    try std.testing.expect(!Kind.inst.isHeap() and Kind.uuid.isHeap());
 }
 
 test "identicalTo: bit-equality over the full Value" {
@@ -452,6 +475,8 @@ test "coincidentally-equal payload values hash disjointly across kinds" {
     const ch = fromChar(65).?.hashImmediate();
     const sy = testSymbol(65).hashImmediate();
     const kw = testKeyword(65).hashImmediate();
+    const in = fromInst(65).hashImmediate();
+    try std.testing.expect(in != fx and in != ch and in != sy and in != kw);
     try std.testing.expect(fx != ch);
     try std.testing.expect(fx != sy);
     try std.testing.expect(fx != kw);
@@ -472,15 +497,26 @@ test "signed zero: identical? distinguishes, = folds, hash matches =" {
 
 /// One of each immediate kind, with the edge cases of `=`: both
 /// zeros, NaN, and a keyword and a symbol sharing an intern id.
-fn immediateSamples() [16]Value {
+fn immediateSamples() [19]Value {
     return .{
         nilValue(),      fromBool(true),   fromBool(false),
         fromChar('a').?, fromChar('b').?,  fromFixnum(0).?,
         fromFixnum(1).?, fromFixnum(-1).?, fromFloat(0.0),
         fromFloat(-0.0), fromFloat(1.0),   fromFloat(std.math.nan(f64)),
         testKeyword(1),  testKeyword(2),   testSymbol(1),
-        testSymbol(2),
+        testSymbol(2),   fromInst(0),      fromInst(1),
+        fromInst(-1),
     };
+}
+
+test "fromInst: every i64 is an instant, and its milliseconds come back" {
+    for ([_]i64{ std.math.minInt(i64), -1, 0, 1, std.math.maxInt(i64) }) |ms| {
+        const v = fromInst(ms);
+        try std.testing.expect(v.isInst() and v.isTruthy());
+        try std.testing.expectEqual(ms, v.asInstMs());
+        try std.testing.expect(v.equalImmediate(fromInst(ms)));
+    }
+    try std.testing.expect(!fromInst(1).equalImmediate(fromFixnum(1).?));
 }
 
 test "equalImmediate is an equivalence, and equal values hash equal" {

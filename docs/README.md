@@ -12,6 +12,7 @@ canonical Form schema in [`PLAN.md`](../PLAN.md) §23 and §28.
 | `src/root.zig` | `build.zig` `checkLayering` | The one runtime module: every runtime file, declared bottom-up in layering order |
 | `src/stack.zig` | [`VM.md`](VM.md) §13.1 | Native stack guard: `check` on every recursion over input depth, `:stack-overflow` |
 | `src/value.zig` | [`VALUE.md`](VALUE.md) | 16-byte tagged Value, the Kind table |
+| `src/inst.zig`, `src/uuid.zig` | [`STDLIB.md`](STDLIB.md) §12, §14; [`SEMANTICS.md`](SEMANTICS.md) §2.8 | The instant's calendar and text; the UUID heap kind, its text and order |
 | `src/heap.zig` | [`HEAP.md`](HEAP.md) | Heap header, header bits, the Heap allocator |
 | `src/dispatch.zig`, `src/hash.zig`, `src/xxhash3.zig` | [`SEMANTICS.md`](SEMANTICS.md) §2, §3, §3.3 | Cross-kind `=` and hash; the kind → equality category → hash domain table; XXH3-64 |
 | `src/intern.zig` | [`INTERN.md`](INTERN.md) | Symbol and keyword interning |
@@ -33,13 +34,12 @@ canonical Form schema in [`PLAN.md`](../PLAN.md) §23 and §28.
 | `src/expand.zig`, `src/loader.zig` | [`MACROEXPAND.md`](MACROEXPAND.md) | Macroexpander, syntax-quote, host macros; §2b namespaces and the loader |
 | `src/compile.zig` | [`COMPILER.md`](COMPILER.md) | Form → Tiny → bytecode, recur and capture lowering |
 | `src/vm.zig` | [`VM.md`](VM.md) | Bytecode format, opcodes, frames, try/throw, execution errors |
-| `src/stdlib.zig`, `src/stdlib/*.nx`, `src/image.zig`, `src/imagegen.zig`, `src/format.zig` | [`STDLIB.md`](STDLIB.md) | Namespaces and embedded sources, the stdlib image (§1), text, `nexis.string`, `nexis.set`, `nexis.walk`, `nexis.edn`, printing, I/O, documentation (§10), `nexis.sys` and `nexis.shell` (§11), `nexis.time` (§12), `nexis.json` (§13) |
+| `src/stdlib.zig`, `src/stdlib/*.nx`, `src/image.zig`, `src/imagegen.zig`, `src/format.zig` | [`STDLIB.md`](STDLIB.md) | Namespaces and embedded sources, the stdlib image (§1), text, `nexis.string`, `nexis.set`, `nexis.walk`, `nexis.edn`, printing, I/O, documentation (§10), `nexis.sys` and `nexis.shell` (§11), `nexis.time` (§12), `nexis.json` (§13), UUIDs (§14) |
 | `src/cli.zig`, `src/disasm.zig`, `src/stdlib/{test,pprint,math}.nx` | [`TOOLING.md`](TOOLING.md) | Commands, REPL, error report, disassembler, test runner, pprint, math |
 | `src/db.zig` | [`DB.md`](DB.md) | emdb connection, durable refs, the `db/*` surface |
 | `src/nextomic/` | [`NEXTOMIC.md`](NEXTOMIC.md) | The database (authoritative): store, transactions, time, query, pull, API, errors |
 | — | [`GUIDE.md`](GUIDE.md) | Not a spec: nexis for Clojure programmers, the user's account of what is the same and what differs |
 | — | [`NEXTOMIC-EMDB.md`](NEXTOMIC-EMDB.md) | What Nextomic relies on in emdb, the engine facts that shape its keys, and what not to ask of emdb |
 | — | [`FILEMAN-NEXTOMIC.md`](FILEMAN-NEXTOMIC.md) | A design note, not a spec: VistA's FileMan data on Nextomic's time model (`TODO.md` #12) |
-| — | [`INST-UUID.md`](INST-UUID.md) | A design note, not a spec: `#inst` and `#uuid` literals and their value kinds (`TODO.md` #22) |
 | `src/bench.zig`, `bench/` | [`BENCH.md`](BENCH.md) | Benchmark method and harness |
 | — | [`PERF.md`](PERF.md) | Measured numbers, levers, non-goals |

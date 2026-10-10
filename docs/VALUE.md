@@ -33,9 +33,10 @@ of one chunked cons.
 #### 1.2 Payload word interpretation
 
 Determined by `kind` (§2). The payload is a plain `u64`; each accessor
-(`asFixnum`, `asFloat`, `asChar`, `asKeywordId`, `asSymbolId`,
-`nameHash`, `Heap.asHeapHeader`) reinterprets it as signed integer,
-float bits, scalar, intern id, name hash or pointer. Code reads a
+(`asFixnum`, `asFloat`, `asChar`, `asInstMs`, `asKeywordId`,
+`asSymbolId`, `nameHash`, `Heap.asHeapHeader`) reinterprets it as
+signed integer, float bits, scalar, milliseconds, intern id, name hash
+or pointer. Code reads a
 keyword's or symbol's id through `asKeywordId` / `asSymbolId`, never
 from the raw payload, whose high word is the name hash.
 
@@ -49,8 +50,8 @@ a grown stack) holds `nil` without initialization.
 Kind numbers are frozen: the VM switches on them and the codec writes
 them as wire tags (`docs/CODEC.md` §9). A kind number is never reused
 or renumbered; a retired kind leaves a reserved gap. `Kind.isImmediate`
-is `kind < 16`, `Kind.isHeap` is `16 <= kind < 64`. Values 8–15 are
-reserved for immediates, 46–63 for heap kinds, 64 and above for
+is `kind < 16`, `Kind.isHeap` is `16 <= kind < 64`. Values 9–15 are
+reserved for immediates, 47–63 for heap kinds, 64 and above for
 runtime-private sentinels (§2.3).
 
 #### 2.1 Immediates (the payload is the value)
@@ -65,6 +66,7 @@ runtime-private sentinels (§2.3).
 | 5 | `float` | The f64 bits. Every NaN is stored as the canonical quiet NaN `0x7FF8000000000000`; `-0.0` is stored as itself |
 | 6 | `keyword` | The keyword's intern id (`u32`, `docs/INTERN.md`) in the low word, the `hash.nameHash` of its text in the high word (SEMANTICS §3.2) |
 | 7 | `symbol` | As `keyword`, from the symbol table |
+| 8 | `inst` | An instant: the milliseconds since 1970-01-01T00:00:00Z as an i64; every i64 is valid (SEMANTICS §2.8) |
 
 Because NaN is canonical on every entry path (the constructor, codec
 decode, arithmetic), `(= nan nan)` is true and hashes agree. `-0.0` and
@@ -109,6 +111,7 @@ three db handles) the payload is a 16-byte-aligned `*HeapHeader`
 | 43 | `lazy_seq` | Lazy seq (`docs/LAZY.md`) | 0 = lazy block (unrealized, forwarding or realized), 1 = cons cell whose rest may be lazy, 2 = chunked cons: the body is the rest and the chunk's elements, the offset is in tag bits 32..63 |
 | 44 | `regex` | Compiled regular expression (`docs/REGEX.md` §8) | A leaf block: the program, the source text and the tables, inline |
 | 45 | `matcher` | Regex search state (`docs/REGEX.md` §8) | The pattern, the string, where the next search starts and the last match's group spans |
+| 46 | `uuid` | A UUID (SEMANTICS §2.8, `src/uuid.zig`) | A leaf block of its 16 bytes in network order: 128 bits do not fit the 120 a Value leaves beside its kind byte |
 
 The equality category and hash domain of every kind are SEMANTICS
 §3.3; what each block's trace walks is `docs/GC.md` §5; which kinds
@@ -139,6 +142,7 @@ Every immediate has one constructor in `src/value.zig`, which enforces
 | `fromChar(scalar: u21) ?Value` | null on a surrogate or a value above 10FFFF |
 | `fromFixnum(n: i64) ?Value` | null outside `[fixnum_min, fixnum_max]` (`isFixnumRange`); the caller builds a bignum (`bignum.fromI64`) |
 | `fromFloat(f: f64) Value` | infallible; canonicalizes NaN |
+| `fromInst(ms: i64) Value` | infallible: every i64 is an instant |
 | `fromKeyword(id: u32, name_hash: u32)`, `fromSymbol(id: u32, name_hash: u32)` | pack an id and its name hash; neither is validated. The interner is the one caller that pairs them (`Interner.keywordValue`, `internKeywordValue` and the symbol forms, `docs/INTERN.md` §2); tests without an interner use `testKeyword(id)` / `testSymbol(id)`, which hash as their id and compile only in a test build |
 | `fromNativeFnPtr(descriptor)` | a `native_fn` over a static descriptor |
 
@@ -154,7 +158,7 @@ the db natives build the connection and transaction-handle Values,
 whose payload is no heap block.
 
 The predicates are `isNil`, `isBool`, `isChar`, `isFixnum`, `isFloat`,
-`isKeyword`, `isSymbol`, and `isTruthy` / `isFalsy` (only `nil` and
+`isInst`, `isKeyword`, `isSymbol`, and `isTruthy` / `isFalsy` (only `nil` and
 `false` are falsy: kinds 0 and 1; SEMANTICS §1).
 
 ---

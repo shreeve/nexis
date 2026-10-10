@@ -16,8 +16,8 @@
 
 (defn write-str
   "The JSON text of x: a map an object, any other collection or seq an
-  array, a keyword or symbol its name with its namespace, an Instant
-  its ISO-8601 text. Options: :key-fn, a function of each map key to
+  array, a keyword or symbol its name with its namespace, an instant
+  its ISO-8601 text, a UUID its canonical text. Options: :key-fn, a function of each map key to
   its string (else a keyword's or symbol's whole name, an integer's
   digits); :value-fn, a function of each map entry's key and value
   whose result is written, the entry left out when it is :value-fn

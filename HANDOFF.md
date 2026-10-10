@@ -58,11 +58,11 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 255/255 steps succeeded; 1534/1535 tests passed (1 skipped)
+Build Summary: 259/259 steps succeeded; 1546/1547 tests passed (1 skipped)
 ```
 
 With `../nexus` checked out the gate includes `parser-check`'s two
-steps; without it the count is 253 steps. Any output besides the
+steps; without it the count is 257 steps. Any output besides the
 summary tree is a failure. The largest binaries are `unit` (every
 inline test in `src/`) and `eval_pipeline` (the language corpus);
 `cli-unit` runs `src/cli.zig`'s own tests.
@@ -166,7 +166,8 @@ runtime throw) instead of faulting (`docs/VM.md` §13.1).
 
 `src/value.zig`: a 16-byte `{tag, payload}` cell. Immediates are nil,
 booleans, chars, fixnums (i48), floats (f64), keywords and symbols
-(intern ids); heap kinds are numbered 16-45, with 22 (`byte_vector`),
+(intern ids) and instants (i64 epoch milliseconds); heap kinds are
+numbered 16-46, with 22 (`byte_vector`),
 28 and 29 reserved because kind bytes are the codec's wire tags
 (`docs/VALUE.md`). An integer result outside i48 is a bignum and one
 that fits is a fixnum again (`docs/BIGNUM.md`). Equality, hash and
@@ -542,8 +543,8 @@ after numbers in the commit message.
    and short ids (`docs/PERF.md` §3.36; store format 3, which refuses
    every other). A pull of 10k entities is 4% slower cold on Linux for
    the variable-length entity; §6 "Store size" lists what is left.
-4. A design the owner approved, an amendment first: `#inst` and
-   `#uuid` (`docs/INST-UUID.md`, `TODO.md` #22).
+4. `as-of` of an instant (`TODO.md` #22): a time view taken at an
+   instant as Datomic's `as-of` takes a `Date`.
 5. `TODO.md`'s "Open from revamp 3" (#24–#29): the multimethod
    registry, protocol names in print, duplicates left between files,
    and the deferred test and doc pass.

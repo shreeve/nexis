@@ -120,13 +120,11 @@ Each needs a PLAN amendment before code (`AGENTS.md`, authority order).
     `docs/FILEMAN-NEXTOMIC.md` has the mapping from `^DD`, the three
     ways to combine them (a temporal mirror first) and a first
     demonstration. The capture hook belongs to em's repository.
-22. **`#inst` and `#uuid`** (PLAN §4, §23 #25, §24 #3, §28). Approved by
-    the owner; `docs/INST-UUID.md` is the design: an immediate `inst`
-    kind (epoch milliseconds) and a heap `uuid` kind, the two tagged
-    literals and their round trip through `pr-str`, `read-string`,
-    `nexis.edn` and the codec, Nextomic's `:db.type/instant` and
-    `:db.type/uuid` taking and returning only the new kinds (stored
-    bytes unchanged), and a commit plan with its tests.
+22. **`as-of` of an instant.** Datomic's `(d/as-of db #inst "...")`
+    takes a `Date` and resolves it through the `:db/txInstant` index to
+    the last transaction at or before it; nexis's `as-of` and `since`
+    take a basis `t` only (`docs/NEXTOMIC.md` §4). The `inst` kind and
+    the AVET entries of `:db/txInstant` make it a small change.
 
 ## Open from revamp 3
 

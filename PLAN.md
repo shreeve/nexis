@@ -150,7 +150,6 @@ oversight; widening this list or removing a row takes an amendment.
 | Software transactional memory | emdb transactions are the language's transaction story; a second concurrency model is a trap. |
 | Agents, `core.async` | One thread (§23 #5); a scheduling model is a large semantic sink. |
 | Reader conditionals `#?(...)` | One compile target. |
-| Tagged literals `#inst`, `#uuid` | Rich literals are functions or macros (§24 #3). |
 | Rationals, decimals | The number tower is fixnum + bignum + f64 (§23 #10). |
 | Forcing every fast path through `seq` | `seq` is the iteration abstraction (§23 #35); map lookup, vector indexing and typed-vector kernels stay direct. |
 | Multiple compile targets | Zig-native only. |
@@ -176,8 +175,8 @@ in source is a `with-meta` datum, not a field.
 
 **Layer 2 — runtime Value.** What bytecode manipulates: a 16-byte
 tagged cell (§23 #1). Immediates are nil, booleans, chars, fixnums
-(i48), floats (f64), keywords and symbols (intern ids); every other
-kind is a pointer to a heap object with a shared header
+(i48), floats (f64), instants (i64 epoch milliseconds), keywords and
+symbols (intern ids); every other kind is a pointer to a heap object with a shared header
 (`docs/VALUE.md`, `docs/HEAP.md`). Collections compare structurally;
 Vars, atoms and durable refs by identity.
 
@@ -270,10 +269,10 @@ Each item is a commitment; changing one takes an Amendment Log entry
     annotation field; source metadata is the `with-meta` datum. Macros
     see and produce Forms (§5).
 25. **Serialization has a fixed scope.** Serializable: nil, bool,
-    char, fixnum, bignum, f64, string, keyword and symbol (as text),
-    list, vector, map, set, typed vector, a lazy seq (written as the
-    list it realizes to), and sorted map and sorted set in the natural
-    order. Everything else (functions, Vars, atoms,
+    char, fixnum, bignum, f64, instant, UUID, string, keyword and
+    symbol (as text), list, vector, map, set, typed vector, a lazy seq
+    (written as the list it realizes to), and sorted map and sorted set
+    in the natural order. Everything else (functions, Vars, atoms,
     transients, durable refs, byte vectors, records, protocols, db and
     Nextomic handles, regexes and matchers, a sorted collection with a
     comparator of its own) is not; encoding one raises the keyword
@@ -348,8 +347,11 @@ lives in one place:
 Deliberately undecided. The numbers are stable; closed questions are
 removed.
 
-- **#3 Tagged literals.** A `#inst`-style literal would be a
-  macro-based reader extension, not a reader feature.
+- **#3 Tagged literals.** `#inst` and `#uuid` are read (Amendment
+  2026-10-10); every other tag is `:unknown-tag`. User tags
+  (`*data-readers*`, `nexis.edn`'s `:readers` and `:default`) are
+  open: the grammar already reads `#tag form`, and the question is
+  where a tag's function lives at read time, which has no namespace.
 - **#4 AOT and bytecode caches.** Programs compile from source on every
   run; there is no object-file format.
 - **#5 Schema or spec language.** None exists.
@@ -418,6 +420,8 @@ true, false                          ;; bool
 3.14, 1e9, 1.5e-3, ##Inf, ##NaN      ;; real (f64; ##Inf, ##-Inf, ##NaN the symbolic floats)
 "hello"                              ;; string (UTF-8; may span lines)
 #"a\d+", #"\""                       ;; regex (the text between the quotes, no escape processing)
+#inst "2026-10-09T12:30+02:00"       ;; inst (epoch milliseconds, i64; Clojure's #inst grammar)
+#uuid "0123abcd-4567-89ef-0123-456789abcdef" ;; uuid (128 bits; Java's UUID.fromString grammar)
 \a, \newline, \u{2603}, \u2603       ;; char (Unicode scalar)
 :foo, :ns/foo                        ;; keyword
 foo, ns/foo, set!, ->>, λ            ;; symbol
@@ -478,8 +482,15 @@ all before macroexpansion.
 | a form nested past the native stack's budget | reader error `:nesting-too-deep` |
 | `#"a\d"` | the `regex` datum of the text `a\d`: a backslash and the character after it are kept as written, so `#"\""` holds `\"` |
 | `#"("`, `#"a{2,1}"`, `#"(?=a)"` | reader error `:invalid-regex`, the detail the compiler's sentence and the index in the pattern |
+| `#inst "2026-10-09T12:30:15.123+02:00"` | the `inst` datum of the instant, 1791541815123 ms; the golden printer writes `(inst "2026-10-09T10:30:15.123-00:00")` |
+| `#uuid "0123ABCD-4567-89EF-0123-456789ABCDEF"`, `#uuid "1-2-3-4-5"` | the `uuid` datum of its 16 bytes; the golden printer writes the canonical lower-case text |
+| `#inst #_x "1970"` | a discard between the tag and its string is skipped |
+| `#inst "2020-13"`, `#inst 5` | reader error `:invalid-inst` |
+| `#uuid "x"`, `#uuid 5` | reader error `:invalid-uuid` |
+| `#foo/bar 1`, `#ns.Rec{:a 1}` | reader error `:unknown-tag`, before the tag's form is read |
+| `#{#inst "2020" #inst "2020-01-01T00:00Z"}` | reader error `:duplicate-literal-element`: two `inst` datums of the same milliseconds |
 | `#"abc` with no closing quote | parse error at the `#"` |
-| `##Infinity`, `#?(...)`, `::k` | parse error naming the construct |
+| `##Infinity`, `#?(...)`, `::k` | parse error naming the construct; `#` and a letter is a tag, not a parse error |
 
 Only statically detectable literal keys and elements count as
 duplicates: `{:a 1 (keyword "a") 2}` reads. Two `regex` datums are
@@ -490,8 +501,8 @@ where each literal is a distinct `Pattern`.
 
 | Stage | Input | Output | Responsibilities |
 |---|---|---|---|
-| **Parser** (`src/parser.zig`, generated by nexus; scanner `src/nexis.zig`) | source text | `Sexp` tree with spans | Tokenizing and LALR(1) parsing; drops `#_` and the form it discards. No other normalization. |
-| **Reader** (`src/reader.zig`) | `Sexp` | canonical Form tree | The §28.3 rules: spans, metadata merging, `#(...)` to the anon-fn datum, the `syntax-quote` marker, the `regex` datum and its validation, the reader errors. |
+| **Parser** (`src/parser.zig`, generated by nexus; scanner `src/nexis.zig`) | source text | `Sexp` tree with spans | Tokenizing and LALR(1) parsing; drops `#_` and the form it discards; a tag and its form as one tagged node. No other normalization. |
+| **Reader** (`src/reader.zig`) | `Sexp` | canonical Form tree | The §28.3 rules: spans, metadata merging, `#(...)` to the anon-fn datum, the `syntax-quote` marker, the `regex` datum and its validation, the `inst` and `uuid` datums from their tags, `:unknown-tag`, the reader errors. |
 | **Macroexpander** (`src/expand.zig`) | Form | expanded Form | Macros to a fixpoint; expands `syntax-quote` (qualification, auto-gensym, unquote and splice); turns the anon-fn datum into `fn*`; passes a macro its call (`&form`), the locals in scope (`&env`) and its arguments (§23 #34). |
 | **Compiler** (`src/compile.zig`, `lowerForm`) | expanded Form | bytecode | Resolves symbols to slot, upvalue, Var or special form, reporting unresolved ones; lowers through the Tiny IR to bytecode (`docs/COMPILER.md`). |
 
@@ -517,6 +528,7 @@ The Form column is the golden pretty-printer's output
 | 9 | `'foo`, `` `foo `` | `(quote (symbol foo))`, `(syntax-quote (symbol foo))` |
 | 10 | `(+ -1 2)` | `(list (symbol +) (int -1) (int 2))` |
 | 11 | `(re-find #"\d+" s)` | `(list (symbol re-find) (regex "\\d+") (symbol s))` |
+| 12 | `(< #inst "2026" t)` | `(list (symbol <) (inst "2026-01-01T00:00:00.000-00:00") (symbol t))` |
 
 - **2.** The reader merges a `^` chain into one map, as Clojure's
   reader assoc's each outer `^` onto the metadata of the form it wraps:
@@ -536,6 +548,8 @@ The Form column is the golden pretty-printer's output
   begins a number, so `-1` is a literal, not `(- 1)`.
 - **11.** The regex datum holds the source's text, `\d+`; the golden
   pretty-printer escapes the backslash (`docs/FORMS.md` §5).
+- **12.** The reader parses the text once: the `inst` datum holds
+  milliseconds, and the golden printer writes Clojure's text of them.
 
 ### 28.6 Golden test contract
 
@@ -1057,3 +1071,51 @@ entry stating the decision and its rationale.
   is added. `docs/MACROEXPAND.md` §1.3 is the authority;
   `docs/FORMS.md` §4, `docs/VM.md` §10.7 and §13, the `defmacro`
   doc row and `CLOJURE-REVIEW.md` carry it.
+- **2026-10-10 — Instants and UUIDs are value kinds (§5, §23 #25).**
+  An instant is the immediate kind `inst` (8): the payload is the
+  milliseconds since 1970-01-01T00:00:00Z as an i64, the precision and
+  range of Clojure's `java.util.Date`. It is `=` and hashes by its
+  milliseconds, orders by them under `compare`, is not a number,
+  carries no metadata, satisfies `Inst`, and `class` names it `:inst`.
+  A UUID is the heap kind `uuid` (46), a leaf block of its 16 bytes:
+  128 bits do not fit the 120 a Value leaves beside its kind byte. It
+  is `=` and hashes by its bytes, carries no metadata, and `class`
+  names it `:uuid`. `compare` orders it by unsigned bytes, which is its
+  text's order, RFC 9562's and Nextomic's index order, where Java's
+  `UUID.compareTo` compares signed longs. Both serialize: kind byte 8
+  and a zigzag LEB128 i64, kind byte 46 and 16 bytes, additive to
+  codec format 1.0. `random-uuid` and `parse-uuid` return a uuid,
+  `random-uuid` from the process CSPRNG as Java's `SecureRandom`;
+  `uuid?` is true of the kind only, as in Clojure. The record
+  `nexis.time.Instant` is removed: `nexis.time` makes and takes the
+  kind. Nextomic's `:db.type/instant` and `:db.type/uuid` take and
+  return the kinds and nothing else, as Datomic's take a `Date` and a
+  `UUID`; the stored bytes do not change. Reason: Clojure programs and
+  EDN data carry instants and UUIDs as values, a record could be
+  neither stored nor compared, and a UUID string was not `uuid?` in
+  Clojure; one kind per Nextomic type keeps every query path comparing
+  one representation. `docs/VALUE.md` §2 and `docs/SEMANTICS.md` §2.8
+  are the authority; `docs/CODEC.md` §2 and §3, `docs/GC.md` §5,
+  `docs/SORTED.md` §6, `docs/STDLIB.md` §5, §8, §12, §13 and §14,
+  `docs/NEXTOMIC.md` §2.2 and §9 and `CLOJURE-REVIEW.md` carry it.
+- **2026-10-10 — The `#inst` and `#uuid` literals (§4, §24 #3,
+  §28.2–§28.5).** Supersedes the §4 "Tagged literals" row. The
+  scanner reads `#` and a letter as a tag token and the grammar
+  `#tag form` as a tagged form; the reader reads `#inst "text"` as the
+  atom datum `inst`, the instant the text names in Clojure's `#inst`
+  grammar (a signed or longer year, a lower-case `T` or `Z` and an
+  offset without its colon also read), and `#uuid "text"` as the atom
+  datum `uuid`, in the grammar of Java's `UUID.fromString`. A text that
+  names no instant or UUID is `:invalid-inst` or `:invalid-uuid`; any
+  other tag is `:unknown-tag`. The compiler lifts both datums into
+  constants and `quote` and macros see the values. An instant prints as
+  Clojure prints a `Date`, `#inst "2026-10-09T10:30:15.123-00:00"`, a
+  UUID as `#uuid "…"`, in both modes, and both read back `=`;
+  `nexis.edn` reads both, EDN's two built-in tags. User tags
+  (`*data-readers*`, `:readers`) stay open (§24 #3). Reason: EDN data
+  and Clojure source write instants and UUIDs as literals, and reading
+  them as values, not as the forms that build them, is what lets data
+  round-trip through `pr-str`, `read-string` and `nexis.edn`.
+  `docs/FORMS.md` §2, §3 and §5 are the authority; `docs/STDLIB.md` §4,
+  `docs/SEMANTICS.md` §6.1, `docs/TOOLING.md` and `CLOJURE-REVIEW.md`
+  carry it.

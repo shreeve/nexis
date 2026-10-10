@@ -46,6 +46,7 @@ const heap_mod = @import("heap.zig");
 const hash_mod = @import("hash.zig");
 const stack = @import("stack.zig");
 const string = @import("string.zig");
+const uuid = @import("uuid.zig");
 const list = @import("coll/list.zig");
 const lazy = @import("coll/lazy.zig");
 const vector = @import("coll/vector.zig");
@@ -166,6 +167,7 @@ fn heapHashBase(v: Value) u64 {
     const base: u64 = switch (k) {
         .string => string.hashHeader(h),
         .bignum => bignum.hashHeader(h),
+        .uuid => uuid.hashHeader(h),
         .list => list.hashSeq(v, &hashValue),
         .lazy_seq => lazyHash(v),
         .persistent_vector => vector.hashSeq(h, &hashValue),
@@ -211,6 +213,7 @@ pub fn equal(a: Value, b: Value) bool {
     return switch (ka) {
         .string => string.bytesEqual(ah, bh),
         .bignum => bignum.limbsEqual(ah, bh),
+        .uuid => uuid.bytesEqual(ah, bh),
         .list => list.equalSeq(a, b, &equal),
         .lazy_seq => walkEqual(a, b),
         .persistent_vector => vector.equalSeq(ah, bh, &equal),

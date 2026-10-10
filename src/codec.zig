@@ -15,8 +15,9 @@
 //! width LE. See CODEC.md §2 for the per-kind table.
 //!
 //! Scope (CODEC.md §1): the data kinds (nil, bool, char, fixnum,
-//! float, keyword, symbol, string, bignum, list, vector, map, set,
-//! typed vector, and the sorted map and set in the natural order)
+//! float, instant, keyword, symbol, string, bignum, UUID, list,
+//! vector, map, set, typed vector, and the sorted map and set in the
+//! natural order)
 //! nested to any depth. Every other kind is
 //! `error.UnserializableKind`.
 //!
@@ -33,6 +34,7 @@ const heap_mod = @import("heap.zig");
 const intern_mod = @import("intern.zig");
 const hash_mod = @import("hash.zig");
 const string = @import("string.zig");
+const uuid = @import("uuid.zig");
 const bignum = @import("bignum.zig");
 const list_mod = @import("coll/list.zig");
 const lazy_mod = @import("coll/lazy.zig");
@@ -329,6 +331,14 @@ const Encoder = struct {
                 try e.byte(@backingInt(k));
                 try writeU64Le(&e.buf, e.allocator, @bitCast(hash_mod.canonicalizeFloat(v.asFloat())));
             },
+            .inst => {
+                try e.byte(@backingInt(k));
+                try writeIleb128Zigzag(&e.buf, e.allocator, v.asInstMs());
+            },
+            .uuid => {
+                try e.byte(@backingInt(k));
+                try e.buf.appendSlice(e.allocator, uuid.bytesOf(v));
+            },
             .keyword => try e.named(k, e.interner.keywordName(v.asKeywordId())),
             .symbol => try e.named(k, e.interner.symbolName(v.asSymbolId())),
             .string => try e.named(k, string.asBytes(v)),
@@ -506,6 +516,9 @@ const Decoder = struct {
             // rather than promoted: the kind byte is authoritative.
             @backingInt(Kind.fixnum) => value.fromFixnum(try readIleb128Zigzag(bytes, cursor)) orelse error.MalformedPayload,
             @backingInt(Kind.float) => value.fromFloat(@bitCast(try readU64Le(bytes, cursor))),
+            // Every i64 is an instant.
+            @backingInt(Kind.inst) => value.fromInst(try readIleb128Zigzag(bytes, cursor)),
+            @backingInt(Kind.uuid) => uuid.make(d.heap, (try readBytes(bytes, cursor, 16))[0..16].*),
             @backingInt(Kind.keyword) => d.interner.internKeywordValue(try readBytes(bytes, cursor, try d.count(1))),
             @backingInt(Kind.symbol) => d.interner.internSymbolValue(try readBytes(bytes, cursor, try d.count(1))),
             @backingInt(Kind.string) => string.fromBytes(d.heap, try readBytes(bytes, cursor, try d.count(1))),
@@ -659,6 +672,35 @@ test "roundtrip: fixnum across full i48 range" {
         try testing.expect(got.kind() == .fixnum);
         try testing.expectEqual(n, got.asFixnum());
     }
+}
+
+test "roundtrip: an instant across the i64 range, byte for byte" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+    for ([_]i64{ std.math.minInt(i64), -1, 0, 1, 1_791_541_815_123, std.math.maxInt(i64) }) |ms| {
+        const got = try ctx.roundtrip(value.fromInst(ms));
+        try testing.expect(got.identicalTo(value.fromInst(ms)));
+    }
+    // `[8]` and the zigzag LEB128 of the milliseconds.
+    const bytes = try encode(testing.allocator, &ctx.interner, value.fromInst(-1));
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualSlices(u8, &.{ 1, 0, 8, 1 }, bytes);
+    // An eleven-byte LEB128 is no i64.
+    try testing.expectError(error.MalformedPayload, decode(&ctx.heap, &ctx.interner, &.{ 1, 0, 8, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0 }, &synthHash, &synthEq));
+}
+
+test "roundtrip: a uuid is its kind byte and 16 bytes; fewer is TruncatedInput" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+    const u = [16]u8{ 0xff, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 0xee };
+    const v = try uuid.make(&ctx.heap, u);
+    const bytes = try encode(testing.allocator, &ctx.interner, v);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualSlices(u8, &([_]u8{ 1, 0, 46 } ++ u), bytes);
+    const got = try decode(&ctx.heap, &ctx.interner, bytes, &synthHash, &synthEq);
+    try testing.expect(got.kind() == .uuid);
+    try testing.expectEqualSlices(u8, &u, uuid.bytesOf(got));
+    try testing.expectError(error.TruncatedInput, decode(&ctx.heap, &ctx.interner, bytes[0 .. bytes.len - 1], &synthHash, &synthEq));
 }
 
 test "roundtrip: float (+0.0, -0.0, Inf, -Inf, NaN canonicalized, normal)" {
@@ -1166,7 +1208,7 @@ test "decode: a map or set whose count disagrees with its distinct entries is Ma
 test "decode: every kind byte outside the serializable set is MalformedPayload" {
     var ctx = TestCtx.init();
     defer ctx.deinit();
-    const serializable = [_]Kind{ .nil, .false_, .true_, .char, .fixnum, .float, .keyword, .symbol, .string, .bignum, .persistent_map, .persistent_set, .persistent_vector, .list, .typed_vector, .sorted_map, .sorted_set };
+    const serializable = [_]Kind{ .nil, .false_, .true_, .char, .fixnum, .float, .inst, .keyword, .symbol, .string, .bignum, .uuid, .persistent_map, .persistent_set, .persistent_vector, .list, .typed_vector, .sorted_map, .sorted_set };
     for (0..256) |b| {
         const byte: u8 = @intCast(b);
         if (std.mem.findScalar(Kind, &serializable, @fromBackingInt(byte)) != null) continue;

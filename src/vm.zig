@@ -5285,6 +5285,8 @@ pub fn kindPhrase(k: value_mod.Kind) []const u8 {
         .nil => "nil",
         .false_, .true_ => "a boolean",
         .fixnum, .bignum => "an integer",
+        .inst => "an instant",
+        .uuid => "a UUID",
         .persistent_map => "a map",
         .persistent_set => "a set",
         .sorted_map => "a sorted map",

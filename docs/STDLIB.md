@@ -5,7 +5,7 @@ owns: the namespaces and how they boot, the core text natives,
 `nexis.string`, `nexis.set`, printing (`src/format.zig`), the I/O
 natives, the documentation `doc` reads (§10), the process and its
 programs (`nexis.sys`, `nexis.shell`, §11), instants (`nexis.time`,
-§12) and JSON (`nexis.json`, §13). The natives are in
+§12), JSON (`nexis.json`, §13) and UUIDs (§14). The natives are in
 `src/stdlib.zig`, one table per namespace; the rest of the library is
 nexis in `src/stdlib/*.nx`.
 An error a native or a library function raises is caught as its error
@@ -114,7 +114,7 @@ Var inside a `binding`.
 | `nexis.math` | `math_natives` | `math.nx` (`PI`, `E`, `floor-div`, `floor-mod`) | TOOLING.md §4 |
 | `nexis.sys` | (`#%getenv`, `#%cwd` in `internal_natives`) | `sys.nx` | §11 |
 | `nexis.shell` | (`#%sh` in `internal_natives`) | `shell.nx` | §11 |
-| `nexis.time` | (`#%now-ms`, `#%format-instant`, `#%parse-instant` in `internal_natives`) | `time.nx` | §12 |
+| `nexis.time` | (`#%now-ms`, `#%inst`, `#%inst-ms`, `#%format-instant`, `#%parse-instant` in `internal_natives`) | `time.nx` | §12 |
 | `nexis.json` | (`#%json-read`, `#%json-write` in `internal_natives`) | `json.nx` | §13 |
 | `nexis.test` | — | `test.nx` | TOOLING.md §3 |
 | `nexis.pprint` | — | `pprint.nx` | TOOLING.md §4 |
@@ -319,8 +319,9 @@ as they are, so with no `:eof` in them a string with no form is
 evaluated (the reader has no `#=`). It reads nexis's syntax, which
 EDN's is a part of: reader sugar (`'x`, `@x`, `#()`) reads as the form
 it stands for, where Clojure's EDN reader refuses it, and the reader
-has no tagged literals (PLAN §4), so a tag is a `:reader-error` and
-`:readers` and `:default` have nothing to apply to. There is no `read`
+reads the tags `#inst` and `#uuid` (EDN's two built-in tags,
+`docs/FORMS.md` §3); any other tag is `:reader-error`, and `:readers`
+and `:default` have nothing to apply to (PLAN §24 #3). There is no `read`
 from a stream.
 
 ---
@@ -341,7 +342,7 @@ their elements in the same mode. Who uses which:
 |---|---|
 | `print`, `println`, `print-str`, `println-str` | display |
 | `pr`, `prn`, `pr-str`, `prn-str`; the REPL and `nexis -e` results; error-report payloads | readable |
-| `str`, `%s`, `join`, `spit` | nil is empty (`%s` writes `nil`); a string or char display, a float in Java's spelling (`(str ##Inf)` is `"Infinity"`); any other value readable, so `(str ["a"])` is `"[\"a\"]"` and `(str [##Inf])` `"[##Inf]"` |
+| `str`, `%s`, `join`, `spit` | nil is empty (`%s` writes `nil`); a string or char display, a float in Java's spelling (`(str ##Inf)` is `"Infinity"`), an instant `Instant.toString`'s text (`2020-01-01T00:00:00Z`), a UUID its canonical text; any other value readable, so `(str ["a"])` is `"[\"a\"]"` and `(str [##Inf])` `"[##Inf]"` |
 
 **By kind** (both modes unless the row says otherwise):
 
@@ -352,6 +353,8 @@ their elements in the same mode. Who uses which:
 | float | SEMANTICS.md §6.3, in both modes (`str` and `%s` of a bare float write Java's `NaN`, `Infinity`, `-Infinity`) |
 | char, string | display: a char's UTF-8, a string's bytes. readable: SEMANTICS.md §6.4, §6.5 |
 | keyword, symbol | `:ns/name`, `ns/name`; names are not escaped |
+| instant | `#inst "2026-10-09T10:30:15.123-00:00"`, Clojure's text of a `Date`: always the milliseconds and `-00:00`; a year before 0 or past 9999 with its sign and at least four digits (`#inst "+10000-01-01T00:00:00.000-00:00"`), so the text always reads back (`src/inst.zig`) |
+| UUID | `#uuid "0123abcd-4567-89ef-0123-456789abcdef"`, the canonical lower-case text |
 | list, vector, set | `(a b)`, `[a b]`, `#{a b}`, elements separated by one space; a sorted set in its order |
 | lazy seq | as a list, `(a b)`, `()` when empty. The printer runs no code: every caller but an error report realizes the value first, and a block whose body has not run prints as `...`, as does a cell of a realized cycle met again (`docs/LAZY.md` §8) |
 | map | `{k v, k v}`, entries separated by `, `; a sorted map in its order |
@@ -458,7 +461,7 @@ returns a realized list where Clojure returns a lazy seq.
 | `lazy-cat` | macro | `(lazy-cat coll...)`: `(concat (lazy-seq coll) ...)`, each coll's expression evaluated when the walk reaches it |
 | `iterate`, `repeat`, `repeatedly`, `cycle` | 2, 1–2, 1–2, 1 | Lazy and, without a count, infinite (`docs/LAZY.md` §7): `(take 5 (iterate inc 0))`; `(iterate f x n)` is `:arity-mismatch`; `repeat`'s count is truncated, as Clojure's `(long n)`, and every other sequence function's rounds up (`docs/LAZY.md` §9) |
 | `doall`, `dorun` | 1–2 | Walk the seq, realizing it (the first `n` steps with a count, as Clojure's `next` loop); `doall` returns its argument, `dorun` nil |
-| `rand`, `rand-int`, `shuffle` | 0–1, 1, 1 | Clojure's, over one process-wide generator seeded from the I/O's entropy at its first use (as `random-uuid` and `random-sample`): `(rand-int n)` of an integer is `(int (rand n))`, so 0 for 0 and in (n, 0] below it |
+| `rand`, `rand-int`, `shuffle` | 0–1, 1, 1 | Clojure's, over one process-wide generator seeded from the I/O's entropy at its first use (as `random-sample`): `(rand-int n)` of an integer is `(int (rand n))`, so 0 for 0 and in (n, 0] below it |
 | `in-ns` | 1 | `(in-ns 'name)`: makes the namespace named by the symbol current, creating it with `nexis.core` referred; nil, where Clojure returns the namespace |
 | `counted?` | 1 | True of a list, vector, map, set, record, typed vector or transient; false of nil, strings and lazy seqs |
 | `indexed?` | 1 | True of a vector or typed vector |
@@ -482,8 +485,8 @@ returns a realized list where Clojure returns a lazy seq.
 | `array-map` | 0+ | `(apply hash-map kvs)`: a map of up to eight entries keeps its insertion order (§5), all that Clojure's array map promises; a larger one is a hash map, as Clojure's becomes one past eight |
 | `bigint`, `biginteger` | 1 | `long`: one integer domain (BIGNUM.md), so a number truncated to an integer of any size |
 | `decimal?` | 1 | false: there are no decimals (PLAN §4) |
-| `Inst`, `inst-ms*` | protocol | Clojure's `Inst`: an instant is a value of a type extended to it, whose `inst-ms*` is its epoch milliseconds. `nexis.time`'s `Instant` extends it (§12), and so may any record |
-| `inst?`, `inst-ms` | 1 | `(satisfies? Inst x)`; `(inst-ms* inst)`, `:no-protocol-impl` for anything else (an integer included: `nexis.time/inst-ms` takes one too) |
+| `Inst`, `inst-ms*` | protocol | Clojure's `Inst`: an instant is a value of a type extended to it, whose `inst-ms*` is its epoch milliseconds. The `inst` kind extends it (§12), and so may any record |
+| `inst?`, `inst-ms` | 1 | `(satisfies? Inst x)`; `(inst-ms* inst)`, an integer (a bignum past the fixnum range, as a Java `long`), `:no-protocol-impl` for anything else, an integer included |
 | `qualified-ident?`, `simple-ident?` | 1 | Whether `x` is a keyword or symbol with a namespace, without one |
 | `bit-and-not`, `bit-flip` | 2+, 2 | `(bit-and x (bit-not y))` over each further argument; `bit-flip` is `bit-set` or `bit-clear` of the bit, as `bit-test` finds it |
 | `alter-var-root` | 2+ | `(alter-var-root v f & args)`: sets the root of the Var `v` to `(apply f root args)` and returns it; a `binding` in force is left as it is. An unbound Var's root is nil to `f` and bound after (Clojure passes its `Unbound` object). A non-Var is `:kind-mismatch` |
@@ -495,9 +498,9 @@ returns a realized list where Clojure returns a lazy seq.
 | `all-ns` | 0 | Every namespace's name, sorted |
 | `ns-interns`, `ns-publics` | 1 | The map of name symbol to Var of every Var interned in the namespace (the ones it refers to from another excluded), an unbound one a `declare` or a forward reference made included; `ns-publics` leaves out those marked `:private`. `clojure.string` and its kin hold `nexis.string`'s Vars, so ask the `nexis.*` namespace |
 | `resolve`, `ns-resolve` | 1, 2 | `(resolve sym)`, `(ns-resolve ns sym)`: the Var `sym` names in the current namespace or `ns`, resolved as the compiler resolves a global (an unqualified name the namespace's own or referred, then `nexis.core`'s; a qualified one through an alias or a namespace name), else nil. A host macro (`when`, `let`, `defn`, ...) has no Var, so it resolves to nil |
-| `random-uuid` | 0 | A random version-4 UUID. A UUID is its canonical lowercase text, a string, as Nextomic's `:db.type/uuid` values are; there is no `#uuid` literal |
-| `parse-uuid` | 1 | The canonical text of the UUID a string spells as 8-4-4-4-12 hex digits of either case, else nil (Java's lenient short groups included); a non-string is `:kind-mismatch` |
-| `uuid?` | 1 | Whether `x` is a string in the canonical form (so `(uuid? (random-uuid))` is true, and an uppercase spelling is not) |
+| `random-uuid` | 0 | A random version-4 UUID (§14), from the I/O's cryptographically secure generator, as Java's `randomUUID` draws on `SecureRandom`, not from `rand`'s |
+| `parse-uuid` | 1 | The UUID a string names in Java's `UUID.fromString` grammar (§14), else nil; a non-string is `:kind-mismatch` |
+| `uuid?` | 1 | `(instance? :uuid x)`: true of a UUID, false of every string, as in Clojure; `(some? (parse-uuid s))` tests a string |
 | `re-pattern`, `re-matcher`, `re-find`, `re-matches`, `re-groups`, `re-seq` | 1, 2, 1–2, 2, 1, 2 | Clojure's regular expressions, over the linear-time engine of `docs/REGEX.md`, which owns their rows (§9 there): `(re-find #"\d+" "ab12")` is `"12"`, `(re-seq #"(\w)=(\d)" "a=1 b=2")` is `(["a=1" "a" "1"] ["b=2" "b" "2"])`, lazy |
 
 ---
@@ -737,49 +740,71 @@ buffer included; `sh` runs there with the test's `std.Io`.
 ### 12. Instants: `nexis.time`
 
 `src/stdlib/time.nx` holds instants, their ISO-8601 text and
-durations, each function a docstring'd `defn`; three natives in
-`internal_natives` read the clock and convert the text.
+durations, each function a docstring'd `defn`; five natives in
+`internal_natives` read the clock, make and take apart an instant, and
+convert the text, over `src/inst.zig`, which owns the calendar and the
+text.
 
-**The representation.** An instant is the record
-`nexis.time.Instant` of one field, `:ms`, the milliseconds since
-1970-01-01T00:00:00Z on the proleptic Gregorian calendar, UTC, with no
-leap seconds: Java's `Instant` to the millisecond, the precision of
-Clojure's `#inst` and of Nextomic's `:db.type/instant`. A record needs
-no new value kind (PLAN §23): it is `=` and hashes by its `:ms`,
-`(:ms i)` reads it, and it prints as `#nexis.time.Instant{:ms
-1791549015123}`. It is not `compare`-able, as records are not
-(`docs/SORTED.md` §6): sort instants with `(sort-by t/inst-ms xs)`.
-It extends `nexis.core`'s `Inst` protocol, so Clojure's `inst?` and
-`inst-ms` take it (§8). There is no `#inst` literal (PLAN §4;
-`TODO.md` #22 has the design note). The range is
-the fixnum's, ±2^47 ms: -2490-03-17 to 6429-10-17.
+**The representation.** An instant is the `inst` kind
+(`docs/SEMANTICS.md` §2.8), an immediate whose payload is the
+milliseconds since 1970-01-01T00:00:00Z on the proleptic Gregorian
+calendar, UTC, with no leap seconds, as an i64: Java's `Date` to the
+millisecond and its range, about 292 million years either side of
+1970. `#inst "..."` reads one, and one prints as Clojure prints a
+`Date` (§5). It is `=` and hashes by its milliseconds, `compare` and
+`sort` order instants by them (`docs/SORTED.md` §6), and it extends
+`nexis.core`'s `Inst` protocol, so Clojure's `inst?` and `inst-ms`
+take it (§8). `str` of one is its ISO-8601 text, as `format` writes
+it.
+
+**Text.** `parse` and `#inst` read one grammar (`inst.parse`), Clojure's
+`#inst` widened by the spellings Java's `Instant.toString` writes:
+
+```
+instant = year [ "-" MM [ "-" DD [ T HH [ ":" mm [ ":" ss [ "." 1*DIGIT ] ] ] ] ] ] [ offset ]
+year    = [ "+" / "-" ] 4*9DIGIT          ; Clojure: exactly four digits, no sign
+T       = "T" / "t"                       ; Clojure: "T"
+offset  = "Z" / "z" / ( "+" / "-" ) HH [ ":" ] mm     ; Clojure: "Z" or ±HH:mm
+```
+
+A month is 1–12, a day 1 to the month's length, an hour 0–23, a
+minute 0–59, a second 0–59, or 60 in minute 59, which rolls into the
+next minute as Clojure's lenient calendar does; an offset's hour is
+0–23 and its minute 0–59. The first three digits of a fraction are
+the milliseconds and the rest are ignored. An instant past the i64
+range is not one. Two writers share the calendar (`inst.write`): the
+literal style, Clojure's `yyyy-MM-ddTHH:mm:ss.SSS-00:00`, for the
+printer, and the ISO style, `Instant.toString`'s
+`2026-10-09T12:30:15.123Z` with the fraction left out when it is
+zero, for `str`, `format` and JSON. Both write a year before 0 with a
+`-` and one past 9999 with a `+`, at least four digits, so every
+instant's text reads back as the instant; Clojure prints the year
+10000 unsigned, which its reader refuses.
 
 **Nextomic.** A `:db.type/instant` value, `:db/txInstant` included, is
-epoch milliseconds, a long (`docs/NEXTOMIC.md` §2), and every function
-here that takes an instant takes such a long as well: `(t/format
-(:db/txInstant tx))` writes one, `(t/instant ms)` makes it an Instant,
-and `(t/inst-ms i)` is what a transaction asserts.
+an instant (`docs/NEXTOMIC.md` §2.2), so `(t/format (:db/txInstant
+tx))` writes one and `(t/plus (t/now) (t/days 1))` is what a
+transaction asserts; a long is the wrong type there, as in Datomic.
 
 | Name | Arity | Semantics | Errors |
 |---|---|---|---|
-| `now` | 0 | The wall clock (`CLOCK_REALTIME`) as an Instant, to the millisecond | — |
-| `instant` | 1 | An Instant of epoch milliseconds (an integer), of ISO-8601 text as `parse` reads it, or of an Instant (itself) | `:kind-mismatch`, as `parse` |
-| `inst?` | 1 | Whether `x` is an Instant | — |
-| `inst-ms` | 1 | The epoch milliseconds of an instant: an Instant's `:ms`, an integer itself (Clojure's `inst-ms`) | `:kind-mismatch` |
-| `parse` | 1 | The Instant ISO-8601 text names, in the grammar of Clojure's `#inst`, which RFC 3339's is a part of: `YYYY` (with an optional sign), then optionally `-MM`, `-DD`, `THH:MM`, `:SS` and a fraction of 1 to 9 digits, each only after the one before, truncated to the millisecond; then `Z`, an offset `+HH:MM` or `+HHMM`, or nothing, which is UTC. `T` and `Z` may be lower case. A field out of its range (month 13, February 29 of a common year, hour 24, second 60) is not an instant | `:kind-mismatch` (not a string), `:invalid-argument` (any other text; an instant past the range) |
-| `format` | 1 | The instant's ISO-8601 text in UTC as Java's `Instant.toString` writes it: `2026-10-09T12:30:15.123Z`, the fraction left out when it is zero, a year before 1 written with a `-` (`-0001-01-01T00:00:00Z`) | `:kind-mismatch` (not an instant, or past the range) |
+| `now` | 0 | The wall clock (`CLOCK_REALTIME`) as an instant, to the millisecond | — |
+| `instant` | 1 | The instant of `x`: an instant (any `Inst`) itself, epoch milliseconds (an integer), or ISO-8601 text as `parse` reads it | `:kind-mismatch`, as `parse`; `:invalid-argument` past the i64 range |
+| `parse` | 1 | The instant ISO-8601 text names, in the grammar above | `:kind-mismatch` (not a string), `:invalid-argument` (any other text) |
+| `format` | 1 | The ISO text of the instant `instant` makes of `x` | as `instant` |
 | `seconds`, `minutes`, `hours`, `days` | 1 | A duration of `n` of the unit, in milliseconds: a duration is a number of milliseconds, a day 24 hours | — |
-| `plus`, `minus` | 1+ | `(plus x d ...)`: the Instant each duration later (`minus`: earlier) than the instant `x`, `long` of the sum | `:kind-mismatch` |
-| `between` | 2 | The duration from instant `a` to instant `b`, negative when `b` is earlier | `:kind-mismatch` |
-| `before?`, `after?` | 2 | Whether instant `a` is earlier (later) than instant `b` | `:kind-mismatch` |
+| `plus`, `minus` | 1+ | `(plus x d ...)`: the instant each duration later (`minus`: earlier) than `x`, `long` of the sum | `:kind-mismatch`; `:invalid-argument` past the range |
+| `between` | 2 | The duration from `a` to `b`, negative when `b` is earlier | `:kind-mismatch` |
+| `before?`, `after?` | 2 | Whether `a` is earlier (later) than `b` | `:kind-mismatch` |
 
+Every function that takes an instant takes what `instant` takes.
 There are no time zones but UTC, no local dates, and no calendar
 arithmetic (a month later); a program that needs them builds them on
-`inst-ms`. `src/stdlib.zig` checks the calendar against
-`std.time.epoch` and day by day over the whole range, and that every
-instant's text reads back as the same instant;
-`test/integration/eval_pipeline.zig` pins each row and a Nextomic
-round trip.
+`inst-ms`. `src/inst.zig` checks the calendar against
+`std.time.epoch` and day by day over years -2500 to 6500, each rule of
+the grammar, and that every instant's text in either style reads back
+as the same instant; `test/integration/eval_pipeline.zig` pins each
+row and a Nextomic round trip.
 
 ---
 
@@ -814,8 +839,8 @@ array; a string a string; a character a one-character string; a
 keyword or symbol its whole name without the colon (`:person/name` is
 `"person/name"`, where `clojure.data.json` writes `"name"`: a
 Nextomic attribute keeps its namespace; `:key-fn name` gives
-`clojure.data.json`'s keys); a `nexis.time.Instant` its ISO-8601 text
-(§12); an integer its digits; a double Java's `Double.toString`
+`clojure.data.json`'s keys); an instant its ISO-8601 text (§12) and a
+UUID its canonical text (§14), as `clojure.data.json` writes them; an integer its digits; a double Java's `Double.toString`
 (`1.0E10`), a valid JSON number; `true`, `false` and nil `null`. A map
 key is a string as it is, a keyword or symbol by its whole name, an
 integer by its digits. A string is written as UTF-8 with `"`, `\` and
@@ -858,3 +883,42 @@ through.
 the options, each error and its position, a round trip of every kind
 JSON holds, files, and a text 200,000 arrays deep, which reads, and
 writes as `:stack-overflow`.
+
+---
+
+### 14. UUIDs
+
+A UUID is the `uuid` kind (`docs/SEMANTICS.md` §2.8): a leaf block of
+its 16 bytes in network order, `src/uuid.zig`. `#uuid "..."` reads
+one, `random-uuid` and `parse-uuid` make one and `uuid?` tests for one
+(§8); it prints as `#uuid "0123abcd-4567-89ef-0123-456789abcdef"`
+(§5), and `str` of one is its canonical text: lower-case hex in groups
+of 8, 4, 4, 4 and 12 digits joined by `-`.
+
+**Text.** `parse-uuid` and `#uuid` read the grammar of Java's
+`UUID.fromString` (`uuid.parse`): five groups of 1–8, 1–4, 1–4, 1–4
+and 1–12 hex digits of either case joined by `-`, each group right
+aligned in its field, at most 36 characters, so `"1-2-3-4-5"` is
+`#uuid "00000001-0002-0003-0004-000000000005"`. An empty group, a
+sixth group, a digit that is not hex and a 37th character are refused,
+as Java refuses them; so are two of Java's accidents, a sign on a
+group (`Long.parseLong` takes `+1`) and a group longer than its field,
+whose high digits Java drops.
+
+**Order.** `compare` orders two UUIDs by their bytes, unsigned: the
+order of their canonical texts, RFC 9562's, in which a version-7 UUID
+sorts by its time, and Nextomic's index order. Java's
+`UUID.compareTo` compares two signed longs, so Clojure sorts
+`#uuid "80000000-…"` before `#uuid "00000000-…"`; nexis does not
+(`CLOJURE-REVIEW.md`).
+
+**Randomness.** `random-uuid` is version 4, variant `10`, its other
+122 bits from the I/O's cryptographically secure generator
+(`std.Io.random`, seeded from the operating system), as Java's
+`randomUUID` draws on `SecureRandom`: an identity minted for a store is
+not predictable from `rand`'s output, which comes from a fast
+generator of its own (§8).
+
+`src/uuid.zig` pins the grammar, its refusals and the text round trip;
+`test/integration/eval_pipeline.zig` pins the four functions, the
+order and a durable ref holding a UUID.

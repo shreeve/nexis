@@ -38,6 +38,8 @@
 const std = @import("std");
 const value = @import("../../value.zig");
 const intern_mod = @import("../../intern.zig");
+const inst_mod = @import("../../inst.zig");
+const uuid_mod = @import("../../uuid.zig");
 const key = @import("../key.zig");
 const datom_mod = @import("../datom.zig");
 const schema_mod = @import("../schema.zig");
@@ -1111,11 +1113,7 @@ fn resolveConst(ctx: *Ctx, c: ir.Constant, pos: usize, attr: ?Attr) Failure!?Con
                     error.ValueType => return null,
                     else => return err,
                 };
-                const cell = try marshal.cellOf(try ctx.db(), ctx.arena, val);
-                // A uuid compares as its canonical text, as a bound
-                // variable's does: another spelling names no value.
-                if (val == .uuid and !std.mem.eql(u8, cell.str, c.cell.str)) return null;
-                return .{ .cell = cell, .bytes = bytes };
+                return .{ .cell = try marshal.cellOf(try ctx.db(), val), .bytes = bytes };
             }
             return switch (c) {
                 .cell => |cell| .{ .cell = cell },
@@ -1410,6 +1408,16 @@ pub fn explainCell(c: Cell, ctx: *const Ctx, w: *std.Io.Writer) !void {
                 try w.writeByte(b);
             }
             try w.writeByte('"');
+        },
+        .inst => |ms| {
+            try w.writeAll("#inst \"");
+            try inst_mod.write(w, ms, .literal);
+            try w.writeByte('"');
+        },
+        .uuid => |u| {
+            var text: [uuid_mod.text_len]u8 = undefined;
+            uuid_mod.writeText(&text, u);
+            try w.print("#uuid \"{s}\"", .{&text});
         },
         .vm => try w.writeAll("#value"),
     }

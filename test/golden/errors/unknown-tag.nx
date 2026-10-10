@@ -1,0 +1,2 @@
+; nexis reads the tags #inst and #uuid and no other.
+#foo/bar 1
