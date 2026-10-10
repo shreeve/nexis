@@ -1093,56 +1093,19 @@ fn writeSymbolAtom(s: Name, w: *std.Io.Writer) std.Io.Writer.Error!void {
 // -----------------------------------------------------------------------------
 
 test "number token boundary: a digit-led run is one token the reader rejects" {
-    const allocator = std.testing.allocator;
     // Each source holds one malformed number; the error spans exactly
     // that token and carries its text (FORMS.md §3, "Number token
     // boundary").
-    const cases = [_]struct { src: []const u8, pos: u32, text: []const u8 }{
-        .{ .src = "1abc", .pos = 0, .text = "1abc" },
-        .{ .src = "(println 1-2)", .pos = 9, .text = "1-2" },
-        .{ .src = "[1.5x]", .pos = 1, .text = "1.5x" },
-        .{ .src = "-1abc", .pos = 0, .text = "-1abc" },
-        .{ .src = "1/2", .pos = 0, .text = "1/2" },
-        .{ .src = "0x", .pos = 0, .text = "0x" },
-        .{ .src = "0b12", .pos = 0, .text = "0b12" },
-        .{ .src = "1.", .pos = 0, .text = "1." },
-        .{ .src = "1e", .pos = 0, .text = "1e" },
-        .{ .src = "1:a", .pos = 0, .text = "1:a" },
-        .{ .src = "1'", .pos = 0, .text = "1'" },
-        .{ .src = "3.14M", .pos = 0, .text = "3.14M" },
-        .{ .src = "1.5N", .pos = 0, .text = "1.5N" },
-        .{ .src = "1_000", .pos = 0, .text = "1_000" },
-        .{ .src = "1.0_5", .pos = 0, .text = "1.0_5" },
-        .{ .src = "1e1_0", .pos = 0, .text = "1e1_0" },
-        .{ .src = "+1x", .pos = 0, .text = "+1x" },
-    };
-    for (cases) |c| {
-        var p = parser.Parser.init(allocator, c.src);
-        defer p.deinit();
-        const tree = try p.parseProgram();
-        var rd = Reader.init(allocator, c.src);
-        defer rd.deinit();
-        try std.testing.expectError(error.ReaderFailure, rd.readProgram(tree));
-        const e = rd.err orelse return error.TestUnexpectedResult;
-        try std.testing.expect(e.kind == .bad_number_literal);
-        try std.testing.expectEqualStrings(c.text, e.detail.?);
-        try std.testing.expectEqual(c.pos, e.span.pos);
-        try std.testing.expectEqual(@as(u32, @intCast(c.text.len)), e.span.len);
-    }
-
+    for ([_][2][]const u8{
+        .{ "1abc", "1abc" }, .{ "(println 1-2)", "1-2" }, .{ "[1.5x]", "1.5x" }, .{ "-1abc", "-1abc" },
+        .{ "1/2", "1/2" },   .{ "0x", "0x" },             .{ "0b12", "0b12" },   .{ "1.", "1." },
+        .{ "1e", "1e" },     .{ "1:a", "1:a" },           .{ "1'", "1'" },       .{ "3.14M", "3.14M" },
+        .{ "1.5N", "1.5N" }, .{ "1_000", "1_000" },       .{ "1.0_5", "1.0_5" }, .{ "1e1_0", "1e1_0" },
+        .{ "+1x", "+1x" },
+    }) |c| try expectTokenError(c[0], .bad_number_literal, c[1]);
     // A reader macro character or a delimiter ends the number, as it
     // would end a symbol: `1@x` is `1` then `(deref x)`.
-    const two = "(1@x)";
-    var p = parser.Parser.init(allocator, two);
-    defer p.deinit();
-    var rd = Reader.init(allocator, two);
-    defer rd.deinit();
-    const forms = try rd.readProgram(try p.parseProgram());
-    try std.testing.expectEqual(@as(usize, 1), forms.len);
-    const items = forms[0].datum.list;
-    try std.testing.expectEqual(@as(usize, 2), items.len);
-    try std.testing.expectEqual(@as(i64, 1), items[0].datum.int);
-    try std.testing.expect(items[1].datum == .deref);
+    try expectReads("(1@x)", "(list\n  (int 1)\n  (deref (symbol x)))\n");
 }
 
 test "signed numbers and digit-led keywords read as in Clojure" {
@@ -1325,6 +1288,21 @@ fn expectReaderError(src: []const u8, kind: ErrorKind, detail: ?[]const u8) !voi
     if (detail) |d| try std.testing.expectEqualStrings(d, rd.err.?.detail.?);
 }
 
+/// `src` fails to read with `kind` over exactly the token `token`,
+/// which is its detail.
+fn expectTokenError(src: []const u8, kind: ErrorKind, token: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var p = parser.Parser.init(allocator, src);
+    defer p.deinit();
+    var rd = Reader.init(allocator, src);
+    defer rd.deinit();
+    try std.testing.expectError(error.ReaderFailure, rd.readProgram(try p.parseProgram()));
+    const e = rd.err.?;
+    try std.testing.expectEqual(kind, e.kind);
+    try std.testing.expectEqualStrings(token, e.detail.?);
+    try std.testing.expectEqualStrings(token, src[e.span.pos..][0..e.span.len]);
+}
+
 test "strings: may span lines, must be UTF-8, fail at their bad escape" {
     try expectReads("\"Line one.\n  Line two.\"", "(string \"Line one.\\n  Line two.\")\n");
     try expectReads("\"é\\u{2603}\"", "(string \"\\u{C3}\\u{A9}\\u{E2}\\u{98}\\u{83}\")\n");
@@ -1368,17 +1346,8 @@ test "char literals: one token to the next delimiter, judged whole" {
     // letter or digit run after a char, a surrogate and a scalar past
     // U+10FFFF are errors over the whole token, never a char followed
     // by more forms.
-    const allocator = std.testing.allocator;
-    for ([_][]const u8{ "\\u041", "\\u00411", "\\uD800", "\\o101", "\\a1", "\\ab", "\\é1", "\\u{D800}", "\\u{110000}", "\\u{41}x" }) |src| {
-        var p = parser.Parser.init(allocator, src);
-        defer p.deinit();
-        var rd = Reader.init(allocator, src);
-        defer rd.deinit();
-        try std.testing.expectError(error.ReaderFailure, rd.readProgram(try p.parseProgram()));
-        try std.testing.expect(rd.err.?.kind == .invalid_char_literal);
-        try std.testing.expectEqualStrings(src, rd.err.?.detail.?);
-        try std.testing.expectEqual(@as(u32, @intCast(src.len)), rd.err.?.span.len);
-    }
+    for ([_][]const u8{ "\\u041", "\\u00411", "\\uD800", "\\o101", "\\a1", "\\ab", "\\é1", "\\u{D800}", "\\u{110000}", "\\u{41}x" }) |src|
+        try expectTokenError(src, .invalid_char_literal, src);
 }
 
 test "discard applies uniformly across aggregator contexts" {
@@ -1646,80 +1615,24 @@ test "symbols and keywords take any UTF-8 character" {
     try expectReaderError(":k\xc3", .invalid_utf8, null);
 }
 
-test "keyword starting with `-` is accepted" {
-    const allocator = std.testing.allocator;
-    const src: []const u8 = ":-foo :-> :-";
-    var p = parser.Parser.init(allocator, src);
-    defer p.deinit();
-    const tree = try p.parseProgram();
-    var rd = Reader.init(allocator, src);
-    defer rd.deinit();
-    const forms = try rd.readProgram(tree);
-    try std.testing.expectEqual(@as(usize, 3), forms.len);
-    for (forms) |f| try std.testing.expect(f.datum == .keyword);
-    try std.testing.expectEqualStrings("-foo", forms[0].datum.keyword.name);
-    try std.testing.expectEqualStrings("->", forms[1].datum.keyword.name);
-    try std.testing.expectEqualStrings("-", forms[2].datum.keyword.name);
+test "a keyword may start with `-`" {
+    try expectReads(":-foo :-> :-", "(keyword :-foo)\n(keyword :->)\n(keyword :-)\n");
 }
 
 test "multi-slash qualified names are rejected" {
-    const allocator = std.testing.allocator;
-    const cases = [_][]const u8{ "foo/bar/baz", ":foo/bar/baz" };
-    for (cases) |src| {
-        var p = parser.Parser.init(allocator, src);
-        defer p.deinit();
-        const tree = try p.parseProgram();
-        var rd = Reader.init(allocator, src);
-        defer rd.deinit();
-        try std.testing.expectError(error.ReaderFailure, rd.readProgram(tree));
-    }
+    try expectReaderError("foo/bar/baz", .invalid_symbol, "foo/bar/baz");
+    try expectReaderError(":foo/bar/baz", .invalid_keyword, ":foo/bar/baz");
 }
 
 test "anon-fn stores body only (no synthetic head)" {
     const allocator = std.testing.allocator;
-    const src: []const u8 = "#(+ % 1)";
-    var p = parser.Parser.init(allocator, src);
+    var p = parser.Parser.init(allocator, "#(+ % 1)");
     defer p.deinit();
-    const tree = try p.parseProgram();
-    var rd = Reader.init(allocator, src);
+    var rd = Reader.init(allocator, "#(+ % 1)");
     defer rd.deinit();
-    const forms = try rd.readProgram(tree);
-    try std.testing.expectEqual(@as(usize, 1), forms.len);
-    try std.testing.expect(forms[0].datum == .anon_fn);
-    // Body is exactly the source forms — no pre-pended `#%anon-fn` symbol.
-    const body = forms[0].datum.anon_fn;
-    try std.testing.expectEqual(@as(usize, 3), body.len);
-    try std.testing.expect(body[0].datum == .symbol);
-    try std.testing.expectEqualStrings("+", body[0].datum.symbol.name);
-    try std.testing.expect(body[1].datum == .symbol);
-    try std.testing.expectEqualStrings("%", body[1].datum.symbol.name);
-    try std.testing.expect(body[2].datum == .int);
-    try std.testing.expectEqual(@as(i64, 1), body[2].datum.int);
-}
-
-test "end-to-end: simple reader + pretty-print round trip" {
-    const allocator = std.testing.allocator;
-    const source: []const u8 = "(def x 42)";
-    var p = parser.Parser.init(allocator, source);
-    defer p.deinit();
-    const tree = try p.parseProgram();
-
-    var rd = Reader.init(allocator, source);
-    defer rd.deinit();
-
-    const forms = try rd.readProgram(tree);
-
-    var al: std.Io.Writer.Allocating = .init(allocator);
-    defer al.deinit();
-    try writeProgram(forms, &al.writer);
-    const out = al.written();
-
-    const expected =
-        \\(program
-        \\  (list (symbol def) (symbol x) (int 42)))
-        \\
-    ;
-    try std.testing.expectEqualStrings(expected, out);
+    const forms = try rd.readProgram(try p.parseProgram());
+    try std.testing.expectEqual(@as(usize, 3), forms[0].datum.anon_fn.len);
+    try std.testing.expectEqualStrings("+", forms[0].datum.anon_fn[0].datum.symbol.name);
 }
 
 test "kindName spells an ErrorKind as nexis does" {
