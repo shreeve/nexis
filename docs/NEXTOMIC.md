@@ -279,7 +279,7 @@ past 256 bytes bypasses the clue (a slower seek, not an error).
 | `"aid"` | u32 next attribute / ident id |
 | `"ig"` | u64 ident generation, bumped by every rename; absent reads as 0. A connection's ident cache remembers the generation it loaded under and reloads at the start of an operation when the store's has moved, so a rename in another connection or process is seen at once; it keeps what a read finds only when the read's snapshot is at that generation, so a read older than its own connection's rename (a query function that renames) never puts a retired name back |
 | `"sg"` | u64 schema generation, bumped by every transaction that writes a datom on an attribute-partition entity; absent reads as 0. A connection's schema cache serves a newer basis while the generation is the one it was built under and the txlog entries committed since hold no attribute-partition datom, since only data was committed; the entries settle it for a writer that leaves the generation alone, and each is read once per connection |
-| `"ft"` | `[fold:1][t:6]`: the case folding the `nx/fulltext` rows are written under (3, the tokenizer of §5 "fulltext") and the `t` they are current at, stamped by bootstrap and every transaction. The folding is part of the format: a build that folds otherwise writes another format number |
+| `"ft"` | `[fold:1][t:6]`: the case folding the `nx/fulltext` rows are written under (3, the tokenizer of §5 "fulltext") and the `t` they are current at, stamped by bootstrap and every transaction, and read by nothing: the rows are written in the commit of their values. The folding is part of the format: a build that folds otherwise writes another format number |
 | `"n"` `[a:4]` | u64 count of the current datoms of attribute `a`, at most `2^47 - 1` (no more than there are ids), kept by every transaction and excision; the planner's estimate (§5) |
 
 ### 2.4 Bootstrap
@@ -939,10 +939,9 @@ token, as are `ΣΟΦΙΑΣ` and `σοφιας`; a byte that is not UTF-8 stays 
 it is, and no accent or normalization is removed. A folded run longer
 than 255 bytes is not a token, and a needle without tokens matches
 nothing. Indexing and search fold through one tokenizer. The plain view
-at the newest basis intersects the `nx/fulltext` rows of the tokens
-when they are current (§2.3 `"ft"`), then reads the matching values
-from EAVT; an as-of, since or history view, or one over stale rows,
-re-tokenises the attribute's values under that view, so it answers
+at the newest basis intersects the `nx/fulltext` rows of the tokens,
+then reads the matching values from EAVT; an as-of, since or history
+view re-tokenises the attribute's values under that view, so it answers
 with the values its time held.
 An attribute without `:db/fulltext` at the basis is `:nextomic/tx-data`
 naming it; an unknown one `:nextomic/unknown-attribute`; a needle that

@@ -59,7 +59,6 @@ const TestDir = store_mod.TestDir;
 const TestConn = db_mod.TestConn;
 const txRange = db_mod.txRange;
 const format_version = store_mod.format_version;
-const fulltext_fold = store_mod.fulltext_fold;
 const repeat = string_mod.repeat;
 
 const testing = std.testing;
@@ -2363,7 +2362,7 @@ test "transaction functions splice their tx-data in place, nest to a bound, and 
 
 // ── the store ────────────────────────────────────────────────────
 
-test "a count, a fulltext stamp or a t read out of its range is Corrupted" {
+test "a count or a t read out of its range is Corrupted" {
     var td = try TestDir.init("store_ranges");
     defer td.deinit();
     const store = try Store.open(testing.allocator, td.path.ptr, .{});
@@ -2373,11 +2372,6 @@ test "a count, a fulltext stamp or a t read out of its range is Corrupted" {
     // No attribute holds more current datoms than there are ids.
     try store.writeAttrCount(txn, boot.doc, key.id_max + 1);
     try testing.expectError(error.Corrupted, store.attrCount(txn, boot.doc));
-    var stamp: [1 + key.id_len]u8 = undefined;
-    stamp[0] = fulltext_fold;
-    key.writeId(stamp[1..][0..key.id_len], key.tx_partition_bit | 1);
-    try store.sysPut(txn, "ft", &stamp);
-    try testing.expectError(error.Corrupted, store.readFulltextStamp(txn));
     var raw: [key.id_len]u8 = undefined;
     key.writeId(&raw, key.tx_partition_bit);
     try testing.expectError(error.Corrupted, key.readT(&raw));

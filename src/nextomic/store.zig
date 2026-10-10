@@ -231,8 +231,6 @@ pub const boot = struct {
 /// `fold`), part of the format (NEXTOMIC.md §2.3 `"ft"`).
 pub const fulltext_fold: u8 = 3;
 
-pub const FulltextStamp = struct { fold: u8, t: u64 };
-
 pub const Store = struct {
     allocator: Allocator,
     /// The file's one environment in this process, shared with every
@@ -541,26 +539,15 @@ pub const Store = struct {
         try self.sysPutInt(txn, "ig", 8, gen);
     }
 
-    /// The `nx/fulltext` stamp: the folding its rows were written under
-    /// and the `t` they are current at; null when absent.
-    pub fn readFulltextStamp(self: *Store, txn: *Txn) !?FulltextStamp {
-        const raw = (try self.sysGet(txn, "ft")) orelse return null;
-        if (raw.len != 1 + key.id_len) return error.Corrupted;
-        return .{ .fold = raw[0], .t = try key.readT(raw[1..][0..key.id_len]) };
-    }
-
-    /// Stamp the rows current at `t` under `fulltext_fold`.
+    /// Stamp the `nx/fulltext` rows current at `t` under
+    /// `fulltext_fold`. Nothing reads the stamp: every store this build
+    /// opens writes its rows in the same commit as their values, under
+    /// this folding, so it is the format's bytes alone (NEXTOMIC.md §2.3).
     pub fn writeFulltextStamp(self: *Store, txn: *Txn, t: u64) !void {
         var buf: [1 + key.id_len]u8 = undefined;
         buf[0] = fulltext_fold;
         key.writeId(buf[1..][0..key.id_len], t);
         try self.sysPut(txn, "ft", &buf);
-    }
-
-    /// Whether the rows are this build's folding, current at `t`.
-    pub fn fulltextFresh(self: *Store, txn: *Txn, t: u64) !bool {
-        const stamp = (try self.readFulltextStamp(txn)) orelse return false;
-        return stamp.fold == fulltext_fold and stamp.t == t;
     }
 
     /// Schema generation: bumped by every transaction that writes a
