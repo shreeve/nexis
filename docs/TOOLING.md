@@ -16,7 +16,7 @@ samples are the committed goldens under `test/golden/cli/`, which
 | `nexis -e EXPR [ARG...]` | Evaluates EXPR's forms (reported as `<-e>`) and prints each value that is not nil, as `prn` does. |
 | `nexis repl` | The read-eval-print loop below. |
 | `nexis test FILE...` | Reads every file (one that cannot be read stops it before any runs, exit 2), runs each (restoring the current namespace after each), then `(nexis.test/run-all-tests)` (§3); exit 1 when an assertion failed or a test threw. A file's own definitions cannot change the exit status. `require` searches the working directory, then each file's directory. |
-| `nexis doc NAME` | Prints what `(doc NAME)` prints (STDLIB.md §10) on stdout: the documentation of a function, macro, special form or namespace. A NAME that names nothing is `nexis: no documentation for NAME` on stderr, exit 1; one that cannot be a symbol (empty, starting with a digit or `:`, or holding whitespace, a bracket, a quote or a reader macro character) is ``nexis: doc takes a symbol (try `nexis --help`)``, exit 1. |
+| `nexis doc NAME` | Prints what `(doc NAME)` prints (STDLIB.md §10) on stdout: the documentation of a function, macro, special form or namespace. A NAME that names nothing is `nexis: no documentation for NAME` on stderr, exit 1; one that does not read as one symbol (`-1`, `nil`, `a/b/c`, `(exit 7)`) is ``nexis: doc takes a symbol (try `nexis --help`)``, exit 1. |
 | `nexis disasm FILE`, `nexis --disasm FILE` | §2. |
 | `nexis --help`, `nexis -h` | The usage text, on stdout, exit 0. With no arguments, a command missing its FILE, or an argument `repl`, `disasm`, `--help` or `--version` takes no more of, the same text on stderr and exit 1; an unknown command is ``nexis: unknown command 'X' (try `nexis --help`)``, exit 1. |
 | `nexis --version`, `nexis -V` | `nexis 0.2.0`: `nexis` and its version, on stdout, exit 0. The version is `build.zig.zon`'s `.version`, which the build passes to the CLI as the `version` build option. |
@@ -26,7 +26,8 @@ every top-level form, then compile and run each before compiling the
 next, on one VM (MACROEXPAND.md §2b, the loader). `require` searches
 the working directory, then the directory of the file being run.
 `*command-line-args*` holds the ARGs (`run` and `-e`); a first line
-that begins `#!` is a comment, so a script can be made executable. A
+that begins `#!`, after a byte-order mark if one opens the file, is a
+comment, so a script can be made executable. A
 file (run, tested, disassembled or required) that opens with a UTF-8
 byte-order mark is read without it, so its line-1 columns and carets
 count from the character after the mark (`test/golden/cli/bom.nx`;
@@ -200,10 +201,13 @@ nexis: test/golden/cli/divide-by-zero.nx:5:3: runtime error: DivideByZero
   argument, got 0`). An uncaught throw is `UncaughtThrow` followed by
   the thrown value as `pr-str` prints it (`runtime error:
   UncaughtThrow {:error :negative, :value -3}`, `uncaught-throw.err`,
-  whose `throw` spans two lines and is underlined on its first); an
-  error map a handler rethrew is printed without the place keys it
-  carries (`:fn`, `:file`, `:line`, `:column`; VM.md §13), which the
-  header and the trace show (`VM.withoutPlace`). An
+  whose `throw` spans two lines and is underlined on its first). An
+  error map's place keys (`:fn`, `:file`, `:line`, `:column`; VM.md
+  §13) are left out when they name the frame the trace shows the
+  error raised in, the innermost running the program's code, which
+  the header and the trace then show; a map the program built, or one
+  a handler changed (`(throw (assoc e :k v))`, reported at that
+  throw), is printed whole. An
   error or a thrown value that leaves through a `finally`, a `catch`
   no clause of which matches, or a `catch` that throws it again is
   reported where it was raised, with its detail and the frames it left,
@@ -345,12 +349,15 @@ the private helpers.
   `(catch MATCHER ...)` would take (a keyword tag, MACROEXPAND.md §2b,
   or `any`) and fails when `expr` returns, reporting the value; a
   throw the matcher does not take propagates and counts as an error.
+  `(is (thrown-with-msg? MATCHER re expr) msg?)` passes when, besides,
+  `re` finds a match in the thrown value's message (`ex-message`), and
+  fails reporting the pattern and the message when it does not.
   `(is expr msg?)` passes when `expr` is truthy. Every `is` returns
   whether it passed. The head is matched by name, so `t/thrown?` and
   `thrown?` are the same. `msg` is evaluated once, after the values,
   whether the assertion passes or fails, as in Clojure. An assertion
   is one call of a helper (`check=`, `check-truthy`; a
-  `thrown?` with a keyword tag is a `try` whose handler calls
+  `thrown?` or `thrown-with-msg?` is a `try` whose handler calls
   `check-thrown`) with the quoted form, the values and the message,
   so the judging and the reporting are compiled once, in
   `nexis.test`: `(is (= a 1))` as a function's body is seven
@@ -374,9 +381,9 @@ the private helpers.
   (`join-fixtures`, `compose-fixtures`). A fixture's throw is not a
   test's and propagates out of the run, as in Clojure.
 - `(run-tests)` runs the current namespace's tests in definition
-  order, `(run-tests 'my.ns)` a named namespace's, `(run-all-tests)`
-  every namespace that registered a test, in first-registration
-  order. Each returns `{:test n :pass n :fail n :error n}`: tests
+  order, `(run-tests 'my.ns 'other.ns)` the named namespaces',
+  `(run-all-tests)` every namespace that registered a test, in
+  first-registration order. Each returns `{:test n :pass n :fail n :error n}`: tests
   run, assertions passed, assertions failed, tests that threw. A
   test's throw is caught by `any` and counted as an error; the next
   test still runs. `(successful? summary)` is whether a summary has
@@ -411,7 +418,8 @@ lines; `zig build examples` runs the demo.
 
 **`nexis.pprint`** (`src/stdlib/pprint.nx`): `(pprint x)` prints `x`
 and a newline, `(pprint-str x)` returns the text. A collection whose
-`pr-str` fits within 72 columns from its indent prints on one line,
+`pr-str` fits within `*print-right-margin*` columns (dynamic, 72 at
+the root, as Clojure's) from its indent prints on one line,
 as `pr-str` prints it. A longer one breaks: a map one `key value`
 pair per line, separated by `,`, each value laid out from the column
 after its key; a vector, list or set of scalars filled line by line

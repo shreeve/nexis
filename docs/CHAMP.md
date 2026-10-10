@@ -23,8 +23,8 @@ points (§8). Costs:
 | `assoc`/`conj`, `dissoc`/`disj` | O(log₃₂ n) path copy, one new node per level; an array form copies its ≤ 8 payloads |
 | `mapFromEntries`, `setFromElements` | O(n log n): a sort by slot path, then one allocation per node |
 | `count` | O(1) |
-| `=` | O(n) lookups (§6.3) |
-| `hash` | O(n) the first time; cached in the root header (§7.5) |
+| `=` | O(n) lookups (§6.1) |
+| `hash` | O(n) the first time; cached in the root header (§7.3) |
 
 The language surface lives in `src/stdlib.zig`: `hash-map`, `hash-set`,
 `set`, `assoc`, `dissoc`, `disj`, `get` (nil or the default when
@@ -69,7 +69,7 @@ the same order, whatever their build history, except inside a
 collision node (§2.3). `canonicalTrie` checks this layout.
 
 The layout is a representation property, not an equality mechanism:
-`=` and `hash` are semantic (§6.3, §7) and compare an array form with a
+`=` and `hash` are semantic (§6.1, §7) and compare an array form with a
 trie freely, since a trie that shrinks below 9 keys stays a trie
 (§5.4).
 
@@ -198,7 +198,7 @@ trie of the nine keys.
 
 A trie that shrinks below 9 keys stays subkind 1, as Clojure's
 `PersistentHashMap.without` does: demotion would churn at the 8/9
-boundary. Equal maps can therefore differ in subkind, which §6.3 and §7
+boundary. Equal maps can therefore differ in subkind, which §6.1 and §7
 handle. A trie left with one key is a root interior holding that one
 payload.
 
@@ -226,16 +226,16 @@ The category rule (a map is never `=` to a set, a record or a
 sequential) is dispatch's (SEMANTICS §3.3); this section is the
 same-kind comparison `equalMap`/`equalSet`.
 
-#### 6.3 Same-kind equality
+#### 6.1 Same-kind equality
 
 One strategy serves every subkind pair (array/array, trie/trie,
 array/trie): the same header is equal; different counts are unequal;
 otherwise every entry `(k, v)` of `a` must be found in `b` by `mapGet`
 with an `=` value (for a set, every element found by `setContains`).
 Collision nodes need no special case. A map value may be nil, so the
-lookup must tell an absent key from a nil value (§6.6).
+lookup must tell an absent key from a nil value (§6.3).
 
-#### 6.5 Key comparison
+#### 6.2 Key comparison
 
 Key comparison inside the module (`keyEquivalent`) tries two shortcuts
 before `elementEq`: bit identity (same tag and payload), and, when
@@ -244,7 +244,7 @@ immediate is `=` only to an immediate of its own kind (SEMANTICS
 §3.3). Both are exact: two keywords are `=` exactly when their ids
 are equal, and a keyword or fixnum key never reaches the callback.
 
-#### 6.6 `MapLookup`
+#### 6.3 `MapLookup`
 
 `mapGet` returns `MapLookup`, a union of `absent` and `present: Value`,
 not `?Value`: nil is a legal map value, and absence is ordinary flow,
@@ -273,7 +273,7 @@ payload through the same fold, so the result is independent of subkind
 and layout, and `dispatch.hashValue` mixes the kind's domain byte in on
 top.
 
-#### 7.5 Caching
+#### 7.3 Caching
 
 `hashMap` and `hashSet` return the aggregate truncated to `u32` and
 cache it in the root header when nonzero (the HEAP.md cache rule).
@@ -293,11 +293,11 @@ Interior and collision nodes cache nothing.
 | `mapFromEntries(heap, entries, eh, ee)` | `setFromElements(heap, elems, eh, ee)` | §8.1 |
 | `mapAssoc(heap, m, k, v, eh, ee)` | `setConj(heap, s, e, eh, ee)` | §8.1 |
 | `mapDissoc(heap, m, k, eh, ee)` | `setDisj(heap, s, e, eh, ee)` | §8.1 |
-| `mapGet(m, k, eh, ee) MapLookup` | `setContains(s, e, eh, ee) bool`, `setGet(s, e, eh, ee) ?Value` | §6.6 |
+| `mapGet(m, k, eh, ee) MapLookup` | `setContains(s, e, eh, ee) bool`, `setGet(s, e, eh, ee) ?Value` | §6.3 |
 | `mapFind(m, k, eh, ee) ?Entry` | | The stored entry, its key as the map holds it (`find`) |
 | `mapCount(m)`, `mapIter(m)` → `MapIter` | `setCount(s)`, `setIter(s)` → `SetIter` | `next()` gives `?Entry` / `?Value` in iteration order (§8.1) |
 | `hashMap(h, eh)` | `hashSet(h, eh)` | §7 |
-| `equalMap(a, b, eh, ee)` | `equalSet(a, b, eh, ee)` | §6.3; header arguments |
+| `equalMap(a, b, eh, ee)` | `equalSet(a, b, eh, ee)` | §6.1; header arguments |
 | `traceMap(h, visitor)` | `traceSet(h, visitor)` | GC trace: every key and value, every internal node through `markInternal` |
 | `valueFromMapHeader(h)` | `valueFromSetHeader(h)` | the Value for a root header (`docs/TRANSIENT.md` §8) |
 | `mapCollisionCount(m, hash32) ?u32` | `setCollisionCount(s, hash32) ?u32` | tests: the collision node's count along `hash32`, or null (§12.3) |
@@ -321,10 +321,11 @@ constants are public. Every constructor can fail only with
 - `mapFromEntries`/`setFromElements` return what a left fold of
   `mapAssoc`/`setConj` from empty returns (same subkind, same trie,
   same iteration order) and never fail on duplicates: a later entry's
-  value wins, the first key object and its position stay. The payloads
-  are sorted by slot path, on one 64-bit key each (the bit-reversed
-  indexing hash above the input position), equal keys merged, and each
-  node allocated once.
+  value wins, the first key object and its position stay. Up to eight
+  payloads make the array form as the fold makes it, each compared with
+  those kept and none hashed to index (§2.1). More are sorted by slot
+  path, on one 64-bit key each (the bit-reversed indexing hash above the
+  input position), equal keys merged, and each node allocated once.
 - **Iteration order.** An array form iterates in association order. A
   trie iterates depth first from the root: each node's payloads in
   ascending slot order, then its children in their stored, descending
@@ -399,17 +400,16 @@ whether a store over an equal key changes anything (a set's never
 does; a map's does unless the value is bit-identical), and how it
 hashes (§7.1 or the element hash). Layouts, bitmap rules, promotion,
 dissoc, the builder, the iterator and the trace are shared, and the
-public `map*`/`set*` functions are thin wrappers over the two
-instances. Every persistent path copy goes through one primitive,
+public `map*`/`set*` names are the two instances' operations, most of
+them declared as the operation itself. Every persistent path copy goes through one primitive,
 `withSlot`: a copy of an interior with one slot made empty, a payload
 or a child. An in-place edit (§8.3) copies a node on its path that it
 does not own whole (`ownPath`), then rewrites the owned interior where
 it stands: a payload into an empty slot when its block has room
 (`insertData`, else a copy through `withSlot`), a payload into a child
-(`dataToChild`), a payload out (`removeData`), or a lone payload pulled
-up into a child's slot (`withSlotInPlace`). The three specialized
-rewrites are each a pair of moves, which a general rewrite in their
-place does not match.
+(`dataToChild`) or a payload out (`removeData`), each a pair of moves,
+which a general rewrite in their place does not match. A lone payload
+pulled up into a child's slot (§5.5) is a copy through `withSlot`.
 Lookup is an iterative descent; insert and remove recurse at most
 eight levels.
 
@@ -419,14 +419,13 @@ eight levels.
 
 #### 12.1 Unit tests
 
-Inline tests in `champ.zig` cover the body layouts, the array form
-through 0..8 entries, promotion at 9 (and none on a duplicate key at
-8), no demotion, the root dissoc, the same-pointer short-circuits, the
-kept key object, nil keys, values and elements, the builders against
-`assoc`/`conj` folds, insertion-order-independent hashing, cross-subkind
-equality, the keyword and immediate shortcuts, the bitmap ranks, lone-key pull-up
-through every level and out of a collision node, and an immediate key
-bypassing the hash callback.
+Inline tests in `champ.zig` cover what the properties do not reach:
+the body layouts, nil keys and values, promotion at 9 (and none on a
+duplicate key at 8), no demotion, the largest count, the root dissoc,
+the kept key object, the builders against `assoc`/`conj` folds and a
+literal's allocations, the keyword and immediate shortcuts, the bitmap
+ranks, lone-key pull-up through every level and out of a collision
+node, and an immediate key bypassing the hash callback.
 
 #### 12.2 Set properties
 

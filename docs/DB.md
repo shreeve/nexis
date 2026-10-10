@@ -72,23 +72,35 @@ none); a failure there is ignored, and emdb's own open then reports
 ### 3. `Connection`
 
 A plain Zig struct, not a Value: it holds its file's `StoreFile`
-(§3.1), the non-owning allocator, heap and interner the codec needs,
-the two `store_id` halves, an open flag, a count of
-open transactions, the tree-handle cache and its durability (§3.3). The stdlib allocates each
-one on the allocator of the VM that owns the registries (`VM.home`: a
-macro's sub-VM opens for the VM it compiles for, `docs/VM.md` §9.1),
-records it in that VM's `db_connections`, and frees it only at that
-VM's teardown, so no address a Value holds is reused
-while the VM lives. A `db_connection` Value (kind 31) is a pointer to
+(§3.1), the allocator it lives on, the heap and interner the codec
+needs, the two `store_id` halves, an open flag, a count of open
+transactions, the tree-handle cache and its durability (§3.3). `open`
+allocates it and keeps it in one process-wide list; the stdlib opens
+on the allocator and heap of the VM that owns the registries
+(`VM.home`: a macro's sub-VM opens for the VM it compiles for,
+`docs/VM.md` §9.1). A `db_connection` Value (kind 31) is a pointer to
 it; `db_write_txn` (32) and `db_read_txn` (33) point at a transaction
 handle (§3.2).
 
+**Freeing.** A connection is freed by the first collection on its
+heap that finds it closed and named by nothing: the collector flags it
+when it reaches a `db_connection` Value of it, and the sweep after
+marking flags it for every handle still alive on it and every marked
+durable ref made on it (a ref is a leaf the collector does not trace,
+so the sweep looks through the heap's marked refs, only when a closed
+connection is otherwise unreached). No address a Value, ref or handle
+holds is reused while it holds it. An open counts as a page
+(`db.page_size`) of heap allocation, so a loop that opens and closes
+and allocates nothing else still brings the collection that frees
+what it closed. The VM's teardown and `exit` shut down every
+connection left on the heap (`shutdownHeap`).
+
 **Pinned geometry.** `StoreFile.acquire`, which every `open` and
-Nextomic `connect` passes through, overrides the caller's `pageSize`
-with `db.page_size` (16 KiB), `maxNamedTrees` with
-`db.max_named_trees` (128), `maxReaders` with `db.reader_slots`
-(§3.2), `mapSize` with `db.initial_map_size` (1 MiB) and `growStep`
-with `db.map_grow_step` (8 MiB). emdb's default page size is the OS page size, and the page
+Nextomic `connect` passes through, takes only an allocator and opens
+every file with `db.page_size` (16 KiB) pages, `db.max_named_trees`
+(128) trees, `db.reader_slots` reader slots (§3.2), a map of
+`db.initial_map_size` (1 MiB) and a growth step of `db.map_grow_step`
+(8 MiB). emdb's default page size is the OS page size, and the page
 size fixes the key bound and overflow threshold for the life of the
 file, so every store carries the same geometry wherever it is
 created. An existing file keeps the page size it was created with.
@@ -132,7 +144,7 @@ the connection (§3.2), syncs the file when a commit left it unsynced
 (§3.3), releases the `StoreFile` and leaves the struct
 in place with the open flag false: a ref or connection Value that
 still names it reports the connection closed, and a handle reports its
-transaction closed. A second `close` does nothing. `close` while a
+transaction closed, until a collection frees it. A second `close` does nothing. `close` while a
 native holds one of the connection's transactions for a callback, or
 while a Zig-level transaction is open, is refused (`TransactionsOpen`)
 before it ends anything,
@@ -141,8 +153,8 @@ the transaction its native is using. A sync that fails there is
 reported (`:db/sync-failed`) after the connection is closed; once a
 sync of the file has failed, `close` syncs nothing and reports
 nothing (§3.3 "A failed sync is final"). `shutdown` ends
-and frees the connection's handles and closes whatever is open, for
-VM teardown.
+and frees the connection's handles, closes whatever is open and frees
+the connection, for teardown.
 
 **A failed commit aborts.** emdb leaves a transaction whose commit
 failed open, holding the write lock; `commit` aborts it before
@@ -234,8 +246,8 @@ connection, or by a collection:
 256 KiB `<path>-lock`), where emdb's default is 126. Every process
 sharing the file draws on the one table, and a table in use keeps the
 size its first opener gave it until every process has closed the file
-(emdb INV-T14E), so a process that opens a file an older build holds
-open gets the older size.
+(emdb INV-T14E): a process that opens a file another holds open gets
+the size that other gave the table.
 
 #### 3.3 Durability
 
@@ -274,20 +286,14 @@ Local all sync a commit before it returns unless asked not to. `:commit` can
 lose more than its own commits, the whole store where the storage
 reorders writes (the table above), which no program should get
 without asking. A durable commit costs the device's flush, twice, and
-the writing of its pages: on the Linux host of `docs/PERF.md` §3.15
-(ext4 on NVMe) 2.2 ms for a small Nextomic transaction against 13 μs
-with `:commit`, and 6–7 ms on an Apple M5 (APFS, `F_FULLFSYNC`). A
-program of a few transactions pays a few milliseconds: a schema and
-one transaction in a fresh store take 17–23 ms durable against
-10–12 ms with `:commit` on the Linux host, whose `:commit` run syncs
-once at its end. A program of many small transactions pays the flush
-for each: a thousand take 2.1 s durable against 17–22 ms there, and
-6–7 s against 17–23 ms on the M5. Such a program asks for speed: it
-batches its writes into fewer transactions (a transaction of a
+the writing of its pages, milliseconds where `:commit` costs
+microseconds (`docs/PERF.md` §3 "Durable commits" has the figures): a
+program of a few transactions pays a few milliseconds, one of many
+small transactions the flush for each. Such a program asks for speed:
+it batches its writes into fewer transactions (a transaction of a
 thousand entities commits with one pair of flushes), opens its
 connection `{:durability :commit}`, or commits with `{:sync :none}`
-and calls `sync` where it must not lose what it wrote (`docs/PERF.md`
-§3 "Durable commits").
+and calls `sync` where it must not lose what it wrote.
 
 Creating a file syncs its first state before `db/open` returns (emdb
 writes and syncs a new file's meta pages), so a new store is on the
@@ -419,18 +425,18 @@ emdb, codec, intern and allocator errors propagate unchanged.
 
 | Function | Contract |
 |---|---|
-| `open(allocator, heap, interner, path, options) !Connection` | §2, §3. |
-| `StoreFile.acquire(path, options) !*StoreFile` / `release(*StoreFile)` / `beginWrite(*StoreFile, options) !*emdb.Txn` | §3.1; the last `release` syncs (§3.3). |
+| `open(allocator, heap, interner, path) !*Connection` | §2, §3. |
+| `StoreFile.acquire(path, allocator) !*StoreFile` / `release(*StoreFile)` / `beginWrite(*StoreFile, options) !*emdb.Txn` | §3.1; the last `release` syncs (§3.3). |
 | `StoreFile.commit(*StoreFile, txn) !void` / `sync(*StoreFile) !void` / `closingSync(*StoreFile) !void` / `syncFailed(*const StoreFile) bool` / `StoreFile.syncAll() void` | Commit the file's write transaction, noting whether it synced; one full sync when a commit left the file unsynced, `SyncFailed` once a sync of the file has failed; a close's sync, nothing once one has; whether one has; the closing sync of every open file (§3.3). |
 | `Durability.parse(text) ?Durability` / `Durability.process() Durability` | `commit` or `durable`; the process's, from `NEXIS_DURABILITY` (§3.3). |
-| `close(*Connection) !void` / `shutdown(*Connection) void` / `sync(*Connection) !void` | §3, §3.3. |
+| `close(*Connection) !void` / `shutdown(*Connection) void` / `shutdownHeap(*Heap) void` / `sync(*Connection) !void` | §3, §3.3. |
 | `storeId(*const Connection) u128` | §2. |
 | `beginWrite(*Connection) !WriteTxn` / `beginRead(*Connection) !ReadTxn` | `ConnectionUnavailable` on a closed connection. |
 | `commit(*WriteTxn) !void` / `abortWrite(*WriteTxn)` / `abortRead(*ReadTxn)` | End the transaction; a failed commit aborts (§3). |
 | `Handle.create(txn) !*Handle` / `Handle.end(*Handle)` / `handleOf(Value) *Handle` | §3.2; `end` aborts a transaction still open. |
-| `markHandle(Value)` / `sweepHandles(*Heap, complete)` | The collector's two calls (§3.2, `GC.md` §5); the sweep also lets every held snapshot go (§3.4). |
+| `mark(Value)` / `sweepHandles(*Heap, complete)` | The collector's two calls (§3, §3.2, `GC.md` §5): the handles and closed connections nothing reached are freed; the sweep also lets every held snapshot go (§3.4). |
 | `StoreFile.takeHeld(*StoreFile) ?*emdb.Txn` / `keep(*StoreFile, txn)` / `dropHeld(*StoreFile)` / `StoreFile.dropAllHeld()` | The held snapshot (§3.4). |
-| `collectableHandles(*const Connection) bool` / `handleCount() usize` | Whether a collection could end a transaction on the connection's file; the handles alive in the process. |
+| `collectableHandles(*const Connection) bool` / `handleCount() usize` / `connectionCount() usize` | Whether a collection could end a transaction on the connection's file; the handles and the connections alive in the process. |
 | `Walk.begin(*Walk, txn, tree) !bool` / `first(?start)` / `next()` / `end()` | A walk (§3); `begin` is false for an absent tree. |
 | `treeId(txn, name, create) !?TreeId` | §3; null for an absent tree when `create` is false. |
 | `validateTreeName(name) DbError!void` | §6. |
@@ -491,7 +497,8 @@ nonzero.
 #### 7.3 GC trace
 
 None: a ref has no heap children. `conn` points at a non-heap
-`Connection`, and the tree name and key are inline bytes (GC.md §5).
+`Connection`, which the sweep keeps while a marked ref names it (§3),
+and the tree name and key are inline bytes (GC.md §5).
 
 ---
 
@@ -570,21 +577,11 @@ outside its transaction), and it reads back as a list
 
 ### 10. Tests
 
-`test/prop/db.zig` is the emdb round-trip property test: D1 writes 10 000 random
-values across 5 named trees and reads each back equal with an equal
-hash; D2 closes, reopens the file with a fresh heap and interner, and
-reads 2 000 values back; D3 checks that the identity triple alone
-decides ref equality and hash; D4 writes the same key to every tree
-with different values and reads each tree's own back. The inline tests
-in `src/db.zig` pin the canonical store id, the pinned geometry, the
-refusal of a hard-linked file, close refused while a transaction is
-open, the tree-handle cache, `ConnectionUnavailable`, `StoreMismatch`
-and the invalid names. The language surface runs in
-`test/integration/eval_pipeline.zig` (among them: close aborting open
-transactions, ten thousand dropped reads and dropped writes under the
-default and the stress collection policies, and a `db/reduce-tree`
-whose callback writes, deletes and walks the tree under it),
-`test/integration/runtime_polish.zig` and `examples/durable-refs.nx`.
+`test/integration/db_layer.zig` (the layer against real store files),
+`test/prop/db.zig` (round trips of random values through stores) and
+the inline tests of `src/db.zig` cover the Zig layer;
+`test/integration/eval_pipeline.zig`, `test/integration/runtime_polish.zig`
+and `examples/durable-refs.nx` the language surface.
 
 ---
 
@@ -592,12 +589,14 @@ whose callback writes, deletes and walks the tree under it),
 
 `db.zig` imports `value`, `heap`, `intern`, `hash`, `codec` and
 `emdb`. `dispatch.zig` calls its hash and equality helpers at its
-`.durable_ref` arm, and `gc.zig` its `markHandle`
-and `sweepHandles` (§3.2); `format.zig` reads a ref's
+`.durable_ref` arm, and `gc.zig` its `mark`
+and `sweepHandles` (§3, §3.2); `format.zig` reads a ref's
 tree name and key bytes to print it; `stdlib.zig` holds the natives;
-Nextomic imports it only for `failureName`, the geometry constants
-`page_size` and `max_named_trees`, and `StoreFile`, through which it
-shares the file's environment (§3.1); it keeps raw byte keys and never
+Nextomic imports it only for `failureName`, `Durability`, the
+geometry constants `page_size`, `initial_map_size` and
+`map_grow_step`, `StoreFile`, through which it shares the file's
+environment (§3.1), and, in its tests, `engineSyncs`; it keeps raw
+byte keys and never
 goes through `db.zig`'s connections, trees, codec calls or refs.
 
 ---

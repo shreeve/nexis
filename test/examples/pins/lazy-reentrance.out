@@ -1,0 +1,5 @@
+:stack-overflow
+nil true
+([0 :caught] [1 :caught] [2 :caught]) 40
+(:caught)
+:stack-overflow

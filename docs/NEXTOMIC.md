@@ -772,7 +772,9 @@ far; predicates run at the first point all their variables are bound.
 A clause's estimate is taken once and again only after one of its own
 variables is bound, and membership in the bound set is a lookup, so
 ordering n clauses takes O(n) estimates and O(n²) constant-time
-checks.
+checks. Each sub-plan (a `not`, an `or` branch, a rule body) keeps
+tables of its own variables only, so planning's memory grows with the
+query, not with its square.
 A pattern that binds no new variable (`[?e :tags _]` with `?e` bound)
 is an existence test: its seek stops at the first matching datom.
 An `or` costs the sum over its branches of each branch's cheapest
@@ -883,8 +885,10 @@ binding form, and a nil element drops its element under `[?x ...]` or
 symbol resolves through the namespace registry as the compiler resolves
 it (an alias-qualified `ns/name` to that namespace's own var, a bare
 name in the current namespace and then its auto-referred parents) and
-is called with `vm.callValue`; an unbound name throws
-`:nextomic/query-syntax` naming it. A throw inside the function unwinds
+is called with `vm.callValue`. Every function symbol of the plan and
+every custom aggregate resolves once, before any row runs, so an
+unbound name throws `:nextomic/query-syntax` naming it whether or not
+a row would reach its clause. A throw inside the function unwinds
 through the native, the read transaction closes, and the thrown value
 reaches the caller's `try`; `ControlTransferred` propagates unchanged.
 Function position also takes a variable, `[(?pred ?x)]` or `[(?f ?x)
@@ -1154,11 +1158,11 @@ gives the place and the trace.
 | error | when | payload besides `:message` |
 |---|---|---|
 | `:nextomic/unknown-attribute` | an attribute keyword or id names no attribute | `:attr`, as the program wrote it |
-| `:nextomic/value-type` | a value that does not fit its attribute's type (in tx-data, a lookup ref, a `datoms` or `index-range` component, a query input), or a comparison, aggregate, `fulltext` search or `pull` over a value it does not take | `:attr` and `:value`, as the program wrote them, when an attribute refused it; the message names the type (`:db.type/long`), or the operation and the kinds it met (`< compares values of one kind, not a long and a string`) |
+| `:nextomic/value-type` | a value that does not fit its attribute's type (in tx-data, a lookup ref, a `datoms` or `index-range` component, a query input), or a comparison, aggregate, `fulltext` search or `pull` over a value it does not take, or an input or function result that does not fit its binding form | `:attr` and `:value`, as the program wrote them, when an attribute refused it; the message names the type (`:db.type/long`), the operation and the kinds it met (`< compares values of one kind, not a long and a string`), or the binding form, where its value came from and what it found (`[?x ...] takes a vector, list or set, and the input is a long`) |
 | `:nextomic/unique` | two entities would hold one unique `(a v)` | `:attr` and `:value` |
 | `:nextomic/conflict` | two claims in one transaction disagree, or a schema change §3 step 5 refuses as a conflict | `:e` and `:a` |
 | `:nextomic/no-entity` | an entity reference names nothing, or an id no allocator handed out | `:value`, the reference as written; a lookup ref in tx-data that finds nothing, `:attr` and `:value` |
-| `:nextomic/unbound-pattern` | a pattern with nothing bound | none |
+| `:nextomic/unbound-pattern` | a pattern with nothing bound | `:clause`, the index into `:where`; the message shows the pattern |
 | `:nextomic/basis-in-future` | a db-value newer than its file (§4) | none |
 | `:nextomic/closed` | an operation through a released connection or an ended `with` scope | none |
 | `:nextomic/busy` | `release` while an operation is in flight | none |
@@ -1168,8 +1172,8 @@ gives the place and the trace.
 | `:nextomic/nested` | `transact!`, `with` or `excise!` while the file's write transaction is held (a `with` scope, a transaction function, another connection to the same file) | none |
 | `:nextomic/tx-fn` | a transaction function that cannot run | the message names the unbound symbol, or the depth limit and its value |
 | `:nextomic/cas` | a `:db.fn/cas` whose expectation failed | `:attr`, `:expected` and `:actual`, the last two nil for an absent value |
-| `:nextomic/query-syntax` | a query the parser or planner refuses, or an unbound function name at run time | `:clause`, the index into `:where`, when inside a clause. A scoping refusal names the variable at fault in the message: a `:find` or `:with` variable nothing binds, the one an `or` branch mentions and another does not, the join variable an `or-join` branch or a rule body leaves unbound, the one a `not` body has that nothing outside binds, the argument, function-position, `not-join` or required `or-join` variable no clause ever binds |
-| `:nextomic/pull-syntax` | a bad pull pattern (from `pull`, `pull-many` or a find element) | `:clause`, the index of the spec |
+| `:nextomic/query-syntax` | a query the parser or planner refuses, or an unbound function name | `:clause`, the index into `:where`, when inside a clause. The message names what is at fault: the symbol, section, source or binding it does not take, the variable bound twice, the rule a call names with its arity and the count the call passes. A scoping refusal names the variable at fault: a `:find` or `:with` variable nothing binds, the one an `or` branch mentions and another does not, the join variable an `or-join` branch or a rule body leaves unbound, the one a `not` body has that nothing outside binds, the argument, function-position, `not-join` or required `or-join` variable no clause ever binds |
+| `:nextomic/pull-syntax` | a bad pull pattern (from `pull`, `pull-many` or a find element) | `:clause`, the index of the spec; the message names the element, option or attribute at fault |
 | `:kind-mismatch`, `:invalid-argument`, `:arity-mismatch` | the VM's own errors for an argument of the wrong kind (a db-value where a connection belongs), an unknown index, `:sync` or `:durability` option or a negative `t`, or a wrong argument count | as every runtime error's (`docs/VM.md` §13) |
 | `:stack-overflow` | tx-data, a query or a pull pattern nested past the native stack guard | as every runtime error's |
 | `:db/*` | an engine failure, through `db.failureName` (`:db/key-too-large`, `:db/map-full`, `:db/read-only`, `:db/open-failed`, ...); a store whose bytes do not decode, or name an ident it lacks, or a page that fails the engine's check, is `:db/corrupted` | none; a store of another format names both formats in the message and its own as `:format` |
@@ -1201,7 +1205,7 @@ src/nextomic/
   query/exec.zig   scans, matches over collections, built-ins, aggregates, materialising
   query/rules.zig  rule expansion, the stratification check, the semi-naive fixpoint
   query/natives.zig  q and explain (and their arg-map form), the call hook
-  natives.zig    nextomic/* NativeFn table, error mapping, per-VM state, install
+  natives.zig    the nextomic/* table (each row its docstring), error mapping, per-VM state, install
 src/stdlib/nextomic.nx   sugar only (with-conn)
 bench/nextomic.zig       the `nextomic` bench category (docs/PERF.md §3.7)
 ```
@@ -1327,6 +1331,18 @@ damaged page is `:db/corrupted` (§7), never a short scan.
 - **`tx-range` takes the connection.** `(d/tx-range conn from to)`,
   either bound optional or nil, returns the entries as a vector of
   maps; Datomic's reads a log value.
+- **`pull` takes no `:xform`** (§6.2): an attribute option is `:as`,
+  `:limit` or `:default`, and `(:person/name :xform str)` is
+  `:nextomic/pull-syntax` naming the option. Datomic's pull applies
+  an `:xform` function to the attribute's value.
+- **`min` and `max` take values of mixed kinds** (§5 "Aggregates"):
+  they order by the cell order (nil, booleans, numbers, strings,
+  keywords, then other values), where Datomic compares with `compare`
+  and throws on two kinds it cannot compare.
+- **An `:in` lookup ref or ident resolves once per query** (§5): in
+  the source of the first step that reads its variable as an entity,
+  and every later clause reads that eid. Datomic resolves it in the
+  source of each clause that reads it.
 - **Values are the VM's.** A long or an instant is an integer in i64,
   a fixnum or a bignum by its size (§2.2), and an instant is
   milliseconds as a long; Datomic takes a 64-bit long and a

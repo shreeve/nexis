@@ -2,25 +2,10 @@
 //! with a lazy rest, and chunked cons cells.
 //!
 //! Authoritative spec: `docs/LAZY.md` (§2 the shapes, §3 the trace).
-//! Physical storage: `src/heap.zig`. Semantics: `docs/SEMANTICS.md`
-//! §2.6 (a lazy seq is sequential) and §3.3.
-//!
 //! This file knows the bodies and nothing about running code: building
-//! the shapes, reading them, walking a realized chain (`Cursor`, which
-//! stops with `error.Unrealized` at a block whose body has not run) and
-//! tracing. Realizing a block needs a VM: `src/seq.zig` does it in
-//! native context, and `isolated` is the hook through which `=` and
-//! `hash` (`dispatch.zig`, which has no VM) realize one (LAZY.md §6).
-//!
-//! Shapes, in the header's flags bits 1–2 and in the Value's subkind
-//! (LAZY.md §2):
-//!   - 0 lazy — `{ result, op, state, argc, args[argc] }`: Clojure's
-//!     `LazySeq`. `op` 0 runs `args[0]` with no arguments; any other op
-//!     is a producer of `src/seq.zig` whose state is `args`.
-//!   - 1 cons — `{ first, more }`: `more` is nil, a list or a lazy seq.
-//!   - 2 chunked cons — `{ more, count, cap, items[cap] }`, a chunk of
-//!     up to 32 elements in front of `more`; the offset of its first
-//!     element in the Value's tag bits 32..63, as a list view's.
+//! the shapes, reading them, walking a realized chain (`Cursor`) and
+//! tracing. `src/seq.zig` realizes a block in native context; `host`
+//! is the hook through which `=` and `hash` realize one (LAZY.md §6).
 
 const std = @import("std");
 const value = @import("../value.zig");
@@ -46,7 +31,7 @@ pub const Shape = enum(u2) { lazy = 0, cons = 1, chunked = 2 };
 const shape_shift = 1;
 const shape_mask: u8 = 0b11 << shape_shift;
 
-pub fn shapeOfHeader(h: *const HeapHeader) Shape {
+fn shapeOfHeader(h: *const HeapHeader) Shape {
     return @fromBackingInt(@intCast((h.flags & shape_mask) >> shape_shift));
 }
 
@@ -69,6 +54,9 @@ pub const State = enum(u8) {
     /// `result` is nil or a non-empty seq: a non-empty list, a cons or
     /// a chunked cons.
     realized = 2,
+    /// The body is running: a `force` that reaches the block raises
+    /// `:stack-overflow` instead of running it again.
+    running = 3,
 };
 
 const LazyBody = extern struct {
@@ -228,7 +216,7 @@ pub fn isMore(v: Value) bool {
 
 /// Whether `s` may be a realized block's result: nil or a non-empty
 /// seq (LAZY.md §4, the normal form).
-pub fn isSeqResult(s: Value) bool {
+fn isSeqResult(s: Value) bool {
     return switch (s.kind()) {
         .nil => true,
         .list => !list.isEmpty(s),
@@ -254,12 +242,19 @@ pub fn args(lz: Value) []Value {
     return lazyBody(lz).args();
 }
 
-/// Root `v` in the result field of `lz`, a block whose body has not
-/// run: what a producer fills while it runs, so a collection inside a
-/// call marks it (a step that throws leaves it there, garbage the next
-/// run replaces).
+/// Mark the unrealized block `lz` running while its body runs, or
+/// unrealized again once the body has returned.
+pub fn setRunning(lz: Value, running: bool) void {
+    const body = lazyBody(lz);
+    std.debug.assert(body.state == if (running) State.unrealized else State.running);
+    body.state = if (running) .running else .unrealized;
+}
+
+/// Root `v` in the result field of `lz`, a block whose body is
+/// running: what a producer fills while it runs, so a collection
+/// inside a call marks it.
 pub fn setScratch(lz: Value, v: Value) void {
-    std.debug.assert(state(lz) == .unrealized);
+    std.debug.assert(state(lz) == .running);
     lazyBody(lz).result = v;
 }
 
@@ -326,7 +321,7 @@ pub fn chunkedCount(c: Value) usize {
 // =============================================================================
 
 /// The innermost running VM, as `dispatch` reaches it: `=` and `hash`
-/// realize a block they meet through `isolated.realize`, which runs
+/// realize a block they meet through `host.realize`, which runs
 /// the block's body with collection held and any throw caught and
 /// parked on the VM. Null outside a run: a block that would have to
 /// run spoils the answer.
@@ -389,7 +384,7 @@ pub const Cursor = struct {
             },
             .lazy_seq => switch (shapeOf(self.rest)) {
                 .lazy => switch (state(self.rest)) {
-                    .unrealized => return error.Unrealized,
+                    .unrealized, .running => return error.Unrealized,
                     .forwarding, .realized => self.rest = result(self.rest),
                 },
                 .cons => {

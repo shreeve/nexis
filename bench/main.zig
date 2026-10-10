@@ -541,7 +541,7 @@ pub fn main(init: std.process.Init) !u8 {
     const heap_backing = init.gpa;
 
     // ---- Runner ----
-    var runner = try Runner.init(alloc, .{});
+    var runner: Runner = .{ .allocator = alloc, .io = io };
     defer runner.deinit();
 
     // ---- Shared interner + heap for non-DB benches ----
@@ -722,17 +722,17 @@ pub fn main(init: std.process.Init) !u8 {
     if (include(filter, "db-integrated")) {
         var store = try TmpStore.init(alloc, "db");
         defer store.deinit(alloc);
-        var conn = try db.open(alloc, &heap, &interner, store.path.ptr, .{ .allocator = alloc });
-        defer db.close(&conn) catch {};
+        const conn = try db.open(alloc, &heap, &interner, store.path.ptr);
+        defer db.shutdown(conn);
 
         // Seed the key we'll be overwriting.
         {
-            var wtxn = try db.beginWrite(&conn);
+            var wtxn = try db.beginWrite(conn);
             try db.put(&wtxn, "bench", "k", value_mod.fromFixnum(0).?);
             try db.commit(&wtxn);
         }
 
-        var dctx = DbCtx{ .conn = &conn, .key = "k", .value = value_mod.fromFixnum(42).? };
+        var dctx = DbCtx{ .conn = conn, .key = "k", .value = value_mod.fromFixnum(42).? };
         try runner.bench("db_put_commit_scalar", "db-integrated", null, &dctx, benchDbPut);
         try runner.bench("db_get_hit_scalar", "db-integrated", null, &dctx, benchDbGetHit);
     }

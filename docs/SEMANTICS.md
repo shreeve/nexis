@@ -21,7 +21,7 @@ empty collections `[]`, `{}`, `#{}`, `()`, and every char.
 ### 2. Equality (`=`)
 
 - `(identical? x y)` is bit equality of the 16-byte Value: pointer
-  identity for a heap kind (`docs/VALUE.md` §6).
+  identity for a heap kind (`docs/VALUE.md` §4).
 - `(= x y)` is value equality, specified per kind below.
 
 **Cross-kind rule.** Values of different kinds are never `=`, except
