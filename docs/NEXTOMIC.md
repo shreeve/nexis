@@ -1205,7 +1205,7 @@ src/nextomic/
   query/exec.zig   scans, matches over collections, built-ins, aggregates, materialising
   query/rules.zig  rule expansion, the stratification check, the semi-naive fixpoint
   query/natives.zig  q and explain (and their arg-map form), the call hook
-  natives.zig    nextomic/* NativeFn table, error mapping, per-VM state, install
+  natives.zig    the nextomic/* table (each row its docstring), error mapping, per-VM state, install
 src/stdlib/nextomic.nx   sugar only (with-conn)
 bench/nextomic.zig       the `nextomic` bench category (docs/PERF.md §3.7)
 ```
