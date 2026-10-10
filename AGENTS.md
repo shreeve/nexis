@@ -49,7 +49,7 @@ changes to emdb.
 | `zig build nexis` | `bin/nexis` alone, as `install` does |
 | `zig build run -- ARGS` | builds `bin/nexis` and runs it with ARGS, in the caller's environment |
 | `zig build compile` | compiles every binary and test binary the gate runs, without running them (a caller can give the compile phase more cores than the single-threaded test runs that follow) |
-| `zig build quick` | the inner loop: the `unit` binary (every inline test in `src/`), the compile and Nextomic property tests, the `eval_pipeline`, `runtime_polish` and `numbers` integration tests |
+| `zig build quick` | the inner loop: the `unit` binary (every inline test in `src/`), the compile and Nextomic property tests, the `eval_pipeline`, `runtime_polish`, `numbers`, `nextomic_store` and `db_layer` integration tests |
 | `zig build nextomic-test` | the Nextomic unit tests, `test/prop/nextomic_{key,tx}.zig`, the Nextomic integration corpora |
 | `zig build nextomic-nx` | every `test/nextomic/*.nx` through `bin/nexis` from a fresh directory, stdout diffed against its `.out` |
 | `zig build examples` | every `examples/*.nx` through `bin/nexis`, stdout diffed against `test/examples/<name>.out`; those with a `.2.out` run twice; the same for `test/examples/pins/*.nx`, the programs that pin low-level behaviour, against the `.out` beside each |
