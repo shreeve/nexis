@@ -323,6 +323,7 @@ pub fn build(b: *std.Build) void {
             .{ .args = &.{ "run", cli ++ "duplicate-key.nx" }, .stderr = "duplicate-key.err", .exit_code = 3 },
             .{ .args = &.{ "run", cli ++ "invalid-regex.nx" }, .stderr = "invalid-regex.err", .exit_code = 3 },
             .{ .args = &.{ "run", cli ++ "macro-failure.nx" }, .stderr = "macro-failure.err", .exit_code = 4 },
+            .{ .args = &.{ "run", cli ++ "macro-form.nx" }, .stderr = "macro-form.err", .exit_code = 4 },
             .{ .args = &.{ "run", cli ++ "too-many-locals.nx" }, .stderr = "too-many-locals.err", .exit_code = 4 },
             .{ .args = &.{ "run", cli ++ "bom.nx" }, .stderr = "bom.err", .exit_code = 4 },
             .{ .args = &.{ "-e", "\xEF\xBB\xBF(nope)" }, .stderr = "bom-expr.err", .exit_code = 4 },

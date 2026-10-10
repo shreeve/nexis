@@ -96,6 +96,9 @@ pub const ExpandContext = struct {
     /// The calling VM's `io`, given to a user macro's sub-VM so the
     /// macro body can print; null leaves the sub-VM without one.
     io: ?std.Io = null,
+    /// The text the forms were read from, which places a user macro's
+    /// `&form` (§1.3); null for a form with none (`eval`).
+    source: ?*const vm_mod.SourceInfo = null,
     /// Set by the first (innermost) failure of an expansion that
     /// returns an error; the message lives in `allocator`.
     failure: ?Failure = null,
@@ -109,6 +112,13 @@ pub const ExpandContext = struct {
     /// one of them keeps its own place and an error in it is reported
     /// there, not at the macro call.
     arg_spans: ?*std.AutoHashMapUnmanaged(u64, SrcSpan) = null,
+
+    /// The 1-based line and column of `pos` in `source`, found from
+    /// the owning VM's last place when there is one (`VM.placeOf`).
+    fn placeOf(self: *const ExpandContext, source: *const vm_mod.SourceInfo, pos: u32) vm_mod.SourceInfo.LineCol {
+        if (self.namespace) |ns| if (ns.registry) |reg| if (reg.vm) |owner| return owner.placeOf(source, pos);
+        return source.lineCol(pos);
+    }
 
     /// Whether `name` is bound by a binding form around the walk.
     fn isLexical(self: *const ExpandContext, name: []const u8) bool {
@@ -203,13 +213,16 @@ pub fn expandForm(ctx: *ExpandContext, form: *const Form) ExpandError!*Form {
 /// One macro step, the way `macroexpand-1` sees it: when `form` is
 /// a call whose head names a user or host macro (special forms and
 /// the `#%` primitives are not macros), the macro's raw output;
-/// otherwise null. Nothing inside the result is expanded and no
-/// lexical environment applies: the form is top-level data.
+/// otherwise null. `^meta` on the call is a hint and is dropped
+/// first (§2b). Nothing inside the result is expanded and no lexical
+/// environment applies: the form is top-level data, and a user
+/// macro's `&env` is nil unless `ctx.lexical` binds a name (§1.3).
 pub fn expandOnce(ctx: *ExpandContext, form: *const Form) ExpandError!?*Form {
-    if (form.datum != .list) return null;
-    const items = form.datum.list;
+    const call = stripMeta(form);
+    if (call.datum != .list) return null;
+    const items = call.datum.list;
     const macro = findMacro(ctx, items) orelse return null;
-    return try callMacro(ctx, macro, form, items);
+    return try callMacro(ctx, macro, call, items);
 }
 
 /// `form` expanded by `expandOnce` until its head names no macro: a
@@ -1142,7 +1155,9 @@ fn expandDefmacro(ctx: *ExpandContext, list_form: *const Form, items: []const *F
     const b = Builder{ .ctx = ctx, .origin = origin };
     // The Var's metadata says it is a macro, as Clojure's does.
     const meta = try std.mem.concat(ctx.allocator, *Form, &.{ parts.meta, &.{ try b.kw("macro"), try b.item(true) } });
-    const expanded = try expandForm(ctx, try defnDef(b, parts, meta));
+    var with_implicit = parts;
+    with_implicit.fn_tail = try implicitParams(ctx, parts.fn_tail);
+    const expanded = try expandForm(ctx, try defnDef(b, with_implicit, meta));
 
     var why: ?Failure = null;
     const result = ceval.eval(ceval.user_data, expanded, &why) catch |err| {
@@ -1156,8 +1171,34 @@ fn expandDefmacro(ctx: *ExpandContext, list_form: *const Form, items: []const *F
     return b.list(.{ "var", parts.name });
 }
 
+/// `tail`, a `defmacro`'s parameter vector and body or its overload
+/// clauses, its `:arglists` already taken, with `&form` and `&env` in
+/// front of each parameter vector (§1.3).
+fn implicitParams(ctx: *ExpandContext, tail: []const *Form) ExpandError![]const *Form {
+    const out = try ctx.allocator.dupe(*Form, tail);
+    if (stripMeta(tail[0]).datum == .vector) {
+        out[0] = try withImplicit(ctx, tail[0]);
+        return out;
+    }
+    for (out) |*clause| {
+        const items = try ctx.allocator.dupe(*Form, clause.*.datum.list);
+        items[0] = try withImplicit(ctx, items[0]);
+        clause.* = try makeList(ctx, items, clause.*.origin);
+    }
+    return out;
+}
+
+/// The parameter vector `params` with `&form` and `&env` first; a
+/// form that is no vector is left for `fn` to refuse.
+fn withImplicit(ctx: *ExpandContext, params: *const Form) ExpandError!*Form {
+    const vec = stripMeta(params);
+    if (vec.datum != .vector) return mutCast(params);
+    return (Builder{ .ctx = ctx, .origin = vec.origin }).vec(.{ "&form", "&env", vec.datum.vector });
+}
+
 /// Call the user macro `macro_var` on the unevaluated args of
-/// `call_form` and return its output as a Form, unexpanded.
+/// `call_form`, after `&form` and `&env` (§1.3), and return its
+/// output as a Form, unexpanded.
 fn callUserMacro(
     ctx: *ExpandContext,
     macro_var: *vm_mod.Var,
@@ -1169,9 +1210,12 @@ fn callUserMacro(
     const span = call_form.origin;
     if (macro_var.root.kind() != .function) return ctx.fail(span, "macro {s} is not a function", .{name});
     // The closure's routine, or a member of its arity table, takes
-    // the count (docs/VM.md §6).
+    // the count with `&form` and `&env` (docs/VM.md §6); the message
+    // counts the arguments alone.
     const routine = vm_mod.VM.asClosure(macro_var.root).routine;
-    if (routine.entryFor(args.len) == null) return ctx.fail(span, "macro {s} takes {f}, got {d}", .{ name, routine.arityPhrase(), args.len });
+    if (routine.entryFor(args.len + 2) == null) {
+        return ctx.fail(span, "macro {s} takes {f}, got {d}", .{ name, vm_mod.ArityPhrase{ .routine = routine, .hidden = 2 }, args.len });
+    }
 
     // Each argument as data, unevaluated, its collections' places
     // kept for the result.
@@ -1180,9 +1224,12 @@ fn callUserMacro(
     const outer_spans = ctx.arg_spans;
     ctx.arg_spans = &spans;
     defer ctx.arg_spans = outer_spans;
-    const arg_values = try ctx.allocator.alloc(value_mod.Value, args.len);
-    defer ctx.allocator.free(arg_values);
+    const call_values = try ctx.allocator.alloc(value_mod.Value, args.len + 2);
+    defer ctx.allocator.free(call_values);
+    const arg_values = call_values[2..];
     for (args, 0..) |a, i| arg_values[i] = try formToValue(ctx, a);
+    call_values[0] = try callFormValue(ctx, items[0], arg_values, span);
+    call_values[1] = try envValue(ctx);
 
     // A fresh sub-VM that never collects, on the calling VM's heap
     // and registries when the context has them, so a value the macro
@@ -1197,13 +1244,50 @@ fn callUserMacro(
     sub_vm.gc_enabled = false;
     sub_vm.io = ctx.io;
     if (ctx.namespace) |ns| if (ns.registry) |reg| if (reg.vm) |owner| sub_vm.borrowRegistries(owner);
-    const result_value = sub_vm.callValue(macro_var.root, arg_values) catch |err| return macroFailure(ctx, &sub_vm, name, span, err);
+    const result_value = sub_vm.callValue(macro_var.root, call_values) catch |err| return macroFailure(ctx, &sub_vm, name, span, err);
     // The form is data: every lazy seq in it is realized, on the
     // sub-VM, and made a list (docs/LAZY.md §8).
     const saved = sub_vm.installLazyHost();
     defer lazy_mod.host = saved;
     const listed = seq_mod.asLists(&sub_vm, result_value) catch |err| return macroFailure(ctx, &sub_vm, name, span, err);
     return try valueToForm(ctx, listed, span);
+}
+
+/// A macro's `&form` (§1.3): the list of `head` and the argument
+/// values themselves, carrying `{:line l :column c}`, the place of
+/// `span`, when the forms have a source text.
+fn callFormValue(ctx: *ExpandContext, head: *const Form, arg_values: []const value_mod.Value, span: SrcSpan) ExpandError!value_mod.Value {
+    const heap = try ctx.heapForArgs();
+    const values = try ctx.allocator.alloc(value_mod.Value, arg_values.len + 1);
+    defer ctx.allocator.free(values);
+    values[0] = try formToValue(ctx, head);
+    @memcpy(values[1..], arg_values);
+    const form = list_mod.fromSlice(heap, values) catch return ExpandError.OutOfMemory;
+    const source = ctx.source orelse return form;
+    const place = ctx.placeOf(source, span.pos);
+    const entries = [_]value_mod.Value{
+        ctx.interner.internKeywordValue("line") catch return ExpandError.OutOfMemory,
+        value_mod.fromFixnum(place.line).?,
+        ctx.interner.internKeywordValue("column") catch return ExpandError.OutOfMemory,
+        value_mod.fromFixnum(place.col).?,
+    };
+    const meta = collOf(heap, .map, &entries) catch return ExpandError.OutOfMemory;
+    heap_mod.Heap.asHeapHeader(form).setMeta(heap_mod.Heap.asHeapHeader(meta));
+    return form;
+}
+
+/// A macro's `&env` (§1.3): nil when no name is lexical, else the map
+/// from each lexical name to that name, a symbol.
+fn envValue(ctx: *ExpandContext) ExpandError!value_mod.Value {
+    var entries: std.ArrayList(value_mod.Value) = .empty;
+    defer entries.deinit(ctx.allocator);
+    var it = ctx.lexical.iterator();
+    while (it.next()) |e| if (e.value_ptr.* > 0) {
+        const sym = ctx.interner.internSymbolValue(e.key_ptr.*) catch return ExpandError.OutOfMemory;
+        try entries.appendSlice(ctx.allocator, &.{ sym, sym });
+    };
+    if (entries.items.len == 0) return value_mod.nilValue();
+    return collOf(try ctx.heapForArgs(), .map, entries.items) catch ExpandError.OutOfMemory;
 }
 
 /// The failure of the macro `name`, whose sub-VM failed with `err`
@@ -1481,7 +1565,22 @@ pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, call_origin: SrcSpan
     };
     if (carries_meta) {
         const meta_v = dispatch.metaOf(heap_mod.Heap.asHeapHeader(v));
-        if (!meta_v.isNil()) return makeForm(ctx, .{ .with_meta = .{ .target = form, .meta = try valueToForm(ctx, meta_v, origin) } }, origin);
+        if (meta_v.isNil()) return form;
+        const meta = try valueToForm(ctx, meta_v, origin);
+        // A list's place is its span: `:line` and `:column` (an
+        // `&form`'s, §1.3) do not become `^meta`.
+        if (datum == .list and meta.datum == .map) {
+            var kept: std.ArrayList(*Form) = .empty;
+            var i: usize = 0;
+            while (i + 1 < meta.datum.map.len) : (i += 2) {
+                const key = meta.datum.map[i];
+                if (isKw(key, "line") or isKw(key, "column")) continue;
+                try kept.appendSlice(ctx.allocator, meta.datum.map[i..][0..2]);
+            }
+            if (kept.items.len == 0) return form;
+            meta.datum.map = kept.items;
+        }
+        return makeForm(ctx, .{ .with_meta = .{ .target = form, .meta = meta } }, origin);
     }
     return form;
 }

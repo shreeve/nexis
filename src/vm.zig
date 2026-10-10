@@ -436,11 +436,36 @@ pub const SourceInfo = struct {
     /// position.
     pub fn lineCol(self: *const SourceInfo, pos: u32) LineCol {
         const before = self.text[0..@min(pos, self.text.len)];
-        const bom = "\xEF\xBB\xBF";
+        return .{ .line = @intCast(1 + std.mem.count(u8, before, "\n")), .col = columnOf(before) };
+    }
+
+    /// `lineCol(pos)` found from `from`, the place of `from_pos`: only
+    /// the text between the two positions is scanned, or the text
+    /// before `pos` when that is shorter, so places found one from the
+    /// last cost the distance moved.
+    pub fn lineColFrom(self: *const SourceInfo, from_pos: u32, from: LineCol, pos: u32) LineCol {
+        const a = @min(from_pos, self.text.len);
+        const b = @min(pos, self.text.len);
+        // Near the start, a byte-order mark included, from 0.
+        if (@min(a, b) <= bom.len or (b < a and b <= a - b)) return self.lineCol(pos);
+        const between = if (a <= b) self.text[a..b] else self.text[b..a];
+        const lines: u32 = @intCast(std.mem.count(u8, between, "\n"));
+        if (a <= b) return .{ .line = from.line + lines, .col = if (lines == 0) from.col + codePoints(between) else columnOf(between) };
+        return .{ .line = from.line - lines, .col = if (lines == 0) from.col - codePoints(between) else columnOf(self.text[0..b]) };
+    }
+
+    const bom = "\xEF\xBB\xBF";
+
+    /// The column at the end of `before`, a text from its start.
+    fn columnOf(before: []const u8) u32 {
         const start = if (std.mem.findScalarLast(u8, before, '\n')) |nl| nl + 1 else if (std.mem.startsWith(u8, before, bom)) bom.len else 0;
-        var col: u32 = 1;
-        for (before[start..]) |c| col += @intFromBool(c & 0xC0 != 0x80);
-        return .{ .line = @intCast(1 + std.mem.count(u8, before, "\n")), .col = col };
+        return 1 + codePoints(before[start..]);
+    }
+
+    fn codePoints(bytes: []const u8) u32 {
+        var n: u32 = 0;
+        for (bytes) |c| n += @intFromBool(c & 0xC0 != 0x80);
+        return n;
     }
 };
 
@@ -780,9 +805,11 @@ pub const Routine = struct {
 };
 
 /// `Routine.arityPhrase`: the counts a closure over `routine` takes,
-/// for `{f}`.
+/// for `{f}`, each less `hidden`, the leading parameters a caller
+/// passes unseen (a macro's `&form` and `&env`).
 pub const ArityPhrase = struct {
     routine: *const Routine,
+    hidden: u8 = 0,
 
     const Item = union(enum) { one: usize, range: [2]usize, at_least: usize };
 
@@ -837,11 +864,12 @@ pub const ArityPhrase = struct {
     };
 
     pub fn format(self: ArityPhrase, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const h = self.hidden;
         var it = Items.init(self.routine);
         var count: usize = 0;
         var singular = false;
         while (it.next()) |item| : (count += 1) singular = switch (item) {
-            .one, .at_least => |n| n == 1,
+            .one, .at_least => |n| n -| h == 1,
             .range => false,
         };
         it = Items.init(self.routine);
@@ -849,9 +877,9 @@ pub const ArityPhrase = struct {
         while (it.next()) |item| : (i += 1) {
             if (i > 0) try w.writeAll(if (i + 1 == count) " or " else ", ");
             switch (item) {
-                .one => |n| try w.print("{d}", .{n}),
-                .range => |r| try w.print("{d} to {d}", .{ r[0], r[1] }),
-                .at_least => |n| try w.print("at least {d}", .{n}),
+                .one => |n| try w.print("{d}", .{n -| h}),
+                .range => |r| try w.print("{d} to {d}", .{ r[0] -| h, r[1] -| h }),
+                .at_least => |n| try w.print("at least {d}", .{n -| h}),
             }
         }
         try w.writeAll(if (count == 1 and singular) " argument" else " arguments");
@@ -3619,13 +3647,17 @@ pub const VM = struct {
         return .{ .name = f.routine.name, .pc = pc, .span = f.routine.spanAt(pc), .source = f.routine.source };
     }
 
-    /// `source.lineCol(pos)`, remembered for the last place asked: a
-    /// handler taking errors in a loop is at one place, and a line
-    /// costs a scan of the text before it.
-    fn placeOf(self: *VM, source: *const SourceInfo, pos: u32) SourceInfo.LineCol {
+    /// `source.lineCol(pos)`, found from the last place found in the
+    /// same text (`SourceInfo.lineColFrom`): a handler taking errors in
+    /// a loop is at one place, and the expansions of a file placing
+    /// their `&form`s walk it in order.
+    pub fn placeOf(self: *VM, source: *const SourceInfo, pos: u32) SourceInfo.LineCol {
         const c = &self.place_cache;
-        if (c.text.ptr != source.text.ptr or c.text.len != source.text.len or c.pos != pos) {
+        if (c.text.ptr != source.text.ptr or c.text.len != source.text.len) {
             c.* = .{ .text = source.text, .pos = pos, .place = source.lineCol(pos) };
+        } else if (c.pos != pos) {
+            c.place = source.lineColFrom(c.pos, c.place, pos);
+            c.pos = pos;
         }
         return c.place;
     }
@@ -4791,12 +4823,14 @@ pub const VM = struct {
     }
 
     /// `var:store-var A=value W=var_index` — the Var's root
-    /// `:= resolve(A)`, marked bound. Redefining a name updates the
-    /// same Var, so code compiled against it sees the new root.
+    /// `:= resolve(A)`, marked bound and not a macro. Redefining a
+    /// name updates the same Var, so code compiled against it sees
+    /// the new root.
     fn execVarStoreVar(self: *VM, frame: *Frame, inst: Inst) VmError!void {
         const target = try wideVar(frame, inst);
         target.root = try self.resolveIn(frame, inst.a);
         target.bound = true;
+        target.macro = false;
     }
 
     /// `var:var-object A=dst_slot W=var_index` — the Var object
@@ -5913,6 +5947,25 @@ test "SourceInfo.lineCol: columns count code points, past a byte-order mark" {
     try testing.expectEqual(SourceInfo.LineCol{ .line = 2, .col = 3 }, info.lineCol(1000));
     const marked = SourceInfo{ .path = "t.nx", .text = "\xEF\xBB\xBF(x)" };
     try testing.expectEqual(SourceInfo.LineCol{ .line = 1, .col = 1 }, marked.lineCol(3));
+}
+
+test "SourceInfo.lineColFrom: a place found from any other is the place found from the start" {
+    const texts = [_][]const u8{
+        "\xEF\xBB\xBF(a \"\u{e9}\u{20ac}\")\r\n  (b\n\n\u{1F600} c)\n",
+        "(str \"\u{e9}\u{e9}\") (x)\n\u{20ac}x",
+        "\n\n\n",
+        "\xEF\xBB\xBF",
+        "",
+    };
+    for (texts) |text| {
+        const info = SourceInfo{ .path = "t.nx", .text = text };
+        const end: u32 = @intCast(text.len + 2);
+        for (0..end) |a| for (0..end) |b| {
+            const from: u32 = @intCast(a);
+            const to: u32 = @intCast(b);
+            try testing.expectEqual(info.lineCol(to), info.lineColFrom(from, info.lineCol(from), to));
+        };
+    }
 }
 
 test "VM opcodes: mov, return and operand resolution" {
@@ -8199,6 +8252,18 @@ test "VM error detail: an arity sentence names every count a closure takes" {
         r.arities = null;
         var buf: [64]u8 = undefined;
         try testing.expectEqualStrings(case[1], try std.mem.print(&buf, "{f}", .{r.arityPhrase()}));
+    }
+    // Hidden leading parameters (a macro's `&form` and `&env`) are not
+    // counted.
+    for ([_]struct { Routine, []const u8 }{
+        .{ members[2], "0 arguments" },
+        .{ members[3], "1 argument" },
+        .{ rests[4], "at least 2 arguments" },
+    }) |case| {
+        var r = case[0];
+        r.arities = null;
+        var buf: [64]u8 = undefined;
+        try testing.expectEqualStrings(case[1], try std.mem.print(&buf, "{f}", .{ArityPhrase{ .routine = &r, .hidden = 2 }}));
     }
     // Every other count up to 200: past the detail's 160 bytes, the
     // sentence is cut at a character and marked.

@@ -1,0 +1,3 @@
+nexis: test/golden/cli/macro-form.nx:7:1: compile error: macro pair threw (pair 1) needs two forms, at line 7
+    (pair 1)
+    ^^^^^^^^

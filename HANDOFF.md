@@ -58,11 +58,11 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 252/252 steps succeeded; 1530/1531 tests passed (1 skipped)
+Build Summary: 255/255 steps succeeded; 1534/1535 tests passed (1 skipped)
 ```
 
 With `../nexus` checked out the gate includes `parser-check`'s two
-steps; without it the count is 250 steps. Any output besides the
+steps; without it the count is 253 steps. Any output besides the
 summary tree is a failure. The largest binaries are `unit` (every
 inline test in `src/`) and `eval_pipeline` (the language corpus);
 `cli-unit` runs `src/cli.zig`'s own tests.
@@ -343,8 +343,6 @@ failing test (AGENTS.md).
    runs in constant memory; a seq a local or a closure's argument
    holds stays rooted until the slot is reused. Clearing a local at
    its last use needs liveness in the compiler (TODO.md, Performance).
-   **Macros get no `&form` or
-   `&env`** (§23 #34, §24 #13).
 2. **Regular expressions lack Unicode scripts, blocks and binary
    properties** (`\p{IsLatin}`, `\p{InGreek}`, `\p{IsAlphabetic}`),
    `(?U)`, `\X` and `\N{...}` (`docs/REGEX.md` §2), each refused with a
@@ -544,8 +542,7 @@ after numbers in the commit message.
    and short ids (`docs/PERF.md` §3.36; store format 3, which refuses
    every other). A pull of 10k entities is 4% slower cold on Linux for
    the variable-length entity; §6 "Store size" lists what is left.
-4. Two designs the owner approved, each an amendment first:
-   `&form`/`&env` (`docs/FORM-ENV.md`, `TODO.md` #11) and `#inst` and
+4. A design the owner approved, an amendment first: `#inst` and
    `#uuid` (`docs/INST-UUID.md`, `TODO.md` #22).
 5. `TODO.md`'s "Open from revamp 3" (#24–#29): the multimethod
    registry, protocol names in print, duplicates left between files,

@@ -1,0 +1,30 @@
+; test/examples/pins/form-env.nx — &form and &env in user macros.
+; A pin, not a teaching example (docs/MACROEXPAND.md §1.3):
+;   - (meta &form) is the call's {:line :column}, 1-based, the column
+;     in code points, read from this file;
+;   - a call a macro built carries the place of the call that built it;
+;   - a place a macro returns in metadata changes nothing;
+;   - &env names the locals in scope, nil where there are none.
+
+(defmacro where [] (list 'quote (meta &form)))
+
+(println (where))
+  (println (where))
+(println "été" (where))
+(println (when true (where)))
+
+(defmacro make-where [] '(where))
+(println (make-where))
+
+(defmacro placed [x] (with-meta (list 'do x) (meta &form)))
+(println (placed (+ 1 2)) (meta '(placed 1)))
+
+(defmacro locals [] (list 'quote (sort (keys &env))))
+(defmacro local? [s] (contains? &env s))
+(defmacro dialect [] (if (:ns &env) :cljs :clj))
+
+(println (locals) (local? x))
+(let [x 1 [y z] [2 3]]
+  (println (filter #{'x 'y 'z} (locals)) (local? x) (local? w)))
+(defn f [a & {:keys [b]}] (local? b))
+(println (f 1 :b 2) (dialect))
