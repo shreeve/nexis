@@ -207,12 +207,7 @@ pub const Loader = struct {
         defer rdr.deinit();
         const forms = rdr.readProgram(sexp) catch {
             const e = rdr.err orelse return error.OutOfMemory;
-            // Kinds are spelled with underscores in Zig and dashes in
-            // nexis; the detail is the user's own text.
-            var kind_buf: [64]u8 = undefined;
-            const kind = kind_buf[0..@tagName(e.kind).len];
-            @memcpy(kind, @tagName(e.kind));
-            std.mem.replaceScalar(u8, kind, '_', '-');
+            const kind = reader_mod.kindName(e.kind);
             const base: Diagnostic = .{ .source = info, .span = e.span, .label = "", .reading = true };
             if (e.detail) |detail| {
                 // A Clojure number literal says what to write instead.

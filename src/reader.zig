@@ -171,6 +171,22 @@ pub const ErrorKind = enum {
     invalid_regex,
 };
 
+/// `kind` as nexis spells it, in kebab case (`:bad-number-literal`).
+pub fn kindName(kind: ErrorKind) []const u8 {
+    const names = comptime blk: {
+        const tags = std.enums.values(ErrorKind);
+        var out: [tags.len][]const u8 = undefined;
+        for (tags, &out) |tag, *name| {
+            var text: [@tagName(tag).len]u8 = @tagName(tag).*;
+            std.mem.replaceScalar(u8, &text, '_', '-');
+            const final = text;
+            name.* = &final;
+        }
+        break :blk out;
+    };
+    return names[@backingInt(kind)];
+}
+
 pub const Error = struct {
     kind: ErrorKind,
     span: SrcSpan,
@@ -1704,4 +1720,9 @@ test "end-to-end: simple reader + pretty-print round trip" {
         \\
     ;
     try std.testing.expectEqualStrings(expected, out);
+}
+
+test "kindName spells an ErrorKind as nexis does" {
+    try std.testing.expectEqualStrings("bad-number-literal", kindName(.bad_number_literal));
+    try std.testing.expectEqualStrings("invalid-utf8", kindName(.invalid_utf8));
 }
