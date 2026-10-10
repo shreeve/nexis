@@ -169,7 +169,8 @@ otherwise it is an ordinary call. User macros shadow host macros.
    - `(macroexpand-1 form)` is one macro step (`expandOnce`: a user
      or host macro at the head, never a special form or `#%`
      primitive; the raw output, nothing inside it expanded, no
-     lexical environment), or the form itself. `macroexpand` repeats
+     lexical environment), or the form itself. `^meta` on the form is
+     dropped first, as on any call (§2b). `macroexpand` repeats
      it until the head is not a macro. A failure throws the error map
      of `:macro-expansion-failure` (`docs/VM.md` §13), its `:message`
      the expander's sentence (§8): what the macro threw, or why the

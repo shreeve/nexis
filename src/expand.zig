@@ -203,13 +203,15 @@ pub fn expandForm(ctx: *ExpandContext, form: *const Form) ExpandError!*Form {
 /// One macro step, the way `macroexpand-1` sees it: when `form` is
 /// a call whose head names a user or host macro (special forms and
 /// the `#%` primitives are not macros), the macro's raw output;
-/// otherwise null. Nothing inside the result is expanded and no
-/// lexical environment applies: the form is top-level data.
+/// otherwise null. `^meta` on the call is a hint and is dropped
+/// first (§2b). Nothing inside the result is expanded and no lexical
+/// environment applies: the form is top-level data.
 pub fn expandOnce(ctx: *ExpandContext, form: *const Form) ExpandError!?*Form {
-    if (form.datum != .list) return null;
-    const items = form.datum.list;
+    const call = stripMeta(form);
+    if (call.datum != .list) return null;
+    const items = call.datum.list;
     const macro = findMacro(ctx, items) orelse return null;
-    return try callMacro(ctx, macro, form, items);
+    return try callMacro(ctx, macro, call, items);
 }
 
 /// `form` expanded by `expandOnce` until its head names no macro: a

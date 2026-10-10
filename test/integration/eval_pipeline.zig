@@ -7176,6 +7176,9 @@ test "macroexpand: host and user macros, one step and to a fixed head" {
     try expectOutput("(macroexpand '(when-not a b))", "(if a nil (do b))");
     try expectOutputProgram("(defmacro twice [x] `(do ~x ~x)) (macroexpand-1 '(twice 1))", "(do 1 1)");
     try expectOutputProgram("(defmacro w [x] `(when ~x 1)) [(macroexpand-1 '(w a)) (macroexpand '(w a))]", "[(nexis.core/when a 1) (if a (do 1) nil)]");
+    // Metadata on the form is a hint on a call, dropped first.
+    try expectOutputProgram("(defmacro m [x] (list 'do x)) (macroexpand-1 (with-meta '(m 1) {:a 1}))", "(do 1)");
+    try expectOutput("[(macroexpand-1 (with-meta '(when 1 2) {:a 1})) (macroexpand (vary-meta '(-> 1 inc) assoc :b 2))]", "[(if 1 (do 2) nil) (inc 1)]");
 }
 
 test "read-string: forms as data, the first form only, errors thrown" {
