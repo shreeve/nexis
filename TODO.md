@@ -92,10 +92,10 @@ up. Every fix starts with its failing test (`AGENTS.md`).
 
 ## Build and environment
 
-7. **CI builds against unpinned siblings** (`HANDOFF.md` §6.4 #3):
-   `shreeve/emdb` and `shreeve/nexus` at their default branches. The
-   owner decides whether to pin each to a ref. A release builds every
-   target from one emdb commit, which it records (`HANDOFF.md` §6.4).
+7. **CI builds against emdb's default branch** (`HANDOFF.md` §6.4 #3);
+   nexus is pinned to a tag. The owner decides whether to pin emdb
+   too. A release builds every target from one emdb commit, which it
+   records (`HANDOFF.md` §6.4).
 8. **The Linux comparison host's toolchain.** The host of
    `docs/PERF.md` §3.15 keeps its tools under `~/nexis-bench`, whose
    Zig is older than `build.zig.zon`'s `minimum_zig_version`; install

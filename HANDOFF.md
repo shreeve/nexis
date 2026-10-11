@@ -74,7 +74,7 @@ codegen` on macOS, whose Xcode tools carry the LLVM objdump it
 disassembles the Linux release builds with (`docs/VM.md` §8);
 `zig fmt --check` over the tracked Zig files but the generated
 `src/parser.zig`, and `zig build parser-check` against a nexus built
-from `shreeve/nexus`; and an optimized (`-Doptimize=fast`) job that runs a script, the
+from `shreeve/nexus` at the release `NEXUS_REF` names; and an optimized (`-Doptimize=fast`) job that runs a script, the
 benchmark suite once, and the static `x86_64-linux-musl` binary,
 built for x86-64-v2 (`-Dcpu=x86_64_v2`: SSE4.2 and POPCNT, so emdb's
 checksum instructions need no run-time probe; `check-targets` compiles
@@ -410,10 +410,13 @@ failing test (AGENTS.md).
    root may write any file.
 2. `zig fmt --check` fails only on the generated `src/parser.zig`; CI
    checks every other tracked Zig file.
-3. **CI builds against unpinned siblings**: it checks out `shreeve/emdb`
-   and `shreeve/nexus` at their default branches, so a change there
-   that breaks the build shows as a red nexis run. Pinning each to a
-   ref, bumped deliberately, is the owner's call.
+3. **CI builds against emdb's default branch and a pinned nexus**: it
+   checks out `shreeve/emdb` at its default branch, so a change there
+   that breaks the build shows as a red nexis run, and `shreeve/nexus`
+   at the tag `ci.yml`'s `NEXUS_REF` names. A nexus release reaches
+   nexis only when that tag is bumped, in the same commit as
+   `src/parser.zig` regenerated with a nexus built at the new tag
+   (`zig build parser -Dnexus=PATH`).
 4. **Releases publish built binaries, emdb compiled in; emdb's source
    stays private**, so building from source takes access to it, and
    no file of the emdb checkout enters an archive or an artifact.
