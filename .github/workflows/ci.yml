@@ -1,7 +1,7 @@
 # nexis CI: the full gate on macOS and Linux, the codegen check of the
 # fast dispatch handlers on macOS, the gate again with a collection
-# every few kilobytes and every store commit synced, formatting and the
-# parser check, and a speed-optimized build with a benchmark smoke run
+# every few kilobytes and every store commit synced, formatting, and a
+# speed-optimized build with a benchmark smoke run
 # and the static (musl) Linux binaries.
 #
 # `zig build check-targets` is not a job. The test jobs build every
@@ -17,6 +17,12 @@
 # fine-grained personal access token whose only permission is
 # "Contents: read-only" on shreeve/emdb. Secrets do not reach pull
 # requests from forks, so those runs fail at the emdb checkout.
+#
+# src/parser.zig is generated, not committed: every build runs Nexus on
+# nexis.grammar first. Nexus is public and co-developed with nexis, so
+# every job that builds nexis checks out its default branch into
+# `nexus/` beside nexis and builds it; the build finds nexus/bin/nexus
+# in the parent directory. The binary is cached by the Nexus commit.
 #
 # mlugg/setup-zig installs Zig and caches the Zig cache directory (the
 # global cache, with the local caches redirected into it) under a key
@@ -39,9 +45,6 @@ concurrency:
 
 env:
   ZIG_VERSION: 0.17.0
-  # The nexus release src/parser.zig is generated with; bumped with a
-  # regenerated parser (HANDOFF.md §6.4).
-  NEXUS_REF: v2.2.0
 
 jobs:
   test:
@@ -61,10 +64,32 @@ jobs:
           repository: shreeve/emdb
           token: ${{ secrets.EMDB_TOKEN }}
           path: emdb
+      # The parser generator, public and co-developed with nexis: its
+      # default branch, beside nexis, where the build looks for
+      # nexus/bin/nexus.
+      - uses: actions/checkout@v6
+        with:
+          repository: shreeve/nexus
+          path: nexus
       - uses: mlugg/setup-zig@v2.2.1
         with:
           version: ${{ env.ZIG_VERSION }}
           cache-key: ${{ hashFiles('nexis/build.zig.zon') }}
+      # Built for a baseline CPU, since a cached binary can land on an
+      # older runner, and cached by the commit it was built from.
+      - name: Find the nexus commit
+        id: nexus-sha
+        run: echo "sha=$(git -C nexus rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Restore nexus
+        id: nexus
+        uses: actions/cache@v4
+        with:
+          path: nexus/bin/nexus
+          key: nexus-${{ steps.nexus-sha.outputs.sha }}-baseline-zig-${{ env.ZIG_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Build nexus
+        if: steps.nexus.outputs.cache-hit != 'true'
+        working-directory: nexus
+        run: zig build -Doptimize=safe -Dcpu=baseline
       - name: zig build test
         working-directory: nexis
         run: zig build test --summary all
@@ -94,16 +119,38 @@ jobs:
           repository: shreeve/emdb
           token: ${{ secrets.EMDB_TOKEN }}
           path: emdb
+      # The parser generator, public and co-developed with nexis: its
+      # default branch, beside nexis, where the build looks for
+      # nexus/bin/nexus.
+      - uses: actions/checkout@v6
+        with:
+          repository: shreeve/nexus
+          path: nexus
       - uses: mlugg/setup-zig@v2.2.1
         with:
           version: ${{ env.ZIG_VERSION }}
           cache-key: ${{ hashFiles('nexis/build.zig.zon') }}
+      # Built for a baseline CPU, since a cached binary can land on an
+      # older runner, and cached by the commit it was built from.
+      - name: Find the nexus commit
+        id: nexus-sha
+        run: echo "sha=$(git -C nexus rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Restore nexus
+        id: nexus
+        uses: actions/cache@v4
+        with:
+          path: nexus/bin/nexus
+          key: nexus-${{ steps.nexus-sha.outputs.sha }}-baseline-zig-${{ env.ZIG_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Build nexus
+        if: steps.nexus.outputs.cache-hit != 'true'
+        working-directory: nexus
+        run: zig build -Doptimize=safe -Dcpu=baseline
       - name: zig build test -Dgc-stress -Ddurability=durable
         working-directory: nexis
         run: zig build test -Dgc-stress -Ddurability=durable --summary all
 
   lint:
-    name: fmt and parser
+    name: fmt
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -115,26 +162,13 @@ jobs:
           repository: shreeve/emdb
           token: ${{ secrets.EMDB_TOKEN }}
           path: emdb
-      # The parser generator; public. `parser-check` diffs its output
-      # against the committed src/parser.zig.
-      - uses: actions/checkout@v6
-        with:
-          repository: shreeve/nexus
-          ref: ${{ env.NEXUS_REF }}
-          path: nexus
       - uses: mlugg/setup-zig@v2.2.1
         with:
           version: ${{ env.ZIG_VERSION }}
           cache-key: ${{ hashFiles('nexis/build.zig.zon') }}
-      - name: zig fmt --check (src/parser.zig is generated)
+      - name: zig fmt --check
         working-directory: nexis
-        run: git ls-files -z '*.zig' '*.zig.zon' ':!:src/parser.zig' | xargs -0 zig fmt --check
-      - name: build nexus
-        working-directory: nexus
-        run: zig build
-      - name: zig build parser-check
-        working-directory: nexis
-        run: zig build parser-check --summary all
+        run: git ls-files -z '*.zig' '*.zig.zon' | xargs -0 zig fmt --check
 
   release:
     name: optimized, bench and static binary
@@ -149,10 +183,32 @@ jobs:
           repository: shreeve/emdb
           token: ${{ secrets.EMDB_TOKEN }}
           path: emdb
+      # The parser generator, public and co-developed with nexis: its
+      # default branch, beside nexis, where the build looks for
+      # nexus/bin/nexus.
+      - uses: actions/checkout@v6
+        with:
+          repository: shreeve/nexus
+          path: nexus
       - uses: mlugg/setup-zig@v2.2.1
         with:
           version: ${{ env.ZIG_VERSION }}
           cache-key: ${{ hashFiles('nexis/build.zig.zon') }}
+      # Built for a baseline CPU, since a cached binary can land on an
+      # older runner, and cached by the commit it was built from.
+      - name: Find the nexus commit
+        id: nexus-sha
+        run: echo "sha=$(git -C nexus rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Restore nexus
+        id: nexus
+        uses: actions/cache@v4
+        with:
+          path: nexus/bin/nexus
+          key: nexus-${{ steps.nexus-sha.outputs.sha }}-baseline-zig-${{ env.ZIG_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Build nexus
+        if: steps.nexus.outputs.cache-hit != 'true'
+        working-directory: nexus
+        run: zig build -Doptimize=safe -Dcpu=baseline
       - name: optimized bin/nexis
         working-directory: nexis
         run: |
