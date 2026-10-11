@@ -1,8 +1,9 @@
 # nexis.grammar — reader grammar for nexis, the input of the nexus parser generator.
 #
-# `zig build parser` generates src/parser.zig from this file. The parser
-# produces a raw `Sexp` tree that `src/reader.zig` normalizes into the
-# canonical `Form` tree documented in `docs/FORMS.md` (PLAN Appendix C):
+# Every build generates src/parser.zig from this file; `zig build parser`
+# generates it alone. The parser produces a raw `Sexp` tree that
+# `src/reader.zig` normalizes into the canonical `Form` tree documented
+# in `docs/FORMS.md` (PLAN Appendix C):
 #
 #   source.nx ──[src/nexis.zig lexer + this grammar]──► raw Sexp ──[src/reader.zig]──► Form
 #

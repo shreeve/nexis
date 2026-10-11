@@ -134,5 +134,4 @@ nothing else.
   (`install`, a `LazyPath` relative to `install_bin`) that puts
   `bin/nexis` in the checkout for the default prefix and in
   `<prefix>/bin` for `--prefix`.
-- `zig fmt --check` before a commit; the generated `src/parser.zig` is
-  the one file that does not pass.
+- `zig fmt --check` before a commit.
