@@ -108,10 +108,19 @@ re-import its data, after upgrading (`docs/DB.md` §1,
 
 ## Build from source
 
-Building takes Zig 0.17.0 and a sibling checkout of emdb (`../emdb`),
-the storage engine compiled into every binary. emdb's repository is
-private, so only those with access to it can build from source; a
-release's binaries have it compiled in.
+Building takes Zig 0.17.0 and sibling checkouts of emdb (`../emdb`),
+the storage engine compiled into every binary, and of nexus
+(`../nexus`), the parser generator. emdb's repository is private, so
+only those with access to it can build from source; a release's
+binaries have it compiled in. Build nexus first, and every `zig build`
+of nexis then generates `src/parser.zig` from `nexis.grammar` with it:
+
+```bash
+git clone https://github.com/shreeve/nexus ../nexus
+(cd ../nexus && zig build -Doptimize=safe)
+```
+
+`-Dnexus=PATH` names another binary.
 
 ```bash
 zig build install                      # bin/nexis
@@ -320,7 +329,7 @@ has the full tables of reader and semantic differences, and
 | `ZIG.md` | Zig as this tree uses it |
 | `src/` | The runtime (one Zig module, `src/root.zig`); `src/stdlib/*.nx` the library written in nexis |
 | `test/`, `examples/`, `bench/` | Tests (`test/README.md`), example programs, the benchmark harness |
-| `nexis.grammar` | The reader grammar; `src/parser.zig` is generated from it by `zig build parser` (needs `../nexus/bin/nexus`) |
+| `nexis.grammar` | The reader grammar; `src/parser.zig` is generated from it by every build (needs `../nexus/bin/nexus`) |
 
 Every store is opened with a 16 KiB page, fixed for the file's life,
 so the page size never follows a platform's engine default.

@@ -21,9 +21,8 @@
 //!   zig build nexis                   bin/nexis alone
 //!   zig build bench [-- ARGS]         the benchmark suite, optimized for speed
 //!   zig build run -- ARGS             build and run bin/nexis
-//!   zig build parser                  regenerate src/parser.zig from nexis.grammar
-//!   zig build parser-check            diff src/parser.zig against a fresh generation
-//!                                     (part of `test` when nexus is present)
+//!   zig build parser                  generate src/parser.zig from nexis.grammar
+//!                                     (every other step does this first)
 //!   zig build codegen                 disassemble the fast dispatch handlers of the
 //!                                     arm64 and x86-64 release builds: no stack
 //!                                     frame, no call (docs/VM.md §8)
@@ -32,9 +31,11 @@
 //!
 //! The runtime is one module, `nexis`, rooted at src/root.zig; its files
 //! import each other by relative path. `checkLayering` below enforces the
-//! import order src/root.zig declares. The checked-in src/parser.zig is
-//! authoritative; `parser` regenerates it after an edit to nexis.grammar,
-//! with the nexus at ../nexus/bin/nexus or `-Dnexus=PATH`.
+//! import order src/root.zig declares. src/parser.zig is generated, not
+//! committed: nexus runs again only when nexis.grammar or the nexus binary
+//! changes. The binary is `-Dnexus=PATH` (relative to where `zig build`
+//! runs), else nexus/bin/nexus in the nearest parent directory (normally
+//! ../nexus/bin/nexus; build it with `zig build -Doptimize=safe`).
 
 const std = @import("std");
 /// The version, from build.zig.zon: what `nexis --version` prints.
@@ -48,6 +49,11 @@ pub fn build(b: *std.Build) void {
         .gc_stress = b.option(bool, "gc-stress", "run every test and program with a collection every few kilobytes (NEXIS_GC_STRESS)") orelse false,
         .durability = b.option(RunEnv.Durability, "durability", "the durability of every store commit the tests and programs make (NEXIS_DURABILITY; commit unless durable)") orelse .commit,
     };
+
+    // Parser generation: src/parser.zig is made from nexis.grammar on every
+    // build, and every compile step depends on it.
+    const parser_step = b.step("parser", "Generate src/parser.zig from nexis.grammar");
+    parser_gen = generateParser(b, parser_step);
 
     const image = stdlibImage(b);
     const nexis = runtime(b, target, optimize, image);
@@ -67,37 +73,6 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{ .root_source_file = b.path("build.zig"), .target = target, .optimize = optimize }),
     })).step);
 
-    // Parser generation, through the external nexus tool at ../nexus/bin/nexus.
-    const nexus_bin = b.option([]const u8, "nexus", "the nexus parser generator (default ../nexus/bin/nexus)") orelse
-        b.pathResolve(&.{ rootPath(b), "..", "nexus", "bin", "nexus" });
-    const run_nexus = b.addSystemCommand(&.{ nexus_bin, "nexis.grammar", "src/parser.zig" });
-    run_nexus.setCwd(b.path("."));
-    b.step("parser", "Regenerate src/parser.zig from nexis.grammar").dependOn(&run_nexus.step);
-    // The committed src/parser.zig against a generation into the cache;
-    // the gate runs it whenever nexus is there to run. The build
-    // notices a nexus built after it last looked.
-    const parser_check_step = b.step("parser-check", "Fail when src/parser.zig differs from what nexus generates from nexis.grammar");
-    if (std.Io.Dir.cwd().access(b.graph.io, nexus_bin, .{})) |_| {
-        b.dependOnFileMetadata(.{ .cwd_relative = nexus_bin });
-        const generate = b.addSystemCommand(&.{nexus_bin});
-        generate.addFileArg2(b.path("nexis.grammar"), .{});
-        const generated = generate.addOutputFileArg2("parser.zig", .{});
-        generate.addFileInput(.{ .cwd_relative = nexus_bin });
-        generate.expectExitCode(0);
-        _ = generate.captureStdOut(.{});
-        _ = generate.captureStdErr(.{});
-        const compare = b.addSystemCommand(&.{ "sh", "-c", "diff -u \"$1\" \"$2\" >&2 || { echo 'src/parser.zig is stale: run zig build parser' >&2; exit 1; }", "parser-check" });
-        compare.addFileArg2(b.path("src/parser.zig"), .{});
-        compare.addFileArg2(generated, .{});
-        compare.expectExitCode(0);
-        parser_check_step.dependOn(&compare.step);
-        test_step.dependOn(&compare.step);
-    } else |_| {
-        b.graph.poisonCache();
-        const skip = b.addSystemCommand(&.{ "echo", b.fmt("parser-check: skipped, no nexus at {s}", .{nexus_bin}) });
-        parser_check_step.dependOn(&skip.step);
-    }
-
     const suites = listSuites(b);
     const bins = binaries(b, target, optimize, nexis, image, suites);
 
@@ -116,12 +91,12 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&cli_unit.step);
     quick_step.dependOn(&cli_unit.step);
     // The Nextomic subset, compiled only when `nextomic-test` runs alone.
-    const nextomic_unit = b.addRunArtifact(b.addTest(.{
+    const nextomic_unit = b.addRunArtifact(afterParser(b.addTest(.{
         .name = "nextomic-unit",
         .root_module = nexis,
         .filters = &.{"nextomic"},
         .use_llvm = useLlvm(target),
-    }));
+    })));
     nextomic_unit.setCwd(b.path("."));
     env.apply(nextomic_unit, env.gc_stress);
     nextomic_test_step.dependOn(&nextomic_unit.step);
@@ -178,7 +153,7 @@ pub fn build(b: *std.Build) void {
     counted_options.addOption([]const u8, "version", version);
     counted.addOptions("build_options", counted_options);
     counted.addAnonymousImport("stdlib_image", .{ .root_source_file = image });
-    test_step.dependOn(&b.addExecutable(.{ .name = "nexis-counted", .root_module = counted, .use_llvm = useLlvm(target) }).step);
+    test_step.dependOn(&afterParser(b.addExecutable(.{ .name = "nexis-counted", .root_module = counted, .use_llvm = useLlvm(target) })).step);
 
     // Every binary above, compiled and linked for each Linux target the
     // release supports; nothing runs. The musl builds are the static
@@ -204,7 +179,7 @@ pub fn build(b: *std.Build) void {
         module.addOptions("build_options", runtimeOptions(b));
         module.addAnonymousImport("stdlib_image", .{ .root_source_file = image });
         const check = b.addSystemCommand(&.{ "sh", "test/codegen.sh", t.triple });
-        check.addArtifactArg(b.addExecutable(.{ .name = "nexis", .root_module = module, .use_llvm = useLlvm(cross) }));
+        check.addArtifactArg(afterParser(b.addExecutable(.{ .name = "nexis", .root_module = module, .use_llvm = useLlvm(cross) })));
         check.addFileInput(b.path("test/codegen.sh"));
         check.setCwd(b.path("."));
         check.stdio = .inherit;
@@ -514,6 +489,60 @@ fn install(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.Step {
     return &copy.step;
 }
 
+/// The step that writes src/parser.zig; every compile step depends on it.
+var parser_gen: *std.Build.Step = undefined;
+
+/// `compile`, run after the parser is generated.
+fn afterParser(compile: *std.Build.Step.Compile) *std.Build.Step.Compile {
+    compile.step.dependOn(parser_gen);
+    return compile;
+}
+
+/// Generate src/parser.zig from nexis.grammar with the Nexus binary
+/// (`-Dnexus=PATH`, else the nearest parent's nexus/bin/nexus) and copy
+/// it into the source tree. The run's inputs are the grammar and the
+/// binary, so Nexus runs again only when either changes. With no binary
+/// the returned step fails with the way to get one.
+fn generateParser(b: *std.Build, parser_step: *std.Build.Step) *std.Build.Step {
+    const path = (if (b.option([]const u8, "nexus", "Path to the Nexus binary")) |p|
+        b.pathResolve(&.{ std.process.currentPathAlloc(b.graph.io, b.allocator) catch @panic("cannot read the working directory"), p })
+    else
+        findNexus(b)) orelse {
+        const fail = b.addFail("cannot generate src/parser.zig: Nexus not found.\n" ++
+            "Looked for nexus/bin/nexus in every parent directory of the nexis checkout (normally ../nexus/bin/nexus).\n" ++
+            "Get it: git clone https://github.com/shreeve/nexus ../nexus && (cd ../nexus && zig build -Doptimize=safe)\n" ++
+            "or name a binary: zig build -Dnexus=PATH");
+        parser_step.dependOn(&fail.step);
+        return &fail.step;
+    };
+    // Nexus reports progress on stderr; the wrapper shows it only on failure.
+    const gen = std.Build.Step.Run.create(b, "nexus nexis.grammar");
+    gen.addArgs(&.{ "sh", "-c", "\"$@\" 2>\"$3.log\" || { cat \"$3.log\" >&2; exit 1; }", "nexus" });
+    gen.addFileArg(.{ .cwd_relative = path });
+    gen.addFileArg(b.path("nexis.grammar"));
+    const out = gen.addOutputFileArg("parser.zig");
+    const place = b.addUpdateSourceFiles();
+    place.addCopyFileToSource(out, "src/parser.zig");
+    parser_step.dependOn(&place.step);
+    return &place.step;
+}
+
+/// `nexus/bin/nexus` in the nearest parent directory of the build root
+/// that has one (the checkout's sibling, also from nested git worktrees).
+/// A found binary is a declared input; without one every `zig build`
+/// looks again. Null when there is none.
+fn findNexus(b: *std.Build) ?[]const u8 {
+    var dir: []const u8 = b.pathResolve(&.{rootPath(b)});
+    while (std.Io.Dir.path.dirname(dir)) |parent| : (dir = parent) {
+        const candidate = b.pathJoin(&.{ parent, "nexus", "bin", "nexus" });
+        std.Io.Dir.cwd().access(b.graph.io, candidate, .{}) catch continue;
+        b.dependOnFileMetadata(.{ .cwd_relative = candidate });
+        return candidate;
+    }
+    b.graph.poisonCache();
+    return null;
+}
+
 /// The build root as a path string.
 fn rootPath(b: *std.Build) []const u8 {
     return b.fmt("{f}", .{b.root});
@@ -636,14 +665,14 @@ fn binaries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.
         });
         module.addImport("nexis", nexis);
         module.addImport("harness", harness);
-        bin.* = b.addTest(.{ .name = std.Io.Dir.path.stem(suite.path), .root_module = module, .use_llvm = useLlvm(target) });
+        bin.* = afterParser(b.addTest(.{ .name = std.Io.Dir.path.stem(suite.path), .root_module = module, .use_llvm = useLlvm(target) }));
     }
     const cli_mod = cliModule(b, target, optimize);
     cli_mod.addOptions("build_options", runtimeOptions(b));
     cli_mod.addAnonymousImport("stdlib_image", .{ .root_source_file = image });
     return .{
-        .nexis = b.addExecutable(.{ .name = "nexis", .root_module = cli_mod, .use_llvm = useLlvm(target) }),
-        .golden = b.addExecutable(.{
+        .nexis = afterParser(b.addExecutable(.{ .name = "nexis", .root_module = cli_mod, .use_llvm = useLlvm(target) })),
+        .golden = afterParser(b.addExecutable(.{
             .name = "nexis-golden",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/golden.zig"),
@@ -651,12 +680,12 @@ fn binaries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.
                 .optimize = optimize,
             }),
             .use_llvm = useLlvm(target),
-        }),
+        })),
         .bench = benchExe(b, target, optimize, nexis),
-        .unit = b.addTest(.{ .name = "unit", .root_module = nexis, .use_llvm = useLlvm(target) }),
+        .unit = afterParser(b.addTest(.{ .name = "unit", .root_module = nexis, .use_llvm = useLlvm(target) })),
         // The runtime's own tests run in `unit`; this binary reaches
         // them too, through the files cli.zig imports.
-        .cli_unit = b.addTest(.{ .name = "cli-unit", .root_module = cli_mod, .filters = &.{"cli: "}, .use_llvm = useLlvm(target) }),
+        .cli_unit = afterParser(b.addTest(.{ .name = "cli-unit", .root_module = cli_mod, .filters = &.{"cli: "}, .use_llvm = useLlvm(target) })),
         .suites = suite_bins,
     };
 }
@@ -682,7 +711,7 @@ fn benchExe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.
         .optimize = optimize,
     });
     module.addImport("nexis", nexis);
-    return b.addExecutable(.{ .name = "nexis-bench", .root_module = module, .use_llvm = useLlvm(target) });
+    return afterParser(b.addExecutable(.{ .name = "nexis-bench", .root_module = module, .use_llvm = useLlvm(target) }));
 }
 
 /// Every binary on x86_64 compiles through LLVM, whatever the optimize
@@ -730,7 +759,7 @@ fn stdlibImage(b: *std.Build) std.Build.LazyPath {
     module.addImport("emdb", emdbModule(b, host, .debug));
     module.addOptions("build_options", runtimeOptions(b));
     module.addAnonymousImport("stdlib_image", .{ .root_source_file = b.addWriteFiles().add("none.image", "") });
-    const generate = b.addRunArtifact(b.addExecutable(.{ .name = "nexis-imagegen", .root_module = module, .use_llvm = useLlvm(host) }));
+    const generate = b.addRunArtifact(afterParser(b.addExecutable(.{ .name = "nexis-imagegen", .root_module = module, .use_llvm = useLlvm(host) })));
     generate.clearEnvironment();
     generate.expectExitCode(0);
     return generate.addOutputFileArg("stdlib.image");
@@ -805,7 +834,7 @@ fn checkLayering(b: *std.Build) ?[]const u8 {
         if (entry.kind == .directory) b.dependOnDirectoryContents(b.path(b.pathJoin(&.{ "src", entry.path })));
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".zig")) continue;
         const file = b.graph.dupeString(entry.path);
-        if (std.mem.eql(u8, file, "root.zig")) continue;
+        if (std.mem.eql(u8, file, "root.zig") or std.mem.eql(u8, file, "parser.zig")) continue;
         const from = layerUnit(file);
         const from_rank = rank.get(from) orelse if (isExecutableRoot(file))
             std.math.maxInt(usize)
