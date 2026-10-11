@@ -30,7 +30,14 @@ format it was built against (its `BUILD-INFO` names the emdb commit)
 and may refuse another release's, as `:db/corrupted` or
 `:db/open-failed` (§8). After upgrading, recreate a store or re-import
 its data. Hosts are another matter: one release's store carries
-between macOS and Linux (`test/portable/README.md`).
+between macOS and Linux (`test/portable/README.md`). Processes share a
+store through emdb's lock file, whose format can differ between
+releases that read the same store format (0.2.0 and 0.3.0 both read
+format 6; 0.3.0's lock table is another format): such releases use a
+store one at a time, a lone opener rewriting the lock table for its
+own format, and a process that opens it while one of the other format
+holds it is refused with `:db/open-failed` before it touches the table
+or the file, the process already there unaffected.
 
 ---
 

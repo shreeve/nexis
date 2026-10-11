@@ -104,7 +104,10 @@ hosts but not between releases: emdb's file format is not frozen and
 emdb does not migrate a file from one format to another, so a release
 may refuse a store another release wrote. Recreate a store, or
 re-import its data, after upgrading (`docs/DB.md` §1,
-`docs/NEXTOMIC.md` §2).
+`docs/NEXTOMIC.md` §2). Two releases that read the same store, as
+0.2.0 and 0.3.0 do, use it one at a time: while a process of one holds
+it open, a process of the other is refused at open with
+`:db/open-failed` (`docs/DB.md` §1).
 
 ## Build from source
 
