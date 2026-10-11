@@ -240,17 +240,7 @@ collection in the natural order, and quoting one yields it
 
 ### 9. Tests
 
-`test/prop/sorted.zig`: P1 random updates of maps and sets against a
-sorted-array model, the invariants, count, lookups and both walk
-directions checked after every step; P2 a kept version unchanged by
-later updates; P3 the walk from a random bound, both ways; P4 a
-descending comparator and one that equates keys; P5 `=` and hash
-agreement with hash maps and sets and across comparators, and one
-change breaking it; P6 the natural order over strings, keywords and
-vectors; P7 the collector keeping the tree through the root alone and
-sweeping a dropped path; P8 the codec round trip, equal, hash-equal,
-sorted and byte-stable. Inline tests in `sorted.zig` pin the shape
-through 2000 random and 4096 ascending inserts, the walks and the
-natural order; `codec.zig` the wire format and its refusals;
-`eval_pipeline.zig` the language surface ("sorted collections: ...")
-and the rooting under the collector.
+`test/prop/sorted.zig` holds the properties; the inline tests in `sorted.zig`
+pin the shape and the walks, `codec.zig` the wire format and its refusals,
+and `eval_pipeline.zig` the language surface and the rooting under the
+collector.

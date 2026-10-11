@@ -46,8 +46,8 @@ tables, one for keywords and one for symbols.
    `maxInt(u32)` entries returns `error.InternTableFull`, so the id
    cast cannot truncate.
 
-`test/prop/intern.zig` I1–I10 check invariants 1–5, the qualified
-split (§3) and the map/list lockstep (§4) over random names.
+`test/prop/intern.zig` checks invariants 1–5, the qualified split (§3) and
+the map/list lockstep (§4) over random names.
 
 ---
 

@@ -917,7 +917,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
             /// equal hashes keep input order (a collision node is in
             /// association order). One word, stored and compared whole:
             /// on x86-64 an 8-byte load of two 4-byte stores waits for
-            /// them to reach the cache (docs/PERF.md "Natives that return
+            /// them to reach the cache (docs/PERF.md §3.41, "Natives that return
             /// in place").
             key: u64,
 

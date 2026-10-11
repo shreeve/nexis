@@ -336,24 +336,11 @@ already marked, so the walk stops there.
 
 ### 10. Testing
 
-The inline tests in `src/gc.zig` cover the primitives and small graphs
-of every traced kind (roots, nesting, CHAMP and vector interior nodes,
-atoms, idempotence, metadata). `test/prop/gc.zig` G1–G6b drive
-randomized graphs against a reachability model, a half-million-cell
-list (G3b) and a 300,000-level chain of vectors, maps, atoms and meta
-maps (G3c) through a cycle, repeated cycles without leaks
-(G5), and programs that allocate on every step of a loop on a VM under
-`GcPolicy.stress` (G6, G6b). `test/prop/heap.zig` H2, H3 and H6 test
-the sweep primitive with hand-set marks, and `test/prop/transient.zig`
-T4 and T4b collect with a transient as the only root. Under the
-runtime, the `gc:` tests of `test/integration/eval_pipeline.zig` run
-every callback-taking native of §11.5 with allocating callbacks on a
-stressed VM, and `test/nextomic/gc.nx` does the same through `bin/nexis`
-for query predicates, function bindings and custom aggregates. The
-`db:` test of dropped transactions ends ten thousand unreachable read
-handles and dropped writes under both policies.
-`zig build test -Dgc-stress` runs the whole suite with every VM
-under the stress policy (each run gets `NEXIS_GC_STRESS=1`).
+The inline tests in `src/gc.zig`, `test/prop/gc.zig`, `test/prop/heap.zig` and
+`test/prop/transient.zig`, the `gc:` tests of `test/integration/eval_pipeline.zig`
+and `test/nextomic/gc.nx` cover the collector (§11.5's natives among them).
+`zig build test -Dgc-stress` runs the whole suite with every VM under the
+stress policy (each run gets `NEXIS_GC_STRESS=1`).
 
 ---
 

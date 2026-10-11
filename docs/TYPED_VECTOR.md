@@ -186,17 +186,8 @@ is allocated.
 
 ### 9. Testing
 
-Inline tests in `src/coll/typed_vector.zig` cover layout and alignment,
-construction, NaN canonicalization, `nth` (fixnum, bignum promotion,
-float, out of bounds), equality and hash (signed zero and NaN
-included), `format` and `ElemType.fromTag`.
-`test/prop/typed_vector.zig`: T1 codec round trip of both element types
-at lengths 0, 1, 31, 32, 33 and 1000 (equality, hash, bit-exact
-elements, byte-stable re-encode); T2 equality and hash agreement and
-the three ways `=` breaks; T2b signed zero and NaN; T3 never `=` to a persistent vector; T4
-`nth` over every index and `IndexOutOfBounds` at `count` and beyond.
-`src/codec.zig` covers the byte layout, `MalformedPayload` on an
-unknown element tag and `TruncatedInput` on an oversized count.
-`test/integration/eval_pipeline.zig` (`typed vectors: ...`) covers the
-language surface, the kernels and a store round trip, and
-`examples/typed-vectors.nx` runs under `zig build examples`.
+Inline tests in `src/coll/typed_vector.zig` cover the layout and the accessors,
+`test/prop/typed_vector.zig` the properties, `src/codec.zig` the byte layout
+and its refusals, `test/integration/eval_pipeline.zig` the language surface and
+a store round trip, and `examples/typed-vectors.nx` runs under `zig build
+examples`.

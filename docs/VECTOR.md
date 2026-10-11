@@ -199,15 +199,5 @@ cursors in lock step through `elementEq`. A list against a vector:
 sequentials compare by category at every level: `[1 (2 3) 4]` and
 `(1 [2 3] 4)` are `=` and hash alike (PLAN §23 #36).
 
-**Tests.** `test/prop/vector.zig`: V1 `fromSlice`/`nth` round-trip;
-V2 `conj` against `fromSlice`; V2b random `conj`/`assoc`/`pop` walks
-against a model across the 32, 1056 and 32800 boundaries; V3 list and
-vector equal and hash-equal; V4 equivalence laws; V5 `=` implies equal
-hash; V6 never equal to a non-sequential value; V7 length
-discrimination; V8 nested vectors; V9 cross-kind equality and hash at
-the boundary sizes 33 through 32801; V10 branching histories (`conj`,
-`assoc` and `pop` from random earlier versions, so versions share
-tails and claim slots, with heap elements and collections in between)
-keep every version's elements. Unit tests in `vector.zig` cover `pop`
-shapes node for node against `fromSlice`, and a claim and the copy
-that follows a second `conj` from one vector.
+**Tests.** `test/prop/vector.zig` holds the properties; the unit tests in
+`vector.zig` cover `pop` shapes and the claim of a slot.

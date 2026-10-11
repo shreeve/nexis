@@ -254,28 +254,10 @@ the value layer and the collection modules it walks.
 
 ### 7. Testing
 
-The inline tests in `src/codec.zig` cover each kind's round trip (a
-sorted map and set among them, with the refusal of a comparator and of
-keys out of order; an instant at both ends of the i64 range; a UUID
-and a truncated one), the
-envelope, truncation, trailing bytes, malformed LEB128, surrogate
-chars, every one of the 256 kind bytes outside the set
-(`MalformedPayload`, §3), a transient on
-encode, hostile lengths and counts near 2^64 (`TruncatedInput` with
-nothing allocated), a value 200 000 levels deep round-tripping byte
-for byte, 200 000 levels of input of each container kind decoding,
-and the leniency of §2.6.
-
-`test/prop/sorted.zig` P8 round-trips random natural-order sorted maps
-and sets, byte-stable. `test/prop/codec.zig`: **C1** 100 000 random values of every
-serializable kind, nested up to depth 4, round-trip equal with equal
-hashes; **C2** re-encode is byte-equal for every kind but map and set;
-**C3** a transient is `UnserializableKind`; **C4** 1 000 random byte
-slices decode to a value or a `DecodeError`, never a crash; **C5** 500
-hostile headers (lengths and counts near 2^64 or past the input,
-under nesting thousands of levels deep) end in a typed error or a
-value, never `OutOfMemory`, allocating no more than the nesting read. `test/prop/typed_vector.zig`
-T1 is the typed-vector round trip.
+The inline tests in `src/codec.zig` cover each kind's round trip, the envelope
+and the malformed, truncated and hostile inputs; `test/prop/codec.zig` is the
+codec gate property of §5, `test/prop/sorted.zig` and
+`test/prop/typed_vector.zig` round-trip their kinds.
 
 ---
 

@@ -178,8 +178,8 @@ offset). `=` and `hash` over any Value are `dispatch.equal` and
 `dispatch.hashValue`; the immediates go to `Value.equalImmediate` (bit
 equality, with `-0.0 = +0.0`) and `Value.hashImmediate`. The rules and
 the kind table are SEMANTICS §2 and §3.3. `test/prop/primitive.zig`
-checks both implications over randomized immediates (P1–P7); each heap
-kind's property file (`test/prop/string.zig`, `list.zig`, `vector.zig`,
+checks both implications over randomized immediates; each heap kind's
+property file (`test/prop/string.zig`, `list.zig`, `vector.zig`,
 `champ.zig`, ...) checks them for that kind.
 
 ### 5. Elsewhere

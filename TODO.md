@@ -123,17 +123,6 @@ Each needs a PLAN amendment before code (`AGENTS.md`, authority order).
     ways to combine them (a temporal mirror first) and a first
     demonstration. The capture hook belongs to em's repository.
 
-## Open from revamp 3
-
-Small items the revamp-3 streams (PRs 36–45) found across each other's
-files; each is a few lines.
-
-29. **The test and doc pass the revamp deferred:** `eval_pipeline`'s
-    superseded early cases and its fresh VM per case (31 s of the gate),
-    the duplicated pins, `docs/PERF.md`'s superseded tables, test
-    inventories in the docs, and the moved Nextomic suites'
-    `Heap.init(arena)` without `deinit`.
-
 ## Divergences by design, not bugs
 
 9. **`/` by a float zero.** nexis always raises `:divide-by-zero`,

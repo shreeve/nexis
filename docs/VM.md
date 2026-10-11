@@ -1345,21 +1345,11 @@ callback that catches it returns normally through `mapv`, `reduce`,
 
 ### 15. Tests
 
-`src/vm.zig` holds the opcode tests: hand-assembled routines
-covering every dispatched opcode and every trap it can raise, as
-`RunCase` rows run by `expectRuns` (code, constants, tries, capture
-descriptors, a Var table, and the value, kind, Var, error or uncaught
-throw wanted), which also asserts that a run that returns leaves no
-handler, pending finally or frame behind; what verification refuses is
-the rows of `Routine.verify`'s own table, each run through `run` too.
-The tests that inspect VM state, batches and the numeric tower are
-individual. `src/compile.zig` pins the 10k-iteration `recur` loop
-(§11).
-`test/integration/eval_pipeline.zig`, `runtime_polish.zig` and
-`numbers.zig` run source through the compiler and VM (captured loop
-bindings, `letfn*`, variadic calls, every catchable error and its
-error value, error traces); `test/golden/cli/*` pin the reports and `zig build examples`
-runs every example.
+`src/vm.zig` holds the opcode tests (hand-assembled routines run by `expectRuns`,
+and `Routine.verify`'s own table); `src/compile.zig` pins the 10k-iteration
+`recur` loop (§11). `test/integration/eval_pipeline.zig`, `runtime_polish.zig`
+and `numbers.zig` run source through the compiler and VM, `test/golden/cli/*`
+pin the reports and `zig build examples` runs every example.
 
 ---
 

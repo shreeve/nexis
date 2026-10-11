@@ -370,7 +370,7 @@ const Runtime = struct {
     /// reads, sit at a fixed distance from the frames of the natives
     /// under a callback, and a native's store a multiple of 4 KiB from
     /// a field makes the next handler's load of the field wait for it
-    /// (docs/PERF.md §3 "Fast dispatch, Apple M5"). `load_paths` must
+    /// (docs/PERF.md §3.19). `load_paths` must
     /// outlive it.
     fn create(io: std.Io, allocator: std.mem.Allocator, load_paths: []const []const u8) !*Runtime {
         const rt = try allocator.create(Runtime);
