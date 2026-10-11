@@ -239,20 +239,7 @@ nothing of tokens: an owned node is an ordinary block.
 
 ### 11. Testing
 
-`test/prop/transient.zig`: T1a-T1d equivalence (random edit sequences
-through a transient and through the persistent operations give `=` and
-hash-equal results, for maps, sets and vectors, T1d with random
-`conj!`/`assoc!`/`pop!`); T2a-T2d ownership (a frozen transient rejects
-every operation; the wrong family gives `TransientKindMismatch`);
-T3a-T3b the source collection is unchanged; T4, T4b the root survives
-collection through an active or a frozen transient; T5a-T5d every
-persistent map, set and vector any round produced keeps its contents,
-canonical layout and hash while later transients over it and its
-relatives, two at once, edit in place, through collision nodes and
-across the vector's trie boundaries, with collections in between; T6
-the edit clock's wrap. Inline tests in `transient.zig` cover the
-wrapper and that an edit of owned nodes allocates nothing;
-`test/integration/eval_pipeline.zig` ("transients", the wrap of the
-clock under `group-by` and under a `!` call that raises, and the `gc:`
-tests of `group-by` and transient builds under the stress policy)
-covers the language surface.
+`test/prop/transient.zig` holds the properties; the inline tests in
+`transient.zig` cover the wrapper and that an edit of owned nodes allocates
+nothing, and `test/integration/eval_pipeline.zig` the language surface and the
+`gc:` tests under the stress policy.

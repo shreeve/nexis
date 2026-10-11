@@ -93,56 +93,16 @@ fn expectProgramErrorWithStore(name: []const u8, template: []const u8, expected:
 // Literals + arithmetic
 // =============================================================================
 
-test "integration: literals" {
-    try expectOutput("nil", "nil");
-    try expectOutput("true", "true");
-    try expectOutput("false", "false");
-    try expectOutput("0", "0");
-    try expectOutput("42", "42");
-    try expectOutput("-7", "-7");
-    try expectOutput(":hello", ":hello");
-    try expectOutput("'foo", "foo");
-}
-
-test "integration: arithmetic" {
-    try expectOutput("(+ 1 2)", "3");
-    try expectOutput("(+ 0 0)", "0");
-    try expectOutput("(+ -5 5)", "0");
-    try expectOutput("(+ (+ 1 2) (+ 3 4))", "10");
-}
-
-test "integration: comparison" {
-    try expectOutput("(< 1 2)", "true");
-    try expectOutput("(< 2 1)", "false");
-    try expectOutput("(< 5 5)", "false");
-}
-
 // =============================================================================
 // Conditionals
 // =============================================================================
-
-test "integration: if" {
-    try expectOutput("(if true :yes :no)", ":yes");
-    try expectOutput("(if false :yes :no)", ":no");
-    try expectOutput("(if nil :yes :no)", ":no");
-    try expectOutput("(if 0 :truthy :falsy)", ":truthy"); // 0 is truthy
-    try expectOutput("(if :kw :truthy :falsy)", ":truthy");
-}
-
-test "integration: do" {
-    try expectOutput("(do 1)", "1");
-    try expectOutput("(do 1 2 3)", "3");
-    try expectOutput("(do (+ 1 2) (+ 3 4))", "7");
-}
 
 // =============================================================================
 // Bindings (let* + rename, loop* + rename, recur)
 // =============================================================================
 
-test "integration: let*" {
-    try expectOutput("(let* [x 1] x)", "1");
-    try expectOutput("(let* [x 1 y 2] (+ x y))", "3");
-    try expectOutput("(let* [x 1 y x] y)", "1"); // sequential: y sees x
+test "integration: a keyword is truthy" {
+    try expectOutput("(if :kw :truthy :falsy)", ":truthy");
 }
 
 test "integration: let (rename macro)" {
@@ -151,46 +111,9 @@ test "integration: let (rename macro)" {
     try expectOutput("(let [λ 2 café :crème] [(* λ λ) café 'π/τ])", "[4 :crème π/τ]");
 }
 
-test "integration: loop*/recur" {
-    try expectOutput("(loop* [i 0 acc 0] (if (< i 5) (recur (+ i 1) (+ acc i)) acc))", "10");
-    // 0+1+2+3+4 = 10
-}
-
-test "integration: loop (rename macro)" {
-    try expectOutput("(loop [i 0] (if (< i 3) (recur (+ i 1)) i))", "3");
-}
-
 // =============================================================================
 // Functions and closures
 // =============================================================================
-
-test "integration: fn*" {
-    try expectOutput("((fn* [x] (+ x 1)) 41)", "42");
-    try expectOutput("((fn* [x y] (+ x y)) 10 20)", "30");
-    try expectOutput("((fn* [] 99))", "99");
-}
-
-test "integration: fn (rename macro)" {
-    try expectOutput("((fn [x] (+ x 100)) 5)", "105");
-}
-
-test "integration: closures capture outer bindings" {
-    try expectOutput("(let* [x 42] ((fn* [] x)))", "42");
-    try expectOutput("(let* [x 1 y 2] ((fn* [] (+ x y))))", "3");
-}
-
-test "integration: deeply nested closure capture" {
-    try expectOutput("(let* [x 7] ((fn* [] ((fn* [] ((fn* [] x)))))))", "7");
-}
-
-test "integration: named fn* + recursion via self-name" {
-    try expectOutput("((fn* fact [n] (if (< n 2) n (recur (+ n -1)))) 5)", "1");
-}
-
-test "integration: variadic & rest" {
-    // ((fn [x & xs] x) 1 2 3) → 1
-    try expectOutput("((fn* [x & xs] x) 1 2 3)", "1");
-}
 
 test "integration: a variadic fn called with no extra arguments binds its rest parameter to nil" {
     // As in Clojure, on every entry path: call:call, apply, a native
@@ -252,18 +175,10 @@ test "var-quote: #'x reads as (var x), and a printed Var reads back" {
     try expectOutput("(try (read-string \"#'\") (catch :reader-error e :bad))", ":bad");
 }
 
-test "integration: def + Var lookup" {
-    try expectOutput("(do (def x 42) x)", "42");
-}
-
 test "def: a def over a macro makes it a function, as Clojure's def resets the Var's metadata" {
     try expectOutputProgram("(def x 1) (defmacro m [a] a) (def m (fn [a] (symbol? a))) [(m x) (:macro (meta #'m))]", "[false nil]");
     try expectOutputProgram("(defmacro m [a] a) (defn m [a] [a]) (m 1)", "[1]");
     try expectOutputProgram("(defmacro m [a] a) (defn m [a] [a]) (defmacro m [a] (list 'quote a)) (m x)", "x");
-}
-
-test "integration: defn" {
-    try expectOutput("(do (defn inc [x] (+ x 1)) (inc 41))", "42");
 }
 
 test "defn: docstring, attribute map and ^meta land on the Var with :arglists" {
@@ -429,73 +344,13 @@ test "metadata: hints in binding positions are dropped, ^meta on a collection li
     try expectOutputProgram("(defmacro wm [] (with-meta [1 2] {:w 1})) [(wm) (meta (wm))]", "[[1 2] {:w 1}]");
 }
 
-test "integration: defn forward reference (Var late-binding)" {
-    try expectOutput("(do (defn f [] (g)) (defn g [] 99) (f))", "99");
-}
-
 // =============================================================================
 // Macros — each macro from defaultMacros gets a case
 // =============================================================================
 
-test "integration: macro when" {
-    try expectOutput("(when true 1 2 3)", "3");
-    try expectOutput("(when false 1)", "nil");
-}
-
-test "integration: macro when-not" {
-    try expectOutput("(when-not false 7)", "7");
-    try expectOutput("(when-not true 7)", "nil");
-}
-
-test "integration: macro and" {
-    try expectOutput("(and)", "true");
-    try expectOutput("(and 1 2 3)", "3");
-    try expectOutput("(and 1 nil 3)", "nil");
-    try expectOutput("(and 0 1)", "1"); // 0 is truthy
-}
-
-test "integration: macro or" {
-    try expectOutput("(or)", "nil");
-    try expectOutput("(or nil false 7)", "7");
-    try expectOutput("(or false nil)", "nil");
-    try expectOutput("(or 0 7)", "0"); // 0 is truthy
-}
-
-test "integration: macro cond" {
-    try expectOutput("(cond)", "nil");
-    try expectOutput("(cond true :a)", ":a");
-    try expectOutput("(cond false :a false :b :else :c)", ":c");
-}
-
-test "integration: macro ->" {
-    try expectOutput("(-> 1 (+ 2) (+ 3))", "6");
-    try expectOutput("(-> 10)", "10");
-}
-
-test "integration: macro ->>" {
-    try expectOutput("(->> 1 (+ 2) (+ 3))", "6");
-}
-
 // =============================================================================
 // Quote / syntax-quote / collections
 // =============================================================================
-
-test "integration: quote scalar" {
-    try expectOutput("(quote 42)", "42");
-    try expectOutput("(quote foo)", "foo");
-    try expectOutput("(quote :bar)", ":bar");
-}
-
-test "integration: quote list" {
-    try expectOutput("(quote (1 2 3))", "(1 2 3)");
-    try expectOutput("(quote ())", "()");
-    try expectOutput("(quote (a (b c) d))", "(a (b c) d)");
-}
-
-test "integration: quote vector" {
-    try expectOutput("(quote [1 2 3])", "[1 2 3]");
-    try expectOutput("(quote [])", "[]");
-}
 
 test "integration: quote inside a quoted form is the 2-list (quote x)" {
     try expectOutput("'(a 'b [1 'c])", "(a (quote b) [1 (quote c)])");
@@ -518,28 +373,6 @@ test "quote: reader sugar is the data it stands for, metadata included, as a mac
     // A macro may pass a binding vector with metadata on to let or for.
     try expectOutputProgram("(defmacro my-let [bs & body] `(let ~bs ~@body)) (my-let ^:x [a 1] (inc a))", "2");
     try expectOutput("(let ^:x [a 1] (for ^:y [b [a]] b))", "(1)");
-}
-
-test "integration: syntax-quote no unquote" {
-    try expectOutput("`(1 2 3)", "(1 2 3)");
-    // An unqualified symbol with no Var resolves to the current
-    // namespace, as in Clojure.
-    try expectOutput("`(a b c)", "(user/a user/b user/c)");
-}
-
-test "integration: syntax-quote with unquote" {
-    try expectOutput("(let* [x 5] `(value ~x))", "(user/value 5)");
-}
-
-test "integration: syntax-quote with splicing" {
-    try expectOutput(
-        "(let* [xs (quote (b c d))] `(a ~@xs e))",
-        "(user/a b c d user/e)",
-    );
-}
-
-test "integration: syntax-quote vector" {
-    try expectOutput("(let* [x 10 y 20] `[~x ~y])", "[10 20]");
 }
 
 test "integration: synthesize let* form (the macro author's pattern)" {
@@ -644,22 +477,6 @@ test "syntax-quote: a bare binding name inside syntax-quote is the Clojure mista
 // =============================================================================
 // Exception handling
 // =============================================================================
-
-test "integration: try normal exit" {
-    try expectOutput("(try 42 (catch any e e))", "42");
-}
-
-test "integration: try catches throw" {
-    try expectOutput("(try (throw 7) (catch any e e))", "7");
-    try expectOutput("(try (throw :boom) (catch any e e))", ":boom");
-}
-
-test "integration: try cross-frame" {
-    try expectOutput(
-        "(do (defn f [] (throw 99)) (try (f) (catch any e e)))",
-        "99",
-    );
-}
 
 test "integration: try/catch/finally — normal exit" {
     try expectOutput("(try 1 (catch any e 99) (finally 42))", "1");
@@ -856,28 +673,15 @@ test "integration: composite — try with macros" {
 // Native fns (macro-authoring primitives)
 // =============================================================================
 
-test "integration: native list — empty + variadic" {
-    try expectOutput("(list)", "()");
-    try expectOutput("(list 1 2 3)", "(1 2 3)");
-}
-
-test "integration: native cons" {
-    try expectOutput("(cons 0 (list 1 2 3))", "(0 1 2 3)");
-    try expectOutput("(cons :x nil)", "(:x)");
-}
-
-test "integration: native first — nil/list/vector" {
-    try expectOutput("(first nil)", "nil");
-    try expectOutput("(first (list))", "nil");
-    try expectOutput("(first (list :a :b))", ":a");
-    try expectOutput("(first [10 20 30])", "10");
-}
-
-test "integration: native rest — nil/list/vector" {
-    try expectOutput("(rest nil)", "()");
-    try expectOutput("(rest (list))", "()");
-    try expectOutput("(rest (list :a :b :c))", "(:b :c)");
-    try expectOutput("(rest [10 20 30])", "(20 30)");
+test "integration: the native list, cons, first, rest, count, nth, empty?, identity, nil? and some?" {
+    try expectOutput("[(list) (list 1 2 3) (cons 0 (list 1 2 3)) (cons :x nil)]", "[() (1 2 3) (0 1 2 3) (:x)]");
+    try expectOutput("[(first nil) (first (list)) (first (list :a :b)) (first [10 20 30])]", "[nil nil :a 10]");
+    try expectOutput("[(rest nil) (rest (list)) (rest (list :a :b :c)) (rest [10 20 30])]", "[() () (:b :c) (20 30)]");
+    try expectOutput("[(count nil) (count (list)) (count (list 1 2 3)) (count [10 20 30]) (count {:a 1 :b 2}) (count #{1 2 3 4})]", "[0 0 3 3 2 4]");
+    try expectOutput("[(nth (list :a :b :c) 0) (nth (list :a :b :c) 2) (nth [10 20 30] 1)]", "[:a :c 20]");
+    try expectOutput("(try (nth [1 2] 5) (catch any e e))", "{:error :index-out-of-bounds, :message index out of bounds, :fn test-form}");
+    try expectOutput("[(empty? nil) (empty? (list)) (empty? (list 1)) (empty? []) (empty? [1]) (empty? {}) (empty? #{})]", "[true true false true false true true]");
+    try expectOutput("[(identity :hello) (nil? nil) (nil? 0) (some? nil) (some? 0)]", "[:hello true false false true]");
 }
 
 test "integration: seq, rest, next, nthrest and nth over a vector view" {
@@ -896,43 +700,6 @@ test "integration: seq, rest, next, nthrest and nth over a vector view" {
     // Emptying a vector with a seq test each step is linear.
     try expectOutput("(loop [v (vec (range 3000))] (if (seq v) (recur (pop v)) (count v)))", "0");
     try expectOutput("(loop [s (seq (vec (range 3000))) n 0] (if s (recur (next s) (+ n (first s))) n))", "4498500");
-}
-
-test "integration: native count — nil/list/vector/map/set" {
-    try expectOutput("(count nil)", "0");
-    try expectOutput("(count (list))", "0");
-    try expectOutput("(count (list 1 2 3))", "3");
-    try expectOutput("(count [10 20 30])", "3");
-    try expectOutput("(count {:a 1 :b 2})", "2");
-    try expectOutput("(count #{1 2 3 4})", "4");
-}
-
-test "integration: native nth — list + vector" {
-    try expectOutput("(nth (list :a :b :c) 0)", ":a");
-    try expectOutput("(nth (list :a :b :c) 2)", ":c");
-    try expectOutput("(nth [10 20 30] 1)", "20");
-}
-
-test "integration: native nth — out of bounds catchable" {
-    try expectOutput("(try (nth [1 2] 5) (catch any e e))", "{:error :index-out-of-bounds, :message index out of bounds, :fn test-form}");
-}
-
-test "integration: native empty?" {
-    try expectOutput("(empty? nil)", "true");
-    try expectOutput("(empty? (list))", "true");
-    try expectOutput("(empty? (list 1))", "false");
-    try expectOutput("(empty? [])", "true");
-    try expectOutput("(empty? [1])", "false");
-    try expectOutput("(empty? {})", "true");
-    try expectOutput("(empty? #{})", "true");
-}
-
-test "integration: native identity / nil? / some?" {
-    try expectOutput("(identity :hello)", ":hello");
-    try expectOutput("(nil? nil)", "true");
-    try expectOutput("(nil? 0)", "false");
-    try expectOutput("(some? nil)", "false");
-    try expectOutput("(some? 0)", "true");
 }
 
 test "integration: my-cond — user procedural macro using native fns" {
@@ -1288,10 +1055,11 @@ test "named fn: the name is the function itself inside its body" {
 // Destructuring (let / fn / defn params)
 // =============================================================================
 
-test "integration: sequential destructuring (let)" {
-    try expectOutput("(let [[a b c] [10 20 30]] (+ a b c))", "60");
-    try expectOutput("(let [[a b] [1 2 3]] (+ a b))", "3");
-    try expectOutput("(let [[a b c] [1 2]] (nil? c))", "true");
+test "integration: sequential and associative destructuring" {
+    try expectOutput("[(let [[a b c] [10 20 30]] (+ a b c)) (let [[a b] [1 2 3]] (+ a b)) (let [[a b c] [1 2]] (nil? c)) (let [[a b :as v] [10 20]] (+ a b (count v))) (let [[a [b c] d] [1 [2 3] 4]] (+ a b c d))]", "[60 3 true 32 10]");
+    try expectOutput("[(let [{:keys [x y]} {:x 1 :y 2}] (+ x y)) (let [{a :alpha b :beta} {:alpha 10 :beta 20}] (+ a b)) (let [{:keys [a] :as m} {:a 1 :b 2}] (count m))]", "[3 30 2]");
+    // :or applies only when the key is missing.
+    try expectOutput("[(let [{:keys [x y] :or {y 99}} {:x 5}] (+ x y)) (let [{:keys [y] :or {y 99}} {:y 7}] y)]", "[104 7]");
 }
 
 test "integration: sequential destructuring with rest" {
@@ -1311,32 +1079,6 @@ test "integration: sequential destructuring with rest" {
     // With nothing before it, the rest is still a seq of the source.
     try expectOutput("(let [[& r] [1 2]] [r (seq? r)])", "[(1 2) true]");
     try expectOutput("(nil? (let [[& r] []] r))", "true");
-}
-
-test "integration: sequential destructuring with :as" {
-    try expectOutput("(let [[a b :as v] [10 20]] (+ a b (count v)))", "32");
-}
-
-test "integration: nested sequential destructuring" {
-    try expectOutput("(let [[a [b c] d] [1 [2 3] 4]] (+ a b c d))", "10");
-}
-
-test "integration: associative destructuring (:keys)" {
-    try expectOutput("(let [{:keys [x y]} {:x 1 :y 2}] (+ x y))", "3");
-}
-
-test "integration: associative destructuring with explicit keys" {
-    try expectOutput("(let [{a :alpha b :beta} {:alpha 10 :beta 20}] (+ a b))", "30");
-}
-
-test "integration: associative destructuring with :or defaults" {
-    try expectOutput("(let [{:keys [x y] :or {y 99}} {:x 5}] (+ x y))", "104");
-    // :or default applies only when key is missing.
-    try expectOutput("(let [{:keys [y] :or {y 99}} {:y 7}] y)", "7");
-}
-
-test "integration: associative destructuring with :as" {
-    try expectOutput("(let [{:keys [a] :as m} {:a 1 :b 2}] (count m))", "2");
 }
 
 test "destructuring: :strs, :syms, namespaced keys, keyword entries and :or" {
@@ -3227,64 +2969,25 @@ test "integration: collection ops compose with HOFs" {
 // VM.callValue + apply + HOFs + first-class arithmetic
 // =============================================================================
 
-test "integration: variadic native + / * / - / <" {
-    try expectOutput("(+)", "0");
-    try expectOutput("(+ 1 2 3 4 5)", "15");
-    try expectOutput("(*)", "1");
-    try expectOutput("(* 2 3 4)", "24");
-    try expectOutput("(- 10 3)", "7");
-    try expectOutput("(- 7)", "-7");
+test "integration: the variadic natives +, *, -, <, =, inc, dec, not and the number predicates" {
+    try expectOutput("[(+) (+ 1 2 3 4 5) (*) (* 2 3 4) (- 10 3) (- 7) (< 1 2 3) (< 1 3 2)]", "[0 15 1 24 7 -7 true false]");
     try expectOutput("[(try (<) (catch :arity-mismatch _ :arity)) (try (<=) (catch :arity-mismatch _ :arity)) (try (==) (catch :arity-mismatch _ :arity))]", "[:arity :arity :arity]");
     // One argument is true whatever it is, as Clojure's ([x] true).
     try expectOutput("[(< :a) (<= \"s\") (> nil) (>= []) (== :a) (= :a) (< 1) (== ##NaN)]", "[true true true true true true true true]");
-    try expectOutput("(< 1 2 3)", "true");
-    try expectOutput("(< 1 3 2)", "false");
+    try expectOutput("[(try (=) (catch :arity-mismatch _ :arity)) (= 1) (= 1 1 1) (= 1 1 2) (= :a :a) (= [1 2 3] [1 2 3]) (= {:a 1} {:a 1})]", "[:arity true true false true true true]");
+    try expectOutput("[(inc 41) (dec 1) (not nil) (not false) (not 0) (zero? 0) (pos? 5) (neg? -3) (odd? 7) (even? 4)]", "[42 0 true true false true true true true true]");
 }
 
-test "integration: value equality `=` (variadic, structural)" {
-    try expectOutput("(try (=) (catch :arity-mismatch _ :arity))", ":arity");
-    try expectOutput("(= 1)", "true");
-    try expectOutput("(= 1 1 1)", "true");
-    try expectOutput("(= 1 1 2)", "false");
-    try expectOutput("(= :a :a)", "true");
-    try expectOutput("(= [1 2 3] [1 2 3])", "true");
-    try expectOutput("(= {:a 1} {:a 1})", "true");
-}
-
-test "integration: inc / dec / not / predicates" {
-    try expectOutput("(inc 41)", "42");
-    try expectOutput("(dec 1)", "0");
-    try expectOutput("(not nil)", "true");
-    try expectOutput("(not false)", "true");
-    try expectOutput("(not 0)", "false");
-    try expectOutput("(zero? 0)", "true");
-    try expectOutput("(pos? 5)", "true");
-    try expectOutput("(neg? -3)", "true");
-    try expectOutput("(odd? 7)", "true");
-    try expectOutput("(even? 4)", "true");
-}
-
-test "integration: apply (no leading args)" {
-    try expectOutput("(apply + (list 1 2 3 4 5))", "15");
-    try expectOutput("(apply * [2 3 4])", "24");
-}
-
-test "integration: apply with leading args" {
-    try expectOutput("(apply + 10 (list 1 2 3))", "16");
-    try expectOutput("(apply + 1 2 3 (list 4 5))", "15");
-}
-
-test "integration: apply with user fn" {
-    try expectOutput(
-        \\(do (defn square [x] (* x x))
-        \\    (apply square (list 7)))
-    , "49");
-}
-
-test "integration: map (eager) on list + vector" {
-    try expectOutput("(map inc (list 1 2 3 4))", "(2 3 4 5)");
-    try expectOutput("(map inc [10 20 30])", "(11 21 31)");
-    try expectOutput("(map inc nil)", "()");
+test "integration: apply, map, reduce and filter over natives and user functions" {
+    try expectOutput("[(apply + (list 1 2 3 4 5)) (apply * [2 3 4]) (apply + 10 (list 1 2 3)) (apply + 1 2 3 (list 4 5))]", "[15 24 16 15]");
+    try expectOutput("(do (defn square [x] (* x x)) (apply square (list 7)))", "49");
+    try expectOutput("[(map inc (list 1 2 3 4)) (map inc [10 20 30]) (map inc nil) (map (fn* [x] (* x x)) [1 2 3 4])]", "[(2 3 4 5) (11 21 31) () (1 4 9 16)]");
+    try expectOutput("[(reduce + 0 [1 2 3 4 5]) (reduce + 0 (list)) (reduce * 1 [1 2 3 4]) (reduce + 100 nil) (reduce (fn* [acc x] (+ acc (* x x))) 0 [1 2 3])]", "[15 0 24 100 14]");
+    try expectOutput("[(filter odd? [1 2 3 4 5 6 7]) (filter pos? [-2 -1 0 1 2]) (filter some? (list 1 nil 2 nil 3))]", "[(1 3 5 7) (1 2) (1 2 3)]");
+    try expectOutput("(try (doall (map (fn* [x] (throw :boom)) [1 2 3])) (catch any e e))", ":boom");
+    try expectOutput("(try (reduce (fn* [acc x] (if (< 10 acc) (throw :too-big) (+ acc x))) 0 [1 5 8 2]) (catch any e e))", ":too-big");
+    try expectOutput("(try (apply (fn* [x] (throw :inside-apply)) (list 99)) (catch any e e))", ":inside-apply");
+    try expectOutput("(reduce + 0 (filter odd? (map inc [0 1 2 3 4 5])))", "9");
 }
 
 test "integration: a built sequence is a list to every consumer, whatever its length" {
@@ -3304,65 +3007,6 @@ test "integration: a built sequence is a list to every consumer, whatever its le
     // A macro's expansion may be a built sequence, or hold one.
     try expectOutput("(do (defmacro twice-all [& xs] (cons '+ (map (fn [x] (list '* 2 x)) xs))) (twice-all 1 2 3 4))", "20");
     try expectOutput("(do (defmacro as-code [] (map identity '(+ 1 2 3 4))) (as-code))", "10");
-}
-
-test "integration: reduce" {
-    try expectOutput("(reduce + 0 [1 2 3 4 5])", "15");
-    try expectOutput("(reduce + 0 (list))", "0");
-    try expectOutput("(reduce * 1 [1 2 3 4])", "24");
-    try expectOutput("(reduce + 100 nil)", "100");
-}
-
-test "integration: filter" {
-    try expectOutput("(filter odd? [1 2 3 4 5 6 7])", "(1 3 5 7)");
-    try expectOutput("(filter pos? [-2 -1 0 1 2])", "(1 2)");
-    try expectOutput("(filter some? (list 1 nil 2 nil 3))", "(1 2 3)");
-}
-
-test "integration: map with user lambda" {
-    try expectOutput(
-        \\(map (fn* [x] (* x x)) [1 2 3 4])
-    , "(1 4 9 16)");
-}
-
-test "integration: reduce with user lambda" {
-    try expectOutput(
-        \\(reduce (fn* [acc x] (+ acc (* x x))) 0 [1 2 3])
-    , "14");
-}
-
-test "integration: throw inside map propagates to outer catch" {
-    try expectOutput(
-        \\(try (doall (map (fn* [x] (throw :boom)) [1 2 3]))
-        \\     (catch any e e))
-    , ":boom");
-}
-
-test "integration: throw inside reduce propagates" {
-    try expectOutput(
-        \\(try (reduce (fn* [acc x]
-        \\               (if (< 10 acc)
-        \\                 (throw :too-big)
-        \\                 (+ acc x)))
-        \\             0 [1 5 8 2])
-        \\     (catch any e e))
-    , ":too-big");
-}
-
-test "integration: throw through apply" {
-    try expectOutput(
-        \\(try (apply (fn* [x] (throw :inside-apply)) (list 99))
-        \\     (catch any e e))
-    , ":inside-apply");
-}
-
-test "integration: HOFs composed" {
-    try expectOutput(
-        \\(reduce + 0 (filter odd? (map inc [0 1 2 3 4 5])))
-    , "9");
-    // (map inc xs) => (1 2 3 4 5 6)
-    // (filter odd? ...) => (1 3 5)
-    // (reduce + 0 ...) => 9
 }
 
 // =============================================================================
@@ -3613,36 +3257,12 @@ test "integration: defmacro — macro can use already-defined macros in body" {
 // Maps/sets as runtime values
 // =============================================================================
 
-test "integration: quoted empty map" {
-    try expectOutput("(quote {})", "{}");
-}
-
-test "integration: quoted map with keyword keys" {
-    try expectOutput("(quote {:a 1})", "{:a 1}");
-}
-
-test "integration: runtime map literal — computed value" {
-    try expectOutput("(let* [n 42] {:answer n})", "{:answer 42}");
-}
-
-test "integration: nested quoted maps" {
-    try expectOutput("(quote {:outer {:inner 1}})", "{:outer {:inner 1}}");
-}
-
-test "integration: quoted empty set" {
-    try expectOutput("(quote #{})", "#{}");
-}
-
 test "integration: quoted set" {
     try expectOutput("(quote #{:a})", "#{:a}");
 }
 
 test "integration: runtime set literal" {
     try expectOutput("#{:x}", "#{:x}");
-}
-
-test "integration: bare vector literal as expression" {
-    try expectOutput("[1 2 3]", "[1 2 3]");
 }
 
 /// `open`, then `item` n times with every `{d}` in it replaced by
@@ -3748,20 +3368,8 @@ test "integration: catchable — KindMismatch BYPASSES translation when no handl
 // Anon-fn #(...) shorthand
 // =============================================================================
 
-test "integration: anon-fn — bare #(+ 1 2)" {
-    try expectOutput("(#(+ 1 2))", "3");
-}
-
-test "integration: anon-fn — % positional 1" {
-    try expectOutput("(#(+ % 1) 41)", "42");
-}
-
-test "integration: anon-fn — %1 %2 explicit" {
-    try expectOutput("(#(+ %1 %2) 10 20)", "30");
-}
-
-test "integration: anon-fn — closure captures outer binding" {
-    try expectOutput("((fn* [x] (#(+ % x) 3)) 10)", "13");
+test "integration: the #(...) shorthand, bare, positional, closing over a binding and expanding macros" {
+    try expectOutput("[(#(+ 1 2)) (#(+ % 1) 41) (#(+ %1 %2) 10 20) ((fn* [x] (#(+ % x) 3)) 10) (#(when % :yes) :anything)]", "[3 42 30 13 :yes]");
 }
 
 test "anon-fn: % is found inside maps, sets, nested vectors and @" {
@@ -3770,10 +3378,6 @@ test "anon-fn: % is found inside maps, sets, nested vectors and @" {
     try expectOutput("(#(vector [%1 {:k %2}]) 1 2)", "[[1 {:k 2}]]");
     try expectOutput("(#(inc @%) (atom 1))", "2");
     try expectOutput("(#(do {% %2}) :k :v)", "{:k :v}");
-}
-
-test "integration: anon-fn — macro inside body re-expands" {
-    try expectOutput("(#(when % :yes) :anything)", ":yes");
 }
 
 test "integration: composite — syntax-quote inside defn" {

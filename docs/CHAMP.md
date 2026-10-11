@@ -425,39 +425,7 @@ eight levels.
 
 ### 12. Tests
 
-#### 12.1 Unit tests
-
-Inline tests in `champ.zig` cover what the properties do not reach:
-the body layouts, nil keys and values, promotion at 9 (and none on a
-duplicate key at 8), no demotion, the largest count, the root dissoc,
-the kept key object, the builders against `assoc`/`conj` folds and a
-literal's allocations, the keyword and immediate shortcuts, the bitmap
-ranks, lone-key pull-up through every level and out of a collision
-node, and an immediate key bypassing the hash callback.
-
-#### 12.2 Set properties
-
-S1 to S9 in `test/prop/champ.zig` parallel M1 to M10 over sets (S2b is
-the set side of M2b over 20000 string elements; S5 compares an
-array-set with a promoted-then-shrunk trie).
-
-#### 12.3 Collision fixtures
-
-The collision tests key by heap strings and pin the low 32 bits of
-their hash to one value through the `elementHash` callback (§5.1).
-Every one asserts through `mapCollisionCount`/`setCollisionCount`,
-which descend along a 32-bit hash and return the collision node's count
-or null, that its keys reached the collision node, so a fixture cannot
-degrade into a cleanly partitioned trie unnoticed.
-
-#### 12.4 Map properties
-
-`test/prop/champ.zig`: M1 `mapFromEntries`/`mapGet` round-trip; M2
-random `assoc`/`dissoc` against a model; M2b the canonical layout
-(`canonicalTrie`) and equal iteration order at 2000 and 30000 keys
-built in different orders; M3 replace-value; M4 the same-value
-short-circuit returns the same pointer; M5 equality laws; M6 an
-array-map against a promoted-then-shrunk trie, `=` and hash-equal; M7
-never `=` to a non-map; M8 persistence; M9 keyword keys against fixnum
-keys; M10 collision-node stress with five or more keys; M11 `=`
-implies equal `hashValue` across insertion orders.
+`test/prop/champ.zig` holds the map and set properties and the collision
+fixtures (which key by heap strings and pin the low 32 bits of their hash
+through the `elementHash` callback, §5.1); the inline tests of `champ.zig`
+cover the body layouts, promotion and the shortcuts.

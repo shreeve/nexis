@@ -994,33 +994,12 @@ The table serves the runtime error report and `nexis disasm`
 
 ### 9. Tests
 
-`src/compile.zig` holds the tests only the compiler can see: the
-error taxonomy (malformed programs with their variant and the span
-each is reported at), bytecode shape (one Var-table entry per Var, one
-upvalue per captured name, boxing of exactly the captured bindings on
-every path, a quoted scalar needing no extra constant), the routine
-limits of §4.4, the span table, declared names and the stack guard.
-`test/prop/compile.zig` runs source through a program booted as
-`bin/nexis` boots one: the `cases` table (source and printed value for
-every primitive-core form, binding and capture shape, `recur` target,
-quoted literal and the host macros the compiler relies on), the
-`failures` table (source and error), inlining, the instruction counts
-of common shapes (§4.8), slot reuse, constant collections, `eval`'s
-freeing, the randomized properties (capture at nesting depth 1..10,
-syntax-quote equal to the hand-built shape), and a differential test
-comparing random programs over arithmetic, `if` (on a comparison, or
-on an `and` or `or` of comparisons, one negated), shadowing `let*`,
-closures, calls of one and two arguments nested in each other's
-arguments, calls of Vars of three arguments, variadic and through
-`apply`, with the callee itself a call, a call whose argument throws,
-and counting `loop*`s read directly and through `let*` aliases,
-against a reference evaluator, and the same programs, with locals
-moved into calls and read again across a `try`'s handler and
-finally, compiled with locals clearing on and off (§4.9). `src/compile.zig`
-pins the pass on hand-built code: what clears, what a handler keeps,
-the budget, and the check refusing a read of a cleared slot.
-`test/integration/eval_pipeline.zig` runs source end to
-end through every host macro and every `try` exit path.
+`src/compile.zig` holds the tests only the compiler can see (the error
+taxonomy, bytecode shape, the limits of §4.4, the span table, locals
+clearing); `test/prop/compile.zig` runs source through a program booted as
+`bin/nexis` boots one (its `cases` and `failures` tables, the properties and
+the differential test); `test/integration/eval_pipeline.zig` runs source end
+to end.
 
 #### 9.4 Guarantees the tests pin
 

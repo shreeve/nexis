@@ -287,7 +287,7 @@ lose more than its own commits, the whole store where the storage
 reorders writes (the table above), which no program should get
 without asking. A durable commit costs the device's flush, twice, and
 the writing of its pages, milliseconds where `:commit` costs
-microseconds (`docs/PERF.md` §3 "Durable commits" has the figures): a
+microseconds (`docs/PERF.md` §3.39 has the figures): a
 program of a few transactions pays a few milliseconds, one of many
 small transactions the flush for each. Such a program asks for speed:
 it batches its writes into fewer transactions (a transaction of a

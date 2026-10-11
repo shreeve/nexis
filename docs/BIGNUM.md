@@ -202,20 +202,8 @@ NaN, `:invalid-argument` for the infinities). The arithmetic operators promote a
 
 ### 9. Tests
 
-`test/prop/bignum.zig`: N1 `fromI64` gives a fixnum in range (no
-allocation) and a bignum outside it; N2 `fromI64(i64.min)`; N3 and N4
-`fromLimbs` canonicalizes a fixnum-range magnitude and any zero; N5 no
-trailing zero limbs; N6 equality laws; N7 equal bignums share
-`hashValue`; N8 never `=` to a non-bignum; N9 limbs and sign round-trip
-byte-exact; N10 the hash is the sign combined with xxHash3 of the limbs,
-under the kind domain; A1 and A2 `add`, `sub`, `compare` and `mul` agree with `i128`;
-A3 `quot`, `rem` and `mod` agree with `@divTrunc`, `@rem` and `@mod`
-on every sign combination; A4 the fixnum boundary crossed both ways;
-A5 algebraic identities on multi-limb values; A6 decimal text and
-doubles round-trip; A7 `quotientF64` rounds correctly at every scale;
-A8 long text reads as `std`'s conversion reads it around every
-split size; A9 eight times the digits take well under 64 times as
-long to read (release builds only: a debug build times `std`'s
-checks). `src/bignum.zig` carries unit tests for the canonicalizer,
-the accessors, conversion and printing; `test/integration/numbers.zig` runs the tower end to end through
-every operator and predicate.
+`test/prop/bignum.zig` holds the properties, `src/bignum.zig` the unit tests of the
+canonicalizer, the accessors, conversion and printing, and
+`test/integration/numbers.zig` runs the tower end to end through every
+operator and predicate.
+

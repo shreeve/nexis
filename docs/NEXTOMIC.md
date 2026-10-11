@@ -1260,28 +1260,10 @@ read, and the collector marks the db box and that map (`docs/GC.md`
 `stdlib` arms for `contains?`, `keys`, `vals`, `seq`, `count`, `empty?`
 and `into` call `natives.entityHas` and `natives.entityMap`.
 
-Tests: `test/prop/nextomic_key.zig` (encoded order equals value order
-per type, longs over all of i64 and its edges) and
-`test/prop/nextomic_tx.zig` (random transactions against an in-memory
-model, at every basis, facts retracted and asserted again, values that
-prefix one another, excisions and speculative `with`s among them, H1
-checked after every commit); the corpora
-`test/integration/nextomic_q.zig` and `nextomic_pull.zig` against naive
-evaluators over the shared fixture `nextomic_fx.zig`, again over a
-churned store in its current, as-of, since and history views;
-`nextomic_store.zig` (the store, db-values and the transaction
-protocol against store files: bootstrap, batches, the merged and folded
-scans, every view, tempids, upserts, the unique and schema rules,
-`with`, excision, durability, the caches);
-`nextomic_fn.zig` (transaction functions, cas, schema alteration,
-excision, full-text, the refusal of another format, lookup-ref upserts,
-the native stack and `t` bounds);
-`nextomic_size.zig` (the bytes every tree of a fixed history holds,
-pinned, and the pages it takes, bounded); `nextomic_entity.zig` (the
-lazy entity through the pipeline and under the collector's stress
-policy); and the
-end-to-end scripts `test/nextomic/*.nx`, each diffed against its
-`.out` by `zig build nextomic-nx`.
+Tests: `test/prop/nextomic_key.zig` and `nextomic_tx.zig`; the suites
+`test/integration/nextomic_*.zig` (`nextomic_fx.zig` is their shared
+fixture); and the end-to-end scripts `test/nextomic/*.nx`, each diffed against
+its `.out` by `zig build nextomic-nx`.
 
 ---
 
