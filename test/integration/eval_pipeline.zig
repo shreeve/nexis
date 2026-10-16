@@ -4156,6 +4156,7 @@ test "db/open: two connections to one file share its writer; a second write is :
 }
 
 const engineSyncs = nx.db.engineSyncs;
+const syncs_per_file_sync = nx.db.syncs_per_file_sync;
 
 /// Run each `[source expected syncs]` step of `steps` on one program
 /// holding `@STORE@`, where `syncs` is how many engine syncs the step
@@ -4188,11 +4189,11 @@ test "db/open: a commit syncs nothing unless the connection is :durable; db/sync
             "[2 false]",
             0,
         },
-        .{ "(db/sync c)", "nil", 1 },
+        .{ "(db/sync c)", "nil", syncs_per_file_sync },
         .{ "[(db/sync c) (db/sync d)]", "[nil nil]", 0 },
         .{ "(db/put-key! (db/ref d :t :k) 3)", "nil", null },
         .{ "(db/close d)", "nil", 0 },
-        .{ "(do (db/put-key! r 4) (db/close c))", "nil", 1 },
+        .{ "(do (db/put-key! r 4) (db/close c))", "nil", syncs_per_file_sync },
         .{
             \\[(try (db/sync c) (catch any e e))
             \\ (try (db/open "@STORE@" {:durability :batch}) (catch any e e))

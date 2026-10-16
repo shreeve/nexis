@@ -225,10 +225,13 @@ pub const StoreFile = struct {
         };
     }
 
-    /// Make every commit so far durable with one full sync of the
-    /// file, when a commit since the last sync was left without one.
-    /// `error.SyncFailed` once a sync of the file has failed
-    /// (`syncFailed`), whatever is unsynced.
+    /// Make every commit so far durable with one emdb `Env.sync` of the
+    /// file (a confirmed sync point: a data sync on each side of the
+    /// durable anchor's write, emdb INV-SYNC-06), when a commit since
+    /// the last sync was left without one. `error.SyncFailed` once a
+    /// sync of the file has failed (`syncFailed`), whatever is
+    /// unsynced; `error.WriterActive` on the thread that holds the
+    /// file's write transaction (emdb API-E10).
     pub fn sync(self: *StoreFile) !void {
         if (self.syncFailed()) return error.SyncFailed;
         if (!self.unsynced) return;
@@ -236,31 +239,40 @@ pub const StoreFile = struct {
         self.unsynced = false;
     }
 
-    /// Whether a sync of the file's environment has failed: a commit's
-    /// data or meta sync (`DurabilityUnknown` among them) or a full
-    /// sync. The environment then syncs nothing more until the file is
-    /// opened again (emdb INV-SYNC-04), since a failed fsync may have
-    /// dropped the pages it could not write and marked them clean: a
-    /// commit that would sync fails with `SyncFailed` before it writes
-    /// anything, one that syncs nothing still commits, and `sync`
-    /// fails (DB.md §3.3).
+    /// Whether a sync of the file has failed: a commit's data or meta
+    /// sync (`DurabilityUnknown` among them) or a full sync, in this
+    /// environment or any other on the file, in any process. The file
+    /// then syncs nothing more until the system reboots, reopened or
+    /// not (emdb INV-SYNC-04: the mark is in the lock file), since a
+    /// failed fsync may have dropped the pages it could not write and
+    /// marked them clean: a commit that would sync fails with
+    /// `SyncFailed` before it writes anything, one that syncs nothing
+    /// still commits, and `sync` fails (DB.md §3.3).
     pub fn syncFailed(self: *const StoreFile) bool {
         return self.env.inner.syncHasFailed();
     }
 
     /// The sync of a close: `sync`, but nothing once a sync of the file
-    /// has failed, which was reported where it failed. A close cannot
+    /// has failed, which was reported where it failed: a close cannot
     /// make the file durable then, and raising it again would hide the
-    /// error a `finally` or `with-conn` is unwinding with.
+    /// error a `finally` or `with-conn` is unwinding with. Nothing
+    /// either while this thread holds the file's write transaction
+    /// through another holder (a `with-conn` inside a `with-tx` or
+    /// Nextomic `with` scope), where emdb refuses the sync
+    /// (`WriterActive`): the file stays unsynced, for a later sync or
+    /// close.
     pub fn closingSync(self: *StoreFile) !void {
-        if (self.syncFailed()) return;
+        if (self.syncFailed() or self.env.inner.writerOnThisThread()) return;
         try self.sync();
     }
 
-    /// `closingSync` where no caller can take its error: teardown and
-    /// exit.
+    /// The sync of teardown and exit, where no caller can take its
+    /// error: `sync`, nothing once a sync of the file has failed, and a
+    /// warning on stderr when it fails (`WriterActive` among them: an
+    /// exit inside a write transaction).
     fn syncOrWarn(self: *StoreFile) void {
-        self.closingSync() catch |err| std.debug.print("nexis: syncing {s} failed ({s}); its latest commits may be lost if the system crashes\n", .{ self.path, @errorName(err) });
+        if (self.syncFailed()) return;
+        self.sync() catch |err| std.debug.print("nexis: syncing {s} failed ({s}); its latest commits may be lost if the system crashes\n", .{ self.path, @errorName(err) });
     }
 
     /// Sync every open file that needs it and let every held snapshot
@@ -1317,6 +1329,11 @@ pub fn engineSyncs() u64 {
     return emdb.platform.File.syncCalls.load(.monotonic);
 }
 
+/// The engine syncs of one `StoreFile.sync` after commits that synced
+/// nothing: emdb's confirmed sync point, a data sync on each side of
+/// the durable anchor's write (INV-SYNC-06).
+pub const syncs_per_file_sync = 2;
+
 // =============================================================================
 // Inline tests
 // =============================================================================
@@ -1327,10 +1344,10 @@ test "failureName: every emdb error nexis can meet has its keyword; every decode
     // transactions, backup, restore, dump, rollback), and misuse its
     // callers rule out.
     const unreached = [_][]const u8{
-        "InvalidPageSize",   "MapSizeTooLarge",    "PageSizeMismatch", "TxnPrepared",
-        "TxnNotPreparable",  "TxnHasChild",        "Incompatible",     "InvalidCursor",
-        "BackupFormat",      "BackupBaseMismatch", "DumpFormat",       "NoPreviousSnapshot",
-        "TooManyNamedTrees",
+        "InvalidPageSize",    "MapSizeTooLarge",   "InvalidGeometry",    "PageSizeMismatch",
+        "TxnPrepared",        "TxnNotPreparable",  "TxnHasChild",        "Incompatible",
+        "InvalidCursor",      "BackupFormat",      "BackupBaseMismatch", "DumpFormat",
+        "NoPreviousSnapshot", "TooManyNamedTrees",
     };
     inline for (@typeInfo(emdb.Error).error_set.error_names.?) |name| {
         const named = !std.mem.eql(u8, failureName(@field(emdb.Error, name)), "db-error");

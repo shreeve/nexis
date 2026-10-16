@@ -567,7 +567,7 @@ const db_rows = .{
     // Connection + ref + auto-ephemeral primitives.
     .{ "open", 1, 2, &fnDbOpen, "[path] [path opts]", "Returns a connection to the emdb store at path, creating the file and\n  its parent directories; a file the process may only read opens\n  read-only. opts takes :durability, :commit or :durable. An empty\n  path or one with a NUL byte is :invalid-path." },
     .{ "close", 1, 1, &fnDbClose, "[conn]", "Closes conn: aborts its open transactions and syncs the file when a\n  commit left it unsynced. Returns nil; closing twice is nil. Any later\n  use of conn or of a ref through it is :db-closed." },
-    .{ "sync", 1, 1, &fnDbSync, "[conn]", "Makes every commit to conn's file durable, with one full sync when a\n  commit left it unsynced; returns nil. :db/sync-failed once a sync of\n  the file has failed, until it is reopened." },
+    .{ "sync", 1, 1, &fnDbSync, "[conn]", "Makes every commit to conn's file durable, with one full sync when a\n  commit left it unsynced; returns nil. :db/sync-failed once a sync of\n  the file has failed, until the system reboots." },
     .{ "ref", 3, 3, &fnDbRef, "[conn tree key]", "Returns the durable ref naming key in tree of conn's store. tree is a\n  keyword, :a/b naming the tree a/b; key is a keyword, symbol or\n  string, equal by name, so :k, 'k and \"k\" name one key." },
     .{ "ref?", 1, 1, kindIs(&.{.durable_ref}), "[x]", "Returns true if x is a durable ref." },
     .{ "put-key!", 2, 2, &fnDbPutKey, "[ref v]", "Stores v at ref in one write transaction, committed as the\n  connection's durability says; returns nil." },

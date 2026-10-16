@@ -1641,6 +1641,7 @@ test "two identities naming two entities for one tempid conflict, naming the dat
 }
 
 const engineSyncs = store_mod.db_layer.engineSyncs;
+const syncs_per_file_sync = store_mod.db_layer.syncs_per_file_sync;
 
 test "durability: a transaction syncs only when it or its connection asks; sync and release sync what is left once" {
     const tc = try TestConn.init("tx_durability");
@@ -1681,14 +1682,14 @@ test "durability: a transaction syncs only when it or its connection asks; sync 
     _ = try transactOps(tc.conn, arena, add, .{});
     before = engineSyncs();
     try tc.conn.sync();
-    try testing.expectEqual(before + 1, engineSyncs());
+    try testing.expectEqual(before + syncs_per_file_sync, engineSyncs());
     try tc.conn.sync();
-    try testing.expectEqual(before + 1, engineSyncs());
+    try testing.expectEqual(before + syncs_per_file_sync, engineSyncs());
 
     // release syncs, though another connection still holds the file.
     _ = try transactOps(tc.conn, arena, add, .{});
     try other.release();
-    try testing.expectEqual(before + 2, engineSyncs());
+    try testing.expectEqual(before + 2 * syncs_per_file_sync, engineSyncs());
     try testing.expect(!file.unsynced);
 }
 
@@ -1712,7 +1713,7 @@ const MetaSyncFailure = struct {
     }
 };
 
-test "durability: a commit whose meta sync fails stands and reaches the caches; the file then syncs nothing until it is reopened" {
+test "durability: a commit whose meta sync fails stands and reaches the caches; the file then syncs nothing more, reopened too" {
     const tc = try TestConn.init("tx_meta_sync");
     defer tc.deinit();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1759,17 +1760,21 @@ test "durability: a commit whose meta sync fails stands and reaches the caches; 
     try testing.expectEqual(r.t + 1, x.report.t);
     try testing.expectEqual(@as(u64, 1), (try (try tc.conn.db()).attr(name)).?.count);
 
-    // release syncs nothing and raises nothing; reopened, the file
-    // syncs again and holds exactly the commits that published.
+    // release syncs nothing and raises nothing. Reopened, the file
+    // holds exactly the commits that published, and still syncs
+    // nothing: the mark is in the lock file and lasts until the system
+    // reboots (emdb INV-SYNC-04).
     try tc.conn.release();
     try testing.expectEqual(syncs, engineSyncs());
     try tc.reopen();
     const reopened = try tc.conn.db();
     try testing.expectEqual(x.report.t, reopened.basis);
     try testing.expectEqual(@as(u64, 1), (try reopened.attr(name)).?.count);
-    _ = try transactOps(tc.conn, arena, add, .{ .sync = .full });
-    try testing.expect(engineSyncs() > syncs);
-    try tc.conn.sync();
+    try testing.expectError(error.SyncFailed, tc.conn.sync());
+    try testing.expectError(error.SyncFailed, transactOps(tc.conn, arena, add, .{ .sync = .full }));
+    _ = try transactOps(tc.conn, arena, add, .{});
+    try testing.expectEqual(@as(u64, 2), (try (try tc.conn.db()).attr(name)).?.count);
+    try testing.expectEqual(syncs, engineSyncs());
 }
 
 test "durability: a connection opened without :sync takes the process's (NEXIS_DURABILITY)" {
@@ -2443,7 +2448,7 @@ test "open bootstraps once and reopen finds the same ids" {
     }
 }
 
-test "a new store file starts small and grows a step at a time" {
+test "a new store file starts small, doubles up to a step, then grows a step at a time" {
     var td = try TestDir.init("store_map");
     defer td.deinit();
     const store = try Store.open(testing.allocator, td.path.ptr, .{});
@@ -2452,7 +2457,8 @@ test "a new store file starts small and grows a step at a time" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    // Payloads past the first size grow the file in whole steps.
+    // Payloads past the first size grow the file by its own size, at
+    // most a step (emdb INV-GEO02): 1, 2, 4, 8 MiB, then 16, 24, ...
     const payload = try arena.alloc(u8, 4096);
     @memset(payload, 'x');
     const batch = try arena.alloc(Store.Prepared, 512);
@@ -2463,7 +2469,9 @@ test "a new store file starts small and grows a step at a time" {
     try txn.commit();
     const grown = store.file.env.info().mapSize;
     try testing.expect(grown > db_layer.initial_map_size and grown < 64 << 20);
-    try testing.expectEqual(0, (grown - db_layer.initial_map_size) % db_layer.map_grow_step);
+    var size: u64 = db_layer.initial_map_size;
+    while (size < grown) size += @min(size, db_layer.map_grow_step);
+    try testing.expectEqual(size, grown);
 }
 
 test "bootstrap datoms are in every index they belong to" {
