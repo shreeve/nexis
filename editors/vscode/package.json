@@ -1,0 +1,45 @@
+{
+  "name": "vscode-nexis",
+  "displayName": "nexis",
+  "description": "Syntax highlighting for nexis source files (.nx).",
+  "version": "0.1.0",
+  "publisher": "nexis",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shreeve/nexis.git",
+    "directory": "editors/vscode"
+  },
+  "engines": {
+    "vscode": "^1.91.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "nexis",
+    "lisp",
+    "clojure"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "nexis",
+        "extensions": [
+          ".nx"
+        ],
+        "aliases": [
+          "nexis"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "nexis",
+        "scopeName": "source.nexis",
+        "path": "./syntaxes/nexis.tmLanguage.json"
+      }
+    ]
+  }
+}
