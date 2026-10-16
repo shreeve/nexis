@@ -194,6 +194,8 @@ nexis/
 │   ├── portable/                a db/* and a Nextomic store written and dumped, carried between hosts
 │   └── examples/                the pinned output of every examples/*.nx; pins/, the behaviour-pinning programs
 ├── examples/                    working .nx programs (examples/README.md)
+├── editors/                     VS Code, Vim and highlight.js files generated from nexis.grammar's @highlight (editors/README.md)
+├── test/highlight/              sample.nx and sample.nx.hl, the colouring the editor files must give
 ├── bench/                       main.zig (the harness), nextomic.zig (its Nextomic scenarios),
 │                                compare/ (nexis against babashka and JVM Clojure, Nextomic
 │                                against Datalevin and Datomic; docs/BENCH.md §12),
