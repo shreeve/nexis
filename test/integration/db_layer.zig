@@ -335,10 +335,10 @@ test "durability commit: a commit is seen at once and syncs nothing; close syncs
     var aborted = try db.beginWrite(a);
     db.abortWrite(&aborted);
     try db.close(a);
-    try testing.expectEqual(before + 1, db.engineSyncs());
+    try testing.expectEqual(before + db.syncs_per_file_sync, db.engineSyncs());
     try testing.expect(!b.file.unsynced);
     try db.close(b);
-    try testing.expectEqual(before + 1, db.engineSyncs());
+    try testing.expectEqual(before + db.syncs_per_file_sync, db.engineSyncs());
 }
 
 test "durability durable: every commit syncs, which leaves nothing for close; a read-only program never syncs" {
@@ -392,7 +392,7 @@ const MetaSyncFailure = struct {
     }
 };
 
-test "durability durable: after a commit's meta sync fails, the file syncs nothing until it is reopened, and keeps the commits that published" {
+test "durability durable: after a commit's meta sync fails, the file syncs nothing more, reopened too, and keeps the commits that published" {
     var fx = try Fixture.init("meta_sync");
     defer fx.deinit();
 
@@ -448,11 +448,12 @@ test "durability durable: after a commit's meta sync fails, the file syncs nothi
     try db.close(other);
     try testing.expectEqual(before, db.engineSyncs());
 
-    // Reopened, the file syncs again and holds exactly the commits
-    // that published.
+    // Reopened, the file holds exactly the commits that published, and
+    // still syncs nothing: the mark is in the lock file and lasts until
+    // the system reboots (emdb INV-SYNC-04).
     conn = try fx.connect();
     conn.durability = .durable;
-    try testing.expect(!conn.file.syncFailed());
+    try testing.expect(conn.file.syncFailed());
     {
         var r = try db.beginRead(conn);
         defer db.abortRead(&r);
@@ -460,12 +461,16 @@ test "durability durable: after a commit's meta sync fails, the file syncs nothi
         try testing.expect((try db.get(&r, "t", "b", synthHash, synthEq)) == null);
         try testing.expectEqual(@as(i64, 7), (try db.get(&r, "t", "c", synthHash, synthEq)).?.asFixnum());
     }
+    try testing.expectError(error.SyncFailed, db.sync(conn));
+    w = try db.beginWrite(conn);
+    try db.put(&w, "t", "b", value.fromFixnum(6).?);
+    try testing.expectError(error.SyncFailed, db.commit(&w));
+    conn.durability = .commit;
     w = try db.beginWrite(conn);
     try db.put(&w, "t", "b", value.fromFixnum(6).?);
     try db.commit(&w);
-    try testing.expect(db.engineSyncs() > before);
-    try db.sync(conn);
     try db.close(conn);
+    try testing.expectEqual(before, db.engineSyncs());
 }
 
 test "syncAll: one sync for each file written without one; shutdown syncs a file it releases last" {
@@ -492,15 +497,15 @@ test "syncAll: one sync for each file written without one; shutdown syncs a file
     }
     const before = db.engineSyncs();
     db.StoreFile.syncAll();
-    try testing.expectEqual(before + 2, db.engineSyncs());
+    try testing.expectEqual(before + 2 * db.syncs_per_file_sync, db.engineSyncs());
     db.StoreFile.syncAll();
-    try testing.expectEqual(before + 2, db.engineSyncs());
+    try testing.expectEqual(before + 2 * db.syncs_per_file_sync, db.engineSyncs());
 
     var w = try db.beginWrite(conns[2]);
     try db.put(&w, "t", "k", value.fromFixnum(1).?);
     try db.commit(&w);
     db.shutdown(conns[2]);
-    try testing.expectEqual(before + 3, db.engineSyncs());
+    try testing.expectEqual(before + 3 * db.syncs_per_file_sync, db.engineSyncs());
 }
 
 test "held snapshot: kept while it is the latest commit; a commit passing it, a write, a collection and the last release let it go" {
