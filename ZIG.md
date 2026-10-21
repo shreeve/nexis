@@ -3,7 +3,7 @@
 The Zig idioms this tree depends on and the traps that bit it. nexis
 builds with Zig 0.17.0 (`build.zig.zon` `minimum_zig_version`). For
 the language and standard library at large, read the shared guide,
-[ZIG-0.17.md](https://github.com/shreeve/zig-agent-docs/blob/main/ZIG-0.17.md):
+[ZIG-0.17.md](https://gist.githubusercontent.com/shreeve/57a74df35e17dacb30dcaa5d5164a27f/raw/ZIG-0.17.md):
 its API tables, format specifiers and compile-error decoder are all
 checked against 0.17.0. Where an API is in neither, the installed
 standard library is the authority (`zig env` prints `std_dir`;
