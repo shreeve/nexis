@@ -49,7 +49,7 @@ pub fn failureName(err: anyerror) []const u8 {
         error.ValueTooLarge => "db/value-too-large",
         error.MaxDbsReached => "db/max-trees",
         error.NotFound => "db/not-found",
-        error.Corrupted, error.InvalidPage, error.FormatVersionMismatch => "db/corrupted",
+        error.Corrupted, error.InvalidPage, error.FormatVersionMismatch, error.RecoveryNeeded => "db/corrupted",
         error.DatabaseFull => "db/map-full",
         error.DiskFull => "db/disk-full",
         error.QuotaExceeded => "db/quota-exceeded",

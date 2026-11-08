@@ -590,17 +590,19 @@ transactions are never joined into one emdb transaction (`docs/DB.md`
 
 Once a sync of the file fails (a commit's, `:db/durability-unknown`
 among them, or `d/sync`'s or `release`'s own), the file syncs nothing
-more until the system reboots (emdb INV-SYNC-04, `docs/DB.md` §3.3 "A
+more until the system reboots or a lone open repairs it (emdb
+INV-SYNC-04, `docs/DB.md` §3.3 "A
 failed sync is final"): `d/sync`, and a `transact!` or `excise!` whose
 commit would sync (`:sync :full` or `:no-meta`), raise
 `:db/sync-failed`, the transaction publishing nothing; one that syncs
 nothing (`:sync :none`) commits; `release` and the end of `with-conn`
 sync nothing and raise nothing. The mark is in the file's lock file,
-so every connection to the file takes it, in any process, and so does
-a `connect` after every connection was released: the file holds
-exactly the commits that were published, reads are unaffected, and it
-syncs again after the system reboots (`docs/DB.md` §3.3 "A failed
-sync is final").
+so every connection to the file takes it, in any process. A `connect`
+after every connection was released repairs the file to the last
+commit no sync left in doubt and clears the mark, unless a last commit
+that never synced stands under a void anchor, which opens as it stands
+and keeps the mark until the system reboots (emdb INV-T08A). Reads are
+unaffected (`docs/DB.md` §3.3 "A failed sync is final").
 
 ---
 
