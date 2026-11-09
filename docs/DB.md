@@ -305,7 +305,9 @@ and calls `sync` where it must not lose what it wrote.
 
 Creating a file syncs its first state before `db/open` returns (emdb
 writes and syncs a new file's meta pages), so a new store is on the
-disk whatever the durability; opening an existing file syncs nothing.
+disk whatever the durability. Opening an existing file alone may sync
+what recovery asks (emdb INV-SYNC-05, INV-T08A): within the boot that
+wrote it, at least one data sync of the meta pages.
 
 `StoreFile` records whether a commit since the file's last sync went
 without one (`unsynced`). A commit that syncs data and meta makes
@@ -326,8 +328,8 @@ side of the durable anchor's write, emdb INV-SYNC-06), when:
 - the process ends through `exit` or through an error `bin/nexis`
   reports (`StoreFile.syncAll`).
 
-A file nothing wrote since its last sync is not synced again, and a
-program that only reads never syncs. A process killed by a signal ends
+A file nothing wrote since its last sync is not synced again, and
+reading syncs nothing past what its open asked. A process killed by a signal ends
 without the sync: its commits are in the operating system's cache and
 outlive it (the inline test "a commit survives its process ending
 without a sync or a close" commits in a child process that then
@@ -339,10 +341,10 @@ caller can take the error, is reported on stderr.
 `:durable` commit's data or meta sync, the `:db/durability-unknown`
 case among them, or a full sync at `db/sync`, `nextomic/sync`, a
 close or teardown), the file syncs nothing more until the system
-reboots (emdb INV-SYNC-04): a failed fsync may have dropped the pages
+reboots or a lone open repairs it (emdb INV-SYNC-04, INV-T08A): a failed fsync may have dropped the pages
 it could not write and marked them clean, so a later sync that
 succeeded would prove nothing about them. `StoreFile.syncFailed`
-reads the mark. Until the reboot:
+reads the mark. Until then:
 
 - `db/sync` and `nextomic/sync` raise `:db/sync-failed`, whatever is
   unsynced;
@@ -358,11 +360,17 @@ reads the mark. Until the reboot:
 
 The mark is in the file's lock file (emdb DEF-LOCKFILE), so every
 connection and Nextomic store of the file takes it, in this process
-and in any other, and so does every open of the file after it:
-closing every connection and opening the file again leaves it set
-(the inline test "after a commit's meta sync fails, the file syncs
-nothing more, reopened too, and keeps the commits that published").
-The file still holds exactly the commits that were published, and
+and in any other, and so does every open that joins a holder. A
+writable open alone on the file repairs it to the last commit no sync
+left in doubt and clears the mark, so a commit that published with no
+sync after the failure is gone from the reopened file. The exception
+is a last commit that never synced under a void anchor, which opens as
+it stands with the mark kept (emdb INV-T08, INV-T08A; the inline test
+"after a commit's meta sync fails, the file syncs nothing more while
+held, and a lone reopen repairs it, without the commits that synced
+nothing").
+While a connection holds it, the file holds exactly the commits that
+were published, and
 reads are unaffected. A reboot clears the mark, the disk being the
 truth after it. Removing the lock file while no process has the file
 open clears it too, and gives up the protection: it is sound only
@@ -557,10 +565,12 @@ abort can end), `:db/read-only`, `:db/sync-failed`, and
 `:db/durability-unknown`: a `:durable` commit whose meta page did not
 sync. That commit is published and every transaction sees it, but
 whether it is on the disk is unknown, and no later sync can settle
-it: the file syncs nothing more until the system reboots, and every later
-sync and syncing commit raises `:db/sync-failed` (§3.3 "A failed sync
+it: the file syncs nothing more until the system reboots or a lone
+open repairs it, and every later sync and syncing commit raises `:db/sync-failed` (§3.3 "A failed sync
 is final"). `with-tx` reports it like any failed commit, though the
-commit stands. The emdb errors left are the ones no nexis
+commit stands. `RecoveryNeeded`, a file only emdb's explicit recovery could
+open and nexis does not ask for (emdb INV-T08B), is `:db/corrupted`.
+The emdb errors left are the ones no nexis
 call can meet (options it pins or never sets, operations it never
 calls); they would be `:db-error`, and the inline test "failureName"
 holds the table to `emdb.Error`.

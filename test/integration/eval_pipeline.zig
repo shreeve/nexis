@@ -4202,7 +4202,7 @@ test "db/open: a commit syncs nothing unless the connection is :durable; db/sync
             \\ (db/get-key (db/ref (db/open "@STORE@" nil) :t :k))]
             ,
             "[{:error :db-closed, :message db closed, :fn test-form} {:error :invalid-argument, :message invalid argument, :fn test-form} {:error :invalid-argument, :message invalid argument, :fn test-form} {:error :kind-mismatch, :message kind mismatch, :fn test-form} 4]",
-            0,
+            null,
         },
     });
 }
