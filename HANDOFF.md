@@ -58,7 +58,7 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 245/245 steps succeeded; 1482/1483 tests passed (1 skipped)
+Build Summary: 245/245 steps succeeded; 1483/1484 tests passed (1 skipped)
 ```
 
 The gate generates `src/parser.zig` first and needs `../nexus/bin/nexus`

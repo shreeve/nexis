@@ -259,7 +259,7 @@ holds a million values stays linear rather than re-marking them every
 the same effect. A VM with `gc_enabled = false` or a borrowed heap is
 never due.
 
-**Safe point.** The VM tests `gcDue` in two places. The first is
+**Safe point.** The VM tests `gcDue` in three places. The first is
 before fetching an instruction in its one run loop (`VM.loop`, which
 `run`, `callValue` and `runRoutine` drive), at a loop's first fetch
 and at every fetch after an instruction that could have allocated:
@@ -290,14 +290,21 @@ before it is in its place and its own arguments are in the window.
 (a rest list, a closure and its cells) allocate as many blocks as they
 like with no rooting, and what one instruction allocates is in a slot
 before the next fetch. A cycle therefore runs inside a native only
-through a call back into the VM, which is what the rooting rule
-(§11.5) covers, or where a native that holds nothing but its rooted
+through a call back into the VM or a lazy block's realization, which
+the rooting rule (§11.5) covers, or where a native that holds nothing but its rooted
 arguments runs one itself: a native that begins a db transaction
 collects once when the file's writer or reader slots are taken by a
 handle the cycle could end (`docs/DB.md` §3.2). Such a native is at
 the point a `callValue` from it would be, so every frame beneath it is
 already safe for a cycle. `VM.collectGarbage` runs one cycle on demand from a
 safe point and counts it in `gc_cycles`; tests call it directly.
+
+The third is `seq.force`, before it runs a lazy block's step, the block
+on the root stack. A walk made entirely of natives, such as
+`(count (concat (range n) [1]))`, reaches neither of the others. A
+step may call back into the VM and collect, so a native already keeps
+what it holds across a walk on its root scope (§11.5), and a cycle
+here frees nothing live.
 
 ---
 

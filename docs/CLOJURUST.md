@@ -117,9 +117,7 @@ levels deep, a chain of `concat`s and a deep `eval` end in a SIGBUS;
 keeps everything it allocates until it returns, so a hot allocating
 loop reaches 2 GB where the IR tier holds 180 MB. In the same probes
 nexis neither crashed nor hung, deep inputs raising
-`:stack-overflow`. Its weak point is `TODO.md` #31: a lazy walk made
-entirely of natives reaches no safe point, so its garbage is not
-collected.
+`:stack-overflow`.
 
 **Names.** Of `clojure.core` 1.12's 676 public vars, babashka has
 93.8%, clojurust 68.9% and nexis 64.2%. What nexis lacks is mostly the
