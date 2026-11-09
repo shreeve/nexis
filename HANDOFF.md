@@ -553,7 +553,11 @@ after numbers in the commit message.
    records yet (`docs/CLOJURUST.md` §3).
 5. What nexis lacks beside clojurust (`docs/CLOJURUST.md` §5): threads,
    sockets and a server mode, nREPL, packages. The order among them
-   is the owner's call.
+   is the owner's call; `::k` and `#:ns{...}` (`docs/GUIDE.md`) are
+   proposed beside them and need a PLAN amendment.
+6. The next release. `main` builds against emdb 0.11.0; its notes
+   announce the recovery rules of `docs/DB.md` §3.3, an open that may
+   sync and a lone reopen that repairs a file whose sync failed.
 
 Rerun `bb bench/compare/run.clj --out DIR` (`docs/BENCH.md` §12)
 before and after any performance change; on the Apple host nexis
