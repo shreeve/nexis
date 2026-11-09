@@ -451,6 +451,11 @@ after each.
 - *Startup* includes the wrappers' spawn (`time`, `taskset`), the
   same for all.
 
+**clojurust** is not a `run.clj` implementation. Its comparison
+(`docs/PERF.md` §3.43, `docs/CLOJURUST.md`) runs the same language
+bodies and `prelude.clj` by hand, as §11 of PERF states; a program
+that passes 120 s is killed and not run again.
+
 ### 13. The micro kit: `bench/micro/`
 
 What one iteration, call or element of a small program costs the

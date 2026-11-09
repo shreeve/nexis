@@ -35,7 +35,8 @@ changes to emdb.
    §1 is the reader's introduction to Datomic; where the rest of that
    note describes Nextomic, `docs/NEXTOMIC.md` wins).
 4. `CLOJURE-REVIEW.md`: what nexis takes, adapts and rejects from
-   Clojure, and where it differs.
+   Clojure, and where it differs. `docs/CLOJURUST.md` sets nexis beside
+   clojurust, a Clojure in Rust.
 5. `ZIG.md` before writing Zig: the idioms and traps of this
    tree.
 
@@ -196,6 +197,7 @@ nexis/
 ├── examples/                    working .nx programs (examples/README.md)
 ├── editors/                     VS Code, Vim and highlight.js files generated from nexis.grammar's @highlight (editors/README.md)
 ├── test/highlight/              sample.nx and sample.nx.hl, the colouring the editor files must give
+├── misc/                        not in the repository: local checkouts of jank and clojurust, for reference (docs/CLOJURUST.md)
 ├── bench/                       main.zig (the harness), nextomic.zig (its Nextomic scenarios),
 │                                compare/ (nexis against babashka and JVM Clojure, Nextomic
 │                                against Datalevin and Datomic; docs/BENCH.md §12),

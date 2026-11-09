@@ -43,3 +43,4 @@ canonical Form schema in [`PLAN.md`](../PLAN.md) §23 and §28.
 | — | [`FILEMAN-NEXTOMIC.md`](FILEMAN-NEXTOMIC.md) | A design note, not a spec: VistA's FileMan data on Nextomic's time model (`TODO.md` #12) |
 | `src/bench.zig`, `bench/` | [`BENCH.md`](BENCH.md) | Benchmark method and harness |
 | — | [`PERF.md`](PERF.md) | Measured numbers, levers, non-goals |
+| — | [`CLOJURUST.md`](CLOJURUST.md) | Not a spec: nexis beside clojurust, a Clojure in Rust, by design, fidelity, tools and speed |

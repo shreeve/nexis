@@ -370,8 +370,7 @@ it stands with the mark kept (emdb INV-T08, INV-T08A; the inline test
 held, and a lone reopen repairs it, without the commits that synced
 nothing").
 While a connection holds it, the file holds exactly the commits that
-were published, and
-reads are unaffected. A reboot clears the mark, the disk being the
+were published, and reads are unaffected. A reboot clears the mark, the disk being the
 truth after it. Removing the lock file while no process has the file
 open clears it too, and gives up the protection: it is sound only
 once the file's pages are known to be on the disk (emdb INV-SYNC-04).

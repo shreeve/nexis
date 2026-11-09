@@ -282,17 +282,22 @@ Measured with provenance in `docs/PERF.md`, by the comparison harness
 - **Start-up**: about 5 ms and a 6 MB resident set on an Apple M5.
 - **Against babashka**: ahead on all eleven language workloads on the
   M5 (§3.11); on an Intel Core Ultra 9 185H under Linux, ahead on
-  start-up and eight of the ten programs, level on string splitting
-  and behind on the `map`/`filter`/`reduce` pipeline (§3.15).
+  start-up and nine of the ten programs and level on string splitting
+  (§3.15, §3.33).
 - **Against JVM Clojure** (the Linux host): nexis leads warm HotSpot
   on the counting loop, `frequencies`/`group-by` and `sort`, and warm
   HotSpot is 1.2–6.0× faster on the other seven programs; counting the
   JVM's start, nexis finishes first on every one-shot program, in
   1.8–27× less memory (§3.15, §3.32).
+- **Against clojurust** (a Clojure in Rust, on the M5): ahead on all
+  ten programs, 21–401× against its JIT and 13–498× against its
+  compiled binaries; `docs/CLOJURUST.md` compares the two in full
+  (§3.43).
 - **Nextomic**: ahead of Datalevin, Datomic Local and Datomic Pro on
   every phase timed cold but Datalevin's durable commit; a warm
   Datomic Pro peer is level at point lookups; its store is the
-  largest, 3.1× Datalevin's and 7.6× Datomic Pro's (§3.11, §3.15).
+  largest, 1.24× Datalevin's, which keeps no history, and 2.9×
+  Datomic Pro's (§3.11, §3.15, §3.36).
 
 ## Differences from Clojure
 

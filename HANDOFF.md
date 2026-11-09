@@ -549,14 +549,15 @@ after numbers in the commit message.
    and short ids (`docs/PERF.md` §3.36; store format 3, which refuses
    every other). A pull of 10k entities is 4% slower cold on Linux for
    the variable-length entity; §6 "Store size" lists what is left.
-4. `as-of` of an instant (`TODO.md` #22): a time view taken at an
-   instant as Datomic's `as-of` takes a `Date`.
-5. `TODO.md`'s "Open from revamp 3" (#24–#29): the multimethod
-   registry, protocol names in print, duplicates left between files,
-   and the deferred test and doc pass.
+4. `TODO.md` #30: the differences from babashka that no document
+   records yet (`docs/CLOJURUST.md` §3).
+5. What nexis lacks beside clojurust (`docs/CLOJURUST.md` §5): threads,
+   sockets and a server mode, nREPL, packages. The order among them
+   is the owner's call.
 
 Rerun `bb bench/compare/run.clj --out DIR` (`docs/BENCH.md` §12)
 before and after any performance change; on the Apple host nexis
 leads babashka on every row (§3.11), and Nextomic leads Datalevin,
 Datomic Local and Datomic Pro on every phase timed cold but
-Datalevin's durable commit (§3.15).
+Datalevin's durable commit (§3.15). `docs/CLOJURUST.md` sets nexis
+beside clojurust, a Clojure in Rust.
