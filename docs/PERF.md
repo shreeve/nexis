@@ -2167,6 +2167,58 @@ What the rows say:
   the same instructions and runs 7.7% more cycles; on the Linux host it
   is level.
 
+### 3.43 Against clojurust, Apple M5
+
+The ten language programs of §3.11 through nexis and clojurust 0.1.0
+(`docs/CLOJURUST.md`), with babashka as the control: ten rounds, the
+systems alternating, the body and prelude of `bench/compare/lang/`
+unchanged (`docs/BENCH.md` §12). clojurust runs each program twice
+over, on its JIT by `cljrs run` and as a binary from `cljrs compile`.
+Cells are milliseconds measured inside the process, the median with
+the minimum and 95th percentile in brackets; RSS is the median peak of
+nexis, clojurust's JIT run and babashka. Every program that finished
+gave the same answer on every system. A program past 120 s was killed
+and not run again. Provenance: §11.
+
+| Workload | nexis | clojurust JIT | clojurust AOT | babashka 1.13 | JIT ÷ nexis | AOT ÷ nexis | RSS |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| loop/recur, 1M | 5.1 [4.6, 5.9] | 1537 [1144, 1937] | 276 [187, 310] | 74.0 [57.6, 112] | 302 | 54 | 5 / 19 / 83 MB |
+| `fib` 30 | 18.9 [17.5, 28.6] | 1084 [770, 1205] | 1018 [788, 1132] | 131 [113, 153] | 57 | 54 | 5 / 195 / 77 MB |
+| destructuring, 1M calls | 124 [102, 172] | 2841 [2196, 3155] | 1659 [1260, 1789] | 393 [335, 494] | 23 | 13 | 23 / 1036 / 84 MB |
+| map built and read, 1M | 830 [536, 1107] | 17,684 [12,122, 19,881] | >120 s | 1256 [1054, 1435] | 21 | >144 | 97 / 7069 / 192 MB |
+| the same through a transient | 355 [293, 450] | 11,759 [10,117, 15,126] | 10,574 [7560, 11,578] | 981 [754, 1168] | 33 | 30 | 85 / 6552 / 179 MB |
+| vector `conj` and `nth`, 1M | 30.5 [27.7, 58.6] | 10,332 [7669, 12,819] | 8961 [6607, 9776] | 96.3 [75.2, 117] | 339 | 294 | 35 / 6110 / 125 MB |
+| string build and split, 1 MB | 9.3 [8.7, 12.4] | 1452 [1217, 2109] | 1426 [1193, 2492] | 19.3 [17.9, 36.2] | 156 | 153 | 33 / 1413 / 73 MB |
+| `sort`, 1M ints | 38.0 [35.4, 43.6] | >120 s | >120 s | 237 [216, 355] | >3160 | >3160 | 64 / — / 114 MB |
+| `frequencies` and `group-by`, 1M | 72.9 [66.1, 88.3] | 11,507 [8172, 13,337] | 13,807 [9992, 19,438] | 234 [187, 322] | 158 | 189 | 42 / 7708 / 132 MB |
+| map/filter/reduce over 1M maps | 26.5 [22.7, 36.8] | 10,619 [9262, 15,091] | 13,178 [11,565, 17,190] | 38.2 [34.0, 62.0] | 401 | 498 | 188 / 7578 / 210 MB |
+
+An empty program takes 7.1 ms and 4.3 MB in nexis, 14.1 ms and 18.4 MB
+in clojurust, and 19.5 ms and 30.5 MB in babashka, as whole-process
+medians.
+
+What the rows say:
+
+- nexis is ahead of clojurust on every program, by 21–401× against
+  the JIT and 13–498× against the AOT binary. No program was found
+  where clojurust leads.
+- The AOT binary of `map-build-read` and both forms of `sort` do not
+  finish in 120 s.
+- clojurust's peak memory reaches 6–8 GB on the programs that allocate
+  most, 40–184× nexis's; the JIT keeps what a compiled frame allocates until it
+  returns (`docs/CLOJURUST.md` §3).
+- More cores and other JIT thresholds change nothing material: with
+  four cores and `--jit-threshold 100`, `fib` is 1.2–1.3 s and `loop`
+  1.9 s; with the JIT off, `fib` is 2.6–2.7 s.
+- The machine was shared, its load 7–16, and each row's spread from
+  the minimum to the 95th percentile is 22–101% of its median, past
+  BENCH.md §3's 20%. The differences from clojurust are one to three
+  orders of magnitude and stand. The babashka column is a control
+  only: its ratios of record are §3.11 and §3.15.
+- These are single-threaded programs from nexis's own comparison set,
+  so nothing here measures clojurust's threads, against which nexis
+  has no counterpart.
+
 ## 6. Levers and dead ends
 
 Each lever is a measured change: a before/after from `zig build bench`
@@ -2619,4 +2671,5 @@ kept with a caveat. Each §3 section says how its figures were taken.
 | §3.40, §6 "A width-consistent native boundary", "A native's result assembled in a temporary" and "The boundary's other widths" | Intel Core Ultra 9 185H, 30 GiB, Ubuntu 26.04.1 LTS, Linux 7.0.0-34-generic, governor `powersave`, as §3.15; babashka v1.13.224; and Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434); Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `b3370fb` (a source snapshot on the Linux host); both hosts shared with other sessions | 2026-10-09 00:00–01:50 MDT. x86: `bin/nexis` built by `zig build install -Doptimize=fast` from `git archive` snapshots of `bd2cf5c` (before) and `4cd8e90` (after) on the Linux host; `277a3b4`'s build there has the same `.text`, byte for byte. Linux: `micro.sh`, `bb bench/micro/run.clj --counter perf --pin 2 --rounds 10 --programs count,fib,gcall,leaf,getnl,vnth,leaf1,vdestr,cbbase,cbsum,cb,lazy BEFORE AFTER`, twice, each in its own hold of the host's benchmark lease (load 0.9 → 1.2); `pairs.sh`, each run `taskset -c 2 /usr/bin/time -f %M perf stat -x, -e cpu_core/instructions/u,cpu_core/cycles/u,cpu_core/ld_blocks.store_forward/u bin/nexis run P` over `prelude.nx` with each body, the builds interleaved, ten rounds (load 1.0 → 1.3); `run.clj --n 10 --max-load 4 --pin 0-11 --no-build --only lang --impls nexis,bb --workloads destructure,vector-conj-nth,pipeline` from each snapshot, after, before, after, before (load 1.0 → 1.1). The blocked loads located with `perf mem record -t load --ldlat 4` (each sample's data source marks a load blocked on a store's data) and `perf record -e cpu_core/ld_blocks.store_forward/upp`; the dead ends from trial builds of the worktree, `perf stat` at two sizes per unit, three rounds. M5: `bb bench/micro/run.clj --rounds 5` over the same programs, twice, under `tools/heavy` (1 core; load 21.8 → 13.0), the builds `zig build install -Doptimize=fast --prefix DIR` at `bd2cf5c` and `277a3b4`. |
 | §3.41, §6 "A native's result assembled in a temporary" and "A map literal's sort" | Intel Core Ultra 9 185H, 30 GiB, Ubuntu 26.04.1 LTS, Linux 7.0.0-34-generic, governor `powersave`, as §3.15; babashka v1.13.224; and Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434); Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `8463a21` (a source snapshot on the Linux host); both hosts shared with other sessions | 2026-10-09 04:40–05:50 MDT. x86: `bin/nexis` built by `zig build install -Doptimize=fast` on the Linux host from `git archive` snapshots of `1957422` (before) and of `1957422` with the stdlib and champ commits (after; a snapshot of the two commits themselves builds the same `.text` there, byte for byte). Linux: `micro.sh`, `bb bench/micro/run.clj --counter perf --pin 2 --rounds 10 --programs count,fib,gcall,leaf,getnl,vnth,leaf1,vdestr,cbbase,cbsum,cb,lazy BEFORE AFTER`, twice, each in its own hold of the host's benchmark lease (load 0.7 → 1.4); `pairs.sh`, each run `taskset -c 2 /usr/bin/time -f %M perf stat -x, -e cpu_core/instructions/u,cpu_core/cycles/u,cpu_core/ld_blocks.store_forward/u bin/nexis run P` over `prelude.nx` with each body, the builds interleaved, ten rounds (load 0.9 → 1.7); `run.clj --n 10 --max-load 4 --pin 0-11 --no-build --only lang --impls nexis,bb --workloads destructure,vector-conj-nth,pipeline,map-build-read` from each snapshot, after, before, after, before (load 1.3 → 1.7). The natives-alone build and the dead ends from snapshots of the worktree, `perf stat` at two sizes per unit, three rounds, and the destructuring program three or four rounds; the blocked loads located with `perf record -e cpu_core/ld_blocks.store_forward/upp`. M5: `bb bench/micro/run.clj --rounds 5` over the same programs, twice, under `tools/heavy` (1 core; load 17.5 → 14.9, then 6.2 → 6.8), the builds `zig build install -Doptimize=fast --prefix DIR` of the same two trees. |
 | §3.42, §6 "A leaf call's kind and arity in one test" and "A leaf's common case without a frame" | Intel Core Ultra 9 185H, 30 GiB, Ubuntu 26.04.1 LTS, Linux 7.0.0-34-generic, governor `powersave`, as §3.15; babashka v1.13.224; and Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434); Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `fb97dac` on the M5 and, on the Linux host, the source snapshot its revamp worktrees build against; both hosts shared with other sessions | 2026-10-10 15:18–16:08 MDT, varcall. `bin/nexis` built by `zig build install -Doptimize=fast` from `git archive` snapshots of `843a74e` (before), of `843a74e` with the stdlib commit (after), with the mask on top (the arity test), and with the `get`, `count` or `nth` change alone, on the Linux host; on the M5 with `--prefix DIR` from the worktree and a snapshot. Linux: `bb bench/micro/run.clj --counter perf --pin 2 --rounds 5 --programs count,fib,gcall,leaf,getnl,vnth,leaf1,vdestr,casek,mcall,kw,cbbase,cbsum,cb,lazy,xform BEFORE AFTER MASK` in one hold of the host's benchmark lease (load 3.6 → 3.6); `pairs.sh`, each run `taskset -c 2 /usr/bin/time -f %M perf stat -x, -e cpu_core/instructions/u,cpu_core/cycles/u,cpu_core/ld_blocks.store_forward/u bin/nexis run P` over `prelude.nx` with each of the ten bodies, the builds interleaved, seven rounds (load 2.1 → 2.6), and the destructuring loop and the pipeline fifteen rounds; the single-change builds by `perf stat` with `cpu_core/machine_clears.count/u` and `cpu_core/machine_clears.memory_ordering/u`, three rounds; `run.clj --n 10 --max-load 4 --pin 0-11 --no-build --only lang --impls nexis,bb --workloads destructure,vector-conj-nth,pipeline,map-build-read` from each snapshot, after then before (load 1.5 → 2.9). M5: `bb bench/micro/run.clj --rounds 5` over every program under `tools/heavy` (1 core; load 5.8 → 6.1), the mask and frameless builds `--rounds 3` against the build before each; `m5pairs.sh`, each run `/usr/bin/time -l bin/nexis run P` over the same ten programs, the builds interleaved, five rounds (load 4.9 → 5.3), and `sort` fifteen. Dispatch and native counts from a `-Dopcodes=true` build of the after tree. |
+| §3.43 | Apple M5, 10 cores, 32 GiB, macOS 27.0.1, Zig 0.17.0; nexis 0.4.0 at `3f2bc47`, `-Doptimize=fast`; clojurust 0.1.0 at `b847a29b`, `cargo build --release`; babashka v1.13.224; shared with concurrent sessions (load average 13.4 at the start, 7.1 at the end) | 2026-11-08: each `bench/compare/lang/NAME.clj` after `bench/compare/prelude.clj` (`prelude.nx` for nexis) as one file, through `nexis run`, `cljrs run`, `cljrs compile -o BIN` then `BIN`, and `bb`; ten rounds interleaved, under `cpuq --cores 2`, each under `/usr/bin/time -l` with a 120 s limit. The JIT check: four cores, `--jit-threshold` default, 100 and 0, two runs each |
 | §6 "Levers pulled", the `cc935cc` figures of §3.11 | as §3.11 language and database rows, shared with concurrent builds (1-minute load average 5–15) | 2026-09-26: `bb bench/compare/run.clj --only db --n 10 --max-load 6 --no-build` over ReleaseFast binaries of the ws-durability branch (after) and of `cc935cc` (before), run one after the other; each run's third attempt, the first two having seen the load pass 6; ten rounds after a warm-up. The `bin/nexis` read figures: a probe program timing 10,000 of each operation over 10,000 entities with `nano-time`, three runs of each binary, alternating. `db_put_commit_scalar`: `zig build bench -Doptimize=ReleaseFast -- --filter db-integrated,nextomic`, three invocations at the branch head and two at `cc935cc`, alternating, the best median; §3.6's durable M5 figure is the `cc935cc` run's, and the branch head measured 7.2–8.9 ms under `NEXIS_DURABILITY=durable` at load 7 |
