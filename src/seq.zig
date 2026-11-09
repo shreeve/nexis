@@ -765,6 +765,13 @@ pub fn make(vm: *VM, op: u16, args: []const Value) VmError!Value {
 pub fn force(vm: *VM, lz: Value) VmError!Value {
     if (lazy.state(lz) == .realized) return lazy.result(lz);
     stack_guard.check() catch return VmError.StackOverflow;
+    // A walk of natives alone reaches no other safe point (GC.md §7).
+    if (vm.gcDue()) {
+        const scope = vm.rootScope();
+        defer scope.release();
+        try scope.push(lz);
+        vm.collectGarbage();
+    }
     var cur = forwardEnd(lz);
     const raw: Value = while (true) {
         switch (lazy.state(cur)) {

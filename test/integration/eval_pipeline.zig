@@ -7226,6 +7226,24 @@ test "typed vectors: a store round trip through the codec" {
 // The collector under a forced-frequent trigger (VM.md §9, GC.md §7)
 // =============================================================================
 
+test "a lazy walk made entirely of natives collects as it goes" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "(count (concat (range 1000000) [1]))", "1000001" },
+        .{ "(count (drop 5 (take 500000 (repeat 1))))", "499995" },
+        .{ "(last (take 500000 (repeat 1)))", "1" },
+        .{ "(count (distinct (take 500000 (cycle [1 2 3]))))", "3" },
+    };
+    for (cases) |case| {
+        var program: Program = undefined;
+        try program.init();
+        defer program.deinit();
+        const result = try program.run(case[0]);
+        try harness.expectResult(&program, case[0], result, case[1]);
+        // Twice the default window: a walk that collects stays near it.
+        try testing.expect(program.v.ensureHeap().peak_live_bytes < 32 * 1024 * 1024);
+    }
+}
+
 /// `expectOutputProgram` on a VM whose collector is due every few
 /// kilobytes, so a native's callback runs through many cycles; the
 /// program must yield `expected` and at least one cycle must have run.

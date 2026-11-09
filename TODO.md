@@ -80,17 +80,6 @@ up. Every fix starts with its failing test (`AGENTS.md`).
     call site must still see the Var's latest root (PLAN §23 #20;
     `docs/PERF.md` §6 "Inline caches at call sites").
 
-31. **A lazy walk made entirely of natives is not collected.**
-    `Heap.alloc` never collects, and the safe points are VM fetches and
-    `vm.callValue` (`docs/GC.md` §7), so a walk that runs no user code
-    reaches none: `(count (concat (range 10000000) [1]))` peaks at
-    412 MB where babashka holds 125 MB, and at 100,000,000 elements it
-    passes 2 GB where babashka holds 92 MB. `drop`, `take`, `last` and
-    `distinct` over a long lazy source do the same. `(reduce + (take
-    50000000 (repeat 1)))` calls back through the VM and holds 19 MB.
-    The fix is a safe point in the natives' walk, with what it holds
-    rooted.
-
 ## Store size
 
 20. **The store is 1.24× Datalevin's and 2.9× Datomic Pro's.**

@@ -2190,7 +2190,7 @@ pub const VM = struct {
     /// Whether a cycle is due at this safe point: the VM collects,
     /// owns its heap, and the heap has allocated `gc_next_at` bytes
     /// since the last cycle.
-    inline fn gcDue(self: *VM) bool {
+    pub inline fn gcDue(self: *VM) bool {
         // The counter first: below the limit, as at nearly every safe
         // point, nothing else is read.
         const h = &(self.heap orelse return false);
