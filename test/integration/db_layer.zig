@@ -341,7 +341,7 @@ test "durability commit: a commit is seen at once and syncs nothing; close syncs
     try testing.expectEqual(before + db.syncs_per_file_sync, db.engineSyncs());
 }
 
-test "durability durable: every commit syncs, which leaves nothing for close; a read-only program never syncs" {
+test "durability durable: every commit syncs, which leaves nothing for close; reading syncs nothing" {
     var fx = try Fixture.init("durable_mode");
     defer fx.deinit();
 
@@ -363,12 +363,15 @@ test "durability durable: every commit syncs, which leaves nothing for close; a 
     try db.close(conn);
     try testing.expectEqual(after_commit, db.engineSyncs());
 
+    // Opening alone may sync what recovery asks (emdb INV-T08A,
+    // INV-SYNC-05); reading and closing sync nothing past it.
     const reader = try fx.connect();
+    const after_open = db.engineSyncs();
     var r = try db.beginRead(reader);
     try testing.expectEqual(@as(i64, 2), (try db.get(&r, "t", "k", synthHash, synthEq)).?.asFixnum());
     db.abortRead(&r);
     try db.close(reader);
-    try testing.expectEqual(after_commit, db.engineSyncs());
+    try testing.expectEqual(after_open, db.engineSyncs());
 }
 
 /// Fails the meta sync of the next commit on the data file `fd`: once
@@ -392,7 +395,7 @@ const MetaSyncFailure = struct {
     }
 };
 
-test "durability durable: after a commit's meta sync fails, the file syncs nothing more, reopened too, and keeps the commits that published" {
+test "durability durable: after a commit's meta sync fails, the file syncs nothing more while held, and a lone reopen repairs it, without the commits that synced nothing" {
     var fx = try Fixture.init("meta_sync");
     defer fx.deinit();
 
@@ -448,29 +451,25 @@ test "durability durable: after a commit's meta sync fails, the file syncs nothi
     try db.close(other);
     try testing.expectEqual(before, db.engineSyncs());
 
-    // Reopened, the file holds exactly the commits that published, and
-    // still syncs nothing: the mark is in the lock file and lasts until
-    // the system reboots (emdb INV-SYNC-04).
+    // Reopened alone, emdb's recovery repairs the file to the last
+    // commit no sync left in doubt and clears the mark (emdb INV-T08,
+    // INV-T08A): the commit that published with no sync after the
+    // failure is gone, and the file syncs again.
     conn = try fx.connect();
     conn.durability = .durable;
-    try testing.expect(conn.file.syncFailed());
+    try testing.expect(!conn.file.syncFailed());
     {
         var r = try db.beginRead(conn);
         defer db.abortRead(&r);
         try testing.expectEqual(@as(i64, 5), (try db.get(&r, "t", "a", synthHash, synthEq)).?.asFixnum());
         try testing.expect((try db.get(&r, "t", "b", synthHash, synthEq)) == null);
-        try testing.expectEqual(@as(i64, 7), (try db.get(&r, "t", "c", synthHash, synthEq)).?.asFixnum());
+        try testing.expect((try db.get(&r, "t", "c", synthHash, synthEq)) == null);
     }
-    try testing.expectError(error.SyncFailed, db.sync(conn));
-    w = try db.beginWrite(conn);
-    try db.put(&w, "t", "b", value.fromFixnum(6).?);
-    try testing.expectError(error.SyncFailed, db.commit(&w));
-    conn.durability = .commit;
+    try db.sync(conn);
     w = try db.beginWrite(conn);
     try db.put(&w, "t", "b", value.fromFixnum(6).?);
     try db.commit(&w);
     try db.close(conn);
-    try testing.expectEqual(before, db.engineSyncs());
 }
 
 test "syncAll: one sync for each file written without one; shutdown syncs a file it releases last" {
